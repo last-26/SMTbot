@@ -103,6 +103,10 @@ References: `pine/vmc_a.txt`, `pine/vmc_b.txt` (original VMC source). Standalone
 
 **OB sub-module inside the overlay** follows @Nephew_Sam_'s opensource Orderblocks pattern (MPL 2.0): fractals are persisted, and an OB is cut when a later bar trades through one — scanning back in time to the fractal to find the extreme counter candle. Optional 3-bar FVG proximity filter + immediate wick-mitigation delete. Boxes (not lines) are used so `src/data/structured_reader.py:parse_ob_boxes` keeps working.
 
+## Deferred / performans TODO
+
+- **Overlay Pine split (~1200 satır → 2 parça)** — `pine/smt_overlay.pine` tek script olarak ağır; multi-pair round-robin'de sembol değiştikten sonra yerleşme süresi (~3-5s) tarama cycle'ının ana maliyeti. İki parçaya bölmek (`smt_overlay_structure.pine` — MSS/BOS/FVG/OB + `smt_overlay_levels.pine` — liquidity/sessions/PDH-PWH/VMC) TV'nin recompute'unu paralelleştirebilir ve tarama latency'sini aşağı çekebilir. Her iki parça da kendi Pine tablosuna yazmalı; `src/data/structured_reader.py` iki tabloyu tek `MarketState`'e birleştirmeli. **Yapma önceliği düşük** — önce `phase7_prep_prompt.md` (Madde A-F) bitecek, demo'da freshness-poll latency'si fiilen sorun olursa bu optimizasyon ele alınacak.
+
 ## Phase status
 
 | Phase | Status | Summary |
