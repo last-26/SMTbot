@@ -1,0 +1,41 @@
+bot:
+  mode: demo
+  poll_interval_seconds: 5
+  timezone: UTC
+
+trading:
+  symbol: BTC-USDT-SWAP
+  entry_timeframe: 15m
+  htf_timeframe: 4H
+  risk_per_trade_pct: 1.0
+  max_leverage: 20
+  default_rr_ratio: 3.0
+  min_rr_ratio: 2.0
+  max_concurrent_positions: 2
+
+circuit_breakers:
+  max_daily_loss_pct: 3.0
+  max_consecutive_losses: 5
+  max_drawdown_pct: 10.0
+  cooldown_hours: 24
+
+analysis:
+  min_confluence_score: 2
+  candle_buffer_size: 500
+  swing_lookback: 20
+  sr_min_touches: 3
+  sr_zone_atr_mult: 0.5
+  session_filter:
+    - london
+    - new_york
+
+okx:
+  base_url: https://www.okx.com
+  demo_flag: "1"
+
+rl:
+  min_trades_to_train: 50
+  retrain_every_n_trades: 50
+  learning_rate: 0.0003
+  gamma: 0.99
+  ppo_epochs: 10

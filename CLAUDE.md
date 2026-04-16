@@ -861,6 +861,29 @@ pytest tests/ -v
 
 ### Completed
 
+#### Environment Setup (2026-04-16)
+
+**TradingView MCP:**
+- Cloned `tradingview-mcp` to `C:\Users\samet\Desktop\tradingview-mcp\` and ran `npm install`
+- TradingView Desktop extracted from MSIX to `C:\TradingView\` (MSIX sandbox blocks debug port, standalone exe required)
+- Launch command: `"C:\TradingView\TradingView.exe" --remote-debugging-port=9222`
+- CDP verified working on `http://localhost:9222` (Chrome/Electron 140, TradingView 3.0.0)
+- MCP config created at `~/.claude/.mcp.json` with tradingview server pointing to `C:/Users/samet/Desktop/tradingview-mcp/src/server.js`
+
+**IMPORTANT — MSIX won't work for debug mode.** Windows Store / MSIX TradingView ignores `ELECTRON_EXTRA_LAUNCH_ARGS` due to sandbox isolation. Must use the extracted exe at `C:\TradingView\TradingView.exe` with `--remote-debugging-port=9222` argument.
+
+**Python environment:**
+- Python 3.14.0, Node.js v25.2.1
+- Virtual env at `.venv/` with all dependencies installed (pydantic, httpx, pandas, numpy, ta, python-okx, loguru, rich, etc.)
+- `requirements.txt` created (python-okx uses 0.4.x versioning, not 5.x)
+- `config/default.yaml` created with full bot configuration
+- All `__init__.py` files created in `src/` subdirectories
+
+**Not yet set up:**
+- OKX MCP (not needed until Phase 4)
+- OKX demo API keys (not needed until Phase 4)
+- `.env` file (only `.env.example` exists)
+
 #### Phase 1: Pine Script Data Layer (Steps 1.1–1.5)
 
 All 6 Pine Scripts written and committed (2026-04-16):
@@ -885,5 +908,7 @@ Build the Python-side data bridge that:
 - Parses structured tooltip/label text into Python dataclasses
 - Maintains a `MarketState` object updated on every new candle
 - Validates: bot prints structured market state JSON for every 15m candle on BTCUSDT
+
+**Before starting 1.6:** Claude Code must be restarted so MCP config loads. TradingView must be running with `--remote-debugging-port=9222`. Then load Pine Scripts into TradingView chart and verify MCP can read their outputs.
 
 After 1.6, move to **Phase 2: Analysis Engine** (Python-side confluence scoring, candlestick patterns, multi-timeframe logic).

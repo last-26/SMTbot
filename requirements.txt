@@ -1,0 +1,29 @@
+# Core
+pydantic>=2.0
+pyyaml>=6.0
+python-dotenv>=1.0
+
+# Database
+aiosqlite>=0.20
+
+# HTTP
+httpx>=0.27
+
+# OKX
+python-okx>=0.4.0
+websockets>=12.0
+
+# Data analysis
+pandas>=2.0
+numpy>=1.26
+ta>=0.11
+
+# RL (Phase 6)
+# stable-baselines3>=2.3
+# gymnasium>=0.29
+# torch>=2.0
+
+# Logging & UI
+loguru>=0.7
+rich>=13.0
+schedule>=1.2
