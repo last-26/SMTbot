@@ -45,7 +45,9 @@ async def test_symbols_roundrobin_order(monkeypatch, make_ctx):
     _patch_plan_builder(monkeypatch, None)     # don't place any orders
     syms = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP",
             "AVAX-USDT-SWAP", "XRP-USDT-SWAP"]
-    cfg = make_config(symbols=syms, symbol_settle_seconds=0.0)
+    cfg = make_config(symbols=syms, symbol_settle_seconds=0.0,
+                      tf_settle_seconds=0.0, pine_settle_max_wait_s=0.1,
+                      pine_settle_poll_interval_s=0.01)
     bridge = _RecordingBridge()
     ctx, fakes = make_ctx(config=cfg)
     ctx.bridge = bridge
@@ -60,7 +62,9 @@ async def test_symbol_failure_does_not_break_others(monkeypatch, make_ctx):
     _patch_plan_builder(monkeypatch, None)
     syms = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP",
             "AVAX-USDT-SWAP", "XRP-USDT-SWAP"]
-    cfg = make_config(symbols=syms, symbol_settle_seconds=0.0)
+    cfg = make_config(symbols=syms, symbol_settle_seconds=0.0,
+                      tf_settle_seconds=0.0, pine_settle_max_wait_s=0.1,
+                      pine_settle_poll_interval_s=0.01)
     bridge = _RecordingBridge()
 
     # Inject a failure on the 3rd symbol — the loop must keep going.
@@ -91,8 +95,10 @@ async def test_max_concurrent_positions_caps_entries(monkeypatch, make_ctx):
     _patch_plan_builder(monkeypatch, make_plan())
     syms = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP",
             "AVAX-USDT-SWAP", "XRP-USDT-SWAP"]
-    cfg = make_config(symbols=syms,
-                      symbol_settle_seconds=0.0, max_concurrent_positions=2)
+    cfg = make_config(symbols=syms, symbol_settle_seconds=0.0,
+                      tf_settle_seconds=0.0, pine_settle_max_wait_s=0.1,
+                      pine_settle_poll_interval_s=0.01,
+                      max_concurrent_positions=2)
     ctx, fakes = make_ctx(config=cfg)
     ctx.bridge = _RecordingBridge()
     runner = BotRunner(ctx)

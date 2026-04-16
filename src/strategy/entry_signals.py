@@ -44,6 +44,62 @@ from src.strategy.rr_system import calculate_trade_plan
 from src.strategy.trade_plan import TradePlan
 
 
+# ── HTF S/R helpers (Madde D) ───────────────────────────────────────────────
+#
+# These push the raw SL past any HTF S/R zone sitting between entry and SL
+# (so price has to break the zone before stopping us out), and cap the TP
+# below/above the next HTF zone in the profit direction (so we bank profit
+# instead of getting front-run at resistance). Both are pure functions of
+# the geometry — no I/O, easy to unit-test.
+
+
+def _push_sl_past_htf_zone(
+    sl: float, entry: float, direction: Direction,
+    htf_zones: list[SRZone], buffer_atr: float, atr: float,
+) -> float:
+    """Snap SL to just past any HTF zone sitting between SL and entry.
+
+    Bullish long: entry=100, sl=96, HTF support at 97-98 → snap sl to
+    97 - buffer (just below the zone). Bearish short: symmetric. Only
+    ever *tightens* the stop toward entry — never widens risk.
+    """
+    if not htf_zones or atr <= 0:
+        return sl
+    buf = buffer_atr * atr
+    new_sl = sl
+    for z in htf_zones:
+        if direction == Direction.BULLISH:
+            # Zone fully between SL and entry → SL can tighten up to z.bottom-buf
+            if new_sl < z.bottom and z.top < entry:
+                new_sl = max(new_sl, z.bottom - buf)
+        elif direction == Direction.BEARISH:
+            # Zone fully between entry and SL → SL can tighten down to z.top+buf
+            if new_sl > z.top and z.bottom > entry:
+                new_sl = min(new_sl, z.top + buf)
+    return new_sl
+
+
+def _apply_htf_tp_ceiling(
+    tp: float, entry: float, direction: Direction,
+    htf_zones: list[SRZone], buffer_atr: float, atr: float,
+) -> float:
+    """Cap TP so we don't place it past an HTF zone in the profit direction."""
+    if not htf_zones or atr <= 0:
+        return tp
+    buf = buffer_atr * atr
+    new_tp = tp
+    for z in htf_zones:
+        if direction == Direction.BULLISH and z.role in ("RESISTANCE", "MIXED"):
+            # HTF resistance between entry and TP → pull TP down
+            if entry < z.bottom < new_tp:
+                new_tp = min(new_tp, z.bottom - buf)
+        elif direction == Direction.BEARISH and z.role in ("SUPPORT", "MIXED"):
+            # HTF support between TP and entry → pull TP up
+            if new_tp < z.top < entry:
+                new_tp = max(new_tp, z.top + buf)
+    return new_tp
+
+
 # ── Intent (pre-sizing) ─────────────────────────────────────────────────────
 
 
@@ -255,12 +311,20 @@ def build_trade_plan_from_state(
     sl_buffer_mult: float = 0.2,
     swing_lookback: int = 20,
     atr_fallback_mult: float = 2.0,
+    htf_sr_zones: Optional[list[SRZone]] = None,
+    htf_sr_ceiling_enabled: bool = False,
+    htf_sr_buffer_atr: float = 0.2,
 ) -> Optional[TradePlan]:
     """End-to-end: MarketState → TradePlan. Returns None when no trade.
 
     `rr_ratio` is the target. `min_rr_ratio` is a hard floor — this function
     always honors the hard floor by erroring if the caller passed rr_ratio
     below it.
+
+    When `htf_sr_ceiling_enabled`, SL is pushed past any HTF zone between
+    entry and SL, and TP is capped in front of the next HTF zone in the
+    profit direction. If the ceiling pushes R:R below `min_rr_ratio`, the
+    plan is rejected (returns None).
     """
     if rr_ratio < min_rr_ratio:
         raise ValueError(
@@ -283,10 +347,20 @@ def build_trade_plan_from_state(
     if intent is None or not intent.is_tradable:
         return None
 
+    sl_price = intent.sl_price
+    atr = intent.atr
+
+    # Push SL past HTF zones (if the ceiling is enabled and zones provided).
+    if htf_sr_ceiling_enabled and htf_sr_zones and sl_price is not None:
+        sl_price = _push_sl_past_htf_zone(
+            sl_price, intent.entry_price, intent.direction,
+            htf_sr_zones, htf_sr_buffer_atr, atr,
+        )
+
     plan = calculate_trade_plan(
         direction=intent.direction,
         entry_price=intent.entry_price,
-        sl_price=intent.sl_price,
+        sl_price=sl_price,
         account_balance=account_balance,
         risk_pct=risk_pct,
         rr_ratio=rr_ratio,
@@ -302,4 +376,23 @@ def build_trade_plan_from_state(
     if plan.num_contracts <= 0:
         return None
 
+    # Apply the HTF TP ceiling and recompute R:R. Reject when below floor.
+    if htf_sr_ceiling_enabled and htf_sr_zones:
+        new_tp = _apply_htf_tp_ceiling(
+            plan.tp_price, plan.entry_price, plan.direction,
+            htf_sr_zones, htf_sr_buffer_atr, atr,
+        )
+        if new_tp != plan.tp_price:
+            sl_dist = abs(plan.entry_price - plan.sl_price) or 1e-9
+            new_rr = abs(new_tp - plan.entry_price) / sl_dist
+            if new_rr < min_rr_ratio:
+                return None
+            plan = _replace_tp(plan, new_tp=new_tp, new_rr=new_rr)
+
     return plan
+
+
+def _replace_tp(plan: TradePlan, *, new_tp: float, new_rr: float) -> TradePlan:
+    """Return a new TradePlan with tp_price/rr_ratio swapped (dataclass copy)."""
+    from dataclasses import replace
+    return replace(plan, tp_price=new_tp, rr_ratio=new_rr)

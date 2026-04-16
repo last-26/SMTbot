@@ -38,6 +38,8 @@ analysis:
   session_filter:
     - london
     - new_york
+  htf_sr_ceiling_enabled: true    # Madde D — push SL past HTF zones + cap TP
+  htf_sr_buffer_atr: 0.2
 
 okx:
   base_url: https://www.okx.com

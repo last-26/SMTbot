@@ -101,6 +101,8 @@ class AnalysisConfig(BaseModel):
     sr_min_touches: int = 3
     sr_zone_atr_mult: float = 0.5
     session_filter: list[str] = Field(default_factory=list)
+    htf_sr_ceiling_enabled: bool = True      # Madde D
+    htf_sr_buffer_atr: float = 0.2
 
 
 class OKXConfigBlock(BaseModel):

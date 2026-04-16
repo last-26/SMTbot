@@ -459,6 +459,9 @@ class BotRunner:
                 contract_size=cfg.trading.contract_size,
                 swing_lookback=cfg.analysis.swing_lookback,
                 allowed_sessions=cfg.allowed_sessions() or None,
+                htf_sr_zones=self.ctx.htf_sr_cache.get(symbol),
+                htf_sr_ceiling_enabled=cfg.analysis.htf_sr_ceiling_enabled,
+                htf_sr_buffer_atr=cfg.analysis.htf_sr_buffer_atr,
             )
         except Exception:
             logger.exception("plan_build_failed symbol={}", symbol)
