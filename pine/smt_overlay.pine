@@ -59,13 +59,19 @@ bullFVGColor   = input.color(color.new(#00C853, 80), "Bullish FVG Color", group=
 bearFVGColor   = input.color(color.new(#FF1744, 80), "Bearish FVG Color", group="FVG")
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ORDER BLOCK INPUTS
+// ORDER BLOCK INPUTS  (fractal + FVG-confluence variant, see Section 3 below)
 // ═══════════════════════════════════════════════════════════════════════════════
+obFractalMode  = input.string("3-bar", "OB Fractal Mode", options=["3-bar", "5-bar"], group="Order Blocks", tooltip="3-bar = responsive on low TFs, 5-bar = stricter")
 showBullOB     = input.bool(true,  "Show Bullish OBs",    group="Order Blocks")
 showBearOB     = input.bool(true,  "Show Bearish OBs",    group="Order Blocks")
 showBrokenOB   = input.bool(false, "Keep Broken OBs",     group="Order Blocks")
-maxOBAge       = input.int(200, "Max OB Age (bars)",     minval=20, maxval=1000, group="Order Blocks")
-minImpulseATR  = input.float(1.5, "Min Impulse (ATR x)", minval=0.5, step=0.1, group="Order Blocks")
+maxOBAge       = input.int(60,  "Max OB Age (bars)",         minval=20, maxval=500, group="Order Blocks")
+maxActiveOBs   = input.int(3,   "Max Active OBs per side",   minval=1,  maxval=10,  group="Order Blocks", tooltip="Oldest is evicted when cap reached")
+obBoxLength    = input.int(30,  "OB Box Length (bars)",      minval=5,  maxval=200, group="Order Blocks")
+minImpulseATR  = input.float(2.0, "Min Impulse (ATR x)",     minval=0.5, step=0.1,  group="Order Blocks")
+obRequireFVG   = input.bool(true, "Require FVG Confluence",  group="Order Blocks", tooltip="OB must sit within N bars of a same-direction FVG")
+obFVGDistance  = input.int(3,   "Max OB↔FVG Distance (bars)", minval=1, maxval=10,  group="Order Blocks")
+obScanDepth    = input.int(5,   "OB Scan Depth (bars)",      minval=1,  maxval=20,  group="Order Blocks")
 bullOBColor    = input.color(color.new(#00C853, 75), "Bullish OB Color", group="Order Blocks")
 bearOBColor    = input.color(color.new(#FF1744, 75), "Bearish OB Color", group="Order Blocks")
 
@@ -352,8 +358,18 @@ if enableFVG and array.size(fvgBoxes) > 0
             box.set_right(bx, bar_index)
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SECTION 3 — ORDER BLOCKS
+// SECTION 3 — ORDER BLOCKS  (fractal trigger + FVG confluence + active-cap)
 // ═══════════════════════════════════════════════════════════════════════════════
+// Detection pipeline:
+//   1. 3-bar (or 5-bar) fractal breaks — much more responsive on 3m/5m than
+//      the old `ta.pivothigh/pivotlow` trigger.
+//   2. FVG proximity filter — uses the fvgBars/fvgDirs arrays populated in
+//      Section 2. Non-confluent OBs are dropped at creation time.
+//   3. Active cap — at most `maxActiveOBs` bullish and `maxActiveOBs` bearish
+//      boxes on chart; oldest same-direction active OB is evicted on new entry.
+//   4. Fixed-length boxes (`obBoxLength` bars) instead of extend-right-forever.
+// Tooltip contract preserved — `OB|DIR|lo|hi|STATE|TESTED` (Python reader relies
+// on it); `nearestBullOBstr`/`nearestBearOBstr` format untouched further down.
 var array<box>    obBoxes    = array.new<box>()
 var array<float>  obTops     = array.new<float>()
 var array<float>  obBots     = array.new<float>()
@@ -363,21 +379,77 @@ var array<bool>   obBroken   = array.new<bool>()
 var array<bool>   obTested   = array.new<bool>()
 var array<label>  obLabels   = array.new<label>()
 
-// Bullish OB
-if enableOB and not na(swingLow) and showBullOB
-    impulseSize = high[0] - swingLow
+removeOBAt(int idx) =>
+    box.delete(array.get(obBoxes, idx))
+    label.delete(array.get(obLabels, idx))
+    array.remove(obBoxes, idx)
+    array.remove(obTops, idx)
+    array.remove(obBots, idx)
+    array.remove(obDirs, idx)
+    array.remove(obBars, idx)
+    array.remove(obBroken, idx)
+    array.remove(obTested, idx)
+    array.remove(obLabels, idx)
+
+evictOldestDir(int dir) =>
+    oldestIdx = -1
+    oldestBar = 999999999
+    if array.size(obDirs) > 0
+        for k = 0 to array.size(obDirs) - 1
+            if array.get(obDirs, k) == dir and not array.get(obBroken, k)
+                if array.get(obBars, k) < oldestBar
+                    oldestBar := array.get(obBars, k)
+                    oldestIdx := k
+    if oldestIdx != -1
+        removeOBAt(oldestIdx)
+
+countActiveOBDir(int dir) =>
+    n = 0
+    if array.size(obDirs) > 0
+        for k = 0 to array.size(obDirs) - 1
+            if array.get(obDirs, k) == dir and not array.get(obBroken, k)
+                n += 1
+    n
+
+hasNearbyFVG(int obBarIdx, int wantedDir) =>
+    found = false
+    if array.size(fvgBars) > 0
+        for fi = array.size(fvgBars) - 1 to 0
+            if array.get(fvgDirs, fi) == wantedDir
+                if math.abs(array.get(fvgBars, fi) - obBarIdx) <= obFVGDistance
+                    found := true
+                    break
+    found
+
+// Fractal detection — 3-bar pivot sits 1 bar back, 5-bar pivot sits 2 bars back.
+obBull3 = low[1] < low[0] and low[1] < low[2]
+obBear3 = high[1] > high[0] and high[1] > high[2]
+obBull5 = low[2] < low[0] and low[2] < low[1] and low[2] < low[3] and low[2] < low[4]
+obBear5 = high[2] > high[0] and high[2] > high[1] and high[2] > high[3] and high[2] > high[4]
+obIs5Bar = obFractalMode == "5-bar"
+obBullFractal = obIs5Bar ? obBull5 : obBull3
+obBearFractal = obIs5Bar ? obBear5 : obBear3
+obFractOff = obIs5Bar ? 2 : 1
+
+// Bullish OB — last bearish candle within obScanDepth bars before the fractal.
+if enableOB and obBullFractal and showBullOB
+    fractalLow = obIs5Bar ? low[2] : low[1]
+    impulseSize = high[0] - fractalLow
     if impulseSize > atrVal * minImpulseATR
         obBarIdx = -1
         obHi = 0.0
         obLo = 0.0
-        for j = swingLen to swingLen + 5
+        for j = obFractOff + 1 to obFractOff + obScanDepth
             if close[j] < open[j]
                 obBarIdx := bar_index - j
                 obHi     := high[j]
                 obLo     := low[j]
                 break
-        if obBarIdx != -1
-            bx = box.new(obBarIdx, obHi, bar_index, obLo,
+        if obBarIdx != -1 and (not obRequireFVG or hasNearbyFVG(obBarIdx, 1))
+            if countActiveOBDir(1) >= maxActiveOBs
+                evictOldestDir(1)
+            rightEdge = obBarIdx + obBoxLength
+            bx = box.new(obBarIdx, obHi, rightEdge, obLo,
                  border_color=bullOBColor, bgcolor=bullOBColor, border_width=1)
             tt = "OB|BULLISH|" + str.tostring(obLo, "#.##") + "|" + str.tostring(obHi, "#.##") + "|ACTIVE|UNTESTED"
             lb = label.new(obBarIdx, obLo, "", style=label.style_none, tooltip=tt, size=size.tiny)
@@ -390,21 +462,25 @@ if enableOB and not na(swingLow) and showBullOB
             array.push(obTested, false)
             array.push(obLabels, lb)
 
-// Bearish OB
-if enableOB and not na(swingHigh) and showBearOB
-    impulseSize = swingHigh - low[0]
+// Bearish OB — last bullish candle within obScanDepth bars before the fractal.
+if enableOB and obBearFractal and showBearOB
+    fractalHigh = obIs5Bar ? high[2] : high[1]
+    impulseSize = fractalHigh - low[0]
     if impulseSize > atrVal * minImpulseATR
         obBarIdx = -1
         obHi = 0.0
         obLo = 0.0
-        for j = swingLen to swingLen + 5
+        for j = obFractOff + 1 to obFractOff + obScanDepth
             if close[j] > open[j]
                 obBarIdx := bar_index - j
                 obHi     := high[j]
                 obLo     := low[j]
                 break
-        if obBarIdx != -1
-            bx = box.new(obBarIdx, obHi, bar_index, obLo,
+        if obBarIdx != -1 and (not obRequireFVG or hasNearbyFVG(obBarIdx, -1))
+            if countActiveOBDir(-1) >= maxActiveOBs
+                evictOldestDir(-1)
+            rightEdge = obBarIdx + obBoxLength
+            bx = box.new(obBarIdx, obHi, rightEdge, obLo,
                  border_color=bearOBColor, bgcolor=bearOBColor, border_width=1)
             tt = "OB|BEARISH|" + str.tostring(obLo, "#.##") + "|" + str.tostring(obHi, "#.##") + "|ACTIVE|UNTESTED"
             lb = label.new(obBarIdx, obHi, "", style=label.style_none, tooltip=tt, size=size.tiny)
@@ -417,7 +493,7 @@ if enableOB and not na(swingHigh) and showBearOB
             array.push(obTested, false)
             array.push(obLabels, lb)
 
-// OB lifecycle
+// OB lifecycle — age / test / break
 if enableOB and array.size(obBoxes) > 0
     for i = array.size(obBoxes) - 1 to 0
         t   = array.get(obTops, i)
@@ -431,16 +507,7 @@ if enableOB and array.size(obBoxes) > 0
 
         age = bar_index - bar
         if age > maxOBAge
-            box.delete(bx)
-            label.delete(lb)
-            array.remove(obBoxes, i)
-            array.remove(obTops, i)
-            array.remove(obBots, i)
-            array.remove(obDirs, i)
-            array.remove(obBars, i)
-            array.remove(obBroken, i)
-            array.remove(obTested, i)
-            array.remove(obLabels, i)
+            removeOBAt(i)
             continue
 
         if not brk
@@ -462,20 +529,7 @@ if enableOB and array.size(obBoxes) > 0
                     status = dir == 1 ? "BULLISH" : "BEARISH"
                     label.set_tooltip(lb, "OB|" + status + "|" + str.tostring(b, "#.##") + "|" + str.tostring(t, "#.##") + "|BROKEN")
                 else
-                    box.delete(bx)
-                    label.delete(lb)
-                    array.remove(obBoxes, i)
-                    array.remove(obTops, i)
-                    array.remove(obBots, i)
-                    array.remove(obDirs, i)
-                    array.remove(obBars, i)
-                    array.remove(obBroken, i)
-                    array.remove(obTested, i)
-                    array.remove(obLabels, i)
-                    continue
-
-        if not array.get(obBroken, i)
-            box.set_right(bx, bar_index)
+                    removeOBAt(i)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SECTION 4 — LIQUIDITY SWEEPS (equal H/L pools + sweep events)
