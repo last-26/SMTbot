@@ -2,23 +2,24 @@ bot:
   mode: demo
   poll_interval_seconds: 5
   timezone: UTC
-  starting_balance: 10000.0
+  starting_balance: 5000.0  # real OKX demo balance — drives 1R = 5% = $250
 
 trading:
   symbol: BTC-USDT-SWAP
   entry_timeframe: 3m
   htf_timeframe: 15m
-  risk_per_trade_pct: 1.0
-  max_leverage: 20
+  risk_per_trade_pct: 5.0   # 5% of 5000 = $250 per trade (1R)
+  max_leverage: 75
   default_rr_ratio: 3.0
   min_rr_ratio: 2.0
   max_concurrent_positions: 2
   contract_size: 0.01
 
 circuit_breakers:
-  max_daily_loss_pct: 3.0
+  # Scaled up for 5% per-trade risk so a single loss doesn't trip halts.
+  max_daily_loss_pct: 15.0       # ≈ 3 losing trades in a day → halt
   max_consecutive_losses: 5
-  max_drawdown_pct: 10.0
+  max_drawdown_pct: 25.0         # 5R drawdown from peak → permanent halt
   cooldown_hours: 24
 
 analysis:

@@ -206,11 +206,21 @@ class BotRunner:
         if any(k[0] == symbol for k in self.ctx.open_trade_ids):
             return
 
-        # 4. Plan.
+        # 4. Plan. Size against the *actual* OKX USDT balance — the risk
+        # manager's current_balance drifts from reality (fees, funding), and
+        # OKX rejects sCode 51008 when the bot over-estimates available margin.
         cfg = self.ctx.config
         try:
+            okx_balance = await asyncio.to_thread(
+                self.ctx.okx_client.get_balance, "USDT"
+            )
+        except Exception:
+            logger.exception("balance_sync_failed_using_cached")
+            okx_balance = self.ctx.risk_mgr.current_balance
+        sizing_balance = min(okx_balance, self.ctx.risk_mgr.current_balance)
+        try:
             plan = build_trade_plan_from_state(
-                state, self.ctx.risk_mgr.current_balance,
+                state, sizing_balance,
                 candles=candles,
                 min_confluence_score=cfg.analysis.min_confluence_score,
                 risk_pct=cfg.risk_pct_fraction(),
@@ -240,7 +250,9 @@ class BotRunner:
             logger.error("algo_failure_position_auto_closed: {}", exc)
             return
         except (LeverageSetError, OrderRejected, InsufficientMargin, ValueError) as exc:
-            logger.error("order_rejected: {}", exc)
+            code = getattr(exc, "code", None)
+            payload = getattr(exc, "payload", None)
+            logger.error("order_rejected: {} | code={} | payload={}", exc, code, payload)
             return
         except Exception:
             logger.exception("order_unexpected_error")

@@ -189,15 +189,20 @@ class FakeOKXClient:
     """Just the surface the runner touches: enrich_close_fill + get_positions."""
 
     def __init__(self, positions: Optional[list[PositionSnapshot]] = None,
-                 enrich_return: Optional[CloseFill] = None):
+                 enrich_return: Optional[CloseFill] = None,
+                 balance: float = 10_000.0):
         self.positions = positions or []
         self.enrich_return = enrich_return
+        self.balance = balance
 
     def get_positions(self, inst_id: Optional[str] = None) -> list[PositionSnapshot]:
         return list(self.positions)
 
     def enrich_close_fill(self, fill: CloseFill) -> CloseFill:
         return self.enrich_return if self.enrich_return is not None else fill
+
+    def get_balance(self, ccy: str = "USDT") -> float:
+        return self.balance
 
 
 # ── Composite helper ────────────────────────────────────────────────────────

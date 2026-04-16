@@ -19,8 +19,15 @@ This module is pure: no I/O, no async, safe to import from anywhere.
 
 from __future__ import annotations
 
+import math
+
 from src.data.models import Direction
 from src.strategy.trade_plan import TradePlan
+
+# Keep a little balance free for fees + mark-price fluctuations between
+# set_leverage and place_order. OKX rejects with sCode 51008 when initial
+# margin + buffer > available balance.
+_MARGIN_SAFETY = 0.95
 
 
 def _validate(
@@ -105,16 +112,27 @@ def calculate_trade_plan(
     ideal_notional = max_risk_usdt / sl_pct
     required_leverage = ideal_notional / account_balance
 
-    capped = required_leverage > max_leverage
-    if capped:
-        # Shrink notional to fit the leverage cap. Actual risk drops below target.
-        notional = account_balance * max_leverage
+    # Hard ceiling on notional: leverage cap AND margin safety buffer. Without
+    # the buffer, a fully-leveraged order leaves OKX no room for fees and gets
+    # rejected with sCode 51008.
+    max_notional = account_balance * max_leverage * _MARGIN_SAFETY
+    if ideal_notional > max_notional:
+        notional = max_notional
+        capped = True
     else:
         notional = ideal_notional
+        capped = False
 
-    # Round leverage up to at least 1, cap at max_leverage. Using round() here
-    # is fine because notional drives actual risk, not the reported leverage.
-    leverage = min(max(1, round(required_leverage)), max_leverage)
+    # Leverage must be high enough that initial margin (= notional / leverage)
+    # fits within balance × _MARGIN_SAFETY. Using round() would sometimes round
+    # DOWN below that threshold and OKX would reject with sCode 51008.
+    min_lev_for_margin = max(
+        1, math.ceil(notional / (account_balance * _MARGIN_SAFETY))
+    )
+    leverage = min(
+        max(1, math.ceil(required_leverage), min_lev_for_margin),
+        max_leverage,
+    )
 
     # Integer OKX contracts — always round DOWN so we never exceed notional.
     contracts_unit_usdt = contract_size * entry_price

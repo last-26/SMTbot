@@ -117,8 +117,9 @@ def test_long_basic_sizing():
     assert plan.sl_distance == pytest.approx(1.0)
     assert plan.sl_pct == pytest.approx(0.01)
     assert plan.tp_price == pytest.approx(103.0)
-    # Ideal notional = 100 / 0.01 = 10,000 → leverage 1
-    assert plan.leverage == 1
+    # Ideal notional = 100 / 0.01 = 10,000 → required_leverage 1.0, but we
+    # bump actual leverage to 2 so initial margin leaves a 5% fee buffer.
+    assert plan.leverage == 2
     assert plan.required_leverage == pytest.approx(1.0)
     assert plan.capped is False
     # Contracts: 10000 / (0.01 * 100) = 10000
