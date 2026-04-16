@@ -104,8 +104,8 @@ References: `pine/vmc_a.txt`, `pine/vmc_b.txt` (original VMC source). Standalone
 | 3. Strategy Engine (R:R) | ✅ Complete | 5 modules under `src/strategy/`, 67 new tests (164 total). See below. |
 | 4. Execution (OKX) | ✅ Complete | 5 modules under `src/execution/`, 29 new tests (193 total). See below. |
 | 5. Trade Journal | ✅ Complete | 3 modules under `src/journal/` + CLI, 31 new tests (224 total). See below. |
-| 6. Bot runtime loop | 🔜 Next | `src/bot/` async runner wiring TV → analysis → strategy → risk → execution → journal. Prerequisite for any live demo data collection. |
-| 7. RL parameter tuner | Planned | PPO via Stable Baselines3, walk-forward validated. Needs ≥50 logged demo trades from Phase 6 first. |
+| 6. Bot runtime loop | ✅ Complete | `src/bot/` async runner wiring TV → analysis → strategy → risk → execution → journal. `OKXClient.enrich_close_fill` added. 23 new tests (247 total). See below. |
+| 7. RL parameter tuner | 🔜 Next | PPO via Stable Baselines3, walk-forward validated. Needs ≥50 logged demo trades from Phase 6 first. |
 
 ### Phase 1 — Completed (2026-04-16)
 
@@ -256,21 +256,45 @@ tradeAPI.place_algo_order(instId="BTC-USDT-SWAP", tdMode="isolated",
 
 **Tests use** `pytest-asyncio` in `asyncio_mode = auto` (see `pytest.ini`). In-memory SQLite (`":memory:"`) for most tests; one `tmp_path` round-trip test confirms on-disk persistence.
 
-## Phase 6 — Bot runtime loop
+### Phase 6 — Completed (2026-04-16)
 
-Wires Phases 1–5 into an autonomous async runner (`src/bot/`). Until this exists, no demo data is logged and Phase 7 (RL) has no training set.
+4 modules under `src/bot/` + one new method on `OKXClient` + conftest fakes. 23 new tests (247 total).
 
-**Entrypoint:** `python -m src.bot --config config/default.yaml` (already referenced in Workflow commands; package itself is TODO).
+| Module | Purpose | Key APIs |
+|---|---|---|
+| `config.py` | YAML + `.env` → typed config | `BotConfig`, `load_config(path)`, `BotConfig.breakers()` / `allowed_sessions()` / `risk_pct_fraction()` |
+| `lifecycle.py` | Cross-platform shutdown | `install_shutdown_handlers(event)` |
+| `runner.py` | Async outer loop | `BotRunner`, `BotContext`, `BotRunner.from_config(cfg, dry_run=)` |
+| `__main__.py` | CLI entrypoint | `python -m src.bot [--config] [--dry-run] [--once]` |
 
-**Responsibilities:**
-- Poll TV MCP every `bot.poll_interval_seconds` → build `MarketState`
-- Feed state through analysis → `build_trade_plan_from_state` → `RiskManager.can_trade`
-- If allowed: `OrderRouter.place(plan)` → `TradeJournal.record_open` → `RiskManager.register_trade_opened`
-- Poll `PositionMonitor.poll()` → on `CloseFill`: `TradeJournal.record_close` → `RiskManager.register_trade_closed`
-- On startup: `TradeJournal.replay_for_risk_manager(mgr)` to restore peak/DD/streak state
-- Graceful shutdown (SIGINT/SIGTERM) that closes positions cleanly or at least closes the journal
+**One tick (`run_once`):**
+1. `reader.read_market_state()` + `multi_tf.refresh(tf)` — tolerant to TV errors.
+2. **Drain closes first** — `monitor.poll()` → `okx_client.enrich_close_fill(fill)` → `journal.record_close(trade_id, enriched)` → `risk_mgr.register_trade_closed(TradeResult)`.
+3. Symbol-level dedup — skip open if `any(k[0] == symbol for k in ctx.open_trade_ids)`. (Bar-level would need `SignalTableData.last_bar` — not a parsed field today.)
+4. `build_trade_plan_from_state(...)` → `risk_mgr.can_trade(plan)` → `router.place(plan)` (or `_DryRunRouter` when `--dry-run`).
+5. In-memory registration (`monitor.register_open`, `risk_mgr.register_trade_opened`) **before** `journal.record_open`; DB failure logs an orphan rather than losing the live position.
 
-**Out of scope:** RL retraining (Phase 7), websocket streaming (REST polling is fine for MVP), multi-symbol (BTC only until metrics support ETH per CLAUDE.md currency-pair rules).
+**Enrichment (critical fix):** `PositionMonitor._close_fill_from` emits `pnl_usdt=0, exit_price=0` (it only knows the position disappeared). Without enrichment every close looks break-even and risk-manager streaks / drawdown never trip. `OKXClient.enrich_close_fill` queries `/api/v5/account/positions-history`, picks the most recent `(instId, posSide)` row, and returns a `CloseFill` with real `realizedPnl`, `closeAvgPx`, `uTime`. When no match is returned (e.g. fills arriving after REST sync), the raw fill is passed through unchanged.
+
+**Startup prime (`_prime`):**
+1. `journal.replay_for_risk_manager(risk_mgr)` — rebuilds `peak_balance`, `consecutive_losses`, `current_balance` from closed trades.
+2. `_rehydrate_open_positions()` — loads any OPEN rows back into `monitor._tracked` and `ctx.open_trade_ids` so the next poll knows what to expect.
+3. `_reconcile_orphans()` — diffs live OKX positions against journal OPEN rows; **logs only**, never auto-closes (operator decides).
+
+**Shutdown:** `install_shutdown_handlers(event)` wires SIGINT / SIGTERM (+ SIGBREAK on Windows) to `asyncio.Event.set()`. POSIX uses `loop.add_signal_handler`; Windows ProactorEventLoop falls back to `signal.signal` + `loop.call_soon_threadsafe`. Terminal Ctrl-C on Windows still raises `KeyboardInterrupt` at `asyncio.run`, so `__main__` catches that as the reliable backstop.
+
+**DI for testing:** `BotRunner(ctx)` accepts a fully-assembled `BotContext` — reader/router/monitor/okx_client are duck-typed, so `tests/conftest.py` fakes don't inherit from the real classes. `BotRunner.from_config(cfg)` is the production path that wires `TVBridge → StructuredReader`, `OKXClient`, `OrderRouter`, `PositionMonitor`, `TradeJournal`, `RiskManager`.
+
+**Config additions to `config/default.yaml`:** `bot.starting_balance: 10000.0`, `trading.contract_size: 0.01`. Secrets (`OKX_API_KEY/SECRET/PASSPHRASE/DEMO_FLAG`) come from `.env` via `python-dotenv`; `BotConfig` validator rejects empty credentials.
+
+**Usage:**
+```bash
+# Smoke test — full pipeline, one tick, no real orders
+.venv/Scripts/python.exe -m src.bot --config config/default.yaml --dry-run --once
+
+# Demo (real orders on OKX demo env)
+.venv/Scripts/python.exe -m src.bot --config config/default.yaml
+```
 
 ## Phase 7 — Reinforcement learning
 
