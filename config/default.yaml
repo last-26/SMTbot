@@ -33,6 +33,9 @@ okx:
   base_url: https://www.okx.com
   demo_flag: "1"
 
+journal:
+  db_path: "data/trades.db"
+
 rl:
   min_trades_to_train: 50
   retrain_every_n_trades: 50
