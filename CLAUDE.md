@@ -93,7 +93,9 @@ Two production indicators built by combining 6 standalone scripts + VuManChu Cip
 
 **SMT Oscillator fields:** wt1, wt2, wt_state, wt_cross, wt_vwap_fast, rsi, rsi_mfi, stoch_k, stoch_d, stoch_state, last_signal, last_wt_div, momentum, last_bar.
 
-References: `pine/vmc_a.txt`, `pine/vmc_b.txt` (original VMC source). Standalone scripts (`mss_detector.pine`, `fvg_mapper.pine`, `order_block.pine`, `liquidity_sweep.pine`, `session_levels.pine`, `signal_table.pine`) are kept for reference but **not loaded** on the chart.
+References: `pine/vmc_a.txt`, `pine/vmc_b.txt` (original VMC source). Standalone scripts (`mss_detector.pine`, `fvg_mapper.pine`, `liquidity_sweep.pine`, `session_levels.pine`, `signal_table.pine`) are kept for reference but **not loaded** on the chart.
+
+**OB sub-module inside the overlay** follows @Nephew_Sam_'s opensource Orderblocks pattern (MPL 2.0): fractals are persisted, and an OB is cut when a later bar trades through one — scanning back in time to the fractal to find the extreme counter candle. Optional 3-bar FVG proximity filter + immediate wick-mitigation delete. Boxes (not lines) are used so `src/data/structured_reader.py:parse_ob_boxes` keeps working.
 
 ## Phase status
 
