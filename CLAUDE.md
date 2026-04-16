@@ -102,8 +102,8 @@ References: `pine/vmc_a.txt`, `pine/vmc_b.txt` (original VMC source). Standalone
 | 1. Pine + Data Bridge | ✅ Complete | SMT Overlay + Oscillator running on TV. Python bridge reads tables + drawings into unified `MarketState`. |
 | 2. Analysis Engine | ✅ Complete | 7 modules under `src/analysis/`, 97 passing tests. |
 | 3. Strategy Engine (R:R) | ✅ Complete | 5 modules under `src/strategy/`, 67 new tests (164 total). See below. |
-| 4. Execution (OKX) | 🔜 Next | `src/execution/`: order lifecycle via OKX SDK or MCP. |
-| 5. Trade Journal | Planned | SQLite + Pydantic models + reporter. |
+| 4. Execution (OKX) | ✅ Complete | 5 modules under `src/execution/`, 29 new tests (193 total). See below. |
+| 5. Trade Journal | 🔜 Next | SQLite + Pydantic models + reporter. |
 | 6. RL parameter tuner | Planned | PPO via Stable Baselines3, walk-forward validated. |
 
 ### Phase 1 — Completed (2026-04-16)
@@ -182,18 +182,39 @@ Validation: `scripts/test_market_state.py` (supports `--poll N`).
 
 `RiskManager` is pure state + records; no DB. Journal (Phase 5) will replay trades to rebuild it on startup.
 
-## Phase 4 — Execution via OKX
+### Phase 4 — Completed (2026-04-16)
 
-### Order flow
-1. Signal fires with `TradePlan`
-2. `okx account set-leverage --instId ... --lever {n} --mgnMode isolated`
-3. Place entry (market or limit)
-4. Immediately place algo OCO SL/TP
-5. Monitor position via WebSocket
-6. On exit, log to journal
-7. Handle partial fills
+5 modules under `src/execution/` — sync python-okx calls, async-safe (wrap in `asyncio.to_thread` from the bot loop).
 
-### OKX Python SDK
+| Module | Purpose | Key APIs |
+|---|---|---|
+| `errors.py` | Typed exception hierarchy | `ExecutionError`, `OKXError`, `OrderRejected`, `InsufficientMargin`, `LeverageSetError`, `AlgoOrderError` |
+| `models.py` | Execution records | `OrderResult`, `AlgoResult`, `ExecutionReport`, `PositionSnapshot`, `CloseFill`, `OrderStatus`, `PositionState` |
+| `okx_client.py` | Typed wrapper over python-okx | `OKXClient`, `OKXCredentials`, `_check()` envelope validator |
+| `order_router.py` | `TradePlan` → live orders | `OrderRouter`, `RouterConfig`, `dry_run_report()` |
+| `position_monitor.py` | REST-poll positions → `CloseFill` | `PositionMonitor.register_open()`, `poll()` |
+
+**Order flow (`OrderRouter.place`):**
+1. `set_leverage(inst_id, lever, mgnMode="isolated", posSide)` — fails fast before any order
+2. `place_market_order(side=buy/sell, posSide=long/short, sz=plan.num_contracts)`
+3. `place_oco_algo(closing_side, sl/tpTriggerPx=plan.sl_price/tp_price, slOrdPx=-1)`
+4. If algo fails: raise `AlgoOrderError` and (optionally) auto-close via `close_position()` — the position is never left OPEN without SL/TP unless operator disables `close_on_algo_failure`.
+
+**Demo guard:** `OKXClient` refuses to construct with `demo_flag != "1"` unless `allow_live=True` is explicitly passed. One gate, no accidents.
+
+**Envelope handling:** `_check()` validates OKX's `{"code": "0", "msg": "", "data": [...]}` envelope and raises typed errors on failure. Known margin-fail codes `{51008, 51020, 51200, 51201}` map to `InsufficientMargin`; other per-order `sCode` failures raise `OrderRejected`.
+
+**Position monitor:** REST poll (no websocket) — keyed on `(inst_id, pos_side)`. Emits `CloseFill` when a tracked position disappears from `get_positions`. Caller converts `CloseFill` → `TradeResult` and calls `RiskManager.register_trade_closed()`. `exit_price`/`pnl_usdt` are enriched via journal lookup in Phase 5.
+
+**Dry-run:** `dry_run_report(plan)` builds a fake `ExecutionReport` without touching the network — paper-trading hook for pipeline validation.
+
+### OKX setup (manual, before live loop)
+```bash
+# Demo key: OKX → user icon → Demo Trading API → Create V5, Read+Trade, NO withdraw
+# Fill .env: OKX_API_KEY / OKX_API_SECRET / OKX_PASSPHRASE / OKX_DEMO_FLAG=1
+```
+
+### OKX Python SDK reference
 ```python
 import okx.Trade as Trade, okx.Account as Account
 flag = "1"  # demo, "0" = live
@@ -202,18 +223,11 @@ tradeAPI   = Trade.TradeAPI(api_key, secret_key, passphrase, False, flag)
 accountAPI = Account.AccountAPI(api_key, secret_key, passphrase, False, flag)
 
 accountAPI.set_leverage(instId="BTC-USDT-SWAP", lever="10", mgnMode="isolated")
-
-tradeAPI.place_order(
-    instId="BTC-USDT-SWAP", tdMode="isolated",
-    side="buy", posSide="long", ordType="market", sz="1",
-)
-
-tradeAPI.place_algo_order(
-    instId="BTC-USDT-SWAP", tdMode="isolated",
+tradeAPI.place_order(instId="BTC-USDT-SWAP", tdMode="isolated",
+    side="buy", posSide="long", ordType="market", sz="1")
+tradeAPI.place_algo_order(instId="BTC-USDT-SWAP", tdMode="isolated",
     side="sell", posSide="long", ordType="oco", sz="1",
-    slTriggerPx="67500", slOrdPx="-1",   # -1 = market
-    tpTriggerPx="72000", tpOrdPx="-1",
-)
+    slTriggerPx="67500", slOrdPx="-1", tpTriggerPx="72000", tpOrdPx="-1")
 ```
 
 ## Phase 5 — Trade journal
