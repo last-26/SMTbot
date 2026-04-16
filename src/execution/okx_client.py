@@ -107,6 +107,7 @@ class OKXClient:
         if sdk is None:
             import okx.Account as Account
             import okx.MarketData as MarketData
+            import okx.PublicData as PublicData
             import okx.Trade as Trade
             self.trade = Trade.TradeAPI(
                 credentials.api_key, credentials.api_secret, credentials.passphrase,
@@ -117,11 +118,14 @@ class OKXClient:
                 False, credentials.demo_flag,
             )
             self.market = MarketData.MarketAPI(flag=credentials.demo_flag)
+            # mark price lives on PublicAPI in python-okx 0.4.x, not MarketAPI
+            self.public = PublicData.PublicAPI(flag=credentials.demo_flag)
         else:
-            # Test injection path: sdk.trade / sdk.account / sdk.market
+            # Test injection path: sdk.trade / sdk.account / sdk.market / sdk.public
             self.trade = sdk.trade
             self.account = sdk.account
             self.market = sdk.market
+            self.public = getattr(sdk, "public", sdk.market)
 
     # ── Account ─────────────────────────────────────────────────────────────
 
@@ -150,7 +154,7 @@ class OKXClient:
     # ── Market ──────────────────────────────────────────────────────────────
 
     def get_mark_price(self, inst_id: str) -> float:
-        resp = self.market.get_mark_price(instType="SWAP", instId=inst_id)
+        resp = self.public.get_mark_price(instType="SWAP", instId=inst_id)
         data = _check(resp, "get_mark_price")
         return float(data.get("markPx") or 0.0)
 
