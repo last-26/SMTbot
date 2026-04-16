@@ -1,0 +1,1110 @@
+// This Pine Script™ is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// © SMTbot
+//
+// SMT Master Overlay — chart-based analysis + VMC Cipher A
+// Combines: MSS/BOS + FVG + Order Blocks + Liquidity Sweeps + Sessions + VMC A
+//
+// Bot reads via:  tv stream tables --filter "SMT Signals"
+// Uses VMC Cipher A (overlay) content merged with the six existing SMT overlay modules.
+// Ported from Pine v4 (VMC A) → Pine v6.
+// © 2026 — VMC portions derived from VuManChu Cipher A (public, MPL 2.0).
+
+//@version=6
+indicator("SMT Master Overlay",
+          shorttitle="SMT Overlay",
+          overlay=true,
+          max_labels_count=500,
+          max_lines_count=500,
+          max_boxes_count=500)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MODULE TOGGLES — turn subsystems on/off to manage chart clutter
+// ═══════════════════════════════════════════════════════════════════════════════
+enableStructure = input.bool(true,  "Market Structure (MSS/BOS/Swings)", group="Modules")
+enableFVG       = input.bool(true,  "Fair Value Gaps",                   group="Modules")
+enableOB        = input.bool(true,  "Order Blocks",                      group="Modules")
+enableLiquidity = input.bool(true,  "Liquidity Sweeps",                  group="Modules")
+enableSessions  = input.bool(true,  "Session Levels (Asian/London/NY)",  group="Modules")
+enableVMC       = input.bool(true,  "VMC Cipher A (EMA ribbon + signals)", group="Modules")
+enableTable     = input.bool(true,  "Master Signal Table",               group="Modules")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SHARED PARAMETERS (used by multiple modules)
+// ═══════════════════════════════════════════════════════════════════════════════
+swingLen     = input.int(5, "Swing Lookback", minval=2, maxval=50, group="Shared")
+htfTF        = input.timeframe("240", "HTF Timeframe", group="Shared")
+
+bullColor    = input.color(color.new(#00C853, 0),  "Bullish Color", group="Shared")
+bearColor    = input.color(color.new(#FF1744, 0),  "Bearish Color", group="Shared")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MARKET STRUCTURE INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+showStructLabels = input.bool(true,  "Show HH/HL/LH/LL Labels", group="Structure")
+showMSS          = input.bool(true,  "Show MSS Signals",         group="Structure")
+showBOS          = input.bool(false, "Show BOS Signals",         group="Structure")
+showStructLines  = input.bool(false, "Show Structure Lines",     group="Structure")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FVG INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+showBullFVG    = input.bool(true,  "Show Bullish FVGs",   group="FVG")
+showBearFVG    = input.bool(true,  "Show Bearish FVGs",   group="FVG")
+showMitigated  = input.bool(false, "Keep Mitigated FVGs", group="FVG")
+maxFVGAge      = input.int(100, "Max FVG Age (bars)",    minval=10, maxval=500, group="FVG")
+minFVGSize     = input.float(0.0, "Min FVG Size (%)",    minval=0.0, step=0.05, group="FVG")
+extendFVG      = input.bool(true, "Extend FVG Boxes Right", group="FVG")
+bullFVGColor   = input.color(color.new(#00C853, 80), "Bullish FVG Color", group="FVG")
+bearFVGColor   = input.color(color.new(#FF1744, 80), "Bearish FVG Color", group="FVG")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ORDER BLOCK INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+showBullOB     = input.bool(true,  "Show Bullish OBs",    group="Order Blocks")
+showBearOB     = input.bool(true,  "Show Bearish OBs",    group="Order Blocks")
+showBrokenOB   = input.bool(false, "Keep Broken OBs",     group="Order Blocks")
+maxOBAge       = input.int(200, "Max OB Age (bars)",     minval=20, maxval=1000, group="Order Blocks")
+minImpulseATR  = input.float(1.5, "Min Impulse (ATR x)", minval=0.5, step=0.1, group="Order Blocks")
+bullOBColor    = input.color(color.new(#00C853, 75), "Bullish OB Color", group="Order Blocks")
+bearOBColor    = input.color(color.new(#FF1744, 75), "Bearish OB Color", group="Order Blocks")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LIQUIDITY INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+eqThreshold    = input.float(0.05, "Equal Level Threshold (%)", minval=0.01, maxval=0.5, step=0.01, group="Liquidity")
+minTouches     = input.int(2, "Min Touches for Liquidity Pool", minval=2, maxval=5, group="Liquidity")
+sweepWickPct   = input.float(0.1, "Min Sweep Wick (%)", minval=0.01, step=0.01, group="Liquidity")
+maxPoolAge     = input.int(300, "Max Pool Age (bars)",  minval=50, maxval=1000, group="Liquidity")
+showPools      = input.bool(true, "Show Liquidity Pools", group="Liquidity")
+showSweeps     = input.bool(true, "Show Sweep Events",    group="Liquidity")
+poolColor      = input.color(color.new(#FFC107, 50), "Liquidity Pool Color", group="Liquidity")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SESSION INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+showAsian      = input.bool(true, "Asian Session",      group="Sessions")
+showLondon     = input.bool(true, "London Session",     group="Sessions")
+showNY         = input.bool(true, "New York Session",   group="Sessions")
+showPrevDay    = input.bool(true, "Prev Day H/L (PDH/PDL)", group="Sessions")
+showPrevWeek   = input.bool(true, "Prev Week H/L (PWH/PWL)", group="Sessions")
+asianSess      = input.session("2000-0000", "Asian Session (UTC)",  group="Sessions")
+londonSess     = input.session("0700-1600", "London Session (UTC)", group="Sessions")
+nySess         = input.session("1200-2100", "NY Session (UTC)",     group="Sessions")
+asianColor     = input.color(color.new(#9C27B0, 60), "Asian Color", group="Sessions")
+londonColor    = input.color(color.new(#2196F3, 60), "London Color", group="Sessions")
+nyColor        = input.color(color.new(#FF9800, 60), "NY Color",     group="Sessions")
+pdColor        = input.color(color.new(#FFFFFF, 40), "Prev Day Color", group="Sessions")
+pwColor        = input.color(color.new(#FFD700, 40), "Prev Week Color", group="Sessions")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VMC CIPHER A INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+showRibbon     = input.bool(true,  "Show EMA Ribbon",           group="VMC Cipher A")
+showVMCShapes  = input.bool(true,  "Show VMC Shape Signals",    group="VMC Cipher A")
+
+// WaveTrend (used internally to derive the VMC A "red diamond" cluster)
+wtChannelLen   = input.int(9,   "WT Channel Length",            group="VMC Cipher A")
+wtAverageLen   = input.int(13,  "WT Average Length",            group="VMC Cipher A")
+wtMALen        = input.int(3,   "WT MA Length",                 group="VMC Cipher A")
+wtMASource     = input.source(hlc3, "WT MA Source",             group="VMC Cipher A")
+
+// OB/OS thresholds (match VMC A defaults)
+obLevelA       = input.int(53,  "WT Overbought Level 1",        group="VMC Cipher A")
+osLevelA       = input.int(-53, "WT Oversold Level 1",          group="VMC Cipher A")
+osLevel3A      = input.int(-80, "WT Oversold Level 3 (Yellow X)", group="VMC Cipher A")
+
+// EMA ribbon lengths (VMC A defaults)
+ema1Len        = input.int(5,   "EMA 1 Length",                 group="VMC Cipher A")
+ema2Len        = input.int(11,  "EMA 2 Length",                 group="VMC Cipher A")
+ema3Len        = input.int(15,  "EMA 3 Length",                 group="VMC Cipher A")
+ema4Len        = input.int(18,  "EMA 4 Length",                 group="VMC Cipher A")
+ema5Len        = input.int(21,  "EMA 5 Length",                 group="VMC Cipher A")
+ema6Len        = input.int(24,  "EMA 6 Length",                 group="VMC Cipher A")
+ema7Len        = input.int(28,  "EMA 7 Length",                 group="VMC Cipher A")
+ema8Len        = input.int(34,  "EMA 8 Length",                 group="VMC Cipher A")
+
+// RSI/MFI for YellowX pattern
+rsiLenA        = input.int(14, "RSI Length (VMC)",              group="VMC Cipher A")
+rsiMFIperiodA  = input.int(60, "RSI+MFI Period",                group="VMC Cipher A")
+rsiMFImultA    = input.float(150, "RSI+MFI Multiplier",         group="VMC Cipher A")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GLOBAL: ATR
+// ═══════════════════════════════════════════════════════════════════════════════
+atrVal = ta.atr(14)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 1 — MARKET STRUCTURE (MSS / BOS / Swings)
+// ═══════════════════════════════════════════════════════════════════════════════
+swingHigh = ta.pivothigh(high, swingLen, swingLen)
+swingLow  = ta.pivotlow(low,   swingLen, swingLen)
+
+var float  lastSH      = na
+var int    lastSHBar   = na
+var float  prevSH      = na
+var int    prevSHBar   = na
+var float  lastSL      = na
+var int    lastSLBar   = na
+var float  prevSL      = na
+var int    prevSLBar   = na
+var string lastHType   = na
+var string lastLType   = na
+var int    trend       = 0
+var int    lastMSSBar  = 0
+var int    lastBOSBar  = 0
+var float  lastMSSPrice = na
+var string lastMSSDir   = na
+
+if enableStructure and not na(swingHigh)
+    swingBar = bar_index - swingLen
+    string hType = na
+    if not na(lastSH)
+        hType := swingHigh > lastSH ? "HH" : "LH"
+    prevSH    := lastSH
+    prevSHBar := lastSHBar
+    lastSH    := swingHigh
+    lastSHBar := swingBar
+    lastHType := hType
+
+    if showStructLabels and not na(hType)
+        label.new(swingBar, swingHigh, hType,
+             style=label.style_label_down,
+             color=hType == "HH" ? bullColor : bearColor,
+             textcolor=color.white, size=size.tiny)
+
+    if showStructLines and not na(prevSH)
+        line.new(prevSHBar, prevSH, swingBar, swingHigh,
+             color=hType == "HH" ? bullColor : bearColor,
+             style=line.style_dashed, width=1)
+
+if enableStructure and not na(swingLow)
+    swingBar = bar_index - swingLen
+    string lType = na
+    if not na(lastSL)
+        lType := swingLow > lastSL ? "HL" : "LL"
+    prevSL    := lastSL
+    prevSLBar := lastSLBar
+    lastSL    := swingLow
+    lastSLBar := swingBar
+    lastLType := lType
+
+    if showStructLabels and not na(lType)
+        label.new(swingBar, swingLow, lType,
+             style=label.style_label_up,
+             color=lType == "HL" ? bullColor : bearColor,
+             textcolor=color.white, size=size.tiny)
+
+    if showStructLines and not na(prevSL)
+        line.new(prevSLBar, prevSL, swingBar, swingLow,
+             color=lType == "HL" ? bullColor : bearColor,
+             style=line.style_dashed, width=1)
+
+// Initial trend
+if trend == 0
+    if lastHType == "HH" and lastLType == "HL"
+        trend := 1
+    else if lastHType == "LH" and lastLType == "LL"
+        trend := -1
+
+// Bullish MSS
+if enableStructure and not na(swingHigh) and lastHType == "HH" and trend == -1
+    swingBar = bar_index - swingLen
+    if swingBar != lastMSSBar
+        trend        := 1
+        lastMSSBar   := swingBar
+        lastMSSPrice := swingHigh
+        lastMSSDir   := "BULLISH"
+        if showMSS
+            label.new(swingBar, swingHigh, "MSS ▲\nBULLISH",
+                 style=label.style_label_down, color=bullColor,
+                 textcolor=color.white, size=size.small,
+                 tooltip="MSS|BULLISH|" + str.tostring(swingHigh, "#.##") + "|" + str.tostring(swingBar))
+
+// Bearish MSS
+if enableStructure and not na(swingLow) and lastLType == "LL" and trend == 1
+    swingBar = bar_index - swingLen
+    if swingBar != lastMSSBar
+        trend        := -1
+        lastMSSBar   := swingBar
+        lastMSSPrice := swingLow
+        lastMSSDir   := "BEARISH"
+        if showMSS
+            label.new(swingBar, swingLow, "MSS ▼\nBEARISH",
+                 style=label.style_label_up, color=bearColor,
+                 textcolor=color.white, size=size.small,
+                 tooltip="MSS|BEARISH|" + str.tostring(swingLow, "#.##") + "|" + str.tostring(swingBar))
+
+// Bullish BOS (continuation)
+if enableStructure and showBOS and not na(swingHigh) and lastHType == "HH" and trend == 1
+    swingBar = bar_index - swingLen
+    if swingBar != lastBOSBar and swingBar != lastMSSBar
+        lastBOSBar := swingBar
+        label.new(swingBar, swingHigh, "BOS ▲",
+             style=label.style_label_down, color=color.new(bullColor, 50),
+             textcolor=color.white, size=size.tiny,
+             tooltip="BOS|BULLISH|" + str.tostring(swingHigh, "#.##") + "|" + str.tostring(swingBar))
+
+// Bearish BOS (continuation)
+if enableStructure and showBOS and not na(swingLow) and lastLType == "LL" and trend == -1
+    swingBar = bar_index - swingLen
+    if swingBar != lastBOSBar and swingBar != lastMSSBar
+        lastBOSBar := swingBar
+        label.new(swingBar, swingLow, "BOS ▼",
+             style=label.style_label_up, color=color.new(bearColor, 50),
+             textcolor=color.white, size=size.tiny,
+             tooltip="BOS|BEARISH|" + str.tostring(swingLow, "#.##") + "|" + str.tostring(swingBar))
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 2 — FAIR VALUE GAPS
+// ═══════════════════════════════════════════════════════════════════════════════
+var array<box>    fvgBoxes     = array.new<box>()
+var array<float>  fvgTops      = array.new<float>()
+var array<float>  fvgBots      = array.new<float>()
+var array<int>    fvgDirs      = array.new<int>()
+var array<int>    fvgBars      = array.new<int>()
+var array<bool>   fvgMitigated = array.new<bool>()
+var array<label>  fvgLabels    = array.new<label>()
+
+if enableFVG
+    c1h = high[2]
+    c3l = low[0]
+    isBullFVG  = c3l > c1h
+    bullGapPct = isBullFVG ? ((c3l - c1h) / c1h) * 100 : 0.0
+
+    c1l = low[2]
+    c3h = high[0]
+    isBearFVG  = c1l > c3h
+    bearGapPct = isBearFVG ? ((c1l - c3h) / c3h) * 100 : 0.0
+
+    if isBullFVG and showBullFVG and bullGapPct >= minFVGSize
+        b = box.new(bar_index - 2, c3l, bar_index, c1h,
+             border_color=bullFVGColor, bgcolor=bullFVGColor, border_width=1)
+        tt = "FVG|BULLISH|" + str.tostring(c1h, "#.##") + "|" + str.tostring(c3l, "#.##") + "|" + str.tostring(bullGapPct, "#.##") + "%|ACTIVE"
+        l = label.new(bar_index - 1, c1h, "", style=label.style_none, tooltip=tt, size=size.tiny)
+        array.push(fvgBoxes, b)
+        array.push(fvgTops, c3l)
+        array.push(fvgBots, c1h)
+        array.push(fvgDirs, 1)
+        array.push(fvgBars, bar_index)
+        array.push(fvgMitigated, false)
+        array.push(fvgLabels, l)
+
+    if isBearFVG and showBearFVG and bearGapPct >= minFVGSize
+        b = box.new(bar_index - 2, c1l, bar_index, c3h,
+             border_color=bearFVGColor, bgcolor=bearFVGColor, border_width=1)
+        tt = "FVG|BEARISH|" + str.tostring(c3h, "#.##") + "|" + str.tostring(c1l, "#.##") + "|" + str.tostring(bearGapPct, "#.##") + "%|ACTIVE"
+        l = label.new(bar_index - 1, c1l, "", style=label.style_none, tooltip=tt, size=size.tiny)
+        array.push(fvgBoxes, b)
+        array.push(fvgTops, c1l)
+        array.push(fvgBots, c3h)
+        array.push(fvgDirs, -1)
+        array.push(fvgBars, bar_index)
+        array.push(fvgMitigated, false)
+        array.push(fvgLabels, l)
+
+// FVG lifecycle: mitigation + age + extend
+if enableFVG and array.size(fvgBoxes) > 0
+    for i = array.size(fvgBoxes) - 1 to 0
+        t   = array.get(fvgTops, i)
+        b   = array.get(fvgBots, i)
+        dir = array.get(fvgDirs, i)
+        bar = array.get(fvgBars, i)
+        mit = array.get(fvgMitigated, i)
+        bx  = array.get(fvgBoxes, i)
+        lb  = array.get(fvgLabels, i)
+
+        age = bar_index - bar
+        if age > maxFVGAge
+            box.delete(bx)
+            label.delete(lb)
+            array.remove(fvgBoxes, i)
+            array.remove(fvgTops, i)
+            array.remove(fvgBots, i)
+            array.remove(fvgDirs, i)
+            array.remove(fvgBars, i)
+            array.remove(fvgMitigated, i)
+            array.remove(fvgLabels, i)
+            continue
+
+        if not mit
+            isMit = dir == 1 ? low <= b : high >= t
+            if isMit
+                array.set(fvgMitigated, i, true)
+                if showMitigated
+                    dim = dir == 1 ? color.new(bullFVGColor, 92) : color.new(bearFVGColor, 92)
+                    box.set_bgcolor(bx, dim)
+                    box.set_border_color(bx, dim)
+                    label.set_tooltip(lb, "FVG|" + (dir == 1 ? "BULLISH" : "BEARISH") + "|" + str.tostring(b, "#.##") + "|" + str.tostring(t, "#.##") + "|MITIGATED")
+                else
+                    box.delete(bx)
+                    label.delete(lb)
+                    array.remove(fvgBoxes, i)
+                    array.remove(fvgTops, i)
+                    array.remove(fvgBots, i)
+                    array.remove(fvgDirs, i)
+                    array.remove(fvgBars, i)
+                    array.remove(fvgMitigated, i)
+                    array.remove(fvgLabels, i)
+                    continue
+
+        if extendFVG and not array.get(fvgMitigated, i)
+            box.set_right(bx, bar_index)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 3 — ORDER BLOCKS
+// ═══════════════════════════════════════════════════════════════════════════════
+var array<box>    obBoxes    = array.new<box>()
+var array<float>  obTops     = array.new<float>()
+var array<float>  obBots     = array.new<float>()
+var array<int>    obDirs     = array.new<int>()
+var array<int>    obBars     = array.new<int>()
+var array<bool>   obBroken   = array.new<bool>()
+var array<bool>   obTested   = array.new<bool>()
+var array<label>  obLabels   = array.new<label>()
+
+// Bullish OB
+if enableOB and not na(swingLow) and showBullOB
+    impulseSize = high[0] - swingLow
+    if impulseSize > atrVal * minImpulseATR
+        obBarIdx = -1
+        obHi = 0.0
+        obLo = 0.0
+        for j = swingLen to swingLen + 5
+            if close[j] < open[j]
+                obBarIdx := bar_index - j
+                obHi     := high[j]
+                obLo     := low[j]
+                break
+        if obBarIdx != -1
+            bx = box.new(obBarIdx, obHi, bar_index, obLo,
+                 border_color=bullOBColor, bgcolor=bullOBColor, border_width=1)
+            tt = "OB|BULLISH|" + str.tostring(obLo, "#.##") + "|" + str.tostring(obHi, "#.##") + "|ACTIVE|UNTESTED"
+            lb = label.new(obBarIdx, obLo, "", style=label.style_none, tooltip=tt, size=size.tiny)
+            array.push(obBoxes, bx)
+            array.push(obTops, obHi)
+            array.push(obBots, obLo)
+            array.push(obDirs, 1)
+            array.push(obBars, obBarIdx)
+            array.push(obBroken, false)
+            array.push(obTested, false)
+            array.push(obLabels, lb)
+
+// Bearish OB
+if enableOB and not na(swingHigh) and showBearOB
+    impulseSize = swingHigh - low[0]
+    if impulseSize > atrVal * minImpulseATR
+        obBarIdx = -1
+        obHi = 0.0
+        obLo = 0.0
+        for j = swingLen to swingLen + 5
+            if close[j] > open[j]
+                obBarIdx := bar_index - j
+                obHi     := high[j]
+                obLo     := low[j]
+                break
+        if obBarIdx != -1
+            bx = box.new(obBarIdx, obHi, bar_index, obLo,
+                 border_color=bearOBColor, bgcolor=bearOBColor, border_width=1)
+            tt = "OB|BEARISH|" + str.tostring(obLo, "#.##") + "|" + str.tostring(obHi, "#.##") + "|ACTIVE|UNTESTED"
+            lb = label.new(obBarIdx, obHi, "", style=label.style_none, tooltip=tt, size=size.tiny)
+            array.push(obBoxes, bx)
+            array.push(obTops, obHi)
+            array.push(obBots, obLo)
+            array.push(obDirs, -1)
+            array.push(obBars, obBarIdx)
+            array.push(obBroken, false)
+            array.push(obTested, false)
+            array.push(obLabels, lb)
+
+// OB lifecycle
+if enableOB and array.size(obBoxes) > 0
+    for i = array.size(obBoxes) - 1 to 0
+        t   = array.get(obTops, i)
+        b   = array.get(obBots, i)
+        dir = array.get(obDirs, i)
+        bar = array.get(obBars, i)
+        brk = array.get(obBroken, i)
+        tst = array.get(obTested, i)
+        bx  = array.get(obBoxes, i)
+        lb  = array.get(obLabels, i)
+
+        age = bar_index - bar
+        if age > maxOBAge
+            box.delete(bx)
+            label.delete(lb)
+            array.remove(obBoxes, i)
+            array.remove(obTops, i)
+            array.remove(obBots, i)
+            array.remove(obDirs, i)
+            array.remove(obBars, i)
+            array.remove(obBroken, i)
+            array.remove(obTested, i)
+            array.remove(obLabels, i)
+            continue
+
+        if not brk
+            if not tst
+                wasTested = dir == 1 ? (low <= t and close >= b) : (high >= b and close <= t)
+                if wasTested
+                    array.set(obTested, i, true)
+                    status = dir == 1 ? "BULLISH" : "BEARISH"
+                    label.set_tooltip(lb, "OB|" + status + "|" + str.tostring(b, "#.##") + "|" + str.tostring(t, "#.##") + "|ACTIVE|TESTED")
+
+            isBroken = dir == 1 ? close < b : close > t
+            if isBroken
+                array.set(obBroken, i, true)
+                if showBrokenOB
+                    orig = dir == 1 ? bullOBColor : bearOBColor
+                    dim  = color.new(orig, 92)
+                    box.set_bgcolor(bx, dim)
+                    box.set_border_color(bx, dim)
+                    status = dir == 1 ? "BULLISH" : "BEARISH"
+                    label.set_tooltip(lb, "OB|" + status + "|" + str.tostring(b, "#.##") + "|" + str.tostring(t, "#.##") + "|BROKEN")
+                else
+                    box.delete(bx)
+                    label.delete(lb)
+                    array.remove(obBoxes, i)
+                    array.remove(obTops, i)
+                    array.remove(obBots, i)
+                    array.remove(obDirs, i)
+                    array.remove(obBars, i)
+                    array.remove(obBroken, i)
+                    array.remove(obTested, i)
+                    array.remove(obLabels, i)
+                    continue
+
+        if not array.get(obBroken, i)
+            box.set_right(bx, bar_index)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 4 — LIQUIDITY SWEEPS (equal H/L pools + sweep events)
+// ═══════════════════════════════════════════════════════════════════════════════
+var array<float> eqHighLevels   = array.new<float>()
+var array<int>   eqHighTouches  = array.new<int>()
+var array<int>   eqHighBars     = array.new<int>()
+var array<int>   eqHighFirstBar = array.new<int>()
+var array<bool>  eqHighSwept    = array.new<bool>()
+var array<line>  eqHighLines    = array.new<line>()
+
+var array<float> eqLowLevels    = array.new<float>()
+var array<int>   eqLowTouches   = array.new<int>()
+var array<int>   eqLowBars      = array.new<int>()
+var array<int>   eqLowFirstBar  = array.new<int>()
+var array<bool>  eqLowSwept     = array.new<bool>()
+var array<line>  eqLowLines     = array.new<line>()
+
+var string lastSweepInfo = "—"   // for table output
+
+// Process swing highs → equal highs
+if enableLiquidity and not na(swingHigh)
+    swingBar = bar_index - swingLen
+    matched = false
+    if array.size(eqHighLevels) > 0
+        for i = 0 to array.size(eqHighLevels) - 1
+            if not array.get(eqHighSwept, i)
+                level = array.get(eqHighLevels, i)
+                diff  = math.abs(swingHigh - level) / level * 100
+                if diff <= eqThreshold
+                    t = array.get(eqHighTouches, i) + 1
+                    array.set(eqHighTouches, i, t)
+                    array.set(eqHighBars, i, swingBar)
+                    newLvl = (level * (t - 1) + swingHigh) / t
+                    array.set(eqHighLevels, i, newLvl)
+                    if showPools
+                        line.delete(array.get(eqHighLines, i))
+                        firstBar = array.get(eqHighFirstBar, i)
+                        newLn = line.new(firstBar, newLvl, bar_index, newLvl,
+                             color=poolColor, style=line.style_dashed,
+                             width=t >= minTouches ? 2 : 1)
+                        array.set(eqHighLines, i, newLn)
+                    matched := true
+                    break
+    if not matched
+        array.push(eqHighLevels, swingHigh)
+        array.push(eqHighTouches, 1)
+        array.push(eqHighBars, swingBar)
+        array.push(eqHighFirstBar, swingBar)
+        array.push(eqHighSwept, false)
+        ln = showPools ? line.new(swingBar, swingHigh, bar_index, swingHigh, color=color.new(poolColor, 70), style=line.style_dotted, width=1) : line.new(na, na, na, na)
+        array.push(eqHighLines, ln)
+
+// Process swing lows → equal lows
+if enableLiquidity and not na(swingLow)
+    swingBar = bar_index - swingLen
+    matched = false
+    if array.size(eqLowLevels) > 0
+        for i = 0 to array.size(eqLowLevels) - 1
+            if not array.get(eqLowSwept, i)
+                level = array.get(eqLowLevels, i)
+                diff  = math.abs(swingLow - level) / level * 100
+                if diff <= eqThreshold
+                    t = array.get(eqLowTouches, i) + 1
+                    array.set(eqLowTouches, i, t)
+                    array.set(eqLowBars, i, swingBar)
+                    newLvl = (level * (t - 1) + swingLow) / t
+                    array.set(eqLowLevels, i, newLvl)
+                    if showPools
+                        line.delete(array.get(eqLowLines, i))
+                        firstBar = array.get(eqLowFirstBar, i)
+                        newLn = line.new(firstBar, newLvl, bar_index, newLvl,
+                             color=poolColor, style=line.style_dashed,
+                             width=t >= minTouches ? 2 : 1)
+                        array.set(eqLowLines, i, newLn)
+                    matched := true
+                    break
+    if not matched
+        array.push(eqLowLevels, swingLow)
+        array.push(eqLowTouches, 1)
+        array.push(eqLowBars, swingBar)
+        array.push(eqLowFirstBar, swingBar)
+        array.push(eqLowSwept, false)
+        ln = showPools ? line.new(swingBar, swingLow, bar_index, swingLow, color=color.new(poolColor, 70), style=line.style_dotted, width=1) : line.new(na, na, na, na)
+        array.push(eqLowLines, ln)
+
+// Sweep detection — bearish (above equal highs)
+if enableLiquidity and array.size(eqHighLevels) > 0
+    for i = array.size(eqHighLevels) - 1 to 0
+        if array.get(eqHighSwept, i)
+            continue
+        level   = array.get(eqHighLevels, i)
+        touches = array.get(eqHighTouches, i)
+        poolBar = array.get(eqHighBars, i)
+        age     = bar_index - poolBar
+        if age > maxPoolAge
+            line.delete(array.get(eqHighLines, i))
+            array.remove(eqHighLevels, i)
+            array.remove(eqHighTouches, i)
+            array.remove(eqHighBars, i)
+            array.remove(eqHighFirstBar, i)
+            array.remove(eqHighSwept, i)
+            array.remove(eqHighLines, i)
+            continue
+        if touches < minTouches
+            continue
+        wickAbove   = high > level
+        closedBelow = close < level
+        wickSize    = (high - level) / level * 100
+        if wickAbove and closedBelow and wickSize >= sweepWickPct
+            array.set(eqHighSwept, i, true)
+            ln = array.get(eqHighLines, i)
+            line.set_color(ln, color.new(poolColor, 85))
+            line.set_style(ln, line.style_dotted)
+            lastSweepInfo := "BEAR@" + str.tostring(level, "#.##")
+            if showSweeps
+                label.new(bar_index, high, "SWEEP ▼\n" + str.tostring(level, "#.##"),
+                     style=label.style_label_down, color=bearColor,
+                     textcolor=color.white, size=size.small,
+                     tooltip="SWEEP|BEARISH|" + str.tostring(level, "#.##") + "|" + str.tostring(touches) + "|" + str.tostring(bar_index))
+
+// Sweep detection — bullish (below equal lows)
+if enableLiquidity and array.size(eqLowLevels) > 0
+    for i = array.size(eqLowLevels) - 1 to 0
+        if array.get(eqLowSwept, i)
+            continue
+        level   = array.get(eqLowLevels, i)
+        touches = array.get(eqLowTouches, i)
+        poolBar = array.get(eqLowBars, i)
+        age     = bar_index - poolBar
+        if age > maxPoolAge
+            line.delete(array.get(eqLowLines, i))
+            array.remove(eqLowLevels, i)
+            array.remove(eqLowTouches, i)
+            array.remove(eqLowBars, i)
+            array.remove(eqLowFirstBar, i)
+            array.remove(eqLowSwept, i)
+            array.remove(eqLowLines, i)
+            continue
+        if touches < minTouches
+            continue
+        wickBelow   = low < level
+        closedAbove = close > level
+        wickSize    = (level - low) / level * 100
+        if wickBelow and closedAbove and wickSize >= sweepWickPct
+            array.set(eqLowSwept, i, true)
+            ln = array.get(eqLowLines, i)
+            line.set_color(ln, color.new(poolColor, 85))
+            line.set_style(ln, line.style_dotted)
+            lastSweepInfo := "BULL@" + str.tostring(level, "#.##")
+            if showSweeps
+                label.new(bar_index, low, "SWEEP ▲\n" + str.tostring(level, "#.##"),
+                     style=label.style_label_up, color=bullColor,
+                     textcolor=color.white, size=size.small,
+                     tooltip="SWEEP|BULLISH|" + str.tostring(level, "#.##") + "|" + str.tostring(touches) + "|" + str.tostring(bar_index))
+
+// Extend pool lines
+if enableLiquidity and array.size(eqHighLines) > 0
+    for i = 0 to array.size(eqHighLines) - 1
+        if not array.get(eqHighSwept, i) and showPools
+            line.set_x2(array.get(eqHighLines, i), bar_index)
+if enableLiquidity and array.size(eqLowLines) > 0
+    for i = 0 to array.size(eqLowLines) - 1
+        if not array.get(eqLowSwept, i) and showPools
+            line.set_x2(array.get(eqLowLines, i), bar_index)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 5 — SESSION LEVELS + PDH/PDL/PWH/PWL
+// ═══════════════════════════════════════════════════════════════════════════════
+isAsian  = not na(time(timeframe.period, asianSess,  "UTC"))
+isLondon = not na(time(timeframe.period, londonSess, "UTC"))
+isNY     = not na(time(timeframe.period, nySess,     "UTC"))
+
+var float asianHighVal = na
+var float asianLowVal  = na
+var float londonHighVal = na
+var float londonLowVal = na
+var float nyHighVal = na
+var float nyLowVal  = na
+var bool asianActive  = false
+var int  asianStartBar = na
+var bool londonActive = false
+var int  londonStartBar = na
+var bool nyActive     = false
+var int  nyStartBar     = na
+var line asianHighLn  = na
+var line asianLowLn   = na
+var line londonHighLn = na
+var line londonLowLn  = na
+var line nyHighLn     = na
+var line nyLowLn      = na
+
+if enableSessions
+    // Asian
+    if isAsian
+        if not asianActive
+            asianActive   := true
+            asianHighVal  := high
+            asianLowVal   := low
+            asianStartBar := bar_index
+            line.delete(asianHighLn)
+            line.delete(asianLowLn)
+        else
+            asianHighVal := math.max(asianHighVal, high)
+            asianLowVal  := math.min(asianLowVal,  low)
+    else
+        if asianActive
+            asianActive := false
+            if showAsian and not na(asianHighVal)
+                asianHighLn := line.new(asianStartBar, asianHighVal, bar_index, asianHighVal, color=asianColor, style=line.style_solid, width=2)
+                asianLowLn  := line.new(asianStartBar, asianLowVal,  bar_index, asianLowVal,  color=asianColor, style=line.style_solid, width=2)
+
+    // London
+    if isLondon
+        if not londonActive
+            londonActive   := true
+            londonHighVal  := high
+            londonLowVal   := low
+            londonStartBar := bar_index
+            line.delete(londonHighLn)
+            line.delete(londonLowLn)
+        else
+            londonHighVal := math.max(londonHighVal, high)
+            londonLowVal  := math.min(londonLowVal,  low)
+    else
+        if londonActive
+            londonActive := false
+            if showLondon and not na(londonHighVal)
+                londonHighLn := line.new(londonStartBar, londonHighVal, bar_index, londonHighVal, color=londonColor, style=line.style_solid, width=2)
+                londonLowLn  := line.new(londonStartBar, londonLowVal,  bar_index, londonLowVal,  color=londonColor, style=line.style_solid, width=2)
+
+    // NY
+    if isNY
+        if not nyActive
+            nyActive   := true
+            nyHighVal  := high
+            nyLowVal   := low
+            nyStartBar := bar_index
+            line.delete(nyHighLn)
+            line.delete(nyLowLn)
+        else
+            nyHighVal := math.max(nyHighVal, high)
+            nyLowVal  := math.min(nyLowVal,  low)
+    else
+        if nyActive
+            nyActive := false
+            if showNY and not na(nyHighVal)
+                nyHighLn := line.new(nyStartBar, nyHighVal, bar_index, nyHighVal, color=nyColor, style=line.style_solid, width=2)
+                nyLowLn  := line.new(nyStartBar, nyLowVal,  bar_index, nyLowVal,  color=nyColor, style=line.style_solid, width=2)
+
+    // Extend active session lines
+    if not na(asianHighLn)
+        line.set_x2(asianHighLn, bar_index)
+        line.set_x2(asianLowLn,  bar_index)
+    if not na(londonHighLn)
+        line.set_x2(londonHighLn, bar_index)
+        line.set_x2(londonLowLn,  bar_index)
+    if not na(nyHighLn)
+        line.set_x2(nyHighLn, bar_index)
+        line.set_x2(nyLowLn,  bar_index)
+
+// PDH/PDL
+prevDayHigh = enableSessions ? request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on) : na
+prevDayLow  = enableSessions ? request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_on) : na
+
+var line pdHighLn = na
+var line pdLowLn  = na
+if enableSessions and showPrevDay and barstate.islast
+    line.delete(pdHighLn)
+    line.delete(pdLowLn)
+    if not na(prevDayHigh)
+        pdHighLn := line.new(bar_index - 50, prevDayHigh, bar_index, prevDayHigh, color=pdColor, style=line.style_dashed, width=1)
+        pdLowLn  := line.new(bar_index - 50, prevDayLow,  bar_index, prevDayLow,  color=pdColor, style=line.style_dashed, width=1)
+        label.new(bar_index, prevDayHigh, "PDH", style=label.style_none, textcolor=pdColor, size=size.tiny)
+        label.new(bar_index, prevDayLow,  "PDL", style=label.style_none, textcolor=pdColor, size=size.tiny)
+
+// PWH/PWL
+prevWeekHigh = enableSessions ? request.security(syminfo.tickerid, "W", high[1], lookahead=barmerge.lookahead_on) : na
+prevWeekLow  = enableSessions ? request.security(syminfo.tickerid, "W", low[1],  lookahead=barmerge.lookahead_on) : na
+
+var line pwHighLn = na
+var line pwLowLn  = na
+if enableSessions and showPrevWeek and barstate.islast
+    line.delete(pwHighLn)
+    line.delete(pwLowLn)
+    if not na(prevWeekHigh)
+        pwHighLn := line.new(bar_index - 100, prevWeekHigh, bar_index, prevWeekHigh, color=pwColor, style=line.style_dashed, width=2)
+        pwLowLn  := line.new(bar_index - 100, prevWeekLow,  bar_index, prevWeekLow,  color=pwColor, style=line.style_dashed, width=2)
+        label.new(bar_index, prevWeekHigh, "PWH", style=label.style_none, textcolor=pwColor, size=size.tiny)
+        label.new(bar_index, prevWeekLow,  "PWL", style=label.style_none, textcolor=pwColor, size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 6 — VMC CIPHER A (EMA ribbon + WaveTrend-derived signals)
+// ═══════════════════════════════════════════════════════════════════════════════
+// WaveTrend function (for internal use by VMC A shape signals)
+f_wavetrend(_src, _chlen, _avg, _malen) =>
+    esa = ta.ema(_src, _chlen)
+    de  = ta.ema(math.abs(_src - esa), _chlen)
+    ci  = (_src - esa) / (0.015 * de)
+    tci = ta.ema(ci, _avg)
+    wt1_ = tci
+    wt2_ = ta.sma(wt1_, _malen)
+    [wt1_, wt2_]
+
+// RSI+MFI proxy (VMC A uses this for the Yellow X pattern)
+f_rsimfi(_period, _multiplier) =>
+    ta.sma(((close - open) / (high - low)) * _multiplier, _period)
+
+// VMC calculations (always compute — used by the signal table even if shapes hidden)
+[wtA1, wtA2] = f_wavetrend(wtMASource, wtChannelLen, wtAverageLen, wtMALen)
+rsiA         = ta.rsi(close, rsiLenA)
+rsiMFIA      = f_rsimfi(rsiMFIperiodA, rsiMFImultA)
+
+// EMA ribbon
+vEma1 = ta.ema(close, ema1Len)
+vEma2 = ta.ema(close, ema2Len)
+vEma3 = ta.ema(close, ema3Len)
+vEma4 = ta.ema(close, ema4Len)
+vEma5 = ta.ema(close, ema5Len)
+vEma6 = ta.ema(close, ema6Len)
+vEma7 = ta.ema(close, ema7Len)
+vEma8 = ta.ema(close, ema8Len)
+
+// VMC A signals (identical logic to VMC A source, v6 syntax)
+wtCrossA     = ta.cross(wtA1, wtA2)
+wtCrossUp    = wtA2 - wtA1 <= 0
+wtCrossDown  = wtA2 - wtA1 >= 0
+wtOverSold   = wtA2 <= osLevelA
+wtOverBought = wtA2 >= obLevelA
+
+longEma      = ta.crossover(vEma2, vEma8)
+shortEma     = ta.crossover(vEma8, vEma2)
+redCross     = ta.crossunder(vEma1, vEma2)
+blueTriangle = ta.crossover(vEma2, vEma3)
+redDiamond   = wtCrossA and wtCrossDown
+yellowCross  = redDiamond and wtA2 < 45 and wtA2 > osLevel3A and rsiA < 30 and rsiA > 15 and rsiMFIA < -5
+bloodDiamond = redDiamond and redCross
+bullCandle   = open > vEma2 and open > vEma8 and (close[1] > open[1]) and (close > open) and not redDiamond and not redCross
+
+// EMA ribbon plotting (grayscale when bearish, tinted blue when bullish)
+ribbonDir = vEma8 < vEma2
+emaCol1 = showRibbon and enableVMC ? (ribbonDir ? color.new(#1573d4, 15) : color.new(color.gray, 15)) : na
+emaCol2 = showRibbon and enableVMC ? (ribbonDir ? color.new(#3096ff, 15) : color.new(color.gray, 15)) : na
+emaCol3 = showRibbon and enableVMC ? (ribbonDir ? color.new(#57abff, 15) : color.new(color.gray, 15)) : na
+emaCol4 = showRibbon and enableVMC ? (ribbonDir ? color.new(#85c2ff, 15) : color.new(color.gray, 15)) : na
+emaCol5 = showRibbon and enableVMC ? (ribbonDir ? color.new(#9bcdff, 15) : color.new(color.gray, 15)) : na
+emaCol6 = showRibbon and enableVMC ? (ribbonDir ? color.new(#b3d9ff, 15) : color.new(color.gray, 15)) : na
+emaCol7 = showRibbon and enableVMC ? (ribbonDir ? color.new(#c9e5ff, 15) : color.new(color.gray, 15)) : na
+emaCol8 = showRibbon and enableVMC ? (ribbonDir ? color.new(#dfecfb, 15) : color.new(color.gray, 15)) : na
+
+p1 = plot(vEma1, color=emaCol1, linewidth=2, title="EMA 1")
+p2 = plot(vEma2, color=emaCol2, linewidth=2, title="EMA 2")
+plot(vEma3, color=emaCol3, linewidth=2, title="EMA 3")
+plot(vEma4, color=emaCol4, linewidth=2, title="EMA 4")
+plot(vEma5, color=emaCol5, linewidth=2, title="EMA 5")
+plot(vEma6, color=emaCol6, linewidth=2, title="EMA 6")
+plot(vEma7, color=emaCol7, linewidth=2, title="EMA 7")
+p8 = plot(vEma8, color=emaCol8, linewidth=2, title="EMA 8")
+fill(p1, p2, color=color.new(#1573d4, 85), title="Ribbon fill 1")
+fill(p2, p8, color=color.new(#363a45, 85), title="Ribbon fill 2")
+
+// VMC shape signals (the actual VMC A markers above/below bars)
+plotshape(showVMCShapes and enableVMC and longEma,      style=shape.circle,     color=color.new(#00ff00, 50), location=location.abovebar, size=size.tiny,  title="Long EMA (Green Circle)")
+plotshape(showVMCShapes and enableVMC and shortEma,     style=shape.circle,     color=color.new(#ff0000, 50), location=location.abovebar, size=size.tiny,  title="Short EMA (Red Circle)")
+plotshape(showVMCShapes and enableVMC and redCross,     style=shape.xcross,     color=color.new(#ff0000, 50), location=location.abovebar, size=size.tiny,  title="Red Cross")
+plotshape(showVMCShapes and enableVMC and blueTriangle, style=shape.triangleup, color=color.new(#0064ff, 50), location=location.abovebar, size=size.small, title="Blue Triangle")
+plotshape(showVMCShapes and enableVMC and redDiamond,   style=shape.diamond,    color=color.new(#ff0000, 25), location=location.abovebar, size=size.tiny,  title="Red Diamond")
+plotshape(showVMCShapes and enableVMC and bullCandle,   style=shape.diamond,    color=color.new(color.yellow, 75), location=location.abovebar, size=size.tiny,  title="Bull Candle (Yellow Diamond)")
+plotshape(showVMCShapes and enableVMC and bloodDiamond, style=shape.diamond,    color=color.new(#ff0000, 15), location=location.abovebar, size=size.small, title="Blood Diamond")
+plotshape(showVMCShapes and enableVMC and yellowCross,  style=shape.xcross,     color=color.new(color.yellow, 25), location=location.abovebar, size=size.small, title="Yellow X (HIGH-PROB BUY)")
+
+// Track last VMC signal for the table
+var string lastVMCSignal = "—"
+if enableVMC and yellowCross
+    lastVMCSignal := "YELLOW_X_BUY@" + str.tostring(close, "#.##")
+else if enableVMC and bloodDiamond
+    lastVMCSignal := "BLOOD_DIAMOND_SELL@" + str.tostring(close, "#.##")
+else if enableVMC and longEma
+    lastVMCSignal := "LONG_EMA@" + str.tostring(close, "#.##")
+else if enableVMC and shortEma
+    lastVMCSignal := "SHORT_EMA@" + str.tostring(close, "#.##")
+else if enableVMC and bullCandle
+    lastVMCSignal := "BULL_CANDLE@" + str.tostring(close, "#.##")
+else if enableVMC and redDiamond
+    lastVMCSignal := "RED_DIAMOND@" + str.tostring(close, "#.##")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 7 — DERIVED AGGREGATES (for the Master Table)
+// ═══════════════════════════════════════════════════════════════════════════════
+// HTF trend via EMA(9) vs EMA(21) on HTF
+htfEmaFast = request.security(syminfo.tickerid, htfTF, ta.ema(close, 9),  lookahead=barmerge.lookahead_off)
+htfEmaSlow = request.security(syminfo.tickerid, htfTF, ta.ema(close, 21), lookahead=barmerge.lookahead_off)
+htfTrend   = htfEmaFast > htfEmaSlow ? "BULLISH" : htfEmaFast < htfEmaSlow ? "BEARISH" : "RANGING"
+
+// Structure string
+structureStr = na(lastHType) ? "—" : lastHType + "_" + (na(lastLType) ? "" : lastLType) + (trend == 1 ? "_bullish" : trend == -1 ? "_bearish" : "")
+
+// Nearest active FVG
+nearestBullFVGstr = ""
+nearestBearFVGstr = ""
+nearestBullFVGdist = 1e12
+nearestBearFVGdist = 1e12
+activeBullFVGs = 0
+activeBearFVGs = 0
+if array.size(fvgTops) > 0
+    for i = 0 to array.size(fvgTops) - 1
+        if not array.get(fvgMitigated, i)
+            mid = (array.get(fvgTops, i) + array.get(fvgBots, i)) / 2
+            d   = math.abs(close - mid)
+            if array.get(fvgDirs, i) == 1
+                activeBullFVGs += 1
+                if d < nearestBullFVGdist
+                    nearestBullFVGdist := d
+                    nearestBullFVGstr  := "BULL@" + str.tostring(array.get(fvgBots, i), "#.##") + "-" + str.tostring(array.get(fvgTops, i), "#.##")
+            else
+                activeBearFVGs += 1
+                if d < nearestBearFVGdist
+                    nearestBearFVGdist := d
+                    nearestBearFVGstr  := "BEAR@" + str.tostring(array.get(fvgBots, i), "#.##") + "-" + str.tostring(array.get(fvgTops, i), "#.##")
+
+// Nearest active OB
+nearestBullOBstr = ""
+nearestBearOBstr = ""
+nearestBullOBdist = 1e12
+nearestBearOBdist = 1e12
+if array.size(obDirs) > 0
+    for i = 0 to array.size(obDirs) - 1
+        if not array.get(obBroken, i)
+            mid = (array.get(obTops, i) + array.get(obBots, i)) / 2
+            d   = math.abs(close - mid)
+            dir = array.get(obDirs, i)
+            if dir == 1 and d < nearestBullOBdist
+                nearestBullOBdist := d
+                nearestBullOBstr  := "BULL@" + str.tostring(array.get(obBots, i), "#.##") + "-" + str.tostring(array.get(obTops, i), "#.##")
+            if dir == -1 and d < nearestBearOBdist
+                nearestBearOBdist := d
+                nearestBearOBstr  := "BEAR@" + str.tostring(array.get(obBots, i), "#.##") + "-" + str.tostring(array.get(obTops, i), "#.##")
+
+// Liquidity levels (nearest above/below with min touches)
+liqAboveStr = ""
+liqBelowStr = ""
+liqAboveCount = 0
+liqBelowCount = 0
+if array.size(eqHighLevels) > 0
+    for i = 0 to array.size(eqHighLevels) - 1
+        if not array.get(eqHighSwept, i) and array.get(eqHighTouches, i) >= minTouches and array.get(eqHighLevels, i) > close
+            if liqAboveStr == ""
+                liqAboveStr := str.tostring(array.get(eqHighLevels, i), "#.##")
+            else
+                liqAboveStr += "," + str.tostring(array.get(eqHighLevels, i), "#.##")
+            liqAboveCount += 1
+            if liqAboveCount >= 3
+                break
+if array.size(eqLowLevels) > 0
+    for i = 0 to array.size(eqLowLevels) - 1
+        if not array.get(eqLowSwept, i) and array.get(eqLowTouches, i) >= minTouches and array.get(eqLowLevels, i) < close
+            if liqBelowStr == ""
+                liqBelowStr := str.tostring(array.get(eqLowLevels, i), "#.##")
+            else
+                liqBelowStr += "," + str.tostring(array.get(eqLowLevels, i), "#.##")
+            liqBelowCount += 1
+            if liqBelowCount >= 3
+                break
+
+// Active session
+activeSess = isLondon ? "LONDON" : isNY ? "NEW_YORK" : isAsian ? "ASIAN" : "OFF"
+
+// VMC summary
+ribbonBias = ribbonDir ? "BULLISH" : "BEARISH"
+wtBiasStr  = wtA2 >= obLevelA ? "OVERBOUGHT" : wtA2 <= osLevelA ? "OVERSOLD" : "NEUTRAL"
+wtCrossStr = wtCrossA ? (wtCrossUp ? "UP" : "DOWN") : "—"
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 8 — CONFLUENCE SCORE (0–7, enhanced with VMC)
+// ═══════════════════════════════════════════════════════════════════════════════
+int confluenceScore = 0
+// 1. HTF trend aligned with LTF
+if (htfTrend == "BULLISH" and trend == 1) or (htfTrend == "BEARISH" and trend == -1)
+    confluenceScore += 1
+// 2. Price near an OB or FVG in trend direction
+priceNearBullOB  = nearestBullOBdist  < atrVal * 2 and trend == 1
+priceNearBearOB  = nearestBearOBdist  < atrVal * 2 and trend == -1
+priceNearBullFVG = nearestBullFVGdist < atrVal * 2 and trend == 1
+priceNearBearFVG = nearestBearFVGdist < atrVal * 2 and trend == -1
+if priceNearBullOB or priceNearBearOB or priceNearBullFVG or priceNearBearFVG
+    confluenceScore += 1
+// 3. Recent MSS in signal direction
+if not na(lastMSSDir) and bar_index - lastMSSBar < 50
+    if (lastMSSDir == "BULLISH" and trend == 1) or (lastMSSDir == "BEARISH" and trend == -1)
+        confluenceScore += 1
+// 4. Last sweep aligned with trend
+if (str.startswith(lastSweepInfo, "BULL") and trend == 1) or (str.startswith(lastSweepInfo, "BEAR") and trend == -1)
+    confluenceScore += 1
+// 5. Active session (London or NY)
+if isLondon or isNY
+    confluenceScore += 1
+// 6. EMA ribbon bias aligned with trend (VMC A)
+if (ribbonDir and trend == 1) or (not ribbonDir and trend == -1)
+    confluenceScore += 1
+// 7. VMC high-probability signal fired in last 3 bars
+//    Initialize to -999 so the first 3 bars don't trigger a false positive
+var int lastYellowCrossBar  = -999
+var int lastBloodDiamondBar = -999
+if yellowCross
+    lastYellowCrossBar := bar_index
+if bloodDiamond
+    lastBloodDiamondBar := bar_index
+if (bar_index - lastYellowCrossBar <= 3 and trend == 1) or (bar_index - lastBloodDiamondBar <= 3 and trend == -1)
+    confluenceScore += 1
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 9 — MASTER SIGNAL TABLE
+//   Bot reads via:  tv stream tables --filter "SMT Signals"
+// ═══════════════════════════════════════════════════════════════════════════════
+var table sigTable = table.new(position.top_right, 2, 20, bgcolor=color.new(color.black, 75), border_width=1)
+
+if enableTable and barstate.islast
+    bullCol = color.new(#00C853, 0)
+    bearCol = color.new(#FF1744, 0)
+    neutCol = color.gray
+
+    trendCol = trend == 1 ? bullCol : trend == -1 ? bearCol : neutCol
+    htfCol   = htfTrend == "BULLISH" ? bullCol : htfTrend == "BEARISH" ? bearCol : neutCol
+    confCol  = confluenceScore >= 5 ? bullCol : confluenceScore >= 3 ? color.yellow : bearCol
+    ribbonCol = ribbonDir ? bullCol : bearCol
+
+    int row = 0
+
+    table.cell(sigTable, 0, row, "=== SMT Signals ===", text_color=color.white, text_size=size.small)
+    table.cell(sigTable, 1, row, syminfo.ticker,         text_color=color.white, text_size=size.small)
+    row += 1
+
+    table.cell(sigTable, 0, row, "trend_htf", text_color=neutCol, text_size=size.small)
+    table.cell(sigTable, 1, row, htfTrend,    text_color=htfCol,  text_size=size.small)
+    row += 1
+
+    trendLTF = trend == 1 ? "BULLISH" : trend == -1 ? "BEARISH" : "UNDEFINED"
+    table.cell(sigTable, 0, row, "trend_ltf", text_color=neutCol,  text_size=size.small)
+    table.cell(sigTable, 1, row, trendLTF,    text_color=trendCol, text_size=size.small)
+    row += 1
+
+    table.cell(sigTable, 0, row, "structure",    text_color=neutCol,  text_size=size.small)
+    table.cell(sigTable, 1, row, structureStr,   text_color=trendCol, text_size=size.small)
+    row += 1
+
+    table.cell(sigTable, 0, row, "last_mss", text_color=neutCol, text_size=size.small)
+    mssStr = na(lastMSSDir) ? "—" : lastMSSDir + "@" + str.tostring(lastMSSPrice, "#.##")
+    mssCol = lastMSSDir == "BULLISH" ? bullCol : lastMSSDir == "BEARISH" ? bearCol : neutCol
+    table.cell(sigTable, 1, row, mssStr, text_color=mssCol, text_size=size.small)
+    row += 1
+
+    table.cell(sigTable, 0, row, "active_fvg", text_color=neutCol, text_size=size.small)
+    fvgStr = nearestBullFVGstr != "" ? nearestBullFVGstr : nearestBearFVGstr != "" ? nearestBearFVGstr : "—"
+    table.cell(sigTable, 1, row, fvgStr, text_color=color.white, text_size=size.small)
+    row += 1
+
+    table.cell(sigTable, 0, row, "active_ob", text_color=neutCol, text_size=size.small)
+    obStr = nearestBullOBstr != "" ? nearestBullOBstr : nearestBearOBstr != "" ? nearestBearOBstr : "—"
+    table.cell(sigTable, 1, row, obStr, text_color=color.white, text_size=size.small)
+    row += 1
+
+    table.cell(sigTable, 0, row, "liquidity_above", text_color=neutCol, text_size=size.small)
+    table.cell(sigTable, 1, row, liqAboveStr == "" ? "—" : liqAboveStr, text_color=bearCol, text_size=size.small)
+    row += 1
+
+    table.cell(sigTable, 0, row, "liquidity_below", text_color=neutCol, text_size=size.small)
+    table.cell(sigTable, 1, row, liqBelowStr == "" ? "—" : liqBelowStr, text_color=bullCol, text_size=size.small)
+    row += 1
+
+    table.cell(sigTable, 0, row, "last_sweep", text_color=neutCol, text_size=size.small)
+    sweepCol = str.startswith(lastSweepInfo, "BULL") ? bullCol : str.startswith(lastSweepInfo, "BEAR") ? bearCol : neutCol
+    table.cell(sigTable, 1, row, lastSweepInfo, text_color=sweepCol, text_size=size.small)
+    row += 1
+
+    table.cell(sigTable, 0, row, "session", text_color=neutCol, text_size=size.small)
+    sessColor = isLondon ? color.new(#2196F3, 0) : isNY ? color.new(#FF9800, 0) : isAsian ? color.new(#9C27B0, 0) : neutCol
+    table.cell(sigTable, 1, row, activeSess, text_color=sessColor, text_size=size.small)
+    row += 1
+
+    // ─── VMC Cipher A block ───────────────────────────────────────────────────
+    table.cell(sigTable, 0, row, "vmc_ribbon", text_color=neutCol, text_size=size.small)
+    table.cell(sigTable, 1, row, ribbonBias,   text_color=ribbonCol, text_size=size.small)
+    row += 1
+
+    wtColor = wtBiasStr == "OVERBOUGHT" ? bearCol : wtBiasStr == "OVERSOLD" ? bullCol : neutCol
+    table.cell(sigTable, 0, row, "vmc_wt_bias", text_color=neutCol, text_size=size.small)
+    table.cell(sigTable, 1, row, wtBiasStr + " (" + str.tostring(wtA2, "#.##") + ")", text_color=wtColor, text_size=size.small)
+    row += 1
+
+    table.cell(sigTable, 0, row, "vmc_wt_cross", text_color=neutCol, text_size=size.small)
+    crossCol = wtCrossStr == "UP" ? bullCol : wtCrossStr == "DOWN" ? bearCol : neutCol
+    table.cell(sigTable, 1, row, wtCrossStr, text_color=crossCol, text_size=size.small)
+    row += 1
+
+    table.cell(sigTable, 0, row, "vmc_last_signal", text_color=neutCol, text_size=size.small)
+    vmcSigCol = str.contains(lastVMCSignal, "BUY") or str.contains(lastVMCSignal, "LONG") or str.contains(lastVMCSignal, "BULL") ? bullCol : str.contains(lastVMCSignal, "SELL") or str.contains(lastVMCSignal, "SHORT") or str.contains(lastVMCSignal, "BLOOD") ? bearCol : neutCol
+    table.cell(sigTable, 1, row, lastVMCSignal, text_color=vmcSigCol, text_size=size.small)
+    row += 1
+
+    table.cell(sigTable, 0, row, "vmc_rsi_mfi", text_color=neutCol, text_size=size.small)
+    rsiMfiCol = rsiMFIA > 0 ? bullCol : rsiMFIA < 0 ? bearCol : neutCol
+    table.cell(sigTable, 1, row, str.tostring(rsiMFIA, "#.##"), text_color=rsiMfiCol, text_size=size.small)
+    row += 1
+
+    // ─── Summary ──────────────────────────────────────────────────────────────
+    table.cell(sigTable, 0, row, "confluence", text_color=neutCol, text_size=size.small)
+    table.cell(sigTable, 1, row, str.tostring(confluenceScore) + "/7", text_color=confCol, text_size=size.small)
+    row += 1
+
+    table.cell(sigTable, 0, row, "atr_14", text_color=neutCol, text_size=size.small)
+    table.cell(sigTable, 1, row, str.tostring(atrVal, "#.##"), text_color=color.white, text_size=size.small)
+    row += 1
+
+    table.cell(sigTable, 0, row, "price", text_color=neutCol, text_size=size.small)
+    table.cell(sigTable, 1, row, str.tostring(close, "#.##"), text_color=color.white, text_size=size.small)
+    row += 1
+
+    // Row 18 = sanity marker (confirms full table rendered)
+    table.cell(sigTable, 0, row, "last_bar", text_color=neutCol, text_size=size.small)
+    table.cell(sigTable, 1, row, str.tostring(bar_index), text_color=color.white, text_size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ALERTS (VMC A originals + key SMT events)
+// ═══════════════════════════════════════════════════════════════════════════════
+alertcondition(yellowCross,  "VMC Yellow X (High-Prob BUY)", "Yellow X: OS WaveTrend + RSI + MFI confluence")
+alertcondition(bloodDiamond, "VMC Blood Diamond (SELL)",     "Blood Diamond: Red Diamond + Red Cross")
+alertcondition(redDiamond,   "VMC Red Diamond",              "Red Diamond")
+alertcondition(longEma,      "VMC Long EMA",                 "EMA2 crossover EMA8")
+alertcondition(shortEma,     "VMC Short EMA",                "EMA8 crossover EMA2")
+alertcondition(blueTriangle, "VMC Blue Triangle",            "EMA2 crossover EMA3")
+alertcondition(lastMSSDir == "BULLISH" and lastMSSBar == bar_index - swingLen, "Bullish MSS", "Bullish Market Structure Shift")
+alertcondition(lastMSSDir == "BEARISH" and lastMSSBar == bar_index - swingLen, "Bearish MSS", "Bearish Market Structure Shift")

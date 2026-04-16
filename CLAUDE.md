@@ -31,11 +31,11 @@ Claude Code + MCP = **Orkestra Şefi** (Orchestrator). Claude writes Pine Script
 │  (CDP port 9222)       │            │  Demo: --profile demo          │
 │                        │            │  Live: --profile live           │
 │  Custom Pine Scripts:  │            │                                │
-│  - MSS Detector        │            │  Supported:                    │
-│  - FVG Mapper          │            │  - BTC-USDT-SWAP               │
-│  - OB Identifier       │            │  - ETH-USDT-SWAP               │
-│  - Liquidity Sweeper   │            │  - All perpetual swaps         │
-│  - Session Levels      │            │  - Algo orders (OCO, trailing) │
+│  - SMT Overlay (chart) │            │  Supported:                    │
+│    MSS/FVG/OB/Liq/Sess │            │  - BTC-USDT-SWAP               │
+│    + VMC Cipher A       │            │  - ETH-USDT-SWAP               │
+│  - SMT Oscillator       │            │  - All perpetual swaps         │
+│    WT/RSI/MFI/Stoch/Div│            │  - Algo orders (OCO, trailing) │
 └────────────┬───────────┘            └──────────────┬─────────────────┘
              │                                       │
              ▼                                       ▼
@@ -230,13 +230,16 @@ trading-bot/
 │       ├── BTC-USDT-SWAP.yaml    # Per-pair overrides
 │       └── ETH-USDT-SWAP.yaml
 │
-├── pine/                         # Pine Script indicators (Claude writes these)
-│   ├── mss_detector.pine         # Market Structure Shift detector
-│   ├── fvg_mapper.pine           # Fair Value Gap zones
-│   ├── order_block.pine          # Order Block identifier
-│   ├── liquidity_sweep.pine      # Liquidity sweep detector
-│   ├── session_levels.pine       # Session highs/lows
-│   └── signal_table.pine         # Master signal table (outputs JSON-like data)
+├── pine/                         # Pine Script indicators
+│   ├── smt_overlay.pine          # SMT Master Overlay (chart): PA + VMC Cipher A — ACTIVE
+│   ├── smt_oscillator.pine       # SMT Master Oscillator (lower pane): VMC Cipher B — ACTIVE
+│   ├── vmc_a.txt                 # VuManChu Cipher A reference source (porting input)
+│   ├── vmc_b.txt                 # VuManChu Cipher B reference source (porting input)
+│   ├── mss_detector.pine         # Standalone MSS detector (reference, not loaded)
+│   ├── fvg_mapper.pine           # Standalone FVG mapper (reference, not loaded)
+│   ├── order_block.pine          # Standalone OB identifier (reference, not loaded)
+│   ├── liquidity_sweep.pine      # Standalone liquidity sweep (reference, not loaded)
+│   └── session_levels.pine       # Standalone session levels (reference, not loaded)
 │
 ├── src/
 │   ├── __init__.py
@@ -886,7 +889,7 @@ pytest tests/ -v
 
 #### Phase 1: Pine Script Data Layer (Steps 1.1–1.5)
 
-All 6 Pine Scripts written and committed (2026-04-16):
+All 6 individual Pine Scripts written and committed (2026-04-16):
 
 | Step | Script | File | Output Format |
 |---|---|---|---|
@@ -899,16 +902,57 @@ All 6 Pine Scripts written and committed (2026-04-16):
 
 All scripts use Pine Script v6, output structured data via tooltips/tables, and are readable by the bot through TradingView MCP commands.
 
+#### Phase 1: SMT Overlay + SMT Oscillator (2026-04-16)
+
+The 6 individual scripts were combined with VuManChu Cipher A and B into two final production indicators that run on TradingView:
+
+| Script | File | Type | Purpose |
+|---|---|---|---|
+| **SMT Master Overlay** | `pine/smt_overlay.pine` | Chart overlay | MSS/BOS + FVG boxes + OB boxes + liquidity lines/sweeps + session H/L + PDH/PDL/PWH/PWL + VMC Cipher A (EMA ribbon + WaveTrend shape signals). Outputs 20-row "SMT Signals" table with confluence 0-7. **Primary script for PA + overlay signals.** |
+| **SMT Master Oscillator** | `pine/smt_oscillator.pine` | Lower pane | VMC Cipher B: WaveTrend waves + RSI + MFI + Stochastic RSI + Schaff TC + all divergences (WT/RSI/Stoch, regular + hidden) + buy/sell/gold dots. Outputs 15-row "SMT Oscillator" table with momentum 0-5. **Secondary script for momentum + divergences.** |
+
+**SMT Signals table fields (20 rows, from smt_overlay.pine):**
+- PA: trend_htf, trend_ltf, structure, last_mss, active_fvg, active_ob, liquidity_above, liquidity_below, last_sweep
+- Sessions: session
+- VMC Cipher A: vmc_ribbon, vmc_wt_bias (state + WT2 value), vmc_wt_cross, vmc_last_signal, vmc_rsi_mfi
+- Summary: confluence (0-7), atr_14, price, last_bar
+
+**SMT Oscillator table fields (15 rows, from smt_oscillator.pine):**
+- WaveTrend: wt1, wt2, wt_state, wt_cross, wt_vwap_fast
+- RSI/MFI: rsi (value + state), rsi_mfi (value + bias)
+- Stochastic: stoch_k, stoch_d, stoch_state
+- Signals: last_signal (type + bars ago), last_wt_div (type + bars ago)
+- Summary: momentum (0-5), last_bar
+
+Reference files: `pine/vmc_a.txt` and `pine/vmc_b.txt` contain the original VuManChu Cipher source code used during porting.
+
+Individual scripts (`pine/mss_detector.pine`, etc.) are kept as standalone references but are NOT loaded on the chart.
+
+#### Phase 1, Step 1.6: Data Bridge (2026-04-16)
+
+Python-side data bridge completed:
+
+| File | Purpose |
+|---|---|
+| `src/data/models.py` | Pydantic models: `MarketState`, `SignalTableData` (VMC A overlay fields), `OscillatorTableData` (VMC B momentum fields), `MSSEvent`, `FVGZone`, `OrderBlock`, `LiquidityLevel`, `SweepEvent`, `SessionLevel` |
+| `src/data/tv_bridge.py` | Async TradingView CLI wrapper. Calls `node tradingview-mcp/src/cli/index.js` subprocess. Parallel fetch of tables+labels+boxes+lines+status. |
+| `src/data/structured_reader.py` | Parses two Pine Script tables + drawing objects into `MarketState`. Handles SMT Signals table (20 fields), SMT Oscillator table (15 fields), MSS/BOS labels, FVG/OB boxes, session lines, sweep labels. |
+| `src/data/candle_buffer.py` | Rolling OHLCV candle buffer with `Candle` dataclass, `CandleBuffer` (single TF), `MultiTFBuffer` (multi TF). |
+| `scripts/test_market_state.py` | Phase 1.6 validation script. Connects to TradingView, fetches all Pine data, prints MarketState JSON + summary. Supports `--poll N` for continuous monitoring. |
+
+**TV CLI arg format:** `data tables --filter`, `data labels --filter --max`, `data boxes --filter --verbose`, `data lines --filter --verbose` (not `--study-filter`).
+
+**Bot reads tables via:** `tv stream tables --filter "SMT Signals"` (overlay) and `tv stream tables --filter "SMT Oscillator"` (oscillator).
+
+**Validation:** Test script confirmed working — connects to TradingView CDP, fetches data in parallel (5 concurrent CLI calls), parses into MarketState. Both SMT Overlay and SMT Oscillator are loaded and running on the chart.
+
+### Phase 1 Complete
+
+Phase 1 (Infrastructure + Pine Script data layer) is fully complete:
+- All Pine Scripts written, merged, and running on TradingView (smt_overlay + smt_oscillator)
+- Python data bridge reads both tables + all drawing objects into a unified `MarketState`
+- Two-indicator architecture provides both PA analysis (overlay) and momentum/divergence data (oscillator)
+
 ### Next Up
 
-#### Phase 1, Step 1.6: Data Bridge (`src/data/structured_reader.py`)
-
-Build the Python-side data bridge that:
-- Connects to TradingView MCP to read Pine Script drawing objects and table data
-- Parses structured tooltip/label text into Python dataclasses
-- Maintains a `MarketState` object updated on every new candle
-- Validates: bot prints structured market state JSON for every 15m candle on BTCUSDT
-
-**Before starting 1.6:** Claude Code must be restarted so MCP config loads. TradingView must be running with `--remote-debugging-port=9222`. Then load Pine Scripts into TradingView chart and verify MCP can read their outputs.
-
-After 1.6, move to **Phase 2: Analysis Engine** (Python-side confluence scoring, candlestick patterns, multi-timeframe logic).
+**Phase 2: Analysis Engine** — Python-side confluence scoring, candlestick pattern detection, multi-timeframe logic. Build on top of the MarketState that Phase 1.6 provides.
