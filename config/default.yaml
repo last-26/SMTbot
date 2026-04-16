@@ -6,8 +6,8 @@ bot:
 
 trading:
   symbol: BTC-USDT-SWAP
-  entry_timeframe: 15m
-  htf_timeframe: 4H
+  entry_timeframe: 3m
+  htf_timeframe: 15m
   risk_per_trade_pct: 1.0
   max_leverage: 20
   default_rr_ratio: 3.0
