@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from src.execution.errors import (
@@ -29,6 +30,7 @@ from src.execution.errors import (
 )
 from src.execution.models import (
     AlgoResult,
+    CloseFill,
     OrderResult,
     OrderStatus,
     PositionSnapshot,
@@ -254,3 +256,48 @@ class OKXClient:
                 leverage=int(float(row.get("lever") or 0)),
             ))
         return snapshots
+
+    def enrich_close_fill(self, fill: CloseFill) -> CloseFill:
+        """Replace the PositionMonitor's zeroed PnL/exit fields with real values.
+
+        PositionMonitor.poll() emits CloseFill with pnl_usdt=0 / exit_price=0
+        because it only knows the position disappeared. Before feeding the
+        close to the journal / risk manager we must fill in the real numbers
+        from /api/v5/account/positions-history (realizedPnl, closeAvgPx, uTime).
+        When no matching row is returned we pass the fill through unchanged so
+        the caller can still log / decide; zero-PnL closes are never silently
+        accepted further up the stack.
+        """
+        resp = self.account.get_positions_history(
+            instType="SWAP", instId=fill.inst_id, limit="5",
+        )
+        # Error envelopes propagate as OKXError (same pattern as get_positions).
+        if str(resp.get("code", "")) != "0":
+            raise OKXError(f"positions_history: {resp.get('msg')}", payload=resp)
+
+        rows = resp.get("data") or []
+        matches = [r for r in rows if r.get("posSide") == fill.pos_side
+                   and r.get("instId") == fill.inst_id]
+        if not matches:
+            return fill
+
+        # Most recent by uTime (close timestamp); fall back to cTime.
+        def _ts(r: dict) -> int:
+            return int(r.get("uTime") or r.get("cTime") or "0")
+        row = max(matches, key=_ts)
+
+        exit_price = float(row.get("closeAvgPx") or row.get("avgPx") or fill.exit_price)
+        pnl = float(row.get("realizedPnl") or row.get("pnl") or fill.pnl_usdt)
+        ts_ms = _ts(row)
+        closed_at = (datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+                     if ts_ms else fill.closed_at)
+
+        return CloseFill(
+            inst_id=fill.inst_id,
+            pos_side=fill.pos_side,
+            entry_price=fill.entry_price,
+            exit_price=exit_price,
+            size=fill.size,
+            pnl_usdt=pnl,
+            closed_at=closed_at,
+        )
