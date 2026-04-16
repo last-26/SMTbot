@@ -97,7 +97,7 @@ class TVBridge:
         self, count: int = 100, summary: bool = False
     ) -> dict[str, Any]:
         """Get OHLCV bar data from the chart."""
-        args = ["data", "ohlcv", "--count", str(count)]
+        args = ["ohlcv", "--count", str(count)]
         if summary:
             args.append("--summary")
         return await self._run(*args)
