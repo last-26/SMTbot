@@ -103,8 +103,8 @@ References: `pine/vmc_a.txt`, `pine/vmc_b.txt` (original VMC source). Standalone
 | 2. Analysis Engine | ✅ Complete | 7 modules under `src/analysis/`, 97 passing tests. |
 | 3. Strategy Engine (R:R) | ✅ Complete | 5 modules under `src/strategy/`, 67 new tests (164 total). See below. |
 | 4. Execution (OKX) | ✅ Complete | 5 modules under `src/execution/`, 29 new tests (193 total). See below. |
-| 5. Trade Journal | 🔜 Next | SQLite + Pydantic models + reporter. |
-| 6. RL parameter tuner | Planned | PPO via Stable Baselines3, walk-forward validated. |
+| 5. Trade Journal | ✅ Complete | 3 modules under `src/journal/` + CLI, 31 new tests (224 total). See below. |
+| 6. RL parameter tuner | 🔜 Next | PPO via Stable Baselines3, walk-forward validated. |
 
 ### Phase 1 — Completed (2026-04-16)
 
@@ -230,11 +230,30 @@ tradeAPI.place_algo_order(instId="BTC-USDT-SWAP", tdMode="isolated",
     slTriggerPx="67500", slOrdPx="-1", tpTriggerPx="72000", tpOrdPx="-1")
 ```
 
-## Phase 5 — Trade journal
+### Phase 5 — Completed (2026-04-16)
 
-SQLite via `aiosqlite` + Pydantic `TradeRecord` model. Fields: trade_id, timestamps (signal/entry/exit), symbol, direction, timeframes, htf_bias, prices (entry/SL/TP/exit), rr_ratio, leverage, num_contracts, risk_amount_usdt, pnl_usdt, **pnl_r** (e.g. +2.8R), fees, outcome, confluence_score, patterns_detected, market_structure, liquidity_context, ob_level, fvg_level, screenshot_entry/exit, notes.
+3 modules under `src/journal/` + a CLI. Async SQLite via `aiosqlite`, Pydantic `TradeRecord`, pure-function reporter. 31 new tests (224 total).
 
-**Performance metrics:** win rate (overall + per pattern + per session), avg R, profit factor, expectancy, max consecutive W/L, max drawdown, Sharpe, Calmar.
+| Module | Purpose | Key APIs |
+|---|---|---|
+| `models.py` | Persisted trade shape | `TradeRecord` (Pydantic), `TradeOutcome` (OPEN/WIN/LOSS/BREAKEVEN/CANCELED) |
+| `database.py` | Async SQLite CRUD | `TradeJournal.record_open/close/mark_canceled`, `list_open_trades/list_closed_trades`, `replay_for_risk_manager` |
+| `reporter.py` | Pure metrics | `win_rate[_by_session/_by_factor]`, `avg_r`, `profit_factor`, `max_drawdown`, `equity_curve`, `sharpe_r`, `calmar`, `summary`, `format_summary` |
+| `scripts/report.py` | CLI | `python scripts/report.py --last 7d [--db ...] [--starting-balance N]` |
+
+**Lifecycle:** `record_open(TradePlan, ExecutionReport, symbol=, signal_timestamp=, …)` → row with `TradeOutcome.OPEN` and a fresh `uuid4().hex` `trade_id`. `record_close(trade_id, CloseFill)` stamps `exit_price`, `pnl_usdt`, computes `pnl_r = pnl_usdt / risk_amount_usdt`, flips outcome to WIN/LOSS/BREAKEVEN by sign. `mark_canceled(trade_id, reason)` covers entries that never filled.
+
+**Schema:** single `trades` table, `confluence_factors` stored as JSON-encoded TEXT, indexes on `outcome`, `entry_timestamp`, `exit_timestamp`. Auto-created on `connect()`. `data/` directory auto-created if missing.
+
+**Replay:** `await journal.replay_for_risk_manager(mgr)` walks closed trades in `entry_timestamp` order, calling `register_trade_opened()` + `register_trade_closed(TradeResult)` on the manager — reconstructs `peak_balance`, `consecutive_losses`, `current_balance` from durable truth. `open_positions` returns to 0 because every open is paired with a close.
+
+**Reporter:** Sharpe is deliberately *un-annualized* per-trade R Sharpe — Phase 6 RL uses it as a reward shape, not a finance-standard stat. `profit_factor` is `sum(wins_usdt)/|sum(losses_usdt)|` (`inf` when no losses). `max_drawdown` returns `(usdt, pct)` from running peak. Bucketings: `win_rate_by_session` keyed on `TradeRecord.session`, `win_rate_by_factor` explodes each trade across its `confluence_factors` (one trade tagged with N factors counts once per factor).
+
+**Integration hooks (not yet wired):** `OrderRouter` and `PositionMonitor` do not call the journal directly — that wiring lives in the outer bot loop (Phase 7+). The journal's contract is `(TradePlan, ExecutionReport, CloseFill)` so glue will be a handful of lines.
+
+**Config:** `config/default.yaml` → `journal.db_path: "data/trades.db"`. CLI reads this when `--db` omitted.
+
+**Tests use** `pytest-asyncio` in `asyncio_mode = auto` (see `pytest.ini`). In-memory SQLite (`":memory:"`) for most tests; one `tmp_path` round-trip test confirms on-disk persistence.
 
 ## Phase 6 — Reinforcement learning
 
