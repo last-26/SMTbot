@@ -104,7 +104,8 @@ References: `pine/vmc_a.txt`, `pine/vmc_b.txt` (original VMC source). Standalone
 | 3. Strategy Engine (R:R) | ✅ Complete | 5 modules under `src/strategy/`, 67 new tests (164 total). See below. |
 | 4. Execution (OKX) | ✅ Complete | 5 modules under `src/execution/`, 29 new tests (193 total). See below. |
 | 5. Trade Journal | ✅ Complete | 3 modules under `src/journal/` + CLI, 31 new tests (224 total). See below. |
-| 6. RL parameter tuner | 🔜 Next | PPO via Stable Baselines3, walk-forward validated. |
+| 6. Bot runtime loop | 🔜 Next | `src/bot/` async runner wiring TV → analysis → strategy → risk → execution → journal. Prerequisite for any live demo data collection. |
+| 7. RL parameter tuner | Planned | PPO via Stable Baselines3, walk-forward validated. Needs ≥50 logged demo trades from Phase 6 first. |
 
 ### Phase 1 — Completed (2026-04-16)
 
@@ -140,7 +141,7 @@ Validation: `scripts/test_market_state.py` (supports `--poll N`).
 
 **Patterns:** doji, hammer, shooting star, pin bar, bullish/bearish engulfing, inside bar, morning/evening star.
 
-**Confluence factors** (each independently weighted, RL-tunable in Phase 6): `htf_trend_alignment`, `mss_alignment`, `at_order_block`, `at_fvg`, `at_sr_zone`, `recent_sweep`, `ltf_pattern`, `oscillator_momentum`, `oscillator_signal`, `vmc_ribbon`, `session_filter`. OB/FVG factors accept either Pine-derived (from `MarketState.signal_table`) or Python-recomputed zones.
+**Confluence factors** (each independently weighted, RL-tunable in Phase 7): `htf_trend_alignment`, `mss_alignment`, `at_order_block`, `at_fvg`, `at_sr_zone`, `recent_sweep`, `ltf_pattern`, `oscillator_momentum`, `oscillator_signal`, `vmc_ribbon`, `session_filter`. OB/FVG factors accept either Pine-derived (from `MarketState.signal_table`) or Python-recomputed zones.
 
 **Design notes:**
 - Pine Script remains primary source of truth; Python supplements (HTF without chart switch, cross-checks, testability).
@@ -247,15 +248,31 @@ tradeAPI.place_algo_order(instId="BTC-USDT-SWAP", tdMode="isolated",
 
 **Replay:** `await journal.replay_for_risk_manager(mgr)` walks closed trades in `entry_timestamp` order, calling `register_trade_opened()` + `register_trade_closed(TradeResult)` on the manager — reconstructs `peak_balance`, `consecutive_losses`, `current_balance` from durable truth. `open_positions` returns to 0 because every open is paired with a close.
 
-**Reporter:** Sharpe is deliberately *un-annualized* per-trade R Sharpe — Phase 6 RL uses it as a reward shape, not a finance-standard stat. `profit_factor` is `sum(wins_usdt)/|sum(losses_usdt)|` (`inf` when no losses). `max_drawdown` returns `(usdt, pct)` from running peak. Bucketings: `win_rate_by_session` keyed on `TradeRecord.session`, `win_rate_by_factor` explodes each trade across its `confluence_factors` (one trade tagged with N factors counts once per factor).
+**Reporter:** Sharpe is deliberately *un-annualized* per-trade R Sharpe — Phase 7 RL uses it as a reward shape, not a finance-standard stat. `profit_factor` is `sum(wins_usdt)/|sum(losses_usdt)|` (`inf` when no losses). `max_drawdown` returns `(usdt, pct)` from running peak. Bucketings: `win_rate_by_session` keyed on `TradeRecord.session`, `win_rate_by_factor` explodes each trade across its `confluence_factors` (one trade tagged with N factors counts once per factor).
 
-**Integration hooks (not yet wired):** `OrderRouter` and `PositionMonitor` do not call the journal directly — that wiring lives in the outer bot loop (Phase 7+). The journal's contract is `(TradePlan, ExecutionReport, CloseFill)` so glue will be a handful of lines.
+**Integration hooks (not yet wired):** `OrderRouter` and `PositionMonitor` do not call the journal directly — that wiring lives in the outer bot loop (Phase 6). The journal's contract is `(TradePlan, ExecutionReport, CloseFill)` so glue will be a handful of lines.
 
 **Config:** `config/default.yaml` → `journal.db_path: "data/trades.db"`. CLI reads this when `--db` omitted.
 
 **Tests use** `pytest-asyncio` in `asyncio_mode = auto` (see `pytest.ini`). In-memory SQLite (`":memory:"`) for most tests; one `tmp_path` round-trip test confirms on-disk persistence.
 
-## Phase 6 — Reinforcement learning
+## Phase 6 — Bot runtime loop
+
+Wires Phases 1–5 into an autonomous async runner (`src/bot/`). Until this exists, no demo data is logged and Phase 7 (RL) has no training set.
+
+**Entrypoint:** `python -m src.bot --config config/default.yaml` (already referenced in Workflow commands; package itself is TODO).
+
+**Responsibilities:**
+- Poll TV MCP every `bot.poll_interval_seconds` → build `MarketState`
+- Feed state through analysis → `build_trade_plan_from_state` → `RiskManager.can_trade`
+- If allowed: `OrderRouter.place(plan)` → `TradeJournal.record_open` → `RiskManager.register_trade_opened`
+- Poll `PositionMonitor.poll()` → on `CloseFill`: `TradeJournal.record_close` → `RiskManager.register_trade_closed`
+- On startup: `TradeJournal.replay_for_risk_manager(mgr)` to restore peak/DD/streak state
+- Graceful shutdown (SIGINT/SIGTERM) that closes positions cleanly or at least closes the journal
+
+**Out of scope:** RL retraining (Phase 7), websocket streaming (REST polling is fine for MVP), multi-symbol (BTC only until metrics support ETH per CLAUDE.md currency-pair rules).
+
+## Phase 7 — Reinforcement learning
 
 **Architecture:** parameter tuner, NOT raw decision maker. Rule-based strategy generates signals; RL tunes:
 - `confluence_threshold` (2-5), `pattern_weights` (dict), `min_rr_ratio` (1.5-5.0)
@@ -271,7 +288,7 @@ tradeAPI.place_algo_order(instId="BTC-USDT-SWAP", tdMode="isolated",
 - Never deploy params that didn't improve OOS
 - If params swing wildly → reduce learning rate
 - Retrain trigger: every 50 new trades OR weekly
-- Min data: 50 trades before first training
+- Min data: 50 trades before first training (Phase 6 must have run long enough to log them)
 
 **Training cycle:** Claude triggers `python scripts/train_rl.py --min-trades 50 --walk-forward`. Improved params → `config/strategies/active.yaml`.
 
