@@ -1,0 +1,293 @@
+// This Pine Script™ is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// © SMTbot
+
+//@version=6
+indicator("Order Block Identifier", overlay=true, max_boxes_count=500, max_labels_count=500)
+
+// ─── INPUTS ───────────────────────────────────────────────────────────────────
+swingLen       = input.int(5, "Swing Lookback", minval=2, maxval=50)
+showBullOB     = input.bool(true, "Show Bullish OBs")
+showBearOB     = input.bool(true, "Show Bearish OBs")
+showBroken     = input.bool(false, "Show Broken OBs", tooltip="Keep broken (invalidated) OBs visible")
+maxOBAge       = input.int(200, "Max OB Age (bars)", minval=20, maxval=1000)
+extendOB       = input.bool(true, "Extend OB Boxes Right")
+minImpulseATR  = input.float(1.5, "Min Impulse Size (ATR mult)", minval=0.5, step=0.1, tooltip="Impulse move must be at least this many ATRs")
+
+bullOBColor    = input.color(color.new(#00C853, 70), "Bullish OB Color")
+bearOBColor    = input.color(color.new(#FF1744, 70), "Bearish OB Color")
+brokenAlpha    = input.int(92, "Broken OB Opacity", minval=50, maxval=95)
+
+// ─── ATR FOR IMPULSE FILTERING ────────────────────────────────────────────────
+atrVal = ta.atr(14)
+
+// ─── OB DATA STORAGE ─────────────────────────────────────────────────────────
+var array<box>   obBoxes    = array.new<box>()
+var array<float> obTops     = array.new<float>()
+var array<float> obBottoms  = array.new<float>()
+var array<int>   obDirs     = array.new<int>()       // 1 = bull, -1 = bear
+var array<int>   obBars     = array.new<int>()        // creation bar index
+var array<bool>  obBroken   = array.new<bool>()       // invalidated?
+var array<bool>  obTested   = array.new<bool>()       // price returned to it?
+var array<label> obLabels   = array.new<label>()
+
+// ─── SWING DETECTION ──────────────────────────────────────────────────────────
+swingHigh = ta.pivothigh(high, swingLen, swingLen)
+swingLow  = ta.pivotlow(low, swingLen, swingLen)
+
+// ─── BULLISH ORDER BLOCK DETECTION ───────────────────────────────────────────
+// A bullish OB is the last bearish (red) candle before a strong bullish impulse
+// that breaks a swing high (creates a new higher high).
+//
+// Logic:
+// 1. Detect a swing low formation (pivot low confirmed)
+// 2. Check that the move UP from the swing low is impulsive (> ATR threshold)
+// 3. Find the last bearish candle at/near the swing low — that's the OB
+// 4. OB zone = [low, high] of that bearish candle
+
+if not na(swingLow) and showBullOB
+    swingBar = bar_index - swingLen
+    swingPrice = swingLow
+
+    // Measure the impulse move from swing low to the highest point after
+    impulseHigh = high[0]  // current bar (swingLen bars after the pivot)
+    impulseSize = impulseHigh - swingPrice
+
+    if impulseSize > atrVal * minImpulseATR
+        // Find the last bearish candle at or near the swing low
+        obBarIdx = -1
+        obHi = 0.0
+        obLo = 0.0
+
+        for j = swingLen to swingLen + 5  // look back up to 5 bars before pivot
+            if close[j] < open[j]  // bearish candle
+                obBarIdx := bar_index - j
+                obHi := high[j]
+                obLo := low[j]
+                break
+
+        if obBarIdx != -1
+            obBox = box.new(
+                 obBarIdx, obHi,
+                 bar_index, obLo,
+                 border_color = bullOBColor,
+                 bgcolor      = bullOBColor,
+                 border_width = 1
+                 )
+
+            tooltipText = "OB|BULLISH|" + str.tostring(obLo, "#.##") + "|" + str.tostring(obHi, "#.##") + "|ACTIVE|UNTESTED"
+
+            obLbl = label.new(
+                 obBarIdx, obLo,
+                 "",
+                 style   = label.style_none,
+                 tooltip = tooltipText,
+                 size    = size.tiny
+                 )
+
+            array.push(obBoxes, obBox)
+            array.push(obTops, obHi)
+            array.push(obBottoms, obLo)
+            array.push(obDirs, 1)
+            array.push(obBars, obBarIdx)
+            array.push(obBroken, false)
+            array.push(obTested, false)
+            array.push(obLabels, obLbl)
+
+// ─── BEARISH ORDER BLOCK DETECTION ───────────────────────────────────────────
+// A bearish OB is the last bullish (green) candle before a strong bearish impulse
+// that breaks a swing low (creates a new lower low).
+
+if not na(swingHigh) and showBearOB
+    swingBar = bar_index - swingLen
+    swingPrice = swingHigh
+
+    // Measure the impulse move from swing high downward
+    impulseLow = low[0]
+    impulseSize = swingPrice - impulseLow
+
+    if impulseSize > atrVal * minImpulseATR
+        // Find the last bullish candle at or near the swing high
+        obBarIdx = -1
+        obHi = 0.0
+        obLo = 0.0
+
+        for j = swingLen to swingLen + 5
+            if close[j] > open[j]  // bullish candle
+                obBarIdx := bar_index - j
+                obHi := high[j]
+                obLo := low[j]
+                break
+
+        if obBarIdx != -1
+            obBox = box.new(
+                 obBarIdx, obHi,
+                 bar_index, obLo,
+                 border_color = bearOBColor,
+                 bgcolor      = bearOBColor,
+                 border_width = 1
+                 )
+
+            tooltipText = "OB|BEARISH|" + str.tostring(obLo, "#.##") + "|" + str.tostring(obHi, "#.##") + "|ACTIVE|UNTESTED"
+
+            obLbl = label.new(
+                 obBarIdx, obHi,
+                 "",
+                 style   = label.style_none,
+                 tooltip = tooltipText,
+                 size    = size.tiny
+                 )
+
+            array.push(obBoxes, obBox)
+            array.push(obTops, obHi)
+            array.push(obBottoms, obLo)
+            array.push(obDirs, -1)
+            array.push(obBars, obBarIdx)
+            array.push(obBroken, false)
+            array.push(obTested, false)
+            array.push(obLabels, obLbl)
+
+// ─── OB VALIDATION: TEST & BREAK CHECK ───────────────────────────────────────
+// Tested: price returns to the OB zone (potential entry point)
+// Broken: price closes through the OB zone (OB invalidated)
+//
+// Bullish OB:
+//   - Tested = price low touches OB zone (low <= obTop and low >= obBottom)
+//   - Broken = close < obBottom (bearish close below the OB)
+//
+// Bearish OB:
+//   - Tested = price high touches OB zone (high >= obBottom and high <= obTop)
+//   - Broken = close > obTop (bullish close above the OB)
+
+if array.size(obBoxes) > 0
+    for i = array.size(obBoxes) - 1 to 0
+        obTop    = array.get(obTops, i)
+        obBot    = array.get(obBottoms, i)
+        obDir    = array.get(obDirs, i)
+        obBar    = array.get(obBars, i)
+        broken   = array.get(obBroken, i)
+        tested   = array.get(obTested, i)
+        bx       = array.get(obBoxes, i)
+        lbl      = array.get(obLabels, i)
+
+        // Age check
+        age = bar_index - obBar
+        if age > maxOBAge
+            box.delete(bx)
+            label.delete(lbl)
+            array.remove(obBoxes, i)
+            array.remove(obTops, i)
+            array.remove(obBottoms, i)
+            array.remove(obDirs, i)
+            array.remove(obBars, i)
+            array.remove(obBroken, i)
+            array.remove(obTested, i)
+            array.remove(obLabels, i)
+            continue
+
+        if not broken
+            // Test check (price enters zone)
+            if not tested
+                wasTested = false
+                if obDir == 1   // bullish OB: price dips into zone
+                    wasTested := low <= obTop and close >= obBot
+                else            // bearish OB: price rises into zone
+                    wasTested := high >= obBot and close <= obTop
+
+                if wasTested
+                    array.set(obTested, i, true)
+                    // Update tooltip
+                    status = obDir == 1 ? "BULLISH" : "BEARISH"
+                    newTooltip = "OB|" + status + "|" + str.tostring(obBot, "#.##") + "|" + str.tostring(obTop, "#.##") + "|ACTIVE|TESTED"
+                    label.set_tooltip(lbl, newTooltip)
+
+            // Break check (price closes through zone)
+            isBrokenNow = false
+            if obDir == 1
+                isBrokenNow := close < obBot
+            else
+                isBrokenNow := close > obTop
+
+            if isBrokenNow
+                array.set(obBroken, i, true)
+
+                if showBroken
+                    origColor = obDir == 1 ? bullOBColor : bearOBColor
+                    dimColor  = color.new(origColor, brokenAlpha)
+                    box.set_bgcolor(bx, dimColor)
+                    box.set_border_color(bx, dimColor)
+                    box.set_border_style(bx, line.style_dotted)
+
+                    status = obDir == 1 ? "BULLISH" : "BEARISH"
+                    newTooltip = "OB|" + status + "|" + str.tostring(obBot, "#.##") + "|" + str.tostring(obTop, "#.##") + "|BROKEN"
+                    label.set_tooltip(lbl, newTooltip)
+                else
+                    box.delete(bx)
+                    label.delete(lbl)
+                    array.remove(obBoxes, i)
+                    array.remove(obTops, i)
+                    array.remove(obBottoms, i)
+                    array.remove(obDirs, i)
+                    array.remove(obBars, i)
+                    array.remove(obBroken, i)
+                    array.remove(obTested, i)
+                    array.remove(obLabels, i)
+                    continue
+
+        // Extend active OBs
+        if extendOB and not (array.get(obBroken, i))
+            box.set_right(bx, bar_index)
+
+// ─── INFO TABLE ──────────────────────────────────────────────────────────────
+var table infoTable = table.new(position.bottom_left, 2, 6, bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islast
+    activeBull = 0
+    activeBear = 0
+    testedCount = 0
+    nearestBullOB = ""
+    nearestBearOB = ""
+    nearestBullDist = 999999999.0
+    nearestBearDist = 999999999.0
+
+    if array.size(obDirs) > 0
+        for i = 0 to array.size(obDirs) - 1
+            if not array.get(obBroken, i)
+                dir = array.get(obDirs, i)
+                if dir == 1
+                    activeBull += 1
+                else
+                    activeBear += 1
+
+                if array.get(obTested, i)
+                    testedCount += 1
+
+                // Nearest OB
+                obMid = (array.get(obTops, i) + array.get(obBottoms, i)) / 2
+                dist = math.abs(close - obMid)
+
+                if dir == 1 and dist < nearestBullDist
+                    nearestBullDist := dist
+                    nearestBullOB := str.tostring(array.get(obBottoms, i), "#.##") + "-" + str.tostring(array.get(obTops, i), "#.##")
+
+                if dir == -1 and dist < nearestBearDist
+                    nearestBearDist := dist
+                    nearestBearOB := str.tostring(array.get(obBottoms, i), "#.##") + "-" + str.tostring(array.get(obTops, i), "#.##")
+
+    table.cell(infoTable, 0, 0, "OB Identifier",      text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 0, "",                    text_color=color.white, text_size=size.small)
+
+    table.cell(infoTable, 0, 1, "Bull OBs",            text_color=color.gray,  text_size=size.small)
+    table.cell(infoTable, 1, 1, str.tostring(activeBull), text_color=bullOBColor, text_size=size.small)
+
+    table.cell(infoTable, 0, 2, "Bear OBs",            text_color=color.gray,  text_size=size.small)
+    table.cell(infoTable, 1, 2, str.tostring(activeBear), text_color=bearOBColor, text_size=size.small)
+
+    table.cell(infoTable, 0, 3, "Tested",              text_color=color.gray,  text_size=size.small)
+    table.cell(infoTable, 1, 3, str.tostring(testedCount), text_color=color.yellow, text_size=size.small)
+
+    table.cell(infoTable, 0, 4, "Nearest Bull",        text_color=color.gray,  text_size=size.small)
+    table.cell(infoTable, 1, 4, nearestBullOB == "" ? "—" : nearestBullOB, text_color=bullOBColor, text_size=size.small)
+
+    table.cell(infoTable, 0, 5, "Nearest Bear",        text_color=color.gray,  text_size=size.small)
+    table.cell(infoTable, 1, 5, nearestBearOB == "" ? "—" : nearestBearOB, text_color=bearOBColor, text_size=size.small)
