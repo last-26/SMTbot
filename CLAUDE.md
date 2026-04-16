@@ -65,7 +65,13 @@ Manual `~/.claude/.mcp.json` entry:
 }
 ```
 
-**Demo API key:** OKX → Trade → Demo Trading → Settings → Single Currency Margin Mode → user icon → Demo Trading API → Create V5 key with Read+Trade. Demo keys are completely separate from live keys.
+**Required OKX account mode (before anything works):**
+1. Demo Trading → user icon → **Settings → Account mode** = **"Futures"** (aka Single-currency margin, `acctLv=2`). Default "Simple" mode has `acctLv=1` + forced `posMode=net_mode`, which rejects every call with `Parameter posSide error` because the code sends `posSide=long/short`.
+2. Same settings page → **Position mode = "Hedge" (Long/Short mode)** — enables `posMode=long_short_mode`.
+3. Verify via `get_account_config()`: expect `acctLv=2`, `posMode=long_short_mode`.
+4. Demo balance reset is **UI-only** (no API endpoint); rotating API keys does not reset balance. The account ships with ~5000 USDT + test BTC/ETH/OKB.
+
+**Demo API key:** Demo Trading → user icon → Demo Trading API → Create V5 key with Read+Trade (never withdrawal). Demo keys are completely separate from live keys.
 
 **Key OKX CLI:**
 ```bash
@@ -168,7 +174,9 @@ Validation: `scripts/test_market_state.py` (supports `--poll N`).
 - `risk_amount = balance * risk_pct`; `sl_pct = |entry - sl| / entry`
 - `tp = entry ± sl_distance * rr_ratio`
 - `ideal_notional = risk_amount / sl_pct`; `required_leverage = ideal / balance`
-- Leverage capped at `max_leverage`; when capped, notional SHRINKS so risk stays bounded.
+- **Margin safety buffer (`_MARGIN_SAFETY = 0.95`)**: `max_notional = balance * max_leverage * 0.95`. Reserves 5% of balance for OKX fees (0.05% taker) + mark drift between `set_leverage` and `place_order`. Without this buffer OKX rejects with `sCode 51008`.
+- Leverage is `max(ceil(required_leverage), min_lev_for_margin, 1)` capped at `max_leverage`. Using `ceil()` (not `round()`) guarantees `notional / leverage ≤ balance * 0.95`.
+- When capped, notional SHRINKS so actual risk < target. Never above.
 - OKX contracts: `num_contracts = int(notional // (contract_size * entry))` (round down). Actual risk re-derived from rounded contracts.
 
 **Break-even win rates:** 1:1 → 50%, 1:2 → 33.3%, 1:3 → 25%, 1:4 → 20%.
@@ -267,14 +275,17 @@ tradeAPI.place_algo_order(instId="BTC-USDT-SWAP", tdMode="isolated",
 | `config.py` | YAML + `.env` → typed config | `BotConfig`, `load_config(path)`, `BotConfig.breakers()` / `allowed_sessions()` / `risk_pct_fraction()` |
 | `lifecycle.py` | Cross-platform shutdown | `install_shutdown_handlers(event)` |
 | `runner.py` | Async outer loop | `BotRunner`, `BotContext`, `BotRunner.from_config(cfg, dry_run=)` |
-| `__main__.py` | CLI entrypoint | `python -m src.bot [--config] [--dry-run] [--once]` |
+| `__main__.py` | CLI entrypoint | `python -m src.bot [--config] [--dry-run] [--once] [--max-closed-trades N]` |
 
 **One tick (`run_once`):**
 1. `reader.read_market_state()` + `multi_tf.refresh(tf)` — tolerant to TV errors.
 2. **Drain closes first** — `monitor.poll()` → `okx_client.enrich_close_fill(fill)` → `journal.record_close(trade_id, enriched)` → `risk_mgr.register_trade_closed(TradeResult)`.
 3. Symbol-level dedup — skip open if `any(k[0] == symbol for k in ctx.open_trade_ids)`. (Bar-level would need `SignalTableData.last_bar` — not a parsed field today.)
-4. `build_trade_plan_from_state(...)` → `risk_mgr.can_trade(plan)` → `router.place(plan)` (or `_DryRunRouter` when `--dry-run`).
-5. In-memory registration (`monitor.register_open`, `risk_mgr.register_trade_opened`) **before** `journal.record_open`; DB failure logs an orphan rather than losing the live position.
+4. **Sync sizing balance from OKX** — `okx_client.get_balance("USDT")` → `sizing_balance = min(okx_balance, risk_mgr.current_balance)`. The risk manager's `current_balance` only tracks P&L and drifts high vs reality (fees, funding); OKX rejects `sCode 51008` when the bot over-estimates available margin.
+5. `build_trade_plan_from_state(state, sizing_balance, ...)` → `risk_mgr.can_trade(plan)` → `router.place(plan)` (or `_DryRunRouter` when `--dry-run`).
+6. In-memory registration (`monitor.register_open`, `risk_mgr.register_trade_opened`) **before** `journal.record_open`; DB failure logs an orphan rather than losing the live position.
+
+**Order rejection logging:** `OrderRejected` / `InsufficientMargin` / `LeverageSetError` exceptions log with `code=` and `payload=` attached so the upstream OKX `sCode` (51008, 51020, etc.) is visible without ad-hoc patching.
 
 **Enrichment (critical fix):** `PositionMonitor._close_fill_from` emits `pnl_usdt=0, exit_price=0` (it only knows the position disappeared). Without enrichment every close looks break-even and risk-manager streaks / drawdown never trip. `OKXClient.enrich_close_fill` queries `/api/v5/account/positions-history`, picks the most recent `(instId, posSide)` row, and returns a `CloseFill` with real `realizedPnl`, `closeAvgPx`, `uTime`. When no match is returned (e.g. fills arriving after REST sync), the raw fill is passed through unchanged.
 
@@ -287,7 +298,14 @@ tradeAPI.place_algo_order(instId="BTC-USDT-SWAP", tdMode="isolated",
 
 **DI for testing:** `BotRunner(ctx)` accepts a fully-assembled `BotContext` — reader/router/monitor/okx_client are duck-typed, so `tests/conftest.py` fakes don't inherit from the real classes. `BotRunner.from_config(cfg)` is the production path that wires `TVBridge → StructuredReader`, `OKXClient`, `OrderRouter`, `PositionMonitor`, `TradeJournal`, `RiskManager`.
 
-**Config additions to `config/default.yaml`:** `bot.starting_balance: 10000.0`, `trading.contract_size: 0.01`. Secrets (`OKX_API_KEY/SECRET/PASSPHRASE/DEMO_FLAG`) come from `.env` via `python-dotenv`; `BotConfig` validator rejects empty credentials.
+**Config additions to `config/default.yaml`:** `bot.starting_balance`, `trading.contract_size: 0.01`. Current defaults tuned for the real demo account (~4255 USDT, 1R ≈ $106):
+- `bot.starting_balance: 4255.0`
+- `trading.risk_per_trade_pct: 2.5` / `max_leverage: 75` / `default_rr_ratio: 3.0` / `min_rr_ratio: 2.0`
+- `circuit_breakers.max_daily_loss_pct: 15.0` / `max_drawdown_pct: 25.0` (wide while farming Phase 7 data; tighten for live).
+
+Secrets (`OKX_API_KEY/SECRET/PASSPHRASE/DEMO_FLAG`) come from `.env` via `python-dotenv`; `BotConfig` validator rejects empty credentials.
+
+**`--max-closed-trades N`:** after each tick, if `len(journal.list_closed_trades()) >= N` the runner sets the shutdown event and exits cleanly. Exactly the primitive Phase 7 needs ("collect 50 closed demo trades, then stop"). Open positions at the moment of stop stay OPEN on OKX under their OCO algo — they resume on next start via `_rehydrate_open_positions()`.
 
 **Usage:**
 ```bash
@@ -296,6 +314,9 @@ tradeAPI.place_algo_order(instId="BTC-USDT-SWAP", tdMode="isolated",
 
 # Demo (real orders on OKX demo env)
 .venv/Scripts/python.exe -m src.bot --config config/default.yaml
+
+# Demo with auto-stop at 50 closed trades (Phase 7 data-collection run)
+.venv/Scripts/python.exe -m src.bot --config config/default.yaml --max-closed-trades 50
 ```
 
 ## Phase 7 — Reinforcement learning

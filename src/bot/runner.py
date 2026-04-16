@@ -132,14 +132,26 @@ class _DryRunRouter:
 
 
 class BotRunner:
-    def __init__(self, ctx: BotContext, shutdown: Optional[asyncio.Event] = None):
+    def __init__(
+        self,
+        ctx: BotContext,
+        shutdown: Optional[asyncio.Event] = None,
+        stop_after_closed_trades: Optional[int] = None,
+    ):
         self.ctx = ctx
         self.shutdown = shutdown or asyncio.Event()
+        self.stop_after_closed_trades = stop_after_closed_trades
 
     # ── Construction ────────────────────────────────────────────────────────
 
     @classmethod
-    def from_config(cls, cfg: BotConfig, *, dry_run: bool = False) -> "BotRunner":
+    def from_config(
+        cls,
+        cfg: BotConfig,
+        *,
+        dry_run: bool = False,
+        stop_after_closed_trades: Optional[int] = None,
+    ) -> "BotRunner":
         bridge = TVBridge()
         reader = StructuredReader(bridge)
         multi_tf = MultiTFBuffer(bridge, max_size=cfg.analysis.candle_buffer_size)
@@ -154,7 +166,7 @@ class BotRunner:
             router=router, monitor=monitor, risk_mgr=risk_mgr,
             okx_client=client, config=cfg,
         )
-        return cls(ctx)
+        return cls(ctx, stop_after_closed_trades=stop_after_closed_trades)
 
     # ── Entry points ────────────────────────────────────────────────────────
 
@@ -173,6 +185,15 @@ class BotRunner:
                     await self.run_once()
                 except Exception:
                     logger.exception("cycle_failed")
+                if self.stop_after_closed_trades is not None:
+                    closed = len(await self.ctx.journal.list_closed_trades())
+                    if closed >= self.stop_after_closed_trades:
+                        logger.info(
+                            "stop_after_closed_trades_reached closed={} limit={}",
+                            closed, self.stop_after_closed_trades,
+                        )
+                        self.shutdown.set()
+                        break
                 try:
                     await asyncio.wait_for(self.shutdown.wait(), timeout=interval)
                 except asyncio.TimeoutError:

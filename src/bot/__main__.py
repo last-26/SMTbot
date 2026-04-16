@@ -29,6 +29,9 @@ def _parser() -> argparse.ArgumentParser:
                    help="Use dry_run_report instead of placing real OKX orders")
     p.add_argument("--once", action="store_true",
                    help="Run exactly one tick and exit (smoke test)")
+    p.add_argument("--max-closed-trades", type=int, default=None,
+                   help="Stop gracefully once N closed trades are in the journal "
+                        "(WIN/LOSS/BREAKEVEN). Useful for RL data collection.")
     return p
 
 
@@ -41,7 +44,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     cfg = load_config(cfg_path)
-    runner = BotRunner.from_config(cfg, dry_run=args.dry_run)
+    runner = BotRunner.from_config(
+        cfg,
+        dry_run=args.dry_run,
+        stop_after_closed_trades=args.max_closed_trades,
+    )
 
     try:
         if args.once:
