@@ -1,0 +1,100 @@
+"""Execution-layer records.
+
+These records cross the boundary from the OKX API (untyped dicts) into
+the bot's typed world. They're intentionally minimal — only what the
+router, monitor, and journal need.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Optional
+
+
+def _utc_now() -> datetime:
+    return datetime.now(tz=timezone.utc)
+
+
+class OrderStatus(str, Enum):
+    PENDING = "PENDING"      # submitted, not yet filled
+    FILLED = "FILLED"        # fully filled
+    PARTIAL = "PARTIAL"      # partially filled
+    CANCELED = "CANCELED"
+    REJECTED = "REJECTED"
+
+
+class PositionState(str, Enum):
+    OPEN = "OPEN"            # entry filled, algo live
+    CLOSED = "CLOSED"        # SL or TP hit, position flat
+    UNPROTECTED = "UNPROTECTED"  # entry filled but algo failed — dangerous
+
+
+@dataclass
+class OrderResult:
+    """Outcome of a single OKX order placement call."""
+    order_id: str
+    client_order_id: str
+    status: OrderStatus
+    filled_sz: float = 0.0
+    avg_price: float = 0.0
+    raw: dict = field(default_factory=dict)
+    submitted_at: datetime = field(default_factory=_utc_now)
+
+
+@dataclass
+class AlgoResult:
+    """Outcome of an OCO SL/TP algo order placement."""
+    algo_id: str
+    client_algo_id: str
+    sl_trigger_px: float
+    tp_trigger_px: float
+    raw: dict = field(default_factory=dict)
+
+
+@dataclass
+class ExecutionReport:
+    """Everything a TradePlan produced on the exchange.
+
+    This is what the journal (Phase 5) will persist and what the caller
+    uses to move the RiskManager from "planned" to "opened".
+    """
+    entry: OrderResult
+    algo: Optional[AlgoResult]
+    state: PositionState
+    leverage_set: bool
+    plan_reason: str = ""
+
+    @property
+    def is_protected(self) -> bool:
+        return self.state == PositionState.OPEN and self.algo is not None
+
+
+@dataclass
+class PositionSnapshot:
+    """A single poll of an open position from OKX."""
+    inst_id: str
+    pos_side: str                 # "long" / "short"
+    size: float                   # contracts; 0 when closed
+    entry_price: float
+    mark_price: float
+    unrealized_pnl: float
+    leverage: int
+    sampled_at: datetime = field(default_factory=_utc_now)
+
+    @property
+    def is_closed(self) -> bool:
+        return self.size == 0.0
+
+
+@dataclass
+class CloseFill:
+    """Emitted by the monitor when a position transitions OPEN → CLOSED."""
+    inst_id: str
+    pos_side: str
+    entry_price: float
+    exit_price: float
+    size: float
+    pnl_usdt: float
+    closed_at: datetime = field(default_factory=_utc_now)
