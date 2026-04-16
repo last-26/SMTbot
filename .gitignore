@@ -1,0 +1,49 @@
+# Environment & secrets
+.env
+.env.local
+.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# RL model weights & checkpoints
+data/models/
+*.pt
+*.pth
+*.onnx
+*.pkl
+*.joblib
+
+# Trade data (local only)
+data/journal.db
+data/screenshots/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Node
+node_modules/
+
+# Logs
+*.log
+logs/
+
+# Claude Code memory (personal)
+.claude/
