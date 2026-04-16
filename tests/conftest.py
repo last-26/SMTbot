@@ -98,7 +98,7 @@ def make_config(**trading_overrides) -> BotConfig:
         "bot": {"mode": "demo", "poll_interval_seconds": 0.01,
                 "timezone": "UTC", "starting_balance": 1_000.0},
         "trading": {
-            "symbol": "BTC-USDT-SWAP", "entry_timeframe": "15m",
+            "symbols": ["BTC-USDT-SWAP"], "entry_timeframe": "15m",
             "htf_timeframe": "4H", "risk_per_trade_pct": 1.0,
             "max_leverage": 20, "default_rr_ratio": 3.0,
             "min_rr_ratio": 2.0, "max_concurrent_positions": 2,
@@ -157,12 +157,12 @@ class FakeMultiTF:
 class FakeRouter:
     def __init__(self, report: Optional[ExecutionReport] = None,
                  raise_exc: Optional[Exception] = None):
-        self.calls: list[TradePlan] = []
+        self.calls: list[tuple[TradePlan, Optional[str]]] = []
         self.report = report or make_report()
         self.raise_exc = raise_exc
 
-    def place(self, plan: TradePlan) -> ExecutionReport:
-        self.calls.append(plan)
+    def place(self, plan: TradePlan, inst_id: Optional[str] = None) -> ExecutionReport:
+        self.calls.append((plan, inst_id))
         if self.raise_exc is not None:
             raise self.raise_exc
         return self.report

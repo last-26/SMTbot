@@ -12,12 +12,13 @@ validation, so the YAML can live in git without leaking credentials.
 from __future__ import annotations
 
 import os
+import warnings
 from pathlib import Path
 from typing import Literal, Optional
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from src.data.models import Session
 from src.execution.okx_client import OKXCredentials
@@ -33,15 +34,38 @@ class RuntimeConfig(BaseModel):
 
 
 class TradingConfig(BaseModel):
-    symbol: str
-    entry_timeframe: str                          # e.g. "15m"
-    htf_timeframe: str                            # e.g. "4H"
+    symbol: Optional[str] = None                  # deprecated single-symbol form
+    symbols: list[str] = Field(default_factory=list)
+    entry_timeframe: str                          # e.g. "3m"
+    htf_timeframe: str                            # e.g. "15m"
+    ltf_timeframe: str = "1m"                     # low-TF reversal (Madde F)
     risk_per_trade_pct: float                     # percent (e.g. 1.0 → 1 %)
     max_leverage: int
     default_rr_ratio: float
     min_rr_ratio: float
     max_concurrent_positions: int
     contract_size: float = 0.01                   # BTC-USDT-SWAP lot size
+    symbol_settle_seconds: float = 4.0            # wait after set_symbol (Madde A/B)
+    tf_settle_seconds: float = 2.5                # wait after set_timeframe (Madde B)
+    pine_settle_max_wait_s: float = 6.0           # freshness-poll timeout (Madde B)
+    pine_settle_poll_interval_s: float = 0.3
+
+    @model_validator(mode="after")
+    def _coerce_symbols(self) -> "TradingConfig":
+        """Backward compat: single `symbol` → list. `symbols` takes precedence."""
+        if not self.symbols:
+            if self.symbol:
+                warnings.warn(
+                    "trading.symbol is deprecated; use trading.symbols: [<list>]",
+                    DeprecationWarning, stacklevel=2,
+                )
+                self.symbols = [self.symbol]
+            else:
+                raise ValueError(
+                    "trading.symbols must be non-empty "
+                    "(or legacy trading.symbol set)"
+                )
+        return self
 
 
 class CircuitBreakerSection(BaseModel):
@@ -148,6 +172,10 @@ class BotConfig(BaseModel):
             max_leverage=self.trading.max_leverage,
             min_rr_ratio=self.trading.min_rr_ratio,
         )
+
+    def primary_symbol(self) -> str:
+        """First symbol — used by legacy call sites that still assume single-symbol."""
+        return self.trading.symbols[0]
 
     def to_okx_credentials(self) -> OKXCredentials:
         return self.okx.to_credentials()

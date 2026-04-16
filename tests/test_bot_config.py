@@ -62,7 +62,9 @@ def test_load_config_from_yaml_and_env(tmp_path, monkeypatch):
     assert isinstance(cfg, BotConfig)
     assert cfg.okx.api_key == "env_key"
     assert cfg.okx.demo_flag == "1"
-    assert cfg.trading.symbol == "BTC-USDT-SWAP"
+    # Legacy `trading.symbol:` form is coerced into `symbols=[symbol]`.
+    assert cfg.trading.symbols == ["BTC-USDT-SWAP"]
+    assert cfg.primary_symbol() == "BTC-USDT-SWAP"
 
 
 def test_missing_okx_credentials_raises(tmp_path, monkeypatch):

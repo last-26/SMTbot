@@ -14,6 +14,7 @@ owns the decision (retry, skip next candle, halt).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 from src.data.models import Direction
 from src.execution.errors import AlgoOrderError, LeverageSetError
@@ -53,16 +54,17 @@ class OrderRouter:
         self.client = client
         self.config = config or RouterConfig()
 
-    def place(self, plan: TradePlan) -> ExecutionReport:
+    def place(self, plan: TradePlan, inst_id: Optional[str] = None) -> ExecutionReport:
         if plan.num_contracts <= 0:
             raise ValueError(f"plan.num_contracts={plan.num_contracts} <= 0")
 
+        inst = inst_id or self.config.inst_id
         pos_side = _pos_side(plan.direction)
 
         # 1. Leverage. If this fails, nothing is open — safe to raise.
         try:
             self.client.set_leverage(
-                inst_id=self.config.inst_id,
+                inst_id=inst,
                 leverage=plan.leverage,
                 mgn_mode=self.config.margin_mode,
                 pos_side=pos_side if self.config.margin_mode == "isolated" else None,
@@ -73,7 +75,7 @@ class OrderRouter:
 
         # 2. Entry. If this raises, no position open, no algo needed.
         entry = self.client.place_market_order(
-            inst_id=self.config.inst_id,
+            inst_id=inst,
             side=_entry_side(plan.direction),
             pos_side=pos_side,
             size_contracts=plan.num_contracts,
@@ -85,7 +87,7 @@ class OrderRouter:
         # 3. Algo. If it fails, the position is live and unprotected.
         try:
             algo = self.client.place_oco_algo(
-                inst_id=self.config.inst_id,
+                inst_id=inst,
                 pos_side=pos_side,
                 size_contracts=plan.num_contracts,
                 sl_trigger_px=plan.sl_price,
@@ -95,7 +97,7 @@ class OrderRouter:
         except Exception as exc:
             if self.config.close_on_algo_failure:
                 try:
-                    self.client.close_position(self.config.inst_id, pos_side, self.config.margin_mode)
+                    self.client.close_position(inst, pos_side, self.config.margin_mode)
                 except Exception:
                     # Best effort — if close also fails, the caller must
                     # intervene manually. Surface the algo error regardless.

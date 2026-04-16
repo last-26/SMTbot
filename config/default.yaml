@@ -5,15 +5,22 @@ bot:
   starting_balance: 4255.0  # post-test OKX demo balance — drives 1R ≈ $106
 
 trading:
-  symbol: BTC-USDT-SWAP
+  symbols: [BTC-USDT-SWAP, ETH-USDT-SWAP, SOL-USDT-SWAP, AVAX-USDT-SWAP, XRP-USDT-SWAP]
   entry_timeframe: 3m
   htf_timeframe: 15m
+  ltf_timeframe: 1m
   risk_per_trade_pct: 2.5   # 2.5% of 4255 ≈ $106 per trade (≈ 1R)
   max_leverage: 75
   default_rr_ratio: 3.0
   min_rr_ratio: 2.0
   max_concurrent_positions: 2
   contract_size: 0.01
+  # Multi-pair settle budgets — wait after set_symbol / set_timeframe so
+  # the heavy SMT Overlay Pine has time to recompute before we read.
+  symbol_settle_seconds: 4.0
+  tf_settle_seconds: 2.5
+  pine_settle_max_wait_s: 6.0
+  pine_settle_poll_interval_s: 0.3
 
 circuit_breakers:
   # Scaled up for 5% per-trade risk so a single loss doesn't trip halts.

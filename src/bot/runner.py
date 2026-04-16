@@ -34,7 +34,7 @@ from src.bot.lifecycle import install_shutdown_handlers
 from src.data.candle_buffer import MultiTFBuffer
 from src.data.models import Direction, MarketState, Session
 from src.data.structured_reader import StructuredReader
-from src.data.tv_bridge import TVBridge
+from src.data.tv_bridge import TVBridge, okx_to_tv_symbol
 from src.execution.errors import (
     AlgoOrderError,
     InsufficientMargin,
@@ -110,11 +110,12 @@ class BotContext:
     reader: Any                # `.read_market_state() -> MarketState` (async)
     multi_tf: Any              # `.refresh(tf, count=)` / `.get_buffer(tf)`
     journal: TradeJournal
-    router: Any                # `.place(plan) -> ExecutionReport` (sync)
+    router: Any                # `.place(plan, inst_id=None) -> ExecutionReport` (sync)
     monitor: Any               # `.register_open`, `.poll` (sync)
     risk_mgr: RiskManager
     okx_client: Any            # `.enrich_close_fill`, `.get_positions`
     config: BotConfig
+    bridge: Any = None         # `.set_symbol`, `.set_timeframe` (async) — optional in tests
     open_trade_ids: dict[tuple[str, str], str] = field(default_factory=dict)
 
 
@@ -127,8 +128,15 @@ class _DryRunRouter:
     def __init__(self, config: RouterConfig):
         self.config = config
 
-    def place(self, plan):
-        return dry_run_report(plan, self.config)
+    def place(self, plan, inst_id: Optional[str] = None):
+        cfg = self.config
+        if inst_id and inst_id != cfg.inst_id:
+            cfg = RouterConfig(
+                inst_id=inst_id,
+                margin_mode=self.config.margin_mode,
+                close_on_algo_failure=self.config.close_on_algo_failure,
+            )
+        return dry_run_report(plan, cfg)
 
 
 class BotRunner:
@@ -156,7 +164,7 @@ class BotRunner:
         reader = StructuredReader(bridge)
         multi_tf = MultiTFBuffer(bridge, max_size=cfg.analysis.candle_buffer_size)
         client = OKXClient(cfg.to_okx_credentials())
-        router_cfg = RouterConfig(inst_id=cfg.trading.symbol)
+        router_cfg = RouterConfig(inst_id=cfg.primary_symbol())
         router = _DryRunRouter(router_cfg) if dry_run else OrderRouter(client, router_cfg)
         monitor = PositionMonitor(client)
         journal = TradeJournal(cfg.journal.db_path)
@@ -164,7 +172,7 @@ class BotRunner:
         ctx = BotContext(
             reader=reader, multi_tf=multi_tf, journal=journal,
             router=router, monitor=monitor, risk_mgr=risk_mgr,
-            okx_client=client, config=cfg,
+            okx_client=client, config=cfg, bridge=bridge,
         )
         return cls(ctx, stop_after_closed_trades=stop_after_closed_trades)
 
@@ -208,29 +216,51 @@ class BotRunner:
     # ── One tick ────────────────────────────────────────────────────────────
 
     async def run_once(self) -> None:
-        # 1. Market data — tolerate TV bridge failures, just skip the tick.
+        # Drain closes once at the start — frees slots, updates risk manager.
+        # Monitor polls all tracked (inst_id, pos_side) pairs regardless of
+        # which symbol the chart currently shows, so this is symbol-agnostic.
+        await self._process_closes()
+
+        for symbol in self.ctx.config.trading.symbols:
+            if self.shutdown.is_set():
+                return
+            try:
+                await self._run_one_symbol(symbol)
+            except Exception:
+                logger.exception("symbol_cycle_failed symbol={}", symbol)
+                continue
+
+    async def _run_one_symbol(self, symbol: str) -> None:
+        cfg = self.ctx.config
+
+        # 1. Switch the TV chart to this symbol (production has a bridge;
+        # tests pass bridge=None and the reader fake already knows the symbol).
+        if self.ctx.bridge is not None:
+            try:
+                await self.ctx.bridge.set_symbol(okx_to_tv_symbol(symbol))
+                await asyncio.sleep(cfg.trading.symbol_settle_seconds)
+            except Exception:
+                logger.exception("set_symbol_failed symbol={}", symbol)
+                return
+
+        # 2. Market data — tolerate TV bridge failures, just skip the symbol.
         try:
             state = await self.ctx.reader.read_market_state()
-            tf_key = _timeframe_key(self.ctx.config.trading.entry_timeframe)
+            tf_key = _timeframe_key(cfg.trading.entry_timeframe)
             await self.ctx.multi_tf.refresh(tf_key, count=100)
         except Exception:
-            logger.exception("fetch_failed")
+            logger.exception("fetch_failed symbol={}", symbol)
             return
         buf = self.ctx.multi_tf.get_buffer(tf_key)
         candles = buf.last(50) if buf is not None else []
 
-        # 2. Drain closes first — frees a slot, updates risk manager.
-        await self._process_closes()
-
         # 3. Symbol-level dedup — skip open if we still hold anything.
-        symbol = self.ctx.config.trading.symbol
         if any(k[0] == symbol for k in self.ctx.open_trade_ids):
             return
 
         # 4. Plan. Size against the *actual* OKX USDT balance — the risk
         # manager's current_balance drifts from reality (fees, funding), and
         # OKX rejects sCode 51008 when the bot over-estimates available margin.
-        cfg = self.ctx.config
         try:
             okx_balance = await asyncio.to_thread(
                 self.ctx.okx_client.get_balance, "USDT"
@@ -253,7 +283,7 @@ class BotRunner:
                 allowed_sessions=cfg.allowed_sessions() or None,
             )
         except Exception:
-            logger.exception("plan_build_failed")
+            logger.exception("plan_build_failed symbol={}", symbol)
             return
 
         if plan is None:
@@ -261,22 +291,23 @@ class BotRunner:
 
         allowed, reason = self.ctx.risk_mgr.can_trade(plan)
         if not allowed:
-            logger.info("blocked reason={}", reason)
+            logger.info("blocked symbol={} reason={}", symbol, reason)
             return
 
         # 5. Place order (sync SDK → to_thread).
         try:
-            report = await asyncio.to_thread(self.ctx.router.place, plan)
+            report = await asyncio.to_thread(self.ctx.router.place, plan, symbol)
         except AlgoOrderError as exc:
-            logger.error("algo_failure_position_auto_closed: {}", exc)
+            logger.error("algo_failure_position_auto_closed symbol={}: {}", symbol, exc)
             return
         except (LeverageSetError, OrderRejected, InsufficientMargin, ValueError) as exc:
             code = getattr(exc, "code", None)
             payload = getattr(exc, "payload", None)
-            logger.error("order_rejected: {} | code={} | payload={}", exc, code, payload)
+            logger.error("order_rejected symbol={}: {} | code={} | payload={}",
+                         symbol, exc, code, payload)
             return
         except Exception:
-            logger.exception("order_unexpected_error")
+            logger.exception("order_unexpected_error symbol={}", symbol)
             return
 
         # 6. In-memory FIRST — can't meaningfully fail; keeps us honest even
@@ -304,7 +335,8 @@ class BotRunner:
                         plan.direction.value, symbol, plan.num_contracts,
                         plan.entry_price, rec.trade_id)
         except Exception:
-            logger.exception("journal_write_failed_live_position_orphaned")
+            logger.exception("journal_write_failed_live_position_orphaned symbol={}",
+                             symbol)
 
     # ── Helpers ─────────────────────────────────────────────────────────────
 

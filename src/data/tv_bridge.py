@@ -198,3 +198,15 @@ class TVBridge:
             "lines": safe(results[3]),
             "status": safe(results[4]),
         }
+
+
+# ── Module-level helpers ─────────────────────────────────────────────────────
+
+
+def okx_to_tv_symbol(okx_symbol: str) -> str:
+    """'BTC-USDT-SWAP' → 'OKX:BTCUSDT.P'; 'BTC-USDT' → 'OKX:BTCUSDT'."""
+    raw = okx_symbol.strip()
+    is_perp = raw.endswith("-SWAP")
+    base = raw.replace("-SWAP", "").replace("-", "")
+    suffix = ".P" if is_perp else ""
+    return f"OKX:{base}{suffix}"

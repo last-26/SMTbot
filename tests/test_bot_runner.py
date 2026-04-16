@@ -66,8 +66,9 @@ async def test_run_once_bullish_signal_places_order_and_journals(monkeypatch, ma
         await runner.run_once()
 
     assert len(fakes.router.calls) == 1
-    placed = fakes.router.calls[0]
+    placed, inst_id = fakes.router.calls[0]
     assert placed.direction == Direction.BULLISH
+    assert inst_id == "BTC-USDT-SWAP"
     assert fakes.risk_mgr.open_positions == 1
     assert len(ctx.open_trade_ids) == 1
     key = ("BTC-USDT-SWAP", "long")
