@@ -192,7 +192,8 @@ class FakeMonitor:
 
 
 class FakeOKXClient:
-    """Just the surface the runner touches: enrich_close_fill + get_positions."""
+    """Surface the runner touches: enrich_close_fill, get_positions, get_balance,
+    cancel_algo, close_position (last two for defensive-close tests)."""
 
     def __init__(self, positions: Optional[list[PositionSnapshot]] = None,
                  enrich_return: Optional[CloseFill] = None,
@@ -200,6 +201,8 @@ class FakeOKXClient:
         self.positions = positions or []
         self.enrich_return = enrich_return
         self.balance = balance
+        self.cancel_algo_calls: list[tuple[str, str]] = []
+        self.close_position_calls: list[tuple[str, str]] = []
 
     def get_positions(self, inst_id: Optional[str] = None) -> list[PositionSnapshot]:
         return list(self.positions)
@@ -209,6 +212,15 @@ class FakeOKXClient:
 
     def get_balance(self, ccy: str = "USDT") -> float:
         return self.balance
+
+    def cancel_algo(self, inst_id: str, algo_id: str) -> dict:
+        self.cancel_algo_calls.append((inst_id, algo_id))
+        return {}
+
+    def close_position(self, inst_id: str, pos_side: str,
+                       td_mode: str = "isolated") -> dict:
+        self.close_position_calls.append((inst_id, pos_side))
+        return {}
 
 
 # ── Composite helper ────────────────────────────────────────────────────────

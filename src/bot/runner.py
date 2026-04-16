@@ -155,6 +155,10 @@ class BotContext:
     ltf_cache: dict[str, LTFState] = field(default_factory=dict)
     # Last close per (symbol, side) — reentry gate (Madde C)
     last_close: dict[tuple[str, str], LastCloseInfo] = field(default_factory=dict)
+    # Madde F — LTF reversal defensive close bookkeeping
+    defensive_close_in_flight: set = field(default_factory=set)
+    pending_close_reasons: dict[tuple[str, str], str] = field(default_factory=dict)
+    open_trade_opened_at: dict[tuple[str, str], datetime] = field(default_factory=dict)
 
 
 # ── Runner ──────────────────────────────────────────────────────────────────
@@ -346,6 +350,71 @@ class BotRunner:
 
         return True, None
 
+    # ── LTF reversal defensive close (Madde F) ──────────────────────────────
+
+    def _get_open_side(self, symbol: str) -> Optional[str]:
+        """Return the pos_side of the open position on `symbol`, if any."""
+        for sym, side in self.ctx.open_trade_ids:
+            if sym == symbol:
+                return side
+        return None
+
+    def _is_ltf_reversal(self, ltf: LTFState, open_side: str, max_age: int) -> bool:
+        """True when the fresh LTF signal contradicts the open side.
+
+        Long open → need BEARISH trend + fresh SELL signal.
+        Short open → need BULLISH trend + fresh BUY signal.
+        "Fresh" = last_signal_bars_ago <= max_age.
+        """
+        if ltf.last_signal_bars_ago > max_age:
+            return False
+        sig = (ltf.last_signal or "").upper()
+        if open_side == "long":
+            return ltf.trend == Direction.BEARISH and sig == "SELL"
+        if open_side == "short":
+            return ltf.trend == Direction.BULLISH and sig == "BUY"
+        return False
+
+    async def _defensive_close(self, symbol: str, side: str, reason: str) -> None:
+        """Cancel algos + close the position, tagged with `close_reason`.
+
+        Idempotent via `defensive_close_in_flight`. The monitor will emit a
+        CloseFill on its next poll, and `_handle_close` will stamp the reason
+        on the journal row.
+        """
+        key = (symbol, side)
+        if key in self.ctx.defensive_close_in_flight:
+            return
+        self.ctx.defensive_close_in_flight.add(key)
+
+        # Cancel any outstanding algos for this (inst, side) via the monitor's
+        # tracked state — best-effort, keep going on failure.
+        tracked = getattr(self.ctx.monitor, "_tracked", {}).get(key)
+        algo_ids = list(tracked.algo_ids) if tracked is not None else []
+        for algo_id in algo_ids:
+            try:
+                await asyncio.to_thread(
+                    self.ctx.okx_client.cancel_algo, symbol, algo_id,
+                )
+            except Exception:
+                logger.exception("defensive_cancel_algo_failed "
+                                 "symbol={} algo_id={}", symbol, algo_id)
+
+        try:
+            await asyncio.to_thread(
+                self.ctx.okx_client.close_position, symbol, side,
+            )
+        except Exception:
+            logger.exception("defensive_close_failed symbol={} side={}",
+                             symbol, side)
+            # Leave the guard set — next cycle's poll may still observe the
+            # close on its own; we don't want to spam the exchange.
+            return
+
+        self.ctx.pending_close_reasons[key] = "EARLY_CLOSE_LTF_REVERSAL"
+        logger.info("defensive_close_triggered symbol={} side={} reason={}",
+                    symbol, side, reason)
+
     async def _wait_for_pine_settle(self) -> bool:
         """Poll the signal table until `last_bar` changes, meaning Pine has
         re-rendered for the new symbol / timeframe. Returns True on change.
@@ -463,6 +532,25 @@ class BotRunner:
         buf = self.ctx.multi_tf.get_buffer(tf_key)
         candles = buf.last(50) if buf is not None else []
 
+        # 2d. LTF reversal defensive close (Madde F) — if we already hold a
+        # position and the LTF oscillator just flipped against us, close it
+        # before looking for new entries. Consumes this tick.
+        open_side = self._get_open_side(symbol)
+        if open_side and cfg.execution.ltf_reversal_close_enabled:
+            ltf = self.ctx.ltf_cache.get(symbol)
+            opened_at = self.ctx.open_trade_opened_at.get((symbol, open_side))
+            if ltf is not None and opened_at is not None:
+                entry_tf_sec = _tf_seconds(cfg.trading.entry_timeframe)
+                elapsed_bars = (_utc_now() - opened_at).total_seconds() / entry_tf_sec
+                if (
+                    elapsed_bars >= cfg.execution.ltf_reversal_min_bars_in_position
+                    and self._is_ltf_reversal(
+                        ltf, open_side, cfg.execution.ltf_reversal_signal_max_age,
+                    )
+                ):
+                    await self._defensive_close(symbol, open_side, "ltf_reversal")
+                    return
+
         # 3. Symbol-level dedup — skip open if we still hold anything.
         if any(k[0] == symbol for k in self.ctx.open_trade_ids):
             return
@@ -560,6 +648,7 @@ class BotRunner:
                 market_structure=_structure_str(state),
             )
             self.ctx.open_trade_ids[(symbol, pos_side)] = rec.trade_id
+            self.ctx.open_trade_opened_at[(symbol, pos_side)] = _utc_now()
             logger.info("opened {} {} {}c @ {} trade_id={}",
                         plan.direction.value, symbol, plan.num_contracts,
                         plan.entry_price, rec.trade_id)
@@ -593,6 +682,10 @@ class BotRunner:
 
         key = (enriched.inst_id, enriched.pos_side)
         trade_id = self.ctx.open_trade_ids.pop(key, None)
+        # Madde F — carry close_reason set by the defensive-close path.
+        close_reason = self.ctx.pending_close_reasons.pop(key, None)
+        self.ctx.defensive_close_in_flight.discard(key)
+        self.ctx.open_trade_opened_at.pop(key, None)
 
         if trade_id is None:
             logger.warning("orphan_close key={} (no matching trade_id)", key)
@@ -604,7 +697,9 @@ class BotRunner:
             return
 
         try:
-            updated = await self.ctx.journal.record_close(trade_id, enriched)
+            updated = await self.ctx.journal.record_close(
+                trade_id, enriched, close_reason=close_reason,
+            )
         except Exception:
             logger.exception("journal_close_failed trade_id={}", trade_id)
             # Still update risk_mgr so streaks / drawdown stay accurate.
@@ -645,6 +740,7 @@ class BotRunner:
                 tp2_price=rec.tp_price,
             )
             self.ctx.open_trade_ids[(rec.symbol, pos_side)] = rec.trade_id
+            self.ctx.open_trade_opened_at[(rec.symbol, pos_side)] = rec.entry_timestamp
             # These don't count against RiskManager.open_positions because
             # replay already paired every recorded open with its close.
 
