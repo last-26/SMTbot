@@ -117,7 +117,8 @@ References: `pine/vmc_a.txt`, `pine/vmc_b.txt` (original VMC source). Standalone
 | 4. Execution (OKX) | ✅ Complete | 5 modules under `src/execution/`, 29 new tests (193 total). See below. |
 | 5. Trade Journal | ✅ Complete | 3 modules under `src/journal/` + CLI, 31 new tests (224 total). See below. |
 | 6. Bot runtime loop | ✅ Complete | `src/bot/` async runner wiring TV → analysis → strategy → risk → execution → journal. `OKXClient.enrich_close_fill` added. 23 new tests (247 total). See below. |
-| 7. RL parameter tuner | 🔜 Next | PPO via Stable Baselines3, walk-forward validated. Needs ≥50 logged demo trades from Phase 6 first. |
+| 6.5 Multi-pair + Multi-TF + Smart Entry/Exit | ✅ Complete | 6-part refactor (Madde A-F): multi-pair round-robin, freshness-polled multi-TF, reentry cooldown/quality gate, HTF S/R ceiling, partial TP + SL-to-BE, LTF reversal defensive close. 63 new tests (310 total). See below. |
+| 7. RL parameter tuner | 🔜 Next | PPO via Stable Baselines3, walk-forward validated. Needs ≥50 logged demo trades from Phase 6.5 first. |
 
 ### Phase 1 — Completed (2026-04-16)
 
@@ -323,6 +324,62 @@ Secrets (`OKX_API_KEY/SECRET/PASSPHRASE/DEMO_FLAG`) come from `.env` via `python
 .venv/Scripts/python.exe -m src.bot --config config/default.yaml --max-closed-trades 50
 ```
 
+### Phase 6.5 — Completed (2026-04-17)
+
+Six-part refactor ("Madde A-F") run between Phase 6 and Phase 7. Goal: (a) multi-asset so 50+ demo trades land faster, (b) stricter entry/exit discipline so the RL reward signal in Phase 7 is cleaner. Six feature commits + this docs commit + a push. 63 new tests total, all 310 passing.
+
+**Madde A — Multi-pair round-robin** (`feat: multi-pair round-robin (Madde A)`)
+- `TradingConfig.symbols: list[str]`; legacy `symbol: str` still loads with `DeprecationWarning`. `BotConfig.primary_symbol()` returns `symbols[0]`.
+- `run_once` extracts `_run_one_symbol(symbol)`; drains closes once at the start then loops symbols with per-symbol try/except so one bad symbol can't break the others.
+- `okx_to_tv_symbol("BTC-USDT-SWAP") → "OKX:BTCUSDT.P"` in `src/data/tv_bridge.py`.
+- Defaults: `symbols: [BTC, ETH, SOL, AVAX, XRP]-USDT-SWAP`. 5 tests (`tests/test_runner_multi_pair.py`).
+
+**Madde B — Multi-TF data pipeline with Pine freshness-check** (`feat: multi-TF pipeline + Pine freshness-check (Madde B)`)
+- Added `SignalTableData.last_bar: Optional[int]` (parsed from row 20 of the SMT Signals Pine table) — the freshness beacon the runner polls between TF switches.
+- `BotRunner._wait_for_pine_settle()`: polls `state.signal_table.last_bar` until it differs from the first reading (meaning Pine has re-rendered for the new chart state). First-read `None` is treated as "Pine doesn't emit last_bar, fall through" so tests with fake readers still work.
+- `_switch_timeframe(tf)`: `bridge.set_timeframe(tf)` → static `tf_settle_seconds` sleep → freshness-poll. False result → skip this symbol's cycle.
+- `_run_one_symbol` runs 3 TF passes: HTF (15m) → LTF (1m) → entry TF (3m). HTF pass caches `detect_sr_zones()` in `ctx.htf_sr_cache[symbol]`; LTF pass caches an `LTFState` in `ctx.ltf_cache[symbol]`; entry pass reads `MarketState`. HTF or entry stale → return; LTF stale → clear cache and continue.
+- `src/data/ltf_reader.py`: new `LTFReader` + `LTFState` dataclass. Thin projection over the SMT Oscillator table — no extra TV calls. `_trend_from_oscillator` heuristic: `wt=OVERSOLD & rsi<40` → BEARISH, symmetric BULLISH, else RANGING.
+- 9 tests (`tests/test_multi_tf_pipeline.py`, `tests/test_ltf_reader.py`).
+
+**Madde C — Per-side reentry cooldown + quality gate** (`feat: per-side reentry cooldown + quality gate (Madde C)`)
+- New `ReentryConfig` in `src/bot/config.py` + `BotContext.last_close: dict[(sym, side), LastCloseInfo]`.
+- `_check_reentry_gate()` — four sequential gates, first fail wins: (1) cooldown `min_bars_after_close * _tf_seconds(entry_tf)`, (2) ATR move `|price - last.price| / atr < min_atr_move`, (3) post-WIN quality `proposed_confluence ≤ last.confluence` blocks, (4) post-LOSS quality `proposed_confluence < last.confluence` blocks (equal passes). BREAKEVEN bypasses the quality gate.
+- `_handle_close` writes `LastCloseInfo` into `ctx.last_close` after the journal stamps outcome. Opposite sides isolated — closing a long doesn't cool off a short.
+- 9 tests (`tests/test_reentry_gate.py`).
+
+**Madde D — HTF S/R integration in SL/TP selection** (`feat: HTF S/R integration in SL/TP selection (Madde D)`)
+- Two pure helpers in `src/strategy/entry_signals.py`: `_push_sl_past_htf_zone()` tightens SL past a zone fully between SL and entry (`sl < z.bottom < z.top < entry` for bullish, symmetric bearish); `_apply_htf_tp_ceiling()` caps TP short of the next opposing zone.
+- `build_trade_plan_from_state()` accepts `htf_sr_zones`, `htf_sr_ceiling_enabled`, `htf_sr_buffer_atr`. After `calculate_trade_plan`, if TP ceiling applies, plan is rebuilt via `dataclasses.replace` with a recomputed `rr_ratio`; plans whose new R:R falls below `min_rr_ratio` are rejected (`return None`).
+- `AnalysisConfig.htf_sr_ceiling_enabled=True` / `htf_sr_buffer_atr=0.2` (defaults). Runner wires `ctx.htf_sr_cache[symbol]` into the plan builder.
+- 8 tests (`tests/test_htf_sr_integration.py`).
+
+**Madde E — Partial TP + SL-to-BE** (`feat: partial TP + SL-to-BE (Madde E)`)
+- `ExecutionConfig` (new): `partial_tp_enabled`, `partial_tp_ratio=0.5`, `partial_tp_rr=1.5`, `move_sl_to_be_after_tp1=True`, `trail_after_partial=False` (reserved for later).
+- `ExecutionReport.algos: list[AlgoResult]` is now the canonical field; the original `algo: Optional[AlgoResult]` lives on as a bi-directionally-normalized back-compat shim (`__post_init__`). `is_protected` checks `bool(self.algos)`.
+- `OrderRouter._place_algos()`: in partial mode, places two OCOs — TP1 at `entry ± sl_dist * partial_tp_rr * sign` on `int(num * ratio)` contracts, TP2 at `plan.tp_price` on the remainder. Degenerate size1/size2 (e.g. `num_contracts=1`) falls back to single algo with a log line. Either leg failing → both cancelled + `close_position`.
+- `PositionMonitor` tracks `initial_size`, `algo_ids`, `tp2_price`, `be_already_moved`. When live size drops below `initial_size` but stays > 0 (= TP1 fill), the monitor cancels the TP2 algo, places a new OCO with SL=entry_price + TP=tp2_price on remaining contracts, and fires an `on_sl_moved(inst_id, pos_side, new_algo_ids)` callback. Failure leaves `be_already_moved=False` so the next poll retries.
+- `from_config` wires `on_sl_moved` via a `ctx_holder` closure → `journal.update_algo_ids(trade_id, new_ids)` so the persisted row tracks the post-TP1 algo state.
+- Journal: new columns `algo_ids TEXT DEFAULT '[]'`, `close_reason TEXT`. Idempotent `_MIGRATIONS` list runs inside try/except `aiosqlite.OperationalError` on every `connect()`, so existing demo databases upgrade cleanly. `_safe_col(row, name)` shields reads from legacy rows. `update_algo_ids()` helper. `record_close(..., close_reason=...)` uses `COALESCE` so passing `None` is a no-op.
+- 16 tests (`tests/test_partial_tp.py`, `tests/test_sl_to_be.py`, `tests/test_journal_partial_tp.py`).
+
+**Madde F — LTF reversal defensive close** (`feat: LTF reversal defensive close (Madde F)`)
+- New fields on `BotContext`: `defensive_close_in_flight: set`, `pending_close_reasons: dict[(sym, side), str]`, `open_trade_opened_at: dict[(sym, side), datetime]`.
+- `_is_ltf_reversal(ltf, open_side, max_age)`: true when `last_signal_bars_ago ≤ max_age` AND trend/signal contradict the open side (long → BEARISH+SELL, short → BULLISH+BUY).
+- `_defensive_close(symbol, side, reason)`: cancels every tracked algo_id via `okx_client.cancel_algo`, calls `okx_client.close_position`, tags `pending_close_reasons[key] = "EARLY_CLOSE_LTF_REVERSAL"`. Idempotent via `defensive_close_in_flight`.
+- `_run_one_symbol` runs the reversal check between the LTF read and the symbol-level dedup block, gated by a minimum-holding-time guard (`ltf_reversal_min_bars_in_position * _tf_seconds(entry_tf)`).
+- `_handle_close` pops `pending_close_reasons` + `open_trade_opened_at`, discards `defensive_close_in_flight`, and passes `close_reason` to `journal.record_close` so the closed trade row records why.
+- `ExecutionConfig` flags: `ltf_reversal_close_enabled=True`, `ltf_reversal_min_confluence=3` (reserved), `ltf_reversal_min_bars_in_position=2`, `ltf_reversal_signal_max_age=3`.
+- 10 tests (`tests/test_ltf_reversal.py`).
+
+**Data pipeline / config changes (global):**
+- `config/default.yaml` grows `trading.symbols` (5 pairs), `trading.ltf_timeframe: "1m"`, `trading.symbol_settle_seconds: 4.0`, `trading.tf_settle_seconds: 2.5`, `trading.pine_settle_max_wait_s: 6.0`, `trading.pine_settle_poll_interval_s: 0.3`, `analysis.htf_sr_ceiling_enabled`/`_buffer_atr`, full `execution:` section, full `reentry:` section.
+- `OKXClient.cancel_algo(inst_id, algo_id)` is pre-existing (Phase 4); Madde E + F reuse it — no new OKX method.
+
+**New files:** `src/data/ltf_reader.py`, `tests/test_runner_multi_pair.py`, `tests/test_multi_tf_pipeline.py`, `tests/test_ltf_reader.py`, `tests/test_reentry_gate.py`, `tests/test_htf_sr_integration.py`, `tests/test_partial_tp.py`, `tests/test_sl_to_be.py`, `tests/test_journal_partial_tp.py`, `tests/test_ltf_reversal.py`.
+
+**Phase 7 unlocks after Phase 6.5 because:** five pairs in parallel should land 50 closed demo trades an order of magnitude faster, and the entry/exit gates kill the noisiest failure modes (revenge re-entries, TP within reach of the next HTF zone, late exits when the LTF has already rolled).
+
 ## Phase 7 — Reinforcement learning
 
 **Architecture:** parameter tuner, NOT raw decision maker. Rule-based strategy generates signals; RL tunes:
@@ -345,11 +402,9 @@ Secrets (`OKX_API_KEY/SECRET/PASSPHRASE/DEMO_FLAG`) come from `.env` via `python
 
 ## Currency pair strategy
 
-**Phase 1 (now):** BTC-USDT-SWAP only. Highest liquidity, predictable PA, available on demo.
+**Phase 6.5 onwards:** 5 OKX perps run round-robin per tick — BTC / ETH / SOL / AVAX / XRP. `trading.symbols` in YAML is the single source of truth; the legacy single-`symbol` YAML form still loads with a `DeprecationWarning`. Circuit breakers (`max_concurrent_positions=2` in defaults) cap total simultaneous exposure across all symbols, not per-symbol.
 
-**Add ETH-USDT-SWAP only when:** ≥100 BTC demo trades logged, win rate ≥40% @ 1:2 (or ≥33% @ 1:3), profit factor > 1.2, ≥2 RL training cycles done, max DD stayed under 10%.
-
-**Do not add more pairs until ETH stable.**
+**To add a 6th pair:** drop it into `trading.symbols`, confirm `okx_to_tv_symbol()` produces a valid TV ticker (add a parametrized test case), and watch the first 20-30 cycles for `htf_settle_timeout` / `set_symbol_failed` log lines — illiquid pairs will flunk the freshness-poll more often.
 
 ## Configuration
 
