@@ -46,6 +46,12 @@ okx:
 journal:
   db_path: "data/trades.db"
 
+reentry:
+  min_bars_after_close: 3             # cooldown in bars of entry_timeframe
+  min_atr_move: 0.5                   # must move ≥ 0.5 * ATR from last exit
+  require_higher_confluence_after_win: true
+  require_higher_or_equal_confluence_after_loss: true
+
 rl:
   min_trades_to_train: 50
   retrain_every_n_trades: 50

@@ -74,6 +74,25 @@ def _timeframe_key(tf: str) -> str:
     return raw
 
 
+def _tf_seconds(tf: str) -> int:
+    """Convert a TV timeframe string to seconds (e.g. '3m' → 180, '4H' → 14400)."""
+    raw = tf.strip()
+    if not raw:
+        return 60
+    suffix = raw[-1]
+    try:
+        val = int(raw[:-1])
+    except ValueError:
+        return 60
+    if suffix in ("m", "M"):
+        return val * 60
+    if suffix in ("h", "H"):
+        return val * 3600
+    if suffix in ("d", "D"):
+        return val * 86400
+    return 60
+
+
 def _direction_to_pos_side(direction: Direction) -> str:
     return "long" if direction == Direction.BULLISH else "short"
 
@@ -104,6 +123,15 @@ def _structure_str(state: MarketState) -> Optional[str]:
 
 
 @dataclass
+class LastCloseInfo:
+    """Snapshot of the most recent close for (symbol, side) — reentry gate."""
+    price: float
+    time: datetime
+    confluence: int
+    outcome: str            # "WIN" | "LOSS" | "BREAKEVEN"
+
+
+@dataclass
 class BotContext:
     """Everything the runner needs, wired together.
 
@@ -125,6 +153,8 @@ class BotContext:
     htf_sr_cache: dict[str, list] = field(default_factory=dict)
     # Latest LTF snapshot per-symbol (Madde B → F)
     ltf_cache: dict[str, LTFState] = field(default_factory=dict)
+    # Last close per (symbol, side) — reentry gate (Madde C)
+    last_close: dict[tuple[str, str], LastCloseInfo] = field(default_factory=dict)
 
 
 # ── Runner ──────────────────────────────────────────────────────────────────
@@ -239,6 +269,51 @@ class BotRunner:
             except Exception:
                 logger.exception("symbol_cycle_failed symbol={}", symbol)
                 continue
+
+    def _check_reentry_gate(
+        self,
+        symbol: str,
+        side: str,
+        *,
+        proposed_confluence: int,
+        current_price: float,
+        atr: float,
+        now: datetime,
+    ) -> tuple[bool, Optional[str]]:
+        """Return (allowed, reason). Reason is populated only when blocked.
+
+        Four sequential gates — first fail wins:
+          1. Time: elapsed < min_bars_after_close * entry_tf_seconds.
+          2. ATR move: |price - last_close.price| < min_atr_move * ATR.
+          3. Quality after WIN: proposed_confluence <= last.confluence.
+          4. Quality after LOSS: proposed_confluence < last.confluence.
+
+        BREAKEVEN bypasses the quality gate (treated as neutral).
+        """
+        last = self.ctx.last_close.get((symbol, side))
+        if last is None:
+            return True, None
+
+        cfg = self.ctx.config.reentry
+        tf_sec = _tf_seconds(self.ctx.config.trading.entry_timeframe)
+
+        elapsed = (now - last.time).total_seconds()
+        if elapsed < cfg.min_bars_after_close * tf_sec:
+            return False, f"cooldown_{cfg.min_bars_after_close}bars"
+
+        if atr > 0 and last.price > 0:
+            if abs(current_price - last.price) / atr < cfg.min_atr_move:
+                return False, "atr_move_insufficient"
+
+        if cfg.require_higher_confluence_after_win and last.outcome == "WIN":
+            if proposed_confluence <= last.confluence:
+                return False, "post_win_needs_higher_confluence"
+
+        if cfg.require_higher_or_equal_confluence_after_loss and last.outcome == "LOSS":
+            if proposed_confluence < last.confluence:
+                return False, "post_loss_needs_ge_confluence"
+
+        return True, None
 
     async def _wait_for_pine_settle(self) -> bool:
         """Poll the signal table until `last_bar` changes, meaning Pine has
@@ -392,6 +467,20 @@ class BotRunner:
         if plan is None:
             return
 
+        # Reentry gate (Madde C): per-side cooldown + ATR move + quality.
+        gate_side = _direction_to_pos_side(plan.direction)
+        gate_allowed, gate_reason = self._check_reentry_gate(
+            symbol, gate_side,
+            proposed_confluence=int(plan.confluence_score),
+            current_price=float(state.signal_table.price or plan.entry_price),
+            atr=float(state.atr or 0.0),
+            now=_utc_now(),
+        )
+        if not gate_allowed:
+            logger.info("reentry_blocked symbol={} side={} reason={}",
+                        symbol, gate_side, gate_reason)
+            return
+
         allowed, reason = self.ctx.risk_mgr.can_trade(plan)
         if not allowed:
             logger.info("blocked symbol={} reason={}", symbol, reason)
@@ -493,6 +582,14 @@ class BotRunner:
             pnl_r=updated.pnl_r or 0.0,
             timestamp=enriched.closed_at or _utc_now(),
         ))
+        # Remember the close for the reentry gate (Madde C). Conf score
+        # comes from the original record; outcome from the post-close update.
+        self.ctx.last_close[key] = LastCloseInfo(
+            price=float(enriched.exit_price or 0.0),
+            time=enriched.closed_at or _utc_now(),
+            confluence=int(updated.confluence_score or 0),
+            outcome=updated.outcome.value,
+        )
         logger.info("closed trade_id={} outcome={} pnl_r={:.2f}",
                     trade_id, updated.outcome.value, updated.pnl_r or 0.0)
 

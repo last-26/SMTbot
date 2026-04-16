@@ -94,7 +94,14 @@ async def test_symbol_level_dedup_blocks_second_open_same_tick(monkeypatch, make
 
 async def test_dedup_clears_after_close_is_processed(monkeypatch, make_ctx):
     _patch_plan_builder(monkeypatch, make_plan())
-    ctx, fakes = make_ctx()
+    cfg = make_config()
+    # Disable the Madde C reentry gate so this dedup test only asserts the
+    # open/close-dedup contract, not the post-close quality gate.
+    cfg.reentry.min_bars_after_close = 0
+    cfg.reentry.min_atr_move = 0.0
+    cfg.reentry.require_higher_confluence_after_win = False
+    cfg.reentry.require_higher_or_equal_confluence_after_loss = False
+    ctx, fakes = make_ctx(config=cfg)
     runner = BotRunner(ctx)
     async with ctx.journal:
         await runner.run_once()                          # open #1

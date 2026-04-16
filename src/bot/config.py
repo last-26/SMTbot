@@ -123,6 +123,25 @@ class JournalConfig(BaseModel):
     db_path: str = "data/trades.db"
 
 
+class ReentryConfig(BaseModel):
+    """Per-side reentry gate (Madde C).
+
+    When the same (symbol, side) just closed, block a second entry until:
+      * at least `min_bars_after_close` bars have elapsed on the entry TF,
+      * AND price has moved ≥ `min_atr_move * ATR` from the prior exit,
+      * AND the new plan's confluence passes the WIN/LOSS quality gate.
+
+    Goals: kill "bot revenge-trades right after TP" noise, avoid placing a
+    weaker setup than the one that just won, and force a *better or equal*
+    setup after a loss (not strictly better — equal is fine since the
+    setup that lost might still be valid on a retest).
+    """
+    min_bars_after_close: int = 3
+    min_atr_move: float = 0.5
+    require_higher_confluence_after_win: bool = True
+    require_higher_or_equal_confluence_after_loss: bool = True
+
+
 _SESSION_MAP = {
     "asian": Session.ASIAN,
     "london": Session.LONDON,
@@ -142,6 +161,7 @@ class BotConfig(BaseModel):
     analysis: AnalysisConfig
     okx: OKXConfigBlock
     journal: JournalConfig = Field(default_factory=JournalConfig)
+    reentry: ReentryConfig = Field(default_factory=ReentryConfig)
 
     @field_validator("okx")
     @classmethod
