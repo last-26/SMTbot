@@ -2,6 +2,7 @@ bot:
   mode: demo
   poll_interval_seconds: 5
   timezone: UTC
+  starting_balance: 10000.0
 
 trading:
   symbol: BTC-USDT-SWAP
@@ -12,6 +13,7 @@ trading:
   default_rr_ratio: 3.0
   min_rr_ratio: 2.0
   max_concurrent_positions: 2
+  contract_size: 0.01
 
 circuit_breakers:
   max_daily_loss_pct: 3.0
