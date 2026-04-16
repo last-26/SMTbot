@@ -856,3 +856,34 @@ pytest tests/ -v
 # 5. tv pine analyze (static analysis)
 # 6. tv screenshot (visual verification)
 ```
+
+## Development Progress
+
+### Completed
+
+#### Phase 1: Pine Script Data Layer (Steps 1.1–1.5)
+
+All 6 Pine Scripts written and committed (2026-04-16):
+
+| Step | Script | File | Output Format |
+|---|---|---|---|
+| 1.1 | MSS Detector | `pine/mss_detector.pine` | Labels: `MSS\|BULLISH\|price\|bar`, Table: trend/SH/SL/lastMSS |
+| 1.2 | FVG Mapper | `pine/fvg_mapper.pine` | Tooltips: `FVG\|DIR\|BOT\|TOP\|SIZE%\|STATUS`, Table: counts/nearest |
+| 1.3 | Order Block ID | `pine/order_block.pine` | Tooltips: `OB\|DIR\|BOT\|TOP\|STATUS\|TEST`, Table: counts/nearest |
+| 1.4 | Liquidity Sweep | `pine/liquidity_sweep.pine` | Labels: `SWEEP\|DIR\|LEVEL\|TOUCHES\|BAR`, Table: pools/nearest |
+| 1.5a | Session Levels | `pine/session_levels.pine` | Lines: Asian/London/NY H/L + PDH/PDL/PWH/PWL, Table: all levels |
+| 1.5b | Signal Table | `pine/signal_table.pine` | Master table: trend_htf, trend_ltf, structure, last_mss, active_fvg, active_ob, liquidity_above/below, last_sweep, session, confluence (0-5), atr_14, price |
+
+All scripts use Pine Script v6, output structured data via tooltips/tables, and are readable by the bot through TradingView MCP commands.
+
+### Next Up
+
+#### Phase 1, Step 1.6: Data Bridge (`src/data/structured_reader.py`)
+
+Build the Python-side data bridge that:
+- Connects to TradingView MCP to read Pine Script drawing objects and table data
+- Parses structured tooltip/label text into Python dataclasses
+- Maintains a `MarketState` object updated on every new candle
+- Validates: bot prints structured market state JSON for every 15m candle on BTCUSDT
+
+After 1.6, move to **Phase 2: Analysis Engine** (Python-side confluence scoring, candlestick patterns, multi-timeframe logic).
