@@ -54,6 +54,19 @@ reentry:
   require_higher_confluence_after_win: true
   require_higher_or_equal_confluence_after_loss: true
 
+execution:
+  # Madde E — partial TP + move SL to breakeven on TP1 fill.
+  partial_tp_enabled: true
+  partial_tp_ratio: 0.5               # 50% of contracts exit at TP1
+  partial_tp_rr: 1.5                  # TP1 at 1.5R
+  move_sl_to_be_after_tp1: true
+  trail_after_partial: false
+  # Madde F — LTF reversal defensive close.
+  ltf_reversal_close_enabled: true
+  ltf_reversal_min_confluence: 3
+  ltf_reversal_min_bars_in_position: 2
+  ltf_reversal_signal_max_age: 3
+
 rl:
   min_trades_to_train: 50
   retrain_every_n_trades: 50

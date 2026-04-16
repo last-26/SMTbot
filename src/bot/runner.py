@@ -203,10 +203,40 @@ class BotRunner:
         ltf_reader = LTFReader(bridge, reader)
         multi_tf = MultiTFBuffer(bridge, max_size=cfg.analysis.candle_buffer_size)
         client = OKXClient(cfg.to_okx_credentials())
-        router_cfg = RouterConfig(inst_id=cfg.primary_symbol())
+        router_cfg = RouterConfig(
+            inst_id=cfg.primary_symbol(),
+            partial_tp_enabled=cfg.execution.partial_tp_enabled,
+            partial_tp_ratio=cfg.execution.partial_tp_ratio,
+            partial_tp_rr=cfg.execution.partial_tp_rr,
+            move_sl_to_be_after_tp1=cfg.execution.move_sl_to_be_after_tp1,
+            trail_after_partial=cfg.execution.trail_after_partial,
+        )
         router = _DryRunRouter(router_cfg) if dry_run else OrderRouter(client, router_cfg)
-        monitor = PositionMonitor(client)
         journal = TradeJournal(cfg.journal.db_path)
+
+        # The monitor needs a way to update algo_ids in the journal when
+        # it moves SL to BE — inject a callback that uses open_trade_ids
+        # on the context to find the matching trade row.
+        ctx_holder: dict[str, BotContext] = {}
+
+        def _on_sl_moved(inst_id: str, pos_side: str, new_algo_ids: list[str]) -> None:
+            c = ctx_holder.get("ctx")
+            if c is None:
+                return
+            trade_id = c.open_trade_ids.get((inst_id, pos_side))
+            if trade_id is None:
+                return
+            import asyncio as _asyncio
+            _asyncio.create_task(
+                c.journal.update_algo_ids(trade_id, new_algo_ids)
+            )
+
+        monitor = PositionMonitor(
+            client,
+            margin_mode=router_cfg.margin_mode,
+            move_sl_to_be_enabled=cfg.execution.move_sl_to_be_after_tp1,
+            on_sl_moved=_on_sl_moved,
+        )
         risk_mgr = RiskManager(cfg.bot.starting_balance, cfg.breakers())
         ctx = BotContext(
             reader=reader, multi_tf=multi_tf, journal=journal,
@@ -214,6 +244,7 @@ class BotRunner:
             okx_client=client, config=cfg, bridge=bridge,
             ltf_reader=ltf_reader,
         )
+        ctx_holder["ctx"] = ctx
         return cls(ctx, stop_after_closed_trades=stop_after_closed_trades)
 
     # ── Entry points ────────────────────────────────────────────────────────
@@ -508,8 +539,11 @@ class BotRunner:
         # 6. In-memory FIRST — can't meaningfully fail; keeps us honest even
         # if the journal write below errors out.
         pos_side = _direction_to_pos_side(plan.direction)
-        self.ctx.monitor.register_open(symbol, pos_side, float(plan.num_contracts),
-                                       plan.entry_price)
+        algo_ids = [a.algo_id for a in report.algos if a.algo_id]
+        self.ctx.monitor.register_open(
+            symbol, pos_side, float(plan.num_contracts), plan.entry_price,
+            algo_ids=algo_ids, tp2_price=plan.tp_price,
+        )
         self.ctx.risk_mgr.register_trade_opened()
 
         # 7. Persist to journal. Failure here leaves an orphan we'll see at
@@ -607,6 +641,8 @@ class BotRunner:
             self.ctx.monitor.register_open(
                 rec.symbol, pos_side,
                 float(rec.num_contracts), rec.entry_price,
+                algo_ids=list(rec.algo_ids),
+                tp2_price=rec.tp_price,
             )
             self.ctx.open_trade_ids[(rec.symbol, pos_side)] = rec.trade_id
             # These don't count against RiskManager.open_positions because

@@ -94,6 +94,12 @@ class TradeRecord(BaseModel):
     pnl_r: Optional[float] = None
     fees_usdt: float = 0.0
 
+    # Partial-TP bookkeeping (Madde E) — list of algo IDs attached to the
+    # position; rewritten by the monitor after SL-to-BE replaces TP2.
+    algo_ids: list[str] = Field(default_factory=list)
+    # Why the position was closed — "EARLY_CLOSE_LTF_REVERSAL" etc. (Madde F).
+    close_reason: Optional[str] = None
+
     # Notes / screenshots (manual or future automation)
     notes: Optional[str] = None
     screenshot_entry: Optional[str] = None

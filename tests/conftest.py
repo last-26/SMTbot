@@ -171,12 +171,18 @@ class FakeRouter:
 class FakeMonitor:
     def __init__(self):
         self.registered: list[tuple[str, str, float, float]] = []
+        self.register_extras: list[dict] = []
         self.queued_fills: list[CloseFill] = []
         self.poll_count = 0
 
     def register_open(self, inst_id: str, pos_side: str,
-                      size: float, entry_price: float) -> None:
+                      size: float, entry_price: float,
+                      *, algo_ids: Optional[list[str]] = None,
+                      tp2_price: Optional[float] = None) -> None:
         self.registered.append((inst_id, pos_side, size, entry_price))
+        self.register_extras.append(
+            {"algo_ids": list(algo_ids or []), "tp2_price": tp2_price}
+        )
 
     def poll(self, inst_id: Optional[str] = None) -> list[CloseFill]:
         self.poll_count += 1

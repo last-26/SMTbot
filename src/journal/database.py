@@ -74,6 +74,9 @@ CREATE TABLE IF NOT EXISTS trades (
     pnl_r               REAL,
     fees_usdt           REAL NOT NULL DEFAULT 0,
 
+    algo_ids            TEXT NOT NULL DEFAULT '[]',
+    close_reason        TEXT,
+
     notes               TEXT,
     screenshot_entry    TEXT,
     screenshot_exit     TEXT
@@ -96,7 +99,16 @@ _COLUMNS = [
     "order_id", "algo_id", "client_order_id", "client_algo_id",
     "entry_timeframe", "htf_timeframe", "htf_bias", "session", "market_structure",
     "exit_price", "pnl_usdt", "pnl_r", "fees_usdt",
+    "algo_ids", "close_reason",
     "notes", "screenshot_entry", "screenshot_exit",
+]
+
+
+# Idempotent migrations — each `ALTER TABLE ... ADD COLUMN` is wrapped in
+# a try/except so re-running on a DB that already has the column is a no-op.
+_MIGRATIONS = [
+    "ALTER TABLE trades ADD COLUMN algo_ids TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE trades ADD COLUMN close_reason TEXT",
 ]
 
 
@@ -119,6 +131,7 @@ def _record_to_row(rec: TradeRecord) -> tuple:
         rec.order_id, rec.algo_id, rec.client_order_id, rec.client_algo_id,
         rec.entry_timeframe, rec.htf_timeframe, rec.htf_bias, rec.session, rec.market_structure,
         rec.exit_price, rec.pnl_usdt, rec.pnl_r, rec.fees_usdt,
+        json.dumps(rec.algo_ids), rec.close_reason,
         rec.notes, rec.screenshot_entry, rec.screenshot_exit,
     )
 
@@ -157,10 +170,20 @@ def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
         pnl_usdt=row["pnl_usdt"],
         pnl_r=row["pnl_r"],
         fees_usdt=row["fees_usdt"] or 0.0,
+        algo_ids=json.loads(_safe_col(row, "algo_ids") or "[]"),
+        close_reason=_safe_col(row, "close_reason"),
         notes=row["notes"],
         screenshot_entry=row["screenshot_entry"],
         screenshot_exit=row["screenshot_exit"],
     )
+
+
+def _safe_col(row: aiosqlite.Row, name: str):
+    """Access a column that may not exist on a pre-migration row."""
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None
 
 
 def _classify(pnl_usdt: float) -> TradeOutcome:
@@ -200,6 +223,12 @@ class TradeJournal:
         self._conn = await aiosqlite.connect(self._db_path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(_SCHEMA)
+        # Idempotent migrations for databases created before Madde E.
+        for sql in _MIGRATIONS:
+            try:
+                await self._conn.execute(sql)
+            except aiosqlite.OperationalError:
+                pass
         await self._conn.commit()
 
     async def close(self) -> None:
@@ -266,6 +295,7 @@ class TradeJournal:
             algo_id=algo.algo_id if algo else None,
             client_order_id=report.entry.client_order_id or None,
             client_algo_id=algo.client_algo_id if algo else None,
+            algo_ids=[a.algo_id for a in report.algos if a.algo_id],
             entry_timeframe=entry_timeframe,
             htf_timeframe=htf_timeframe,
             htf_bias=htf_bias,
@@ -286,11 +316,14 @@ class TradeJournal:
         trade_id: str,
         close_fill: CloseFill,
         fees_usdt: float = 0.0,
+        *,
+        close_reason: Optional[str] = None,
     ) -> TradeRecord:
         """Stamp exit fields on an existing OPEN row and return the updated record.
 
         Computes `pnl_r = pnl_usdt / risk_amount_usdt` from the open row.
-        Raises `KeyError` if the trade_id isn't in the journal.
+        `close_reason` (e.g. "EARLY_CLOSE_LTF_REVERSAL") is persisted for
+        post-hoc analysis. Raises `KeyError` if `trade_id` isn't in the journal.
         """
         existing = await self.get_trade(trade_id)
         if existing is None:
@@ -306,17 +339,31 @@ class TradeJournal:
         await conn.execute(
             """UPDATE trades SET
                    outcome = ?, exit_timestamp = ?, exit_price = ?,
-                   pnl_usdt = ?, pnl_r = ?, fees_usdt = ?
+                   pnl_usdt = ?, pnl_r = ?, fees_usdt = ?,
+                   close_reason = COALESCE(?, close_reason)
                WHERE trade_id = ?""",
             (
                 outcome.value, _iso(close_fill.closed_at), close_fill.exit_price,
-                pnl_usdt, pnl_r, fees_usdt, trade_id,
+                pnl_usdt, pnl_r, fees_usdt, close_reason, trade_id,
             ),
         )
         await conn.commit()
         updated = await self.get_trade(trade_id)
         assert updated is not None
         return updated
+
+    async def update_algo_ids(self, trade_id: str, algo_ids: list[str]) -> None:
+        """Rewrite the `algo_ids` column — used by the SL-to-BE path when
+        the monitor replaces TP2 with a new algo and needs the new ID in
+        the journal."""
+        conn = self._require_conn()
+        cur = await conn.execute(
+            "UPDATE trades SET algo_ids = ? WHERE trade_id = ?",
+            (json.dumps(list(algo_ids)), trade_id),
+        )
+        await conn.commit()
+        if cur.rowcount == 0:
+            raise KeyError(f"No trade with id={trade_id!r}")
 
     async def mark_canceled(self, trade_id: str, reason: str = "") -> None:
         """Flip an OPEN row to CANCELED — used when the entry never filled or the

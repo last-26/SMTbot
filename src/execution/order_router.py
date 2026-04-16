@@ -16,9 +16,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+from loguru import logger
+
 from src.data.models import Direction
 from src.execution.errors import AlgoOrderError, LeverageSetError
 from src.execution.models import (
+    AlgoResult,
     ExecutionReport,
     OrderResult,
     OrderStatus,
@@ -33,6 +36,12 @@ class RouterConfig:
     inst_id: str = "BTC-USDT-SWAP"
     margin_mode: str = "isolated"         # "isolated" or "cross"
     close_on_algo_failure: bool = True    # auto-close if OCO placement fails
+    # Madde E — partial TP + SL-to-BE.
+    partial_tp_enabled: bool = False
+    partial_tp_ratio: float = 0.5         # fraction of contracts exited at TP1
+    partial_tp_rr: float = 1.5            # TP1 RR relative to SL distance
+    move_sl_to_be_after_tp1: bool = True
+    trail_after_partial: bool = False     # disabled in v1 — reserved for later
 
 
 def _pos_side(direction: Direction) -> str:
@@ -84,16 +93,9 @@ class OrderRouter:
         # OKX returns an ord_id immediately; fill status arrives on the next
         # poll. We mark it PENDING → the monitor flips it to FILLED later.
 
-        # 3. Algo. If it fails, the position is live and unprotected.
+        # 3. Algo(s). Partial mode places two OCOs; single mode places one.
         try:
-            algo = self.client.place_oco_algo(
-                inst_id=inst,
-                pos_side=pos_side,
-                size_contracts=plan.num_contracts,
-                sl_trigger_px=plan.sl_price,
-                tp_trigger_px=plan.tp_price,
-                td_mode=self.config.margin_mode,
-            )
+            algos = self._place_algos(inst, plan, pos_side)
         except Exception as exc:
             if self.config.close_on_algo_failure:
                 try:
@@ -108,11 +110,56 @@ class OrderRouter:
 
         return ExecutionReport(
             entry=entry,
-            algo=algo,
+            algos=algos,
             state=PositionState.OPEN,
             leverage_set=leverage_set,
             plan_reason=plan.reason,
         )
+
+    # ── Internal helpers ────────────────────────────────────────────────────
+
+    def _place_algos(
+        self, inst: str, plan: TradePlan, pos_side: str,
+    ) -> list[AlgoResult]:
+        """Place 1 or 2 OCOs depending on partial TP config.
+
+        Partial mode splits `plan.num_contracts` into `size1 + size2` where
+        `size1 = int(num_contracts * partial_tp_ratio)` and `size2 = remainder`.
+        If either split would be 0 (e.g. `num_contracts == 1`), we fall back
+        to a single algo on the full size.
+        """
+        cfg = self.config
+        sign = 1 if plan.direction == Direction.BULLISH else -1
+        sl_dist = abs(plan.entry_price - plan.sl_price)
+
+        if cfg.partial_tp_enabled:
+            size1 = int(plan.num_contracts * cfg.partial_tp_ratio)
+            size2 = plan.num_contracts - size1
+            if size1 > 0 and size2 > 0:
+                tp1 = plan.entry_price + sl_dist * cfg.partial_tp_rr * sign
+                algo1 = self.client.place_oco_algo(
+                    inst_id=inst, pos_side=pos_side, size_contracts=size1,
+                    sl_trigger_px=plan.sl_price, tp_trigger_px=tp1,
+                    td_mode=cfg.margin_mode,
+                )
+                algo2 = self.client.place_oco_algo(
+                    inst_id=inst, pos_side=pos_side, size_contracts=size2,
+                    sl_trigger_px=plan.sl_price, tp_trigger_px=plan.tp_price,
+                    td_mode=cfg.margin_mode,
+                )
+                return [algo1, algo2]
+            # Contract count too small to split — fall through to single algo.
+            logger.info(
+                "partial_tp_fallback_to_single contracts={} ratio={}",
+                plan.num_contracts, cfg.partial_tp_ratio,
+            )
+
+        algo = self.client.place_oco_algo(
+            inst_id=inst, pos_side=pos_side, size_contracts=plan.num_contracts,
+            sl_trigger_px=plan.sl_price, tp_trigger_px=plan.tp_price,
+            td_mode=cfg.margin_mode,
+        )
+        return [algo]
 
 
 # ── Dry-run helper ──────────────────────────────────────────────────────────
@@ -132,7 +179,6 @@ def dry_run_report(plan: TradePlan, config: RouterConfig | None = None) -> Execu
         filled_sz=float(plan.num_contracts),
         avg_price=plan.entry_price,
     )
-    from src.execution.models import AlgoResult  # local import to avoid cycle noise
     fake_algo = AlgoResult(
         algo_id="DRYRUN",
         client_algo_id="DRYRUN",
@@ -140,7 +186,7 @@ def dry_run_report(plan: TradePlan, config: RouterConfig | None = None) -> Execu
         tp_trigger_px=plan.tp_price,
     )
     return ExecutionReport(
-        entry=fake_entry, algo=fake_algo,
+        entry=fake_entry, algos=[fake_algo],
         state=PositionState.OPEN, leverage_set=True,
         plan_reason=plan.reason,
     )

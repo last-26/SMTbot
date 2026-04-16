@@ -57,18 +57,28 @@ class AlgoResult:
 class ExecutionReport:
     """Everything a TradePlan produced on the exchange.
 
-    This is what the journal (Phase 5) will persist and what the caller
-    uses to move the RiskManager from "planned" to "opened".
+    `algos` is the canonical list of algo orders attached to the position —
+    1 entry in single-TP mode, 2 entries in partial-TP mode (TP1/TP2).
+    `algo` is kept as a convenience property that returns the first algo
+    (back-compat for every caller written before Madde E).
     """
     entry: OrderResult
-    algo: Optional[AlgoResult]
-    state: PositionState
-    leverage_set: bool
+    algo: Optional[AlgoResult] = None
+    state: PositionState = PositionState.OPEN
+    leverage_set: bool = True
     plan_reason: str = ""
+    algos: list[AlgoResult] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        # Normalize so both `algos` and `algo` are populated coherently.
+        if not self.algos and self.algo is not None:
+            self.algos = [self.algo]
+        elif self.algos and self.algo is None:
+            self.algo = self.algos[0]
 
     @property
     def is_protected(self) -> bool:
-        return self.state == PositionState.OPEN and self.algo is not None
+        return self.state == PositionState.OPEN and bool(self.algos)
 
 
 @dataclass

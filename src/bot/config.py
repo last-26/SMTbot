@@ -125,6 +125,21 @@ class JournalConfig(BaseModel):
     db_path: str = "data/trades.db"
 
 
+class ExecutionConfig(BaseModel):
+    """Execution-layer knobs (partial TP + SL-to-BE in Madde E, plus the
+    LTF defensive-close flags added in Madde F)."""
+    partial_tp_enabled: bool = False
+    partial_tp_ratio: float = 0.5
+    partial_tp_rr: float = 1.5
+    move_sl_to_be_after_tp1: bool = True
+    trail_after_partial: bool = False
+    # Madde F — LTF reversal defensive close (wired in Commit 6).
+    ltf_reversal_close_enabled: bool = False
+    ltf_reversal_min_confluence: int = 3
+    ltf_reversal_min_bars_in_position: int = 2
+    ltf_reversal_signal_max_age: int = 3
+
+
 class ReentryConfig(BaseModel):
     """Per-side reentry gate (Madde C).
 
@@ -164,6 +179,7 @@ class BotConfig(BaseModel):
     okx: OKXConfigBlock
     journal: JournalConfig = Field(default_factory=JournalConfig)
     reentry: ReentryConfig = Field(default_factory=ReentryConfig)
+    execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
 
     @field_validator("okx")
     @classmethod
