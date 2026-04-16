@@ -72,6 +72,16 @@ def _parse_float(s: str) -> Optional[float]:
         return None
 
 
+def _parse_int(s: Optional[str]) -> Optional[int]:
+    """Parse an int from string, return None on failure / missing."""
+    if s is None:
+        return None
+    try:
+        return int(float(s.strip().replace(",", "")))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
 def _parse_float_list(s: str) -> list[float]:
     """Parse comma-separated floats like '70200,70350'."""
     if not s or s.strip() in ("", "—", "-", "none"):
@@ -182,6 +192,7 @@ def _build_signal_data(kv: dict[str, str]) -> SignalTableData:
         confluence=confluence,
         atr_14=_parse_float(kv.get("atr_14", "0")) or 0.0,
         price=_parse_float(kv.get("price", "0")) or 0.0,
+        last_bar=_parse_int(kv.get("last_bar")),
     )
 
 

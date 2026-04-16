@@ -114,6 +114,10 @@ class SignalTableData(BaseModel):
     confluence: int = 0  # 0-7 with VMC Cipher A
     atr_14: float = 0.0
     price: float = 0.0
+    last_bar: Optional[int] = None  # bar_index of last Pine update — used
+                                    # by the runner's freshness-poll to
+                                    # detect when a symbol / timeframe
+                                    # switch has settled on the chart.
 
 
 class OscillatorTableData(BaseModel):

@@ -23,15 +23,18 @@ monitor.register_open, okx_client.enrich_close_fill / get_positions).
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from loguru import logger
 
+from src.analysis.support_resistance import detect_sr_zones
 from src.bot.config import BotConfig
 from src.bot.lifecycle import install_shutdown_handlers
 from src.data.candle_buffer import MultiTFBuffer
+from src.data.ltf_reader import LTFReader, LTFState
 from src.data.models import Direction, MarketState, Session
 from src.data.structured_reader import StructuredReader
 from src.data.tv_bridge import TVBridge, okx_to_tv_symbol
@@ -116,7 +119,12 @@ class BotContext:
     okx_client: Any            # `.enrich_close_fill`, `.get_positions`
     config: BotConfig
     bridge: Any = None         # `.set_symbol`, `.set_timeframe` (async) — optional in tests
+    ltf_reader: Any = None     # LTFReader — optional (fakes skip it)
     open_trade_ids: dict[tuple[str, str], str] = field(default_factory=dict)
+    # HTF S/R zones cached per-symbol after the HTF pass (Madde B → D)
+    htf_sr_cache: dict[str, list] = field(default_factory=dict)
+    # Latest LTF snapshot per-symbol (Madde B → F)
+    ltf_cache: dict[str, LTFState] = field(default_factory=dict)
 
 
 # ── Runner ──────────────────────────────────────────────────────────────────
@@ -162,6 +170,7 @@ class BotRunner:
     ) -> "BotRunner":
         bridge = TVBridge()
         reader = StructuredReader(bridge)
+        ltf_reader = LTFReader(bridge, reader)
         multi_tf = MultiTFBuffer(bridge, max_size=cfg.analysis.candle_buffer_size)
         client = OKXClient(cfg.to_okx_credentials())
         router_cfg = RouterConfig(inst_id=cfg.primary_symbol())
@@ -173,6 +182,7 @@ class BotRunner:
             reader=reader, multi_tf=multi_tf, journal=journal,
             router=router, monitor=monitor, risk_mgr=risk_mgr,
             okx_client=client, config=cfg, bridge=bridge,
+            ltf_reader=ltf_reader,
         )
         return cls(ctx, stop_after_closed_trades=stop_after_closed_trades)
 
@@ -230,6 +240,54 @@ class BotRunner:
                 logger.exception("symbol_cycle_failed symbol={}", symbol)
                 continue
 
+    async def _wait_for_pine_settle(self) -> bool:
+        """Poll the signal table until `last_bar` changes, meaning Pine has
+        re-rendered for the new symbol / timeframe. Returns True on change.
+
+        Fallbacks:
+          * First readable `last_bar == None` → Pine version doesn't emit
+            the field (or we're in a unit test with a fake reader). The
+            static `tf_settle_seconds` sleep is assumed sufficient; return
+            True immediately so the caller keeps going.
+          * Timeout → False (caller skips the symbol cycle).
+        """
+        cfg = self.ctx.config.trading
+        deadline = time.monotonic() + cfg.pine_settle_max_wait_s
+        baseline: Optional[int] = None
+        first_read = True
+        while time.monotonic() < deadline:
+            try:
+                state = await self.ctx.reader.read_market_state()
+                lb = state.signal_table.last_bar if state.signal_table else None
+                if first_read and lb is None:
+                    return True  # Pine doesn't emit last_bar on this chart
+                first_read = False
+                if lb is not None:
+                    if baseline is None:
+                        baseline = lb
+                    elif lb != baseline:
+                        return True
+            except Exception:
+                pass
+            await asyncio.sleep(cfg.pine_settle_poll_interval_s)
+        return False
+
+    async def _switch_timeframe(self, tf: str) -> bool:
+        """Switch chart TF, sleep the static settle, then freshness-poll.
+
+        Returns True when Pine data reflects the new TF. False on timeout
+        or bridge failure — caller skips the current symbol cycle.
+        """
+        if self.ctx.bridge is None:
+            return True            # tests skip — reader fake already correct
+        try:
+            await self.ctx.bridge.set_timeframe(tf)
+        except Exception:
+            logger.exception("set_timeframe_failed tf={}", tf)
+            return False
+        await asyncio.sleep(self.ctx.config.trading.tf_settle_seconds)
+        return await self._wait_for_pine_settle()
+
     async def _run_one_symbol(self, symbol: str) -> None:
         cfg = self.ctx.config
 
@@ -243,7 +301,52 @@ class BotRunner:
                 logger.exception("set_symbol_failed symbol={}", symbol)
                 return
 
-        # 2. Market data — tolerate TV bridge failures, just skip the symbol.
+        # 2a. HTF pass — switch TF, read S/R from HTF candles, cache.
+        if self.ctx.bridge is not None:
+            htf_ok = await self._switch_timeframe(cfg.trading.htf_timeframe)
+            if not htf_ok:
+                logger.warning("htf_settle_timeout symbol={} — skipping symbol",
+                               symbol)
+                return
+        try:
+            htf_key = _timeframe_key(cfg.trading.htf_timeframe)
+            await self.ctx.multi_tf.refresh(htf_key, count=200)
+            htf_buf = self.ctx.multi_tf.get_buffer(htf_key)
+            htf_candles = htf_buf.last(200) if htf_buf is not None else []
+            if htf_candles:
+                self.ctx.htf_sr_cache[symbol] = detect_sr_zones(
+                    htf_candles,
+                    min_touches=cfg.analysis.sr_min_touches,
+                    zone_atr_mult=cfg.analysis.sr_zone_atr_mult,
+                )
+            else:
+                self.ctx.htf_sr_cache.pop(symbol, None)
+        except Exception:
+            logger.exception("htf_refresh_failed symbol={}", symbol)
+            self.ctx.htf_sr_cache.pop(symbol, None)
+
+        # 2b. LTF pass — read oscillator into LTFState, cache for Madde F.
+        if self.ctx.bridge is not None and self.ctx.ltf_reader is not None:
+            ltf_ok = await self._switch_timeframe(cfg.trading.ltf_timeframe)
+            if not ltf_ok:
+                logger.info("ltf_settle_timeout symbol={} — entry path continues "
+                            "without LTF signal", symbol)
+                self.ctx.ltf_cache.pop(symbol, None)
+            else:
+                try:
+                    self.ctx.ltf_cache[symbol] = await self.ctx.ltf_reader.read(
+                        symbol, cfg.trading.ltf_timeframe)
+                except Exception:
+                    logger.exception("ltf_read_failed symbol={}", symbol)
+                    self.ctx.ltf_cache.pop(symbol, None)
+
+        # 2c. Entry TF pass — switch + settle + read the entry state.
+        if self.ctx.bridge is not None:
+            entry_ok = await self._switch_timeframe(cfg.trading.entry_timeframe)
+            if not entry_ok:
+                logger.warning("entry_settle_timeout symbol={} — skipping",
+                               symbol)
+                return
         try:
             state = await self.ctx.reader.read_market_state()
             tf_key = _timeframe_key(cfg.trading.entry_timeframe)
