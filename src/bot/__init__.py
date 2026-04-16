@@ -8,5 +8,6 @@ merges `.env` secrets into the YAML config tree and validates the result.
 from __future__ import annotations
 
 from src.bot.config import BotConfig, load_config
+from src.bot.runner import BotContext, BotRunner
 
-__all__ = ["BotConfig", "load_config"]
+__all__ = ["BotConfig", "load_config", "BotContext", "BotRunner"]
