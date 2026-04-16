@@ -101,8 +101,8 @@ References: `pine/vmc_a.txt`, `pine/vmc_b.txt` (original VMC source). Standalone
 |---|---|---|
 | 1. Pine + Data Bridge | ✅ Complete | SMT Overlay + Oscillator running on TV. Python bridge reads tables + drawings into unified `MarketState`. |
 | 2. Analysis Engine | ✅ Complete | 7 modules under `src/analysis/`, 97 passing tests. |
-| 3. Strategy Engine (R:R) | 🔜 Next | `src/strategy/`: `rr_system.py`, `entry_signals.py`, `position_sizer.py`, `risk_manager.py`, `trade_plan.py`. |
-| 4. Execution (OKX) | Planned | `src/execution/`: order lifecycle via OKX SDK or MCP. |
+| 3. Strategy Engine (R:R) | ✅ Complete | 5 modules under `src/strategy/`, 67 new tests (164 total). See below. |
+| 4. Execution (OKX) | 🔜 Next | `src/execution/`: order lifecycle via OKX SDK or MCP. |
 | 5. Trade Journal | Planned | SQLite + Pydantic models + reporter. |
 | 6. RL parameter tuner | Planned | PPO via Stable Baselines3, walk-forward validated. |
 
@@ -149,43 +149,38 @@ Validation: `scripts/test_market_state.py` (supports `--poll N`).
 
 **Tests:** 97 passing across 7 files. Run: `.venv/Scripts/python.exe -m pytest tests/ -v`.
 
-## Phase 3 — Strategy engine (R:R system)
+### Phase 3 — Completed (2026-04-16)
 
-### Core math (`src/strategy/rr_system.py`)
+5 modules under `src/strategy/` — pure, synchronous, 67 new tests (164 total).
 
-```python
-def calculate_trade_plan(
-    direction, entry_price, sl_price,
-    account_balance, risk_pct, rr_ratio, max_leverage
-) -> TradePlan
-```
+| Module | Purpose | Key APIs |
+|---|---|---|
+| `trade_plan.py` | Sized trade dataclass | `TradePlan` |
+| `rr_system.py` | R:R math core | `calculate_trade_plan()`, `break_even_win_rate()`, `expected_value_r()` |
+| `position_sizer.py` | SL placement helpers | `sl_from_order_block/fvg/swing/atr()`, `recent_swing_price()` |
+| `entry_signals.py` | Orchestration pipeline | `generate_entry_intent()`, `build_trade_plan_from_state()`, `select_sl_price()` |
+| `risk_manager.py` | Circuit breakers | `RiskManager`, `CircuitBreakerConfig`, `TradeResult` |
 
-Logic:
-- `risk_amount = account_balance * risk_pct`
-- `sl_distance = abs(entry - sl)`, `sl_pct = sl_distance / entry`
-- `tp = entry ± sl_distance * rr_ratio` (sign depends on direction)
-- `position_size_usdt = risk_amount / sl_pct`
-- `required_leverage = position_size_usdt / account_balance`
-- `leverage = min(round(required_leverage), max_leverage)`
-- If capped at max_leverage: shrink position so risk stays bounded
-- OKX BTC-USDT-SWAP: 1 contract = 0.01 BTC, so `num_contracts = int(position_size_usdt / (0.01 * entry))`
+**Core R:R math:**
+- `risk_amount = balance * risk_pct`; `sl_pct = |entry - sl| / entry`
+- `tp = entry ± sl_distance * rr_ratio`
+- `ideal_notional = risk_amount / sl_pct`; `required_leverage = ideal / balance`
+- Leverage capped at `max_leverage`; when capped, notional SHRINKS so risk stays bounded.
+- OKX contracts: `num_contracts = int(notional // (contract_size * entry))` (round down). Actual risk re-derived from rounded contracts.
 
 **Break-even win rates:** 1:1 → 50%, 1:2 → 33.3%, 1:3 → 25%, 1:4 → 20%.
 
-**Dynamic leverage rule (NEVER fixed):** tight SL (0.3%) → ~15-20x, wide SL (2%) → ~3-5x. USDT risk stays constant.
+**SL selection priority** (`select_sl_price`): Pine OB → Pine FVG → Python OB → Python FVG → swing lookback → ATR fallback. All pushed past the level by `buffer_mult * ATR` (default 0.2).
 
-**SL placement:** below OB/FVG/swing-low (LONG) or above (SHORT). Buffer: `ATR(14) * 0.2` beyond invalidation. Avoid round numbers (manipulation targets).
+**Circuit breakers** (non-negotiable, ordered):
+- Drawdown from peak ≥ `max_drawdown_pct` → permanent halt (manual restart). Checked first.
+- Cooldown halt (`halted_until`) blocks until timestamp.
+- Daily realized loss ≥ `max_daily_loss_pct` → halt for `cooldown_hours`.
+- Consecutive losses ≥ `max_consecutive_losses` → halt for `cooldown_hours`.
+- Open positions ≥ `max_concurrent_positions` → block new entries.
+- Plan-level: leverage ≤ `max_leverage`, `rr_ratio ≥ min_rr_ratio`, `num_contracts > 0`.
 
-### Circuit breakers (non-negotiable)
-```yaml
-max_daily_loss_pct: 3.0          # Stop trading 24h
-max_consecutive_losses: 5         # Stop + alert
-max_drawdown_from_peak_pct: 10.0  # Full stop, manual restart
-max_concurrent_positions: 2
-max_leverage: 20
-min_rr_ratio: 2.0
-no_trade_before_news: true
-```
+`RiskManager` is pure state + records; no DB. Journal (Phase 5) will replay trades to rebuild it on startup.
 
 ## Phase 4 — Execution via OKX
 
