@@ -953,6 +953,78 @@ Phase 1 (Infrastructure + Pine Script data layer) is fully complete:
 - Python data bridge reads both tables + all drawing objects into a unified `MarketState`
 - Two-indicator architecture provides both PA analysis (overlay) and momentum/divergence data (oscillator)
 
+#### Phase 2: Analysis Engine (2026-04-16)
+
+Phase 2 (Python-side analysis engine) is complete. Seven modules under
+`src/analysis/` build on top of the `MarketState` provided by Phase 1.6 and
+the raw candle buffer provided by `src.data.candle_buffer`. All modules are
+pure functions on dataclasses — no I/O, no async — so they are fast to run
+and trivial to unit-test.
+
+| Module | File | Purpose | Key APIs |
+|---|---|---|---|
+| Candlestick patterns | `src/analysis/price_action.py` | Single / two / three-candle pattern recognition | `detect_all_patterns()`, `has_entry_pattern()`, `CandlePattern` |
+| Market structure | `src/analysis/market_structure.py` | Swing detection, HH/HL/LH/LL, BOS, CHoCH, MSS | `analyze_structure()`, `find_swing_points()`, `detect_structure_events()`, `MarketStructure` |
+| Fair Value Gaps | `src/analysis/fvg.py` | Python-side FVG detection + mitigation tracking (supplements Pine) | `detect_fvgs()`, `active_fvgs()`, `nearest_fvg()`, `price_in_fvg()` |
+| Order Blocks | `src/analysis/order_blocks.py` | Python-side OB detection with impulse threshold | `detect_order_blocks()`, `active_order_blocks()`, `price_in_order_block()` |
+| Liquidity | `src/analysis/liquidity.py` | Equal highs/lows clustering + sweep detection | `analyze_liquidity()`, `find_equal_highs/lows()`, `detect_sweeps()`, `liquidity_above/below()` |
+| Support/Resistance | `src/analysis/support_resistance.py` | ATR-scaled S/R zone clustering with touch+recency scoring | `detect_sr_zones()`, `at_key_level()`, `nearest_zone()`, `zones_above/below()` |
+| Multi-timeframe confluence | `src/analysis/multi_timeframe.py` | **Capstone** — combines every signal into a single numeric score | `calculate_confluence()`, `score_direction()`, `ConfluenceScore`, `ConfluenceFactor` |
+
+**Patterns detected** (price_action):
+- Single-candle: doji, hammer, shooting star, pin bar
+- Two-candle: bullish/bearish engulfing, inside bar
+- Three-candle: morning star, evening star
+
+**Confluence factors** (multi_timeframe, each independently weighted):
+`htf_trend_alignment`, `mss_alignment`, `at_order_block`, `at_fvg`,
+`at_sr_zone`, `recent_sweep`, `ltf_pattern`, `oscillator_momentum`,
+`oscillator_signal`, `vmc_ribbon`, `session_filter`. The OB/FVG factors
+accept either a Pine-derived signal (from `MarketState.signal_table`) or
+a Python-recomputed zone — whichever the caller provides. Default
+weights in `DEFAULT_WEIGHTS` can be overridden per-call; the RL agent
+(Phase 6) will tune them automatically.
+
+**Design decisions:**
+- Pine Script remains primary source of truth. Python modules supplement
+  it (HTF analysis without chart switch, belt-and-suspenders cross-checks,
+  unit testability).
+- All detectors return dataclasses with price levels, direction, status,
+  and optional metadata — ready for journaling in Phase 5.
+- S/R zones use ATR-scaled band width (not fixed %) so the module works
+  identically on BTC, ETH, or any other instrument without retuning.
+- Sweep→reversal direction mapping is explicit: a bearish sweep (swept
+  highs) produces a BULLISH confluence factor (reversal logic).
+
+**Testing:** 97 tests across 7 test files, all passing.
+```
+tests/test_price_action.py ........ 19 passed
+tests/test_market_structure.py .... 11 passed
+tests/test_fvg.py ................. 12 passed
+tests/test_order_blocks.py ........ 11 passed
+tests/test_liquidity.py ........... 11 passed
+tests/test_support_resistance.py .. 12 passed
+tests/test_multi_timeframe.py ..... 21 passed
+```
+
+Run with: `.venv/Scripts/python.exe -m pytest tests/ -v`
+
+### Phase 2 Complete
+
+Phase 2 (Analysis Engine) is fully complete. The bot can now:
+- Classify market structure (trend + HH/HL/LH/LL + BOS/CHoCH/MSS) from
+  any candle buffer independently of Pine Script.
+- Detect every candlestick pattern in the CLAUDE.md Phase 2 spec.
+- Locate FVG / OB / liquidity / S/R zones on arbitrary timeframes.
+- Score a candidate trade direction by summing independent confluence
+  factors, with the breakdown preserved for later journaling.
+
 ### Next Up
 
-**Phase 2: Analysis Engine** — Python-side confluence scoring, candlestick pattern detection, multi-timeframe logic. Build on top of the MarketState that Phase 1.6 provides.
+**Phase 3: Strategy Engine (R:R System)** — build `src/strategy/` with:
+- `rr_system.py`: core `calculate_trade_plan()` from CLAUDE.md (dynamic
+  leverage, position sizing, SL/TP)
+- `entry_signals.py`: signal generator that consumes `ConfluenceScore`
+  and produces `TradePlan`s
+- `position_sizer.py`, `risk_manager.py` (circuit breakers),
+  `trade_plan.py` (data structure)
