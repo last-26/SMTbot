@@ -26,6 +26,26 @@ from src.bot.config import load_config
 from src.bot.runner import BotRunner
 
 
+def _configure_logging() -> None:
+    """Stderr keeps ANSI colors for the terminal; the on-disk sink is plain
+    text so `tail -f logs/bot.log` stays readable on any shell (default
+    loguru leaks escape codes into the file on Windows)."""
+    logger.remove()
+    logger.add(sys.stderr, colorize=True, level="INFO",
+               backtrace=False, diagnose=False)
+    Path("logs").mkdir(exist_ok=True)
+    logger.add(
+        "logs/bot.log",
+        colorize=False,
+        enqueue=True,
+        rotation="50 MB",
+        retention=10,
+        level="INFO",
+        backtrace=False,
+        diagnose=False,
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m src.bot")
     p.add_argument("--config", default="config/default.yaml",
@@ -48,6 +68,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_logging()
     args = _parser().parse_args(argv)
 
     cfg_path = Path(args.config)

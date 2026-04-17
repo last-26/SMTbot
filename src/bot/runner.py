@@ -31,6 +31,7 @@ from typing import Any, Optional
 from loguru import logger
 
 from src.analysis.liquidity_heatmap import build_heatmap
+from src.analysis.multi_timeframe import calculate_confluence
 from src.analysis.support_resistance import detect_sr_zones
 from src.bot.config import BotConfig
 from src.bot.lifecycle import install_shutdown_handlers
@@ -641,6 +642,7 @@ class BotRunner:
 
     async def _run_one_symbol(self, symbol: str) -> None:
         cfg = self.ctx.config
+        logger.info("symbol_cycle_start symbol={}", symbol)
 
         # 1. Switch the TV chart to this symbol (production has a bridge;
         # tests pass bridge=None and the reader fake already knows the symbol).
@@ -781,13 +783,42 @@ class BotRunner:
                 htf_sr_buffer_atr=cfg.analysis.htf_sr_buffer_atr,
                 crowded_skip_enabled=cfg.derivatives.crowded_skip_enabled,
                 crowded_skip_z_threshold=cfg.derivatives.crowded_skip_z_threshold,
+                ltf_state=self.ctx.ltf_cache.get(symbol),
             )
         except Exception:
             logger.exception("plan_build_failed symbol={}", symbol)
             return
 
         if plan is None:
+            # Decision visibility: log why we passed so the operator can watch
+            # live cycles and understand why SOL/ETH didn't trigger.
+            try:
+                conf = calculate_confluence(
+                    state,
+                    ltf_candles=candles,
+                    allowed_sessions=cfg.allowed_sessions() or None,
+                    ltf_state=self.ctx.ltf_cache.get(symbol),
+                )
+                logger.info(
+                    "symbol_decision symbol={} NO_TRADE price={:.4f} "
+                    "session={} direction={} confluence={:.2f}/{} factors={}",
+                    symbol, float(state.current_price or 0.0),
+                    getattr(state.active_session, "value", "NONE"),
+                    getattr(conf.direction, "value", "UNDEFINED"),
+                    conf.score, cfg.analysis.min_confluence_score,
+                    ",".join(conf.factor_names) or "-",
+                )
+            except Exception:
+                logger.debug("no_trade_log_failed symbol={}", symbol)
             return
+
+        logger.info(
+            "symbol_decision symbol={} PLANNED direction={} entry={:.4f} "
+            "sl={:.4f} tp={:.4f} rr={:.2f} confluence={:.2f} factors={}",
+            symbol, plan.direction.value, plan.entry_price, plan.sl_price,
+            plan.tp_price, plan.rr_ratio, plan.confluence_score,
+            ",".join(plan.confluence_factors) or "-",
+        )
 
         # Reentry gate (Madde C): per-side cooldown + ATR move + quality.
         gate_side = _direction_to_pos_side(plan.direction)

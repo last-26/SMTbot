@@ -79,6 +79,10 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "oscillator_signal": 0.5,
     "vmc_ribbon": 0.5,
     "session_filter": 0.25,
+    # LTF momentum confirmation: full weight when the LTF trend agrees with
+    # the candidate direction, partial weight when the last LTF signal is
+    # fresh and agrees. Keeps it a single principled slot, not stacked.
+    "ltf_momentum_alignment": 0.5,
     # Derivatives (Phase 1.5 Madde 6) — at most one of these three fires per
     # cycle; the elif chain in score_direction enforces that.
     "derivatives_contrarian": 0.7,
@@ -163,6 +167,7 @@ def score_direction(
     sr_zones: Optional[list[SRZone]] = None,
     weights: Optional[dict[str, float]] = None,
     allowed_sessions: Optional[list[Session]] = None,
+    ltf_state: Optional[object] = None,
 ) -> ConfluenceScore:
     """Compute a confluence score for `direction` from the current market state.
 
@@ -323,7 +328,35 @@ def score_direction(
             detail=state.active_session.value,
         ))
 
-    # 12. Derivatives (Phase 1.5 Madde 6) — one slot max per cycle.
+    # 12. LTF momentum alignment — reversal moves often kick off on the LTF
+    # before the entry TF catches them. Full weight when LTF trend matches,
+    # partial when the most recent LTF signal (≤3 bars old) points that way.
+    if ltf_state is not None:
+        ltf_trend = getattr(ltf_state, "trend", None)
+        if ltf_trend == direction:
+            factors.append(ConfluenceFactor(
+                name="ltf_momentum_alignment",
+                weight=w["ltf_momentum_alignment"],
+                direction=direction,
+                detail=f"ltf_trend={getattr(ltf_trend, 'value', ltf_trend)}",
+            ))
+        else:
+            sig_raw = (getattr(ltf_state, "last_signal", "") or "").upper()
+            raw_bars = getattr(ltf_state, "last_signal_bars_ago", None)
+            bars_ago = int(raw_bars) if raw_bars is not None else 99
+            fresh = bars_ago <= 3
+            if fresh and (
+                (direction == Direction.BULLISH and "BUY" in sig_raw) or
+                (direction == Direction.BEARISH and "SELL" in sig_raw)
+            ):
+                factors.append(ConfluenceFactor(
+                    name="ltf_momentum_alignment",
+                    weight=w["ltf_momentum_alignment"] * 0.6,
+                    direction=direction,
+                    detail=f"ltf_signal={sig_raw} bars_ago={bars_ago}",
+                ))
+
+    # 13. Derivatives (Phase 1.5 Madde 6) — one slot max per cycle.
     deriv_state = getattr(state, "derivatives", None)
     if deriv_state is not None:
         regime = getattr(deriv_state, "regime", "UNKNOWN")
@@ -380,6 +413,7 @@ def calculate_confluence(
     sr_zones: Optional[list[SRZone]] = None,
     weights: Optional[dict[str, float]] = None,
     allowed_sessions: Optional[list[Session]] = None,
+    ltf_state: Optional[object] = None,
 ) -> ConfluenceScore:
     """Compute confluence for BOTH directions and return the winning side.
 
@@ -394,12 +428,14 @@ def calculate_confluence(
         ltf_candles=ltf_candles, fvgs=fvgs,
         order_blocks=order_blocks, sr_zones=sr_zones,
         weights=weights, allowed_sessions=allowed_sessions,
+        ltf_state=ltf_state,
     )
     bear = score_direction(
         state, Direction.BEARISH,
         ltf_candles=ltf_candles, fvgs=fvgs,
         order_blocks=order_blocks, sr_zones=sr_zones,
         weights=weights, allowed_sessions=allowed_sessions,
+        ltf_state=ltf_state,
     )
 
     if bull.score == 0 and bear.score == 0:

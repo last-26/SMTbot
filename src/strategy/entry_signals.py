@@ -251,6 +251,7 @@ def generate_entry_intent(
     sl_buffer_mult: float = 0.2,
     swing_lookback: int = 20,
     atr_fallback_mult: float = 2.0,
+    ltf_state: Optional[object] = None,
 ) -> Optional[EntryIntent]:
     """Compute confluence + pick an SL. Returns None when not tradable."""
     if state.current_price <= 0:
@@ -264,6 +265,7 @@ def generate_entry_intent(
         sr_zones=sr_zones,
         weights=weights,
         allowed_sessions=allowed_sessions,
+        ltf_state=ltf_state,
     )
     if not confluence.is_tradable(min_confluence_score):
         return None
@@ -342,6 +344,7 @@ def build_trade_plan_from_state(
     htf_sr_buffer_atr: float = 0.2,
     crowded_skip_enabled: bool = False,
     crowded_skip_z_threshold: float = 3.0,
+    ltf_state: Optional[object] = None,
 ) -> Optional[TradePlan]:
     """End-to-end: MarketState → TradePlan. Returns None when no trade.
 
@@ -371,6 +374,7 @@ def build_trade_plan_from_state(
         sl_buffer_mult=sl_buffer_mult,
         swing_lookback=swing_lookback,
         atr_fallback_mult=atr_fallback_mult,
+        ltf_state=ltf_state,
     )
     if intent is None or not intent.is_tradable:
         return None
