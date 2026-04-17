@@ -7,6 +7,9 @@
                         refresh only. Close-poll still fires so live positions
                         resolve. Pairs with --duration for timed data grabs.
   --duration N        : stop gracefully after N seconds (int).
+  --clear-halt        : after journal replay, wipe halt state + reset daily PnL
+                        and consecutive_losses. Use to resume trading after a
+                        circuit-breaker cooldown without waiting for the timer.
 
 Ctrl-C on Windows terminal short-circuits asyncio.run with a
 KeyboardInterrupt, so we catch it here as a reliable backstop to the
@@ -64,6 +67,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--duration", type=int, default=None,
                    help="Stop gracefully after N seconds. Works with or "
                         "without --derivatives-only.")
+    p.add_argument("--clear-halt", action="store_true",
+                   help="After replaying the journal, clear halt state and "
+                        "reset daily_realized_pnl + consecutive_losses so the "
+                        "bot can trade immediately. Use after a circuit-breaker "
+                        "cooldown when you've manually verified positions.")
     return p
 
 
@@ -83,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
         stop_after_closed_trades=args.max_closed_trades,
         derivatives_only=args.derivatives_only,
         duration_seconds=args.duration,
+        clear_halt=args.clear_halt,
     )
 
     try:

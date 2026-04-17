@@ -245,6 +245,7 @@ class BotRunner:
         stop_after_closed_trades: Optional[int] = None,
         derivatives_only: bool = False,
         duration_seconds: Optional[int] = None,
+        clear_halt: bool = False,
     ):
         self.ctx = ctx
         self.shutdown = shutdown or asyncio.Event()
@@ -252,6 +253,9 @@ class BotRunner:
         # Phase 1.5 — data-collection modes.
         self.derivatives_only = derivatives_only
         self.duration_seconds = duration_seconds
+        # Operator override: after _prime() replays the journal, also wipe any
+        # halt state + daily counters that would block the very first tick.
+        self.clear_halt = clear_halt
 
     # ── Construction ────────────────────────────────────────────────────────
 
@@ -264,6 +268,7 @@ class BotRunner:
         stop_after_closed_trades: Optional[int] = None,
         derivatives_only: bool = False,
         duration_seconds: Optional[int] = None,
+        clear_halt: bool = False,
     ) -> "BotRunner":
         bridge = TVBridge()
         reader = StructuredReader(bridge)
@@ -360,6 +365,7 @@ class BotRunner:
             stop_after_closed_trades=stop_after_closed_trades,
             derivatives_only=derivatives_only,
             duration_seconds=duration_seconds,
+            clear_halt=clear_halt,
         )
 
     # ── Entry points ────────────────────────────────────────────────────────
@@ -952,9 +958,32 @@ class BotRunner:
 
     async def _prime(self) -> None:
         await self.ctx.journal.replay_for_risk_manager(self.ctx.risk_mgr)
+        if self.clear_halt:
+            self._apply_clear_halt()
         await self._rehydrate_open_positions()
         await self._reconcile_orphans()
         await self._load_contract_sizes()
+
+    def _apply_clear_halt(self) -> None:
+        """Operator override (--clear-halt): wipe halt + daily counters that
+        the journal replay rebuilt. Without resetting daily_realized_pnl /
+        consecutive_losses the next loss after restart re-trips the same halt
+        immediately, which defeats the purpose of the flag."""
+        rm = self.ctx.risk_mgr
+        prev_until = rm.halted_until
+        prev_reason = rm.halt_reason
+        prev_daily = rm.daily_realized_pnl
+        prev_streak = rm.consecutive_losses
+        rm.clear_halt()
+        rm.daily_realized_pnl = 0.0
+        rm.day_start_balance = rm.current_balance
+        rm.consecutive_losses = 0
+        logger.warning(
+            "clear_halt_applied prev_halt={} prev_reason={!r} "
+            "reset_daily_pnl={:.2f} reset_streak={}",
+            prev_until.isoformat() if prev_until else None,
+            prev_reason, prev_daily, prev_streak,
+        )
 
     async def _load_contract_sizes(self) -> None:
         """Pre-fetch OKX ctVal + max leverage for every configured symbol.
