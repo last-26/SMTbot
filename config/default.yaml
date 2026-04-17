@@ -17,6 +17,13 @@ trading:
   min_rr_ratio: 2.0
   max_concurrent_positions: 3
   contract_size: 0.01
+  # Operator-side per-symbol leverage caps (on top of OKX instrument caps).
+  # Effective ceiling = min(trading.max_leverage, okx_cap, symbol_cap).
+  # ETH demo wicks burn high-leverage positions even when SL discipline holds,
+  # so cap it at 30x regardless of the global 75x. BTC stays wide (tighter
+  # liq behavior, deeper book). SOL inherits the OKX 50x cap automatically.
+  symbol_leverage_caps:
+    ETH-USDT-SWAP: 30
   # Multi-pair settle budgets — wait after set_symbol / set_timeframe so
   # the heavy SMT Overlay Pine has time to recompute before we read.
   symbol_settle_seconds: 4.0

@@ -111,6 +111,47 @@ async def test_max_concurrent_positions_caps_entries(monkeypatch, make_ctx):
     assert fakes.risk_mgr.open_positions == 2
 
 
+async def test_symbol_leverage_caps_reduce_planner_ceiling(monkeypatch, make_ctx):
+    """`trading.symbol_leverage_caps[sym]` is merged with the global cap and
+    the OKX-fetched per-instrument cap — builder receives the minimum.
+    """
+    captured: dict[str, int] = {}
+
+    def _stub(*a, **kw):
+        # Record the max_leverage actually seen by the planner keyed by symbol.
+        # The runner passes a MarketState positionally; SignalTableData carries
+        # nothing we can key on here, so we fall back to round-robin tracking.
+        captured.setdefault("values", []).append(kw.get("max_leverage"))
+        return None, "below_confluence"
+
+    monkeypatch.setattr("src.bot.runner.build_trade_plan_with_reason", _stub)
+
+    syms = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
+    cfg = make_config(
+        symbols=syms, symbol_settle_seconds=0.0,
+        tf_settle_seconds=0.0, pine_settle_max_wait_s=0.1,
+        pine_settle_poll_interval_s=0.01, max_leverage=75,
+        symbol_leverage_caps={"ETH-USDT-SWAP": 30},
+    )
+    bridge = _RecordingBridge()
+    ctx, fakes = make_ctx(config=cfg)
+    ctx.bridge = bridge
+    # Simulate OKX-fetched per-instrument caps (BTC=100, ETH=100 — both loose).
+    ctx.max_leverage_per_symbol = {"BTC-USDT-SWAP": 100, "ETH-USDT-SWAP": 100}
+
+    runner = BotRunner(ctx)
+    async with ctx.journal:
+        await runner.run_once()
+
+    values = captured.get("values", [])
+    # Each symbol should get one planner call. Cap order follows symbol order.
+    assert len(values) >= 2
+    # BTC: min(75 global, 100 okx, 75 fallback dict-default) = 75
+    assert values[0] == 75
+    # ETH: min(75 global, 100 okx, 30 yaml cap) = 30
+    assert values[1] == 30
+
+
 async def test_legacy_symbol_config_backward_compat():
     """Old single-symbol YAML still loads and emits DeprecationWarning."""
     raw = {

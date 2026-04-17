@@ -820,6 +820,8 @@ class BotRunner:
                     cfg.trading.max_leverage,
                     self.ctx.max_leverage_per_symbol.get(
                         symbol, cfg.trading.max_leverage),
+                    cfg.trading.symbol_leverage_caps.get(
+                        symbol, cfg.trading.max_leverage),
                 ),
                 contract_size=self.ctx.contract_sizes.get(
                     symbol, cfg.trading.contract_size),

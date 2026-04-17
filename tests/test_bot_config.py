@@ -111,3 +111,32 @@ def test_breakers_pulls_caps_from_trading_section():
     assert cb.max_concurrent_positions == 2
     assert cb.max_leverage == 20
     assert cb.min_rr_ratio == 2.0
+
+
+def test_symbol_leverage_caps_default_empty():
+    """Omitting `trading.symbol_leverage_caps` falls back to an empty dict."""
+    cfg = BotConfig(**_valid_raw())
+    assert cfg.trading.symbol_leverage_caps == {}
+
+
+def test_symbol_leverage_caps_parsed_from_yaml():
+    raw = _valid_raw()
+    raw["trading"]["symbol_leverage_caps"] = {
+        "ETH-USDT-SWAP": 30,
+        "SOL-USDT-SWAP": 25,
+    }
+    cfg = BotConfig(**raw)
+    assert cfg.trading.symbol_leverage_caps["ETH-USDT-SWAP"] == 30
+    assert cfg.trading.symbol_leverage_caps["SOL-USDT-SWAP"] == 25
+
+
+def test_symbol_leverage_caps_lookup_missing_symbol_returns_default():
+    """Unlisted symbols return the caller's default — the runner merges
+    min(global, okx_cap, ...dict.get(sym, global)) so missing key = no cap."""
+    raw = _valid_raw()
+    raw["trading"]["symbol_leverage_caps"] = {"ETH-USDT-SWAP": 30}
+    cfg = BotConfig(**raw)
+    # BTC not in dict → dict.get returns the default we pass at call site.
+    assert cfg.trading.symbol_leverage_caps.get(
+        "BTC-USDT-SWAP", cfg.trading.max_leverage
+    ) == cfg.trading.max_leverage

@@ -45,6 +45,12 @@ class TradingConfig(BaseModel):
     min_rr_ratio: float
     max_concurrent_positions: int
     contract_size: float = 0.01                   # BTC-USDT-SWAP lot size
+    # Operator-side per-symbol leverage caps — applied on top of OKX's
+    # instrument-level cap (fetched at startup). The effective ceiling is
+    # min(trading.max_leverage, okx_instrument_cap, symbol_leverage_caps[sym]).
+    # Useful when e.g. ETH's OKX cap is 100x but demo wicks make anything
+    # above 30x unsafe. Unlisted symbols fall back to the global max.
+    symbol_leverage_caps: dict[str, int] = Field(default_factory=dict)
     symbol_settle_seconds: float = 4.0            # wait after set_symbol (Madde A/B)
     tf_settle_seconds: float = 2.5                # wait after set_timeframe (Madde B)
     pine_settle_max_wait_s: float = 6.0           # freshness-poll timeout (Madde B)
