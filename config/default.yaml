@@ -260,8 +260,11 @@ rl:
   # change lands (new confluence factor, min_confluence raise, SL logic),
   # so RL never trains on the pre-change regime.
   #
-  # 2026-04-18 — Sprint 3 fresh start. BLOK A (3 new confluence factors) +
-  # BLOK B (min_conf 3.0 + per-symbol session/swing/HTF overrides) landed
-  # on main. Demo balance reset to $5k, $50 R per trade. 35 pre-reset trades
-  # stay in DB for regime comparison; reporter sees only post-cutoff rows.
-  clean_since: "2026-04-18T00:00:00Z"
+  # 2026-04-17T23:50Z — Sprint 3 fresh start. BLOK A (3 new confluence
+  # factors) + BLOK B (min_conf 3.0 + per-symbol session/swing/HTF overrides)
+  # landed on main. Demo balance reset to $5k, $50 R per trade. 35 pre-reset
+  # trades + 4 CANCELED-manual rows (pre-reset open positions) stay in DB
+  # for regime comparison; reporter sees only post-cutoff rows. Cutoff set
+  # just before operator's bot restart so the first post-restart cycle is
+  # the first row reporter counts.
+  clean_since: "2026-04-17T23:50:00Z"
