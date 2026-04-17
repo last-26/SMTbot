@@ -157,6 +157,11 @@ class AnalysisConfig(BaseModel):
     # Phase 6.9 A2 — max distance (× ATR) to nearest Pine liquidity pool for
     # liquidity_pool_target to fire. 3×ATR ≈ reachable within a few 3m bars.
     liquidity_pool_max_atr_dist: float = 3.0
+    # Phase 6.9 A4 — VWAP hard veto. When true, reject entries where price
+    # sits on the wrong side of every available session VWAP (1m/3m/15m) for
+    # the proposed direction. Opt-in; default off to avoid changing behaviour
+    # for back-compat. Enable after A+B validation for liquidity-driven runs.
+    vwap_hard_veto_enabled: bool = False
 
     @field_validator("confluence_weights")
     @classmethod

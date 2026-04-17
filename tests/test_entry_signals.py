@@ -454,3 +454,98 @@ def test_partial_tp_passes_with_splittable_plan():
     size1 = int(plan.num_contracts * 0.5)
     size2 = plan.num_contracts - size1
     assert size1 > 0 and size2 > 0
+
+
+# ── Phase 6.9 A4 — vwap_hard_veto ───────────────────────────────────────────
+
+
+def _state_with_vwaps(
+    *,
+    direction: Direction = Direction.BULLISH,
+    price: float = 100.0,
+    vwaps: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> MarketState:
+    """Bullish-friendly confluence stack with explicit VWAP values."""
+    sig = SignalTableData(
+        trend_htf=direction,
+        last_mss=f"{direction.value}@99" if direction == Direction.BULLISH else f"{direction.value}@101",
+        active_ob="BULL@95-97" if direction == Direction.BULLISH else "BEAR@103-105",
+        vmc_ribbon=direction.value,
+        price=price,
+        atr_14=1.0,
+        vwap_1m=vwaps[0],
+        vwap_3m=vwaps[1],
+        vwap_15m=vwaps[2],
+    )
+    ob = (
+        OrderBlock(direction=Direction.BULLISH, bottom=95.0, top=97.0)
+        if direction == Direction.BULLISH
+        else OrderBlock(direction=Direction.BEARISH, bottom=103.0, top=105.0)
+    )
+    return MarketState(
+        signal_table=sig,
+        oscillator=OscillatorTableData(),
+        order_blocks=[ob],
+        fvg_zones=[],
+    )
+
+
+def test_vwap_hard_veto_rejects_bullish_below_all_vwaps():
+    # Price 100 below all three VWAPs → reject.
+    state = _state_with_vwaps(
+        direction=Direction.BULLISH, price=100.0, vwaps=(101.0, 102.0, 103.0),
+    )
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0, vwap_hard_veto_enabled=True,
+    )
+    assert plan is None
+    assert reason == "vwap_misaligned"
+
+
+def test_vwap_hard_veto_rejects_bearish_above_all_vwaps():
+    state = _state_with_vwaps(
+        direction=Direction.BEARISH, price=100.0, vwaps=(99.0, 98.0, 97.0),
+    )
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0, vwap_hard_veto_enabled=True,
+    )
+    assert plan is None
+    assert reason == "vwap_misaligned"
+
+
+def test_vwap_hard_veto_passes_when_price_above_one_vwap():
+    # Strict semantics: only rejects when price is below ALL vwaps. A single
+    # VWAP below price means the entry survives (weak alignment still wins).
+    state = _state_with_vwaps(
+        direction=Direction.BULLISH, price=100.0, vwaps=(99.5, 102.0, 103.0),
+    )
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0, vwap_hard_veto_enabled=True,
+    )
+    assert plan is not None
+    assert reason == ""
+
+
+def test_vwap_hard_veto_disabled_by_default():
+    # Same misaligned setup as the first test — with the flag off, passes.
+    state = _state_with_vwaps(
+        direction=Direction.BULLISH, price=100.0, vwaps=(101.0, 102.0, 103.0),
+    )
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0,  # vwap_hard_veto_enabled default=False
+    )
+    assert plan is not None
+    assert reason == ""
+
+
+def test_vwap_hard_veto_fail_open_when_all_vwaps_missing():
+    # All VWAPs zero = missing. Enabling the gate must not block trades the
+    # data pipeline couldn't score — the WS might be briefly disconnected.
+    state = _state_with_vwaps(
+        direction=Direction.BULLISH, price=100.0, vwaps=(0.0, 0.0, 0.0),
+    )
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0, vwap_hard_veto_enabled=True,
+    )
+    assert plan is not None
+    assert reason == ""

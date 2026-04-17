@@ -236,6 +236,33 @@ def select_sl_price(
     return sl_from_atr(entry_price, atr, direction, atr_fallback_mult), "atr_fallback"
 
 
+# ── VWAP hard veto (Phase 6.9 A4) ───────────────────────────────────────────
+#
+# The confluence scorer already awards 3 small factors (vwap_{1,3,15}m_alignment)
+# when price sits on the right side of each session-anchored VWAP. But with
+# min_confluence_score=3.0 a trade can still pass after being on the wrong side
+# of every VWAP, since structural factors (MSS/OB/FVG) and sweeps are weighed
+# independently. On a liquidity-driven futures book, entering into a wall of
+# VWAPs is statistically bad — operator can flip this on to hard-reject such
+# trades pre-SL math.
+#
+# Semantics (strict): bullish entry rejected when price < min(available VWAPs);
+# bearish when price > max(...). Missing (0.0) VWAPs are skipped. Requires at
+# least one VWAP to be present, otherwise no-op (fail-open — can't judge).
+
+
+def _vwap_hard_veto(state: MarketState, direction: Direction, price: float) -> bool:
+    sig = state.signal_table
+    vwaps = [v for v in (sig.vwap_1m, sig.vwap_3m, sig.vwap_15m) if v > 0.0]
+    if not vwaps or price <= 0:
+        return False
+    if direction == Direction.BULLISH:
+        return price < min(vwaps)
+    if direction == Direction.BEARISH:
+        return price > max(vwaps)
+    return False
+
+
 # ── Full pipeline ───────────────────────────────────────────────────────────
 
 
@@ -437,6 +464,7 @@ def build_trade_plan_with_reason(
     partial_tp_ratio: float = 0.5,
     min_rsi_mfi_magnitude: float = 2.0,
     liquidity_pool_max_atr_dist: float = 3.0,
+    vwap_hard_veto_enabled: bool = False,
 ) -> tuple[Optional[TradePlan], str]:
     """Same as `build_trade_plan_from_state` but returns `(plan, reason)`.
 
@@ -444,6 +472,8 @@ def build_trade_plan_with_reason(
       - "below_confluence" — confluence score below threshold or direction UNDEFINED
       - "session_filter"   — allowed_sessions excludes current session
       - "no_sl_source"     — intent produced no SL price
+      - "vwap_misaligned"  — vwap_hard_veto_enabled and price on the wrong
+        side of all available session VWAPs for the proposed direction
       - "crowded_skip"     — derivatives crowded-skip gate blocked
       - "zero_contracts"   — contract rounding wiped position to zero
       - "htf_tp_ceiling"   — HTF S/R ceiling squeezed R:R below min_rr_ratio
@@ -492,6 +522,11 @@ def build_trade_plan_with_reason(
         return None, "no_sl_source"
     if not intent.is_tradable:
         return None, "no_sl_source"
+
+    if vwap_hard_veto_enabled and _vwap_hard_veto(
+        state, intent.direction, intent.entry_price,
+    ):
+        return None, "vwap_misaligned"
 
     if _should_skip_for_derivatives(
         getattr(state, "derivatives", None),

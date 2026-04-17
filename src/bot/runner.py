@@ -942,6 +942,7 @@ class BotRunner:
                 partial_tp_ratio=cfg.execution.partial_tp_ratio,
                 min_rsi_mfi_magnitude=cfg.analysis.min_rsi_mfi_magnitude,
                 liquidity_pool_max_atr_dist=cfg.analysis.liquidity_pool_max_atr_dist,
+                vwap_hard_veto_enabled=cfg.analysis.vwap_hard_veto_enabled,
             )
         except Exception:
             logger.exception("plan_build_failed symbol={}", symbol)
