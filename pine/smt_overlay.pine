@@ -1129,12 +1129,16 @@ if enableTable and barstate.islast
     table.cell(sigTable, 1, row, str.tostring(confluenceScore) + "/7", text_color=confCol, text_size=size.small)
     row += 1
 
+    // Precision: "#.########" drops trailing zeros (so BTC 60000 still reads
+    // "60000") while preserving decimals for low-price pairs. With "#.##",
+    // DOGE's ATR (~0.0008) and XRP's ATR (~0.005) round to 0, which short-
+    // circuits select_sl_price with no_sl_source for every cycle.
     table.cell(sigTable, 0, row, "atr_14", text_color=neutCol, text_size=size.small)
-    table.cell(sigTable, 1, row, str.tostring(atrVal, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(sigTable, 1, row, str.tostring(atrVal, "#.########"), text_color=color.white, text_size=size.small)
     row += 1
 
     table.cell(sigTable, 0, row, "price", text_color=neutCol, text_size=size.small)
-    table.cell(sigTable, 1, row, str.tostring(close, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(sigTable, 1, row, str.tostring(close, "#.########"), text_color=color.white, text_size=size.small)
     row += 1
 
     // ─── Multi-TF VWAP block ─────────────────────────────────────────────────
@@ -1148,15 +1152,15 @@ if enableTable and barstate.islast
     vwap15mCol  = na(vwap15m) ? neutCol : (close > vwap15m ? bullCol : bearCol)
 
     table.cell(sigTable, 0, row, "vwap_1m", text_color=neutCol, text_size=size.small)
-    table.cell(sigTable, 1, row, na(vwap1m)  ? "—" : str.tostring(vwap1m,  "#.##") + " (" + vwap1mSide  + ")", text_color=vwap1mCol,  text_size=size.small)
+    table.cell(sigTable, 1, row, na(vwap1m)  ? "—" : str.tostring(vwap1m,  "#.########") + " (" + vwap1mSide  + ")", text_color=vwap1mCol,  text_size=size.small)
     row += 1
 
     table.cell(sigTable, 0, row, "vwap_3m", text_color=neutCol, text_size=size.small)
-    table.cell(sigTable, 1, row, na(vwap3m)  ? "—" : str.tostring(vwap3m,  "#.##") + " (" + vwap3mSide  + ")", text_color=vwap3mCol,  text_size=size.small)
+    table.cell(sigTable, 1, row, na(vwap3m)  ? "—" : str.tostring(vwap3m,  "#.########") + " (" + vwap3mSide  + ")", text_color=vwap3mCol,  text_size=size.small)
     row += 1
 
     table.cell(sigTable, 0, row, "vwap_15m", text_color=neutCol, text_size=size.small)
-    table.cell(sigTable, 1, row, na(vwap15m) ? "—" : str.tostring(vwap15m, "#.##") + " (" + vwap15mSide + ")", text_color=vwap15mCol, text_size=size.small)
+    table.cell(sigTable, 1, row, na(vwap15m) ? "—" : str.tostring(vwap15m, "#.########") + " (" + vwap15mSide + ")", text_color=vwap15mCol, text_size=size.small)
     row += 1
 
     // Sanity marker (must remain LAST row — runner uses it as freshness beacon)
