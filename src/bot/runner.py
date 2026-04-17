@@ -574,6 +574,7 @@ class BotRunner:
         try:
             await asyncio.to_thread(
                 self.ctx.okx_client.close_position, symbol, side,
+                self.ctx.config.execution.margin_mode,
             )
         except Exception:
             logger.exception("defensive_close_failed symbol={} side={}",
