@@ -143,9 +143,11 @@ async def test_defensive_close_idempotent_same_cycle(make_ctx):
 
 
 def _patch_plan_builder(monkeypatch, plan_or_none):
+    reason = "" if plan_or_none is not None else "below_confluence"
+
     def _stub(*a, **kw):
-        return plan_or_none
-    monkeypatch.setattr("src.bot.runner.build_trade_plan_from_state", _stub)
+        return plan_or_none, reason
+    monkeypatch.setattr("src.bot.runner.build_trade_plan_with_reason", _stub)
 
 
 async def test_long_bearish_ltf_fresh_signal_triggers_close(monkeypatch, make_ctx):

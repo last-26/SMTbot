@@ -17,6 +17,7 @@ from src.data.models import (
 )
 from src.strategy.entry_signals import (
     build_trade_plan_from_state,
+    build_trade_plan_with_reason,
     generate_entry_intent,
     select_sl_price,
 )
@@ -208,3 +209,35 @@ def test_pipeline_returns_none_when_contracts_round_to_zero():
         state, account_balance=10.0, max_leverage=20,
     )
     assert plan is None
+
+
+# ── build_trade_plan_with_reason — reject reason strings ───────────────────
+
+
+def test_reason_below_confluence_when_direction_undefined():
+    state = _state(
+        trend_htf=Direction.UNDEFINED, last_mss="", active_ob="", vmc_ribbon="",
+    )
+    plan, reason = build_trade_plan_with_reason(state, account_balance=10_000.0)
+    assert plan is None
+    assert reason == "below_confluence"
+
+
+def test_reason_zero_contracts_when_balance_too_tight():
+    ob = OrderBlock(direction=Direction.BULLISH, bottom=95, top=97)
+    state = _state(order_blocks=[ob], price=50_000.0, atr=100.0)
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10.0, max_leverage=20,
+    )
+    assert plan is None
+    assert reason == "zero_contracts"
+
+
+def test_reason_empty_on_success():
+    ob = OrderBlock(direction=Direction.BULLISH, bottom=95, top=97)
+    state = _state(order_blocks=[ob])
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0,
+    )
+    assert plan is not None
+    assert reason == ""

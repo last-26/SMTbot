@@ -357,6 +357,69 @@ def build_trade_plan_from_state(
     profit direction. If the ceiling pushes R:R below `min_rr_ratio`, the
     plan is rejected (returns None).
     """
+    plan, _reason = build_trade_plan_with_reason(
+        state, account_balance,
+        candles=candles,
+        python_fvgs=python_fvgs,
+        python_order_blocks=python_order_blocks,
+        sr_zones=sr_zones,
+        weights=weights,
+        allowed_sessions=allowed_sessions,
+        min_confluence_score=min_confluence_score,
+        risk_pct=risk_pct,
+        rr_ratio=rr_ratio,
+        min_rr_ratio=min_rr_ratio,
+        max_leverage=max_leverage,
+        contract_size=contract_size,
+        sl_buffer_mult=sl_buffer_mult,
+        swing_lookback=swing_lookback,
+        atr_fallback_mult=atr_fallback_mult,
+        htf_sr_zones=htf_sr_zones,
+        htf_sr_ceiling_enabled=htf_sr_ceiling_enabled,
+        htf_sr_buffer_atr=htf_sr_buffer_atr,
+        crowded_skip_enabled=crowded_skip_enabled,
+        crowded_skip_z_threshold=crowded_skip_z_threshold,
+        ltf_state=ltf_state,
+    )
+    return plan
+
+
+def build_trade_plan_with_reason(
+    state: MarketState,
+    account_balance: float,
+    *,
+    candles: Optional[list[Candle]] = None,
+    python_fvgs: Optional[list[FVG]] = None,
+    python_order_blocks: Optional[list[PyOrderBlock]] = None,
+    sr_zones: Optional[list[SRZone]] = None,
+    weights: Optional[dict[str, float]] = None,
+    allowed_sessions: Optional[list[Session]] = None,
+    min_confluence_score: float = 2.0,
+    risk_pct: float = 0.01,
+    rr_ratio: float = 3.0,
+    min_rr_ratio: float = 2.0,
+    max_leverage: int = 20,
+    contract_size: float = 0.01,
+    sl_buffer_mult: float = 0.2,
+    swing_lookback: int = 20,
+    atr_fallback_mult: float = 2.0,
+    htf_sr_zones: Optional[list[SRZone]] = None,
+    htf_sr_ceiling_enabled: bool = False,
+    htf_sr_buffer_atr: float = 0.2,
+    crowded_skip_enabled: bool = False,
+    crowded_skip_z_threshold: float = 3.0,
+    ltf_state: Optional[object] = None,
+) -> tuple[Optional[TradePlan], str]:
+    """Same as `build_trade_plan_from_state` but returns `(plan, reason)`.
+
+    `reason` is `""` on success, otherwise one of:
+      - "below_confluence" — confluence score below threshold or direction UNDEFINED
+      - "session_filter"   — allowed_sessions excludes current session
+      - "no_sl_source"     — intent produced no SL price
+      - "crowded_skip"     — derivatives crowded-skip gate blocked
+      - "zero_contracts"   — contract rounding wiped position to zero
+      - "htf_tp_ceiling"   — HTF S/R ceiling squeezed R:R below min_rr_ratio
+    """
     if rr_ratio < min_rr_ratio:
         raise ValueError(
             f"rr_ratio={rr_ratio} is below min_rr_ratio={min_rr_ratio}"
@@ -376,22 +439,33 @@ def build_trade_plan_from_state(
         atr_fallback_mult=atr_fallback_mult,
         ltf_state=ltf_state,
     )
-    if intent is None or not intent.is_tradable:
-        return None
+    if intent is None:
+        # Distinguish the three upstream `generate_entry_intent` None paths.
+        conf = calculate_confluence(
+            state, ltf_candles=candles,
+            fvgs=python_fvgs, order_blocks=python_order_blocks,
+            sr_zones=sr_zones, weights=weights,
+            allowed_sessions=allowed_sessions, ltf_state=ltf_state,
+        )
+        if not conf.is_tradable(min_confluence_score):
+            return None, "below_confluence"
+        if allowed_sessions and state.active_session not in allowed_sessions:
+            return None, "session_filter"
+        return None, "no_sl_source"
+    if not intent.is_tradable:
+        return None, "no_sl_source"
 
-    # Crowded-skip gate (Madde 6) — applied after intent so we know the side.
     if _should_skip_for_derivatives(
         getattr(state, "derivatives", None),
         intent.direction,
         crowded_skip_enabled,
         crowded_skip_z_threshold,
     ):
-        return None
+        return None, "crowded_skip"
 
     sl_price = intent.sl_price
     atr = intent.atr
 
-    # Push SL past HTF zones (if the ceiling is enabled and zones provided).
     if htf_sr_ceiling_enabled and htf_sr_zones and sl_price is not None:
         sl_price = _push_sl_past_htf_zone(
             sl_price, intent.entry_price, intent.direction,
@@ -413,11 +487,9 @@ def build_trade_plan_from_state(
         reason=f"{intent.direction.value} via {intent.sl_source}",
     )
 
-    # Safety: if contract rounding wiped the position to zero, no trade.
     if plan.num_contracts <= 0:
-        return None
+        return None, "zero_contracts"
 
-    # Apply the HTF TP ceiling and recompute R:R. Reject when below floor.
     if htf_sr_ceiling_enabled and htf_sr_zones:
         new_tp = _apply_htf_tp_ceiling(
             plan.tp_price, plan.entry_price, plan.direction,
@@ -427,10 +499,10 @@ def build_trade_plan_from_state(
             sl_dist = abs(plan.entry_price - plan.sl_price) or 1e-9
             new_rr = abs(new_tp - plan.entry_price) / sl_dist
             if new_rr < min_rr_ratio:
-                return None
+                return None, "htf_tp_ceiling"
             plan = _replace_tp(plan, new_tp=new_tp, new_rr=new_rr)
 
-    return plan
+    return plan, ""
 
 
 def _replace_tp(plan: TradePlan, *, new_tp: float, new_rr: float) -> TradePlan:

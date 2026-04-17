@@ -38,10 +38,12 @@ UTC = timezone.utc
 
 
 def _patch_plan_builder(monkeypatch, plan_or_none):
-    """Make build_trade_plan_from_state return a constant value."""
+    """Make build_trade_plan_with_reason return a constant value."""
+    reason = "" if plan_or_none is not None else "below_confluence"
+
     def _stub(*a, **kw):
-        return plan_or_none
-    monkeypatch.setattr("src.bot.runner.build_trade_plan_from_state", _stub)
+        return plan_or_none, reason
+    monkeypatch.setattr("src.bot.runner.build_trade_plan_with_reason", _stub)
 
 
 # ── No-signal / signal paths ────────────────────────────────────────────────

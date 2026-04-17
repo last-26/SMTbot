@@ -22,9 +22,11 @@ from tests.conftest import FakeRouter, make_config, make_plan
 
 
 def _patch_plan_builder(monkeypatch, plan_or_none):
+    reason = "" if plan_or_none is not None else "below_confluence"
+
     def _stub(*a, **kw):
-        return plan_or_none
-    monkeypatch.setattr("src.bot.runner.build_trade_plan_from_state", _stub)
+        return plan_or_none, reason
+    monkeypatch.setattr("src.bot.runner.build_trade_plan_with_reason", _stub)
 
 
 class _RecordingBridge:
