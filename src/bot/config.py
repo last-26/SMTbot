@@ -55,6 +55,12 @@ class TradingConfig(BaseModel):
     tf_settle_seconds: float = 2.5                # wait after set_timeframe (Madde B)
     pine_settle_max_wait_s: float = 6.0           # freshness-poll timeout (Madde B)
     pine_settle_poll_interval_s: float = 0.3
+    # Extra grace window AFTER the freshness poll observes last_bar flip,
+    # before the table is read. The poll only watches the SMT Signals table;
+    # the Oscillator table can lag a beat (especially on 1m where last_bar
+    # flips every wall-clock minute regardless of full re-render). Sleeping
+    # this short post-grace lets the rest of the tables catch up.
+    pine_post_settle_grace_s: float = 0.0
 
     @model_validator(mode="after")
     def _coerce_symbols(self) -> "TradingConfig":

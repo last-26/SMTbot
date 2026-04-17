@@ -30,6 +30,12 @@ trading:
   tf_settle_seconds: 3.5
   pine_settle_max_wait_s: 10.0
   pine_settle_poll_interval_s: 0.3
+  # Post-flip grace — _wait_for_pine_settle only watches Signals.last_bar,
+  # but Oscillator can lag a beat (worst on 1m, where last_bar ticks every
+  # wall-clock minute regardless of full table re-render). 1.0s = enough
+  # for the rest of the tables to catch up; per cycle cost ≈ 4s for 4 TF
+  # switches × 1 symbol, total ~12s for 3 pairs.
+  pine_post_settle_grace_s: 1.0
 
 circuit_breakers:
   # Scaled up for 5% per-trade risk so a single loss doesn't trip halts.

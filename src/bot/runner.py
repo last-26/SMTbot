@@ -672,7 +672,10 @@ class BotRunner:
             logger.exception("set_timeframe_failed tf={}", tf)
             return False
         await asyncio.sleep(self.ctx.config.trading.tf_settle_seconds)
-        return await self._wait_for_pine_settle(baseline)
+        settled = await self._wait_for_pine_settle(baseline)
+        if settled and self.ctx.config.trading.pine_post_settle_grace_s > 0:
+            await asyncio.sleep(self.ctx.config.trading.pine_post_settle_grace_s)
+        return settled
 
     async def _run_one_symbol(self, symbol: str) -> None:
         cfg = self.ctx.config
