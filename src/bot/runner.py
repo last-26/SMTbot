@@ -758,17 +758,29 @@ class BotRunner:
         if any(k[0] == symbol for k in self.ctx.open_trade_ids):
             return
 
-        # 4. Plan. Size against the *actual* OKX USDT balance — the risk
-        # manager's current_balance drifts from reality (fees, funding), and
-        # OKX rejects sCode 51008 when the bot over-estimates available margin.
+        # 4. Plan. Per-slot sizing: each of max_concurrent_positions gets a
+        # fair share of TOTAL equity, not a share of whatever's currently
+        # free. Clamp by live `availEq` so the order still fits on OKX right
+        # now, and by `risk_mgr.current_balance` so circuit-breakers apply.
         try:
-            okx_balance = await asyncio.to_thread(
+            total_eq = await asyncio.to_thread(
+                self.ctx.okx_client.get_total_equity, "USDT"
+            )
+        except Exception:
+            logger.exception("total_eq_sync_failed_using_cached")
+            total_eq = self.ctx.risk_mgr.current_balance
+        try:
+            okx_avail = await asyncio.to_thread(
                 self.ctx.okx_client.get_balance, "USDT"
             )
         except Exception:
             logger.exception("balance_sync_failed_using_cached")
-            okx_balance = self.ctx.risk_mgr.current_balance
-        sizing_balance = min(okx_balance, self.ctx.risk_mgr.current_balance)
+            okx_avail = self.ctx.risk_mgr.current_balance
+        slot_count = max(1, int(cfg.trading.max_concurrent_positions))
+        per_slot = total_eq / slot_count
+        sizing_balance = min(
+            per_slot, okx_avail, self.ctx.risk_mgr.current_balance,
+        )
         try:
             plan = build_trade_plan_from_state(
                 state, sizing_balance,

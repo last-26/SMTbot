@@ -144,6 +144,8 @@ class OKXClient:
             raise LeverageSetError(str(e), code=e.code, payload=e.payload) from e
 
     def get_balance(self, ccy: str = "USDT") -> float:
+        """Available equity (for placing new orders). Excludes margin locked
+        in open positions. Returns `availEq` with `eq` fallback."""
         resp = self.account.get_account_balance(ccy=ccy)
         data = _check(resp, "get_balance")
         # OKX returns nested {details: [{availEq, eq, ...}]}
@@ -151,6 +153,18 @@ class OKXClient:
         for d in details:
             if d.get("ccy") == ccy:
                 return float(d.get("availEq") or d.get("eq") or 0.0)
+        return 0.0
+
+    def get_total_equity(self, ccy: str = "USDT") -> float:
+        """Total account equity INCLUDING margin locked in open positions.
+        Used for per-slot sizing so each of max_concurrent_positions gets a
+        fair share of the account, independent of what's currently free."""
+        resp = self.account.get_account_balance(ccy=ccy)
+        data = _check(resp, "get_balance")
+        details = data.get("details", [])
+        for d in details:
+            if d.get("ccy") == ccy:
+                return float(d.get("eq") or 0.0)
         return 0.0
 
     # ── Market ──────────────────────────────────────────────────────────────

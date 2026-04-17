@@ -117,9 +117,12 @@ def test_long_basic_sizing():
     assert plan.sl_distance == pytest.approx(1.0)
     assert plan.sl_pct == pytest.approx(0.01)
     assert plan.tp_price == pytest.approx(103.0)
-    # Ideal notional = 100 / 0.01 = 10,000 → required_leverage 1.0, but we
-    # bump actual leverage to 2 so initial margin leaves a 5% fee buffer.
-    assert plan.leverage == 2
+    # Ideal notional = 100 / 0.01 = 10,000 → required_leverage 1.0. The
+    # rule picks the MAX feasible leverage (min of max_leverage and the
+    # liquidation-safe ceiling) to minimize margin locked per position, so
+    # concurrent trades fit inside the account. liq_safe = floor(0.6/0.01)
+    # = 60, capped at max_leverage=20 → leverage=20.
+    assert plan.leverage == 20
     assert plan.required_leverage == pytest.approx(1.0)
     assert plan.capped is False
     # Contracts: 10000 / (0.01 * 100) = 10000
@@ -156,6 +159,42 @@ def test_tight_sl_drives_high_leverage():
         account_balance=10_000.0, risk_pct=0.01, max_leverage=50,
     )
     assert plan.required_leverage > wider.required_leverage
+
+
+def test_leverage_picks_max_feasible_for_concurrent_sizing():
+    """Leverage should climb to the cap (or liq-safe ceiling) — NOT stop at
+    required_leverage — so initial margin stays tiny and three concurrent
+    positions all fit in the account.
+
+    Entry 100, SL 99.5 (0.5%), $1000 balance, 2.5% risk, max_leverage=75.
+      ideal_notional  = 25 / 0.005 = 5000
+      required_lev    = 5000 / 1000 = 5
+      liq_safe_lev    = floor(0.6 / 0.005) = 120
+      chosen leverage = min(75, 120) = 75
+      margin locked   = 5000 / 75 ≈ 67 USDT (not 5000/5 = 1000 USDT)
+    """
+    plan = calculate_trade_plan(
+        Direction.BULLISH,
+        entry_price=100.0, sl_price=99.5,
+        account_balance=1_000.0, risk_pct=0.025,
+        max_leverage=75,
+    )
+    assert plan.leverage == 75
+    assert plan.required_leverage == pytest.approx(5.0)
+    margin_locked = plan.position_size_usdt / plan.leverage
+    assert margin_locked < 100.0  # << balance, so 3 can coexist
+
+
+def test_leverage_ceiling_scales_with_sl_width():
+    """Wide SL → lower safe leverage (liquidation closer). 3% SL with
+    max_leverage=75 should pick leverage=20 (floor(0.6 / 0.03) = 20)."""
+    plan = calculate_trade_plan(
+        Direction.BULLISH,
+        entry_price=100.0, sl_price=97.0,  # 3% SL
+        account_balance=10_000.0, risk_pct=0.01,
+        max_leverage=75,
+    )
+    assert plan.leverage == 20
 
 
 def test_leverage_caps_and_marks_capped_flag():

@@ -29,6 +29,14 @@ from src.strategy.trade_plan import TradePlan
 # margin + buffer > available balance.
 _MARGIN_SAFETY = 0.95
 
+# When picking leverage we want to MINIMIZE initial margin so multiple
+# concurrent positions can coexist. Upper-bound leverage by the distance
+# from entry to liquidation: at leverage L, liquidation is ~1/L away, so
+# SL must trigger at well under that fraction. LIQ_SAFETY_FACTOR=0.6
+# means the SL sits at most 60% of the way to liquidation at the chosen
+# leverage (40% buffer for maintenance + mark drift).
+_LIQ_SAFETY_FACTOR = 0.6
+
 
 def _validate(
     direction: Direction,
@@ -123,16 +131,22 @@ def calculate_trade_plan(
         notional = ideal_notional
         capped = False
 
-    # Leverage must be high enough that initial margin (= notional / leverage)
-    # fits within balance × _MARGIN_SAFETY. Using round() would sometimes round
-    # DOWN below that threshold and OKX would reject with sCode 51008.
+    # Leverage floor — margin (= notional / leverage) must fit inside
+    # balance × _MARGIN_SAFETY. Below this OKX rejects with sCode 51008.
     min_lev_for_margin = max(
         1, math.ceil(notional / (account_balance * _MARGIN_SAFETY))
     )
-    leverage = min(
-        max(1, math.ceil(required_leverage), min_lev_for_margin),
-        max_leverage,
+    # Leverage ceiling — liquidation must sit well past SL. At high
+    # leverage, liquidation approaches entry; we require sl_pct to stay
+    # within _LIQ_SAFETY_FACTOR of the liq distance (~1/leverage).
+    liq_safe_leverage = max(
+        1, math.floor(_LIQ_SAFETY_FACTOR / max(sl_pct, 1e-6))
     )
+    # Use the MAX feasible leverage: this minimizes initial margin locked
+    # per position so max_concurrent_positions > 1 actually fits inside
+    # the account. Never drop below the margin floor.
+    leverage = min(max_leverage, liq_safe_leverage)
+    leverage = max(leverage, min_lev_for_margin, 1)
 
     # Integer OKX contracts — always round DOWN so we never exceed notional.
     contracts_unit_usdt = contract_size * entry_price
