@@ -167,8 +167,41 @@ class TVBridge:
         return await self._run("symbol", symbol)
 
     async def set_timeframe(self, tf: str) -> dict[str, Any]:
-        """Change chart timeframe."""
-        return await self._run("timeframe", tf)
+        """Change chart timeframe.
+
+        Normalizes common shorthand (``"15m"`` / ``"1h"`` / ``"1d"``) into the
+        format TradingView's ``chart.setResolution`` accepts:
+
+        * minutes → bare number (``"15m"`` → ``"15"``)
+        * hours   → minute count  (``"1h"``  → ``"60"``, ``"4h"`` → ``"240"``)
+        * days / weeks / months   → uppercase letter (``"1d"`` → ``"D"``)
+        * seconds → ``"15s"`` → ``"15S"``
+
+        Without this, TV silently falls back to whatever resolution is cached
+        on the chart — including premium-only ones like ``"1R"`` (Range bars).
+        """
+        return await self._run("timeframe", self._normalize_tf(tf))
+
+    @staticmethod
+    def _normalize_tf(tf: str) -> str:
+        raw = tf.strip()
+        if not raw:
+            return raw
+        # Already in native TV form (bare digits, or ends in upper-case unit).
+        if raw.isdigit() or raw[-1] in "SHDWM":
+            return raw
+        unit = raw[-1].lower()
+        try:
+            qty = int(raw[:-1])
+        except ValueError:
+            return raw
+        if unit == "m":
+            return str(qty)
+        if unit == "h":
+            return str(qty * 60)
+        if unit in ("s", "d", "w"):
+            return f"{qty}{unit.upper()}"
+        return raw
 
     # ── Convenience: fetch all Pine data in parallel ─────────────────────
 
