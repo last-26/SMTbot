@@ -166,6 +166,21 @@ class DerivativesConfig(BaseModel):
     leverage_buckets: list[tuple[int, float]] = Field(
         default_factory=lambda: [(10, 0.30), (25, 0.35), (50, 0.20), (100, 0.15)]
     )
+    # Regime classifier (Madde 5). Base thresholds default to BTC;
+    # per-symbol overrides (ETH lighter OI, SOL even lighter) merge on top.
+    regime_thresholds: dict[str, float] = Field(
+        default_factory=lambda: {
+            "funding_crowded_z": 2.0,
+            "ls_crowded_z": 2.0,
+            "oi_surge_pct": 8.0,
+            "oi_crash_pct": -10.0,
+            "capitulation_liq_notional": 10_000_000.0,
+            "stale_snapshot_s": 180.0,
+        }
+    )
+    regime_per_symbol_overrides: dict[str, dict[str, float]] = Field(
+        default_factory=dict
+    )
 
 
 class ReentryConfig(BaseModel):

@@ -25,6 +25,12 @@ from typing import Optional
 
 from loguru import logger
 
+from src.analysis.derivatives_regime import (
+    DEFAULT_THRESHOLDS,
+    classify_regime,
+    resolve_thresholds,
+)
+
 
 @dataclass
 class DerivativesState:
@@ -65,6 +71,8 @@ class DerivativesCache:
         journal,
         refresh_interval_s: float = 60.0,
         oi_refresh_every_n_cycles: int = 5,
+        regime_thresholds: Optional[dict[str, float]] = None,
+        regime_per_symbol_overrides: Optional[dict[str, dict[str, float]]] = None,
     ):
         self.watched = list(watched)
         self.liq_stream = liq_stream
@@ -72,6 +80,8 @@ class DerivativesCache:
         self.journal = journal
         self.refresh_interval_s = refresh_interval_s
         self.oi_refresh_every_n_cycles = oi_refresh_every_n_cycles
+        self.regime_thresholds = dict(regime_thresholds or DEFAULT_THRESHOLDS)
+        self.regime_per_symbol_overrides = dict(regime_per_symbol_overrides or {})
         self._states: dict[str, DerivativesState] = {
             s: DerivativesState(symbol=s) for s in self.watched
         }
@@ -211,6 +221,13 @@ class DerivativesCache:
                     state.oi_change_24h_pct = oi_24h
                 if oi_1h is not None:
                     state.oi_change_1h_pct = oi_1h
+
+        # 4) Regime classification (Madde 5) — after all state fields are set.
+        thresholds = resolve_thresholds(
+            symbol, self.regime_thresholds, self.regime_per_symbol_overrides,
+        )
+        analysis = classify_regime(state, **thresholds)
+        state.regime = analysis.regime.value
 
         state.ts_ms = now_ms
 

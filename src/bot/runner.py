@@ -279,6 +279,8 @@ class BotRunner:
                 coinalyze=coinalyze,
                 journal=deriv_journal,
                 refresh_interval_s=cfg.derivatives.coinalyze_refresh_interval_s,
+                regime_thresholds=cfg.derivatives.regime_thresholds,
+                regime_per_symbol_overrides=cfg.derivatives.regime_per_symbol_overrides,
             )
             ctx.liquidation_stream = liq_stream
             ctx.coinalyze_client = coinalyze
