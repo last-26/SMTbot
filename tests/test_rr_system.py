@@ -263,3 +263,63 @@ def test_confluence_metadata_preserved():
     assert plan.confluence_factors == ["htf_trend_alignment", "at_order_block"]
     assert plan.sl_source == "order_block_pine"
     assert plan.reason == "test"
+
+
+# ── margin_balance vs account_balance split ────────────────────────────────
+
+
+def test_margin_balance_defaults_to_account_balance():
+    """Omitting margin_balance must reproduce legacy single-balance math."""
+    plan_default = calculate_trade_plan(
+        Direction.BULLISH, 100, 99, 10_000, risk_pct=0.01, max_leverage=20,
+    )
+    plan_explicit = calculate_trade_plan(
+        Direction.BULLISH, 100, 99, 10_000, risk_pct=0.01, max_leverage=20,
+        margin_balance=10_000,
+    )
+    assert plan_default.num_contracts == plan_explicit.num_contracts
+    assert plan_default.leverage == plan_explicit.leverage
+    assert plan_default.position_size_usdt == plan_explicit.position_size_usdt
+    assert plan_default.risk_amount_usdt == plan_explicit.risk_amount_usdt
+
+
+def test_risk_uses_account_balance_not_margin_balance():
+    """R = account_balance × risk_pct, independent of margin_balance.
+
+    With a 1% SL this is the uncapped path — notional = R / sl_pct fits
+    inside max_notional = margin_balance × max_leverage × 0.95.
+    """
+    plan = calculate_trade_plan(
+        Direction.BULLISH, 100, 99, account_balance=10_000,
+        margin_balance=1_000, risk_pct=0.01, max_leverage=50,
+        contract_size=0.01,
+    )
+    # R must track account_balance (= 100), not margin_balance (= 10)
+    assert plan.max_risk_usdt == pytest.approx(100.0)
+    # Uncapped ⇒ actual ≈ max
+    assert plan.risk_amount_usdt == pytest.approx(100.0, rel=5e-3)
+    assert not plan.capped
+
+
+def test_margin_balance_caps_notional():
+    """Margin-fit ceiling uses margin_balance × max_leverage × 0.95, not
+    account_balance, so a tiny free margin correctly shrinks the position."""
+    # Tight SL (0.5%) ⇒ ideal_notional = 100/0.005 = 20_000. margin_balance
+    # caps max_notional at 100 × 20 × 0.95 = 1_900.
+    plan = calculate_trade_plan(
+        Direction.BULLISH, 100, 99.5, account_balance=10_000,
+        margin_balance=100, risk_pct=0.01, max_leverage=20,
+        contract_size=0.01,
+    )
+    assert plan.capped
+    assert plan.position_size_usdt <= 100 * 20 * 0.95 + 1e-6
+    # Actual risk ends up strictly below max_risk_usdt when capped.
+    assert plan.risk_amount_usdt < plan.max_risk_usdt
+
+
+def test_negative_margin_balance_rejected():
+    with pytest.raises(ValueError):
+        calculate_trade_plan(
+            Direction.BULLISH, 100, 99, account_balance=10_000,
+            margin_balance=-1,
+        )

@@ -762,10 +762,12 @@ class BotRunner:
         if any(k[0] == symbol for k in self.ctx.open_trade_ids):
             return
 
-        # 4. Plan. Per-slot sizing: each of max_concurrent_positions gets a
-        # fair share of TOTAL equity, not a share of whatever's currently
-        # free. Clamp by live `availEq` so the order still fits on OKX right
-        # now, and by `risk_mgr.current_balance` so circuit-breakers apply.
+        # 4. Plan. Risk budget (R = risk_pct × balance) is derived from TOTAL
+        # equity so drawdowns scale R naturally but locked margin in other
+        # positions doesn't shrink it. Margin-fit (notional/leverage ceiling)
+        # uses the smaller of per-slot fair-share and live `availEq` so the
+        # order still fits on OKX right now and multiple concurrent positions
+        # coexist. sCode 51008 avoidance lives on the margin side.
         try:
             total_eq = await asyncio.to_thread(
                 self.ctx.okx_client.get_total_equity, "USDT"
@@ -782,12 +784,12 @@ class BotRunner:
             okx_avail = self.ctx.risk_mgr.current_balance
         slot_count = max(1, int(cfg.trading.max_concurrent_positions))
         per_slot = total_eq / slot_count
-        sizing_balance = min(
-            per_slot, okx_avail, self.ctx.risk_mgr.current_balance,
-        )
+        risk_balance = min(total_eq, self.ctx.risk_mgr.current_balance)
+        margin_balance = min(per_slot, okx_avail)
+        sizing_balance = margin_balance  # retained for logging/back-compat
         try:
             plan, reject_reason = build_trade_plan_with_reason(
-                state, sizing_balance,
+                state, risk_balance,
                 candles=candles,
                 min_confluence_score=cfg.analysis.min_confluence_score,
                 risk_pct=cfg.risk_pct_fraction(),
@@ -800,6 +802,7 @@ class BotRunner:
                 ),
                 contract_size=self.ctx.contract_sizes.get(
                     symbol, cfg.trading.contract_size),
+                margin_balance=margin_balance,
                 swing_lookback=cfg.analysis.swing_lookback,
                 allowed_sessions=cfg.allowed_sessions() or None,
                 htf_sr_zones=self.ctx.htf_sr_cache.get(symbol),
@@ -843,11 +846,11 @@ class BotRunner:
             "symbol_decision symbol={} PLANNED direction={} entry={:.4f} "
             "sl={:.4f} tp={:.4f} rr={:.2f} confluence={:.2f} "
             "contracts={} notional={:.2f} lev={}x margin={:.2f} "
-            "risk={:.2f} sizing_bal={:.2f} factors={}",
+            "risk={:.2f} risk_bal={:.2f} margin_bal={:.2f} factors={}",
             symbol, plan.direction.value, plan.entry_price, plan.sl_price,
             plan.tp_price, plan.rr_ratio, plan.confluence_score,
             plan.num_contracts, plan.position_size_usdt, plan.leverage,
-            margin_locked, plan.risk_amount_usdt, sizing_balance,
+            margin_locked, plan.risk_amount_usdt, risk_balance, margin_balance,
             ",".join(plan.confluence_factors) or "-",
         )
 

@@ -20,6 +20,7 @@ This module is pure: no I/O, no async, safe to import from anywhere.
 from __future__ import annotations
 
 import math
+from typing import Optional
 
 from src.data.models import Direction
 from src.strategy.trade_plan import TradePlan
@@ -79,6 +80,7 @@ def calculate_trade_plan(
     rr_ratio: float = 3.0,
     max_leverage: int = 20,
     contract_size: float = 0.01,
+    margin_balance: Optional[float] = None,
     sl_source: str = "",
     confluence_score: float = 0.0,
     confluence_factors: list[str] | None = None,
@@ -90,11 +92,17 @@ def calculate_trade_plan(
         direction: BULLISH (long) or BEARISH (short).
         entry_price: intended entry.
         sl_price: stop-loss price (below entry for longs, above for shorts).
-        account_balance: free USDT available in the trading account.
+        account_balance: USDT equity used for the *risk* budget (R = balance
+            × risk_pct). Typically the total account equity — independent of
+            how much is currently locked in other positions.
         risk_pct: fraction of `account_balance` to risk (0.01 = 1%).
         rr_ratio: TP distance / SL distance.
         max_leverage: hard cap on leverage (from circuit breakers).
         contract_size: BTC per OKX contract (BTC-USDT-SWAP = 0.01).
+        margin_balance: USDT actually available to post as initial margin for
+            this trade. When omitted, falls back to `account_balance`. Split
+            out so R is sized off total equity while notional/leverage still
+            respect the live free-margin ceiling (sCode 51008 avoidance).
         sl_source: label for journal/telemetry ("order_block", "fvg", …).
         confluence_score: score that led to this trade (for journal).
         confluence_factors: names of factors that contributed (for journal).
@@ -105,6 +113,11 @@ def calculate_trade_plan(
     """
     _validate(direction, entry_price, sl_price, account_balance,
               risk_pct, rr_ratio, max_leverage, contract_size)
+
+    effective_margin = (margin_balance
+                        if margin_balance is not None else account_balance)
+    if effective_margin <= 0:
+        raise ValueError("margin_balance must be positive")
 
     sl_distance = abs(entry_price - sl_price)
     sl_pct = sl_distance / entry_price
@@ -118,12 +131,12 @@ def calculate_trade_plan(
 
     # Ideal notional so that SL hit loses exactly max_risk_usdt.
     ideal_notional = max_risk_usdt / sl_pct
-    required_leverage = ideal_notional / account_balance
+    required_leverage = ideal_notional / effective_margin
 
     # Hard ceiling on notional: leverage cap AND margin safety buffer. Without
     # the buffer, a fully-leveraged order leaves OKX no room for fees and gets
     # rejected with sCode 51008.
-    max_notional = account_balance * max_leverage * _MARGIN_SAFETY
+    max_notional = effective_margin * max_leverage * _MARGIN_SAFETY
     if ideal_notional > max_notional:
         notional = max_notional
         capped = True
@@ -132,9 +145,9 @@ def calculate_trade_plan(
         capped = False
 
     # Leverage floor — margin (= notional / leverage) must fit inside
-    # balance × _MARGIN_SAFETY. Below this OKX rejects with sCode 51008.
+    # effective_margin × _MARGIN_SAFETY. Below this OKX rejects with 51008.
     min_lev_for_margin = max(
-        1, math.ceil(notional / (account_balance * _MARGIN_SAFETY))
+        1, math.ceil(notional / (effective_margin * _MARGIN_SAFETY))
     )
     # Leverage ceiling — liquidation must sit well past SL. At high
     # leverage, liquidation approaches entry; we require sl_pct to stay
