@@ -86,7 +86,11 @@ analysis:
   # src/analysis/multi_timeframe.py (Moderate rebalance baseline below is
   # already baked into code). Only keys set here override; others stay at
   # their defaults. Unknown keys trigger a warning at load time.
-  confluence_weights: {}
+  # htf_trend_alignment hafifçe düşürüldü (0.75 → 0.70): HTF trend bias'ı
+  # LTF momentum'un ezici çoğunluğunu biraz daha rahat flip etmesine izin
+  # verir; 3m entry TF'te HTF (15m) bazen geç kalır.
+  confluence_weights:
+    htf_trend_alignment: 0.70
   # Example override block (uncomment + edit to hand-tune before Phase 7 RL):
   # confluence_weights:
   #   htf_trend_alignment: 0.75
