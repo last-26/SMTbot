@@ -231,10 +231,15 @@ class BotRunner:
         ctx: BotContext,
         shutdown: Optional[asyncio.Event] = None,
         stop_after_closed_trades: Optional[int] = None,
+        derivatives_only: bool = False,
+        duration_seconds: Optional[int] = None,
     ):
         self.ctx = ctx
         self.shutdown = shutdown or asyncio.Event()
         self.stop_after_closed_trades = stop_after_closed_trades
+        # Phase 1.5 — data-collection modes.
+        self.derivatives_only = derivatives_only
+        self.duration_seconds = duration_seconds
 
     # ── Construction ────────────────────────────────────────────────────────
 
@@ -245,6 +250,8 @@ class BotRunner:
         *,
         dry_run: bool = False,
         stop_after_closed_trades: Optional[int] = None,
+        derivatives_only: bool = False,
+        duration_seconds: Optional[int] = None,
     ) -> "BotRunner":
         bridge = TVBridge()
         reader = StructuredReader(bridge)
@@ -324,7 +331,12 @@ class BotRunner:
             # runner calls `ensure_schema` through `_start_derivatives`.
             cache._deriv_journal_bootstrap = deriv_journal
 
-        return cls(ctx, stop_after_closed_trades=stop_after_closed_trades)
+        return cls(
+            ctx,
+            stop_after_closed_trades=stop_after_closed_trades,
+            derivatives_only=derivatives_only,
+            duration_seconds=duration_seconds,
+        )
 
     # ── Entry points ────────────────────────────────────────────────────────
 
@@ -340,6 +352,16 @@ class BotRunner:
                 await self._prime()
                 await self._start_derivatives()
                 interval = self.ctx.config.bot.poll_interval_seconds
+                deadline = (
+                    time.monotonic() + self.duration_seconds
+                    if self.duration_seconds is not None else None
+                )
+                if self.derivatives_only:
+                    logger.info("derivatives_only_mode_enabled — entry pipeline "
+                                "bypassed; close-poll + cache-refresh only")
+                if deadline is not None:
+                    logger.info("duration_limit_active seconds={}",
+                                self.duration_seconds)
                 while not self.shutdown.is_set():
                     try:
                         await self.run_once()
@@ -354,8 +376,17 @@ class BotRunner:
                             )
                             self.shutdown.set()
                             break
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            logger.info("duration_limit_reached — stopping")
+                            self.shutdown.set()
+                            break
+                        wait_s = min(interval, remaining)
+                    else:
+                        wait_s = interval
                     try:
-                        await asyncio.wait_for(self.shutdown.wait(), timeout=interval)
+                        await asyncio.wait_for(self.shutdown.wait(), timeout=wait_s)
                     except asyncio.TimeoutError:
                         pass
         finally:
@@ -420,6 +451,12 @@ class BotRunner:
         # Monitor polls all tracked (inst_id, pos_side) pairs regardless of
         # which symbol the chart currently shows, so this is symbol-agnostic.
         await self._process_closes()
+
+        # Data-collection mode: stream + cache still run in the background via
+        # _start_derivatives; here we just skip the entry/exit pipeline. Close
+        # poll above still fires so any positions already on the book resolve.
+        if self.derivatives_only:
+            return
 
         for symbol in self.ctx.config.trading.symbols:
             if self.shutdown.is_set():

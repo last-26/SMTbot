@@ -1,7 +1,12 @@
 """CLI entrypoint: `python -m src.bot --config config/default.yaml [--dry-run] [--once]`.
 
-  --dry-run : swap OrderRouter for dry_run_report; no OKX orders placed.
-  --once    : run exactly one tick and exit (smoke test for the wiring).
+  --dry-run           : swap OrderRouter for dry_run_report; no OKX orders placed.
+  --once              : run exactly one tick and exit (smoke test for the wiring).
+  --max-closed-trades : stop after N WIN/LOSS/BREAKEVEN rows hit the journal.
+  --derivatives-only  : bypass the entry/exit pipeline; run liq-stream + cache
+                        refresh only. Close-poll still fires so live positions
+                        resolve. Pairs with --duration for timed data grabs.
+  --duration N        : stop gracefully after N seconds (int).
 
 Ctrl-C on Windows terminal short-circuits asyncio.run with a
 KeyboardInterrupt, so we catch it here as a reliable backstop to the
@@ -32,6 +37,13 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--max-closed-trades", type=int, default=None,
                    help="Stop gracefully once N closed trades are in the journal "
                         "(WIN/LOSS/BREAKEVEN). Useful for RL data collection.")
+    p.add_argument("--derivatives-only", action="store_true",
+                   help="Bypass the entry pipeline; run only the derivatives "
+                        "liquidation stream + cache refresh. Pairs with "
+                        "--duration for timed data collection.")
+    p.add_argument("--duration", type=int, default=None,
+                   help="Stop gracefully after N seconds. Works with or "
+                        "without --derivatives-only.")
     return p
 
 
@@ -48,6 +60,8 @@ def main(argv: list[str] | None = None) -> int:
         cfg,
         dry_run=args.dry_run,
         stop_after_closed_trades=args.max_closed_trades,
+        derivatives_only=args.derivatives_only,
+        duration_seconds=args.duration,
     )
 
     try:
