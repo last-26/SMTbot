@@ -118,7 +118,8 @@ References: `pine/vmc_a.txt`, `pine/vmc_b.txt` (original VMC source). Standalone
 | 5. Trade Journal | ✅ Complete | 3 modules under `src/journal/` + CLI, 31 new tests (224 total). See below. |
 | 6. Bot runtime loop | ✅ Complete | `src/bot/` async runner wiring TV → analysis → strategy → risk → execution → journal. `OKXClient.enrich_close_fill` added. 23 new tests (247 total). See below. |
 | 6.5 Multi-pair + Multi-TF + Smart Entry/Exit | ✅ Complete | 6-part refactor (Madde A-F): multi-pair round-robin, freshness-polled multi-TF, reentry cooldown/quality gate, HTF S/R ceiling, partial TP + SL-to-BE, LTF reversal defensive close. 63 new tests (310 total). See below. |
-| 7. RL parameter tuner | 🔜 Next | PPO via Stable Baselines3, walk-forward validated. Needs ≥50 logged demo trades from Phase 6.5 first. |
+| 1.5 Derivatives Data Layer | ✅ Complete | 7-part build (Madde 1-7) + CLI modes: Binance liquidation WS, Coinalyze REST client, derivatives cache + journal, estimated liquidity heatmap, 4-regime classifier, entry signal integration (contrarian/capitulation/heatmap factors + crowded-skip gate), journal enrichment + regime breakdown reporter, `--derivatives-only` / `--duration` runtime modes. 73 new tests (383 total). See below. |
+| 7. RL parameter tuner | 🔜 Next | PPO via Stable Baselines3, walk-forward validated. Needs ≥50 logged demo trades with derivatives snapshots from Phase 1.5 first. |
 
 ### Phase 1 — Completed (2026-04-16)
 
@@ -380,6 +381,73 @@ Six-part refactor ("Madde A-F") run between Phase 6 and Phase 7. Goal: (a) multi
 
 **Phase 7 unlocks after Phase 6.5 because:** five pairs in parallel should land 50 closed demo trades an order of magnitude faster, and the entry/exit gates kill the noisiest failure modes (revenge re-entries, TP within reach of the next HTF zone, late exits when the LTF has already rolled).
 
+### Phase 1.5 — Completed (2026-04-17)
+
+Seven-part derivatives data layer ("Madde 1-7") + a CLI data-collection mode (Commit 8) run between Phase 6.5 and Phase 7. Goal: feed Phase 7 RL a richer feature vector than pure price structure — funding rates, open interest, liquidation flow, long/short ratios, and an estimated liquidity heatmap — plus use them as a principled, weighted entry-signal slot + crowded-skip gate without over-fitting.
+
+**Pair parity (pre-Madde 1):** 5 → 3 pairs (BTC/ETH/SOL), `max_concurrent_positions: 3`. The Coinalyze free tier + Binance WS load both favor fewer, higher-quality pairs — and three pairs is enough to keep the RL training dataset balanced.
+
+**Madde 1 — Binance liquidation WS** (`feat: liquidation stream — Binance forceOrder WS`)
+- `src/data/liquidation_stream.py`: `LiquidationEvent` dataclass + `LiquidationStream` class. Subscribes to `!forceOrder@arr`, parses `e` / `s` / `S` / `p` / `q` into typed events. Per-symbol ring buffer with `recent(symbol, lookback_ms)` + `stats(symbol, lookback_ms)` query APIs. Exponential-backoff reconnect, `ping_interval=180`. `binance_to_okx_symbol` / `okx_to_binance_symbol` helpers. `attach_journal(j)` hooks the derivatives journal writer.
+- New `DerivativesConfig` on `BotConfig.derivatives` (top-level, not under `analysis:` — matches `execution:` / `reentry:`). `enabled: False` default; `config/default.yaml` flips it `True`.
+
+**Madde 2 — Coinalyze REST client** (`feat: coinalyze REST client with rate limiting`)
+- `src/data/derivatives_api.py`: `CoinalyzeClient` + `DerivativesSnapshot` dataclass. Token bucket (40/min). `_request` handles `429 Retry-After` and `401 silent-fail` (missing key → None snapshots, bot keeps running). `ensure_symbol_map` walks `/future-markets` with exchange priority `["A","6","3","F","H"]` (OKX first).
+- Endpoints: current OI/funding/predicted-funding, history funding/LS/liquidations series, OI-change % helper, and the aggregated `fetch_snapshot(okx_symbol) -> DerivativesSnapshot` used by the cache.
+- `scripts/probe_coinalyze.py`: manual schema verification tool (run once before implementation to lock real response key names).
+
+**Madde 3 — Derivatives cache + journal** (`feat: derivatives cache + journal`)
+- `src/data/derivatives_cache.py`: `DerivativesState` + `DerivativesCache`. Startup pulls 720 h funding history + 336 h LS history per symbol for z-score baselines; periodic `_refresh_loop` (configurable interval, default 60 s) computes funding_z_30d / ls_z_14d / OI-change pct / liq imbalance and stamps the regime (Madde 5). `get(symbol) -> DerivativesState`.
+- `src/journal/derivatives_journal.py`: separate async SQLite helper — `CREATE TABLE IF NOT EXISTS liquidations`, `derivatives_snapshots`. Shares the same DB file as the trades journal (single-file backup ops). Insert best-effort (try/except warn); `fetch_funding_history` / `fetch_oi_history` for Phase 7 retrospective training.
+
+**Madde 4 — Estimated liquidity heatmap** (`feat: estimated liquidity heatmap`)
+- `src/analysis/liquidity_heatmap.py`: pure-function builders. `estimate_liquidation_levels(current_price, long_short_ratio, total_oi_usd, leverage_buckets)` synthesizes long/short liq price bands from the configured leverage distribution `[(10, 0.30), (25, 0.35), (50, 0.20), (100, 0.15)]`. `cluster_levels` merges near-price bands. `build_heatmap` unifies estimated + recent-realized (from the liquidation stream) + historical (from `DerivativesJournal`) levels into a single `LiquidityHeatmap` with `clusters_above/below`, `nearest_above/below`, `largest_above/below_notional`.
+- `src/data/models.py`: `LiquidityHeatmap` Pydantic model + two new `Optional` fields on `MarketState`: `derivatives: Optional[DerivativesState]`, `liquidity_heatmap: Optional[LiquidityHeatmap]`. Attached in `_run_one_symbol` at the entry TF pass — failure isolated (try/except logs `deriv_attach_failed`, symbol cycle continues).
+
+**Madde 5 — 4-regime classifier** (`feat: derivatives regime classifier`)
+- `src/analysis/derivatives_regime.py`: `Regime` enum (LONG_CROWDED / SHORT_CROWDED / CAPITULATION / BALANCED / UNKNOWN), `RegimeAnalysis(regime, confidence, reasoning)` dataclass, pure `classify_regime(state, **thresholds)` function. Priority: stale → CAPITULATION (heavy 1 h liq one-sided) → LONG_CROWDED (funding_z high + LS high) → SHORT_CROWDED (symmetric) → BALANCED.
+- Per-symbol threshold overrides in `DerivativesConfig.regime_per_symbol_overrides` — ETH and SOL get smaller `capitulation_liq_notional` ($20 M / $8 M vs $50 M for BTC) because their OI pool is smaller.
+
+**Madde 6 — Entry signal integration** (`feat: entry signal derivatives integration`)
+- `src/analysis/multi_timeframe.py`: 3 new `ConfluenceFactor` types (`derivatives_contrarian=0.7`, `derivatives_capitulation=0.6`, `derivatives_heatmap_target=0.5` in `DEFAULT_WEIGHTS`), added as a single elif chain so at most one fires per cycle — keeps the slot principled, not stacked. `_heatmap_supports_direction(state, direction)` helper gates the heatmap factor on `nearest_cluster within ATR*3` + `notional ≥ 70% of largest`.
+- `src/strategy/entry_signals.py`: `build_trade_plan_from_state` accepts `crowded_skip_enabled` + `crowded_skip_z_threshold`. After `generate_entry_intent`, `_should_skip_for_derivatives(deriv_state, direction, enabled, threshold)` rejects the plan (`return None`) when the intent aligns with a one-sided crowded regime (long into LONG_CROWDED, short into SHORT_CROWDED) AND `|funding_z| ≥ threshold`. Missing data never silently blocks — the gate only trips with evidence.
+
+**Madde 7 — Journal enrichment + reporting** (`feat: journal derivatives enrichment + reporting`)
+- `src/journal/database.py`: 9 idempotent `ALTER TABLE trades ADD COLUMN` migrations wrapped in try/except `aiosqlite.OperationalError` so existing demo databases upgrade cleanly. `record_open` gains 9 Optional kwargs (`regime_at_entry`, `funding_z_at_entry`, `ls_ratio_at_entry`, `oi_change_24h_at_entry`, `liq_imbalance_1h_at_entry`, and 4 `nearest_liq_cluster_{above,below}_{price,notional}` fields). `_safe_col` reads shield legacy rows.
+- `src/journal/models.py:TradeRecord`: 9 matching `Optional[float|str] = None` fields.
+- `src/journal/reporter.py`: `regime_breakdown(closed)` aggregator — per-regime num_trades / win_rate / avg_r / expectancy_r (None → "UNKNOWN" bucket so they stay visible). Surfaced in `summary()["regime_breakdown"]` and rendered by `format_summary()`.
+- `src/bot/runner.py`: `_derive_enrichment(state)` helper extracts the 9 fields from `state.derivatives` + `state.liquidity_heatmap` and spreads them into `journal.record_open(**enrichment)`.
+
+**Commit 8 — CLI `--derivatives-only` + `--duration N`** (`feat: CLI --derivatives-only + --duration modes`)
+- `BotRunner` gains `derivatives_only: bool` and `duration_seconds: Optional[int]` ctor kwargs.
+- `--derivatives-only`: `run_once` early-returns after the close-drain so the entry pipeline is bypassed; WS + Coinalyze cache + close poll keep running. Perfect for "warm the DB with a few hours of liq + funding data before arming the strategy."
+- `--duration N`: wall-clock deadline — `run()`'s wait step clamps to the remaining time so the loop exits within one poll interval of N. Works with or without `--derivatives-only`.
+
+**New files:** `src/data/liquidation_stream.py`, `src/data/derivatives_api.py`, `src/data/derivatives_cache.py`, `src/analysis/liquidity_heatmap.py`, `src/analysis/derivatives_regime.py`, `src/journal/derivatives_journal.py`, `scripts/probe_coinalyze.py`, plus 8 new test modules (`test_liquidation_stream`, `test_derivatives_api`, `test_derivatives_cache`, `test_liquidity_heatmap`, `test_derivatives_regime`, `test_entry_signals_derivatives`, `test_journal_derivatives`, `test_runner_derivatives_only`).
+
+**Global config additions (`config/default.yaml`):** top-level `derivatives:` section with `enabled: true`, `liquidation_buffer_size`, `liquidation_lookback_*_ms`, `coinalyze_refresh_interval_s: 60`, `coinalyze_timeout_s`, `coinalyze_max_retries`, full `heatmap_*` block + `leverage_buckets`, full `regime_thresholds` block + `regime_per_symbol_overrides` (BTC default, ETH $20M capitulation, SOL $8M), `confluence_slot_enabled: true`, `crowded_skip_enabled: true`, `crowded_skip_z_threshold: 3.0`. New env: `COINALYZE_API_KEY=` in `.env.example`.
+
+**Derivatives data sources (like "Pine Scripts" for price):**
+- **Binance USDT-M perp `!forceOrder@arr`** — real-time aggregated liquidation stream (`wss://fstream.binance.com/ws/!forceOrder@arr`). Note: Binance rate-limits to the *largest* liquidation per 1 s window, so small liquidations are invisible — Coinalyze aggregate history fills that gap.
+- **Coinalyze REST** — `open-interest`, `funding-rate`, `predicted-funding`, `long-short-ratio`, `liquidation-history` endpoints. Free-tier key. 40 req/min token bucket. Priority-ordered exchange filter: OKX → Binance → Bybit → Bitget → Huobi.
+
+**Failure isolation posture:** any derivatives subsystem failure (WS disconnect, 401/429 from Coinalyze, cache refresh crash) logs a warning and leaves `state.derivatives=None` / `state.liquidity_heatmap=None`. The strategy then degrades gracefully to pure price-structure signals — the bot never crashes on derivatives errors. Missing `COINALYZE_API_KEY` silently falls through to None snapshots.
+
+**Total tests:** 383 passing (310 → 383, +73).
+
+**Usage examples:**
+```bash
+# Data warm-up: 10 min of liq stream + Coinalyze snapshots, no orders placed
+.venv/Scripts/python.exe -m src.bot --config config/default.yaml \
+    --derivatives-only --duration 600
+
+# Regular demo trading with derivatives factors + crowded-skip gate (default)
+.venv/Scripts/python.exe -m src.bot --config config/default.yaml
+
+# Report with per-regime win-rate breakdown (summary always includes it now)
+.venv/Scripts/python.exe scripts/report.py --last 7d
+```
+
 ## Phase 7 — Reinforcement learning
 
 **Architecture:** parameter tuner, NOT raw decision maker. Rule-based strategy generates signals; RL tunes:
@@ -402,9 +470,9 @@ Six-part refactor ("Madde A-F") run between Phase 6 and Phase 7. Goal: (a) multi
 
 ## Currency pair strategy
 
-**Phase 6.5 onwards:** 5 OKX perps run round-robin per tick — BTC / ETH / SOL / AVAX / XRP. `trading.symbols` in YAML is the single source of truth; the legacy single-`symbol` YAML form still loads with a `DeprecationWarning`. Circuit breakers (`max_concurrent_positions=2` in defaults) cap total simultaneous exposure across all symbols, not per-symbol.
+**Phase 1.5 onwards:** 3 OKX perps run round-robin per tick — BTC / ETH / SOL. (Phase 6.5 shipped with 5 pairs; Phase 1.5 trimmed to 3 because the Coinalyze free-tier 40-req/min budget + Binance WS load both favor fewer, higher-quality pairs, and 3 is enough to keep the Phase 7 RL training dataset balanced.) `trading.symbols` in YAML is the single source of truth; the legacy single-`symbol` YAML form still loads with a `DeprecationWarning`. Circuit breakers (`max_concurrent_positions=3` in defaults) cap total simultaneous exposure across all symbols, not per-symbol.
 
-**To add a 6th pair:** drop it into `trading.symbols`, confirm `okx_to_tv_symbol()` produces a valid TV ticker (add a parametrized test case), and watch the first 20-30 cycles for `htf_settle_timeout` / `set_symbol_failed` log lines — illiquid pairs will flunk the freshness-poll more often.
+**To add a 4th+ pair:** drop it into `trading.symbols`, confirm `okx_to_tv_symbol()` produces a valid TV ticker (add a parametrized test case), add per-symbol regime overrides in `derivatives.regime_per_symbol_overrides` (smaller OI pools → smaller `capitulation_liq_notional`), and watch the first 20-30 cycles for `htf_settle_timeout` / `set_symbol_failed` log lines — illiquid pairs will flunk the freshness-poll more often.
 
 ## Configuration
 
