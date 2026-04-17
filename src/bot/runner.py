@@ -268,6 +268,7 @@ class BotRunner:
         client = OKXClient(cfg.to_okx_credentials())
         router_cfg = RouterConfig(
             inst_id=cfg.primary_symbol(),
+            margin_mode=cfg.execution.margin_mode,
             partial_tp_enabled=cfg.execution.partial_tp_enabled,
             partial_tp_ratio=cfg.execution.partial_tp_ratio,
             partial_tp_rr=cfg.execution.partial_tp_rr,

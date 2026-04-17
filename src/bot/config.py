@@ -128,6 +128,10 @@ class JournalConfig(BaseModel):
 class ExecutionConfig(BaseModel):
     """Execution-layer knobs (partial TP + SL-to-BE in Madde E, plus the
     LTF defensive-close flags added in Madde F)."""
+    # "isolated" = per-position margin silo; "cross" = shared account margin
+    # pool (all positions share equity, better for running max_concurrent
+    # slots concurrently without sCode 51008 blocking new entries).
+    margin_mode: Literal["isolated", "cross"] = "isolated"
     partial_tp_enabled: bool = False
     partial_tp_ratio: float = 0.5
     partial_tp_rr: float = 1.5

@@ -57,6 +57,11 @@ reentry:
   require_higher_or_equal_confluence_after_loss: true
 
 execution:
+  # "cross" = account equity is a shared margin pool across all open
+  # positions (so 3 slots coexist without 51008 starving new entries).
+  # "isolated" = per-position silo (worse for multi-slot, safer for a
+  # single-position book).
+  margin_mode: cross
   # Madde E — partial TP + move SL to breakeven on TP1 fill.
   partial_tp_enabled: true
   partial_tp_ratio: 0.5               # 50% of contracts exit at TP1
