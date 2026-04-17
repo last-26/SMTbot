@@ -103,6 +103,10 @@ class AnalysisConfig(BaseModel):
     session_filter: list[str] = Field(default_factory=list)
     htf_sr_ceiling_enabled: bool = True      # Madde D
     htf_sr_buffer_atr: float = 0.2
+    # Fee-aware min TP distance — a TP closer than this fraction of entry
+    # price cannot survive the partial-TP 3-fill lifecycle net of taker fees
+    # + slippage. Default 0 = off for test back-compat; runtime YAML sets it.
+    min_tp_distance_pct: float = 0.0
 
 
 class OKXConfigBlock(BaseModel):

@@ -832,6 +832,7 @@ class BotRunner:
                 crowded_skip_enabled=cfg.derivatives.crowded_skip_enabled,
                 crowded_skip_z_threshold=cfg.derivatives.crowded_skip_z_threshold,
                 ltf_state=self.ctx.ltf_cache.get(symbol),
+                min_tp_distance_pct=cfg.analysis.min_tp_distance_pct,
             )
         except Exception:
             logger.exception("plan_build_failed symbol={}", symbol)

@@ -42,6 +42,11 @@ analysis:
     - new_york
   htf_sr_ceiling_enabled: true    # Madde D — push SL past HTF zones + cap TP
   htf_sr_buffer_atr: 0.2
+  # Fee-aware min TP distance (fraction of entry price). 0.004 = 0.4% — rejects
+  # tp-too-tight plans where 3× 0.05% taker fee + slippage eats the whole R.
+  # The ETH 05:49 trade had 0.19% TP and lost -3.91R to fees+wick; 0.4% floor
+  # is ~2× round-trip fee cost, leaves breathing room for slippage.
+  min_tp_distance_pct: 0.004
 
 okx:
   base_url: https://www.okx.com

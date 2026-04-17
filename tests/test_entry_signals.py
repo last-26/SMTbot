@@ -241,3 +241,96 @@ def test_reason_empty_on_success():
     )
     assert plan is not None
     assert reason == ""
+
+
+# ── min_tp_distance_pct (fee-aware gate) ────────────────────────────────────
+
+
+def test_min_tp_distance_gate_disabled_by_default():
+    """With default min_tp_distance_pct=0, the gate is off — the same plan
+    that would trip a non-zero threshold still passes."""
+    # Entry 100, SL 99.5 → sl_dist=0.5 → tp_dist=1.5 (rr=3) → tp_pct=1.5%
+    # With threshold=0.0, gate is disabled, plan survives.
+    ob = OrderBlock(direction=Direction.BULLISH, bottom=99.0, top=99.7)
+    state = _state(order_blocks=[ob], price=100.0, atr=1.0)
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0,
+    )
+    assert plan is not None
+    assert reason == ""
+
+
+def test_min_tp_distance_gate_rejects_tight_tp():
+    """A sub-threshold TP distance returns (None, 'tp_too_tight')."""
+    # Very tight SL → very tight TP. SL at 99.95 (0.05%), RR=3 → TP=100.15,
+    # tp_dist_pct = 0.0015 → below 0.004 threshold → reject.
+    ob = OrderBlock(direction=Direction.BULLISH, bottom=99.9, top=99.94)
+    state = _state(order_blocks=[ob], price=100.0, atr=0.01)
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0,
+        min_tp_distance_pct=0.004,  # 0.4%
+    )
+    assert plan is None
+    assert reason == "tp_too_tight"
+
+
+def test_min_tp_distance_gate_allows_wide_tp():
+    """A TP distance above the threshold passes through unchanged."""
+    # SL at 99 (1%), RR=3 → TP at 103, tp_dist_pct=0.03 → above 0.004 floor.
+    ob = OrderBlock(direction=Direction.BULLISH, bottom=98.5, top=99.0)
+    state = _state(order_blocks=[ob], price=100.0, atr=1.0)
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0,
+        min_tp_distance_pct=0.004,
+    )
+    assert plan is not None
+    assert reason == ""
+    tp_dist_pct = (plan.tp_price - plan.entry_price) / plan.entry_price
+    assert tp_dist_pct >= 0.004
+
+
+def test_min_tp_distance_gate_short_side():
+    """Gate works on bearish trades — uses abs() on tp-entry distance."""
+    # Short entry 100, SL 100.05 (0.05%), RR=3 → TP=99.85, dist_pct=0.0015.
+    ob = OrderBlock(direction=Direction.BEARISH, bottom=100.06, top=100.10)
+    state = _state(
+        order_blocks=[ob], price=100.0, atr=0.01,
+        trend_htf=Direction.BEARISH, last_mss="BEARISH@101",
+        active_ob="BEAR@100.06-100.10", vmc_ribbon="BEARISH",
+    )
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0,
+        min_tp_distance_pct=0.004,
+    )
+    assert plan is None
+    assert reason == "tp_too_tight"
+
+
+def test_min_tp_distance_runs_after_htf_ceiling_squeeze():
+    """After an HTF ceiling pulls TP in, the fee-aware floor still applies.
+
+    SL at 99 (rr_ratio=3 would give TP=103), but a RESISTANCE zone at
+    100.3-100.4 caps TP to ~100.1. That sits at ~0.1% — below a 0.004 floor.
+    Order of operations: ceiling first, then fee gate.
+    """
+    from src.analysis.support_resistance import SRZone
+
+    ob = OrderBlock(direction=Direction.BULLISH, bottom=98.5, top=99.0)
+    state = _state(order_blocks=[ob], price=100.0, atr=1.0)
+    # RESISTANCE zone just above entry compresses TP.
+    zone = SRZone(
+        center=100.35, bottom=100.3, top=100.4,
+        touches=3, role="RESISTANCE", score=1.0,
+    )
+    # With HTF ceiling on, TP becomes ~100.1 → rr=~0.1 → below min_rr_ratio
+    # → rejected as "htf_tp_ceiling" before reaching the fee gate.
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0,
+        htf_sr_zones=[zone],
+        htf_sr_ceiling_enabled=True,
+        htf_sr_buffer_atr=0.2,
+        min_tp_distance_pct=0.004,
+    )
+    assert plan is None
+    # The HTF ceiling gate fires first because it's the stricter/earlier check.
+    assert reason == "htf_tp_ceiling"

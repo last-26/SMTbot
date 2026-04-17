@@ -346,6 +346,7 @@ def build_trade_plan_from_state(
     crowded_skip_enabled: bool = False,
     crowded_skip_z_threshold: float = 3.0,
     ltf_state: Optional[object] = None,
+    min_tp_distance_pct: float = 0.0,
 ) -> Optional[TradePlan]:
     """End-to-end: MarketState → TradePlan. Returns None when no trade.
 
@@ -382,6 +383,7 @@ def build_trade_plan_from_state(
         crowded_skip_enabled=crowded_skip_enabled,
         crowded_skip_z_threshold=crowded_skip_z_threshold,
         ltf_state=ltf_state,
+        min_tp_distance_pct=min_tp_distance_pct,
     )
     return plan
 
@@ -412,6 +414,7 @@ def build_trade_plan_with_reason(
     crowded_skip_enabled: bool = False,
     crowded_skip_z_threshold: float = 3.0,
     ltf_state: Optional[object] = None,
+    min_tp_distance_pct: float = 0.0,
 ) -> tuple[Optional[TradePlan], str]:
     """Same as `build_trade_plan_from_state` but returns `(plan, reason)`.
 
@@ -422,6 +425,7 @@ def build_trade_plan_with_reason(
       - "crowded_skip"     — derivatives crowded-skip gate blocked
       - "zero_contracts"   — contract rounding wiped position to zero
       - "htf_tp_ceiling"   — HTF S/R ceiling squeezed R:R below min_rr_ratio
+      - "tp_too_tight"     — TP distance below min_tp_distance_pct (fee drag)
     """
     if rr_ratio < min_rr_ratio:
         raise ValueError(
@@ -505,6 +509,14 @@ def build_trade_plan_with_reason(
             if new_rr < min_rr_ratio:
                 return None, "htf_tp_ceiling"
             plan = _replace_tp(plan, new_tp=new_tp, new_rr=new_rr)
+
+    # Fee-aware min TP distance — a TP closer than N× round-trip taker fees
+    # cannot survive a 3-fill partial-TP lifecycle net of fees even when the
+    # price moves the full R, so reject before order placement.
+    if min_tp_distance_pct > 0.0 and plan.entry_price > 0.0:
+        tp_dist_pct = abs(plan.tp_price - plan.entry_price) / plan.entry_price
+        if tp_dist_pct < min_tp_distance_pct:
+            return None, "tp_too_tight"
 
     return plan, ""
 
