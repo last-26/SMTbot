@@ -120,6 +120,7 @@ References: `pine/vmc_a.txt`, `pine/vmc_b.txt` (original VMC source). Standalone
 | 6.5 Multi-pair + Multi-TF + Smart Entry/Exit | ✅ Complete | 6-part refactor (Madde A-F): multi-pair round-robin, freshness-polled multi-TF, reentry cooldown/quality gate, HTF S/R ceiling, partial TP + SL-to-BE, LTF reversal defensive close. 63 new tests (310 total). See below. |
 | 1.5 Derivatives Data Layer | ✅ Complete | 7-part build (Madde 1-7) + CLI modes: Binance liquidation WS, Coinalyze REST client, derivatives cache + journal, estimated liquidity heatmap, 4-regime classifier, entry signal integration (contrarian/capitulation/heatmap factors + crowded-skip gate), journal enrichment + regime breakdown reporter, `--derivatives-only` / `--duration` runtime modes. 73 new tests (383 total). See below. |
 | Multi-pair live-demo hardening | ✅ Complete (2026-04-17) | Post-Phase-1.5 production fixes observed during first live demo run: LTF momentum factor, clean logging, per-cycle decision visibility log, per-slot sizing + max-feasible leverage, per-symbol OKX `ctVal` + max-leverage lookup (51008/59102 fixes), `scripts/logs.py` viewer. 411 tests total (+28). See below. |
+| Cross margin + risk/margin split + threaded-callback fix | ✅ Complete (2026-04-17) | Second live-demo session: `execution.margin_mode: cross`, split `calculate_trade_plan` balance into `account_balance` (R) vs `margin_balance` (notional cap), `ctx.main_loop` threadsafe dispatch so `_on_sl_moved` callback doesn't crash on `asyncio.create_task` from monitor thread, `_defensive_close` td_mode bug fix. 418 tests total (+7). See below. |
 | 7. RL parameter tuner | 🔜 Next | PPO via Stable Baselines3, walk-forward validated. Needs ≥50 logged demo trades with derivatives snapshots from Phase 1.5 first. |
 
 ### Phase 1 — Completed (2026-04-16)
@@ -482,6 +483,44 @@ Post-Phase-1.5, during the first real multi-pair demo run, three groups of produ
 - Ships at `scripts/logs.py`; run from the project root with `.venv/Scripts/python.exe scripts/logs.py [options]`.
 
 **Total tests:** 411 passing (383 → 411, +28).
+
+### Cross margin + risk/margin split + threaded-callback fix — Completed (2026-04-17)
+
+Post-hardening session fixes observed during the second live-demo run. Cross mode + independent R-budget-vs-margin-fit were needed because isolated mode starved concurrent slots even after the per-slot sizing patch: the moment BTC opened, its isolated margin ($1.4k at 75x) vanished from `availEq` and ETH/SOL sized R off the shrunken free balance instead of total equity. 7 new tests (418 total).
+
+**Cross margin mode** (`feat: cross margin mode` / `a30e680`):
+- `ExecutionConfig.margin_mode: Literal["isolated", "cross"]` (default `"isolated"` for back-compat). `config/default.yaml` flips it to `cross`.
+- `RouterConfig.margin_mode` wires through `from_config`; `OrderRouter` + `OKXClient.set_leverage/place_order/place_oco_algo/close_position` already accepted `tdMode` — just plumbed the config through.
+- Cross mode lets three open positions share the full account equity as margin pool, so a fresh entry isn't rejected by 51008 just because a peer locked isolated margin elsewhere.
+- **Latent bug fixed in same commit:** `BotRunner._defensive_close` hardcoded `td_mode="isolated"` when calling `close_position` — would fail under cross mode with the wrong `posSide` envelope. Now reads `self.ctx.config.execution.margin_mode`.
+
+**Risk-budget vs margin-fit split in `calculate_trade_plan`:**
+- New `margin_balance: Optional[float] = None` param. Defaults to `account_balance` (legacy single-balance behavior preserved).
+- `max_risk_usdt = account_balance × risk_pct` — R comes off **total equity**, independent of currently-locked margin.
+- `required_leverage = ideal_notional / effective_margin`, `max_notional = effective_margin × max_leverage × 0.95`, `min_lev_for_margin` — all use `margin_balance` (free margin). Prevents the planner from sizing R off availEq when other slots already hold margin.
+- `build_trade_plan_from_state` / `build_trade_plan_with_reason` grew a `margin_balance` pass-through.
+- `BotRunner._run_one_symbol`:
+  ```python
+  total_eq    = okx.get_total_equity("USDT")      # all equity incl. locked
+  okx_avail   = okx.get_balance("USDT")            # free for new orders
+  per_slot    = total_eq / max_concurrent_positions
+  risk_balance   = min(total_eq, risk_mgr.current_balance)
+  margin_balance = min(per_slot, okx_avail)
+  plan = build_trade_plan_with_reason(..., risk_balance, margin_balance=margin_balance, ...)
+  ```
+- Log line updated: `PLANNED … risk_bal=<total_eq> margin_bal=<min(per_slot, avail)>` replaces the old `sizing_bal=…`.
+- Live verification: SOL BEARISH 123c @ 87.58 landed at `risk_bal=4244.18 margin_bal=1414.75 risk=106.03` — full $106 R off total equity, only $215 margin locked.
+- 4 new tests in `tests/test_rr_system.py`: `test_margin_balance_defaults_to_account_balance`, `test_risk_uses_account_balance_not_margin_balance`, `test_margin_balance_caps_notional`, `test_negative_margin_balance_rejected`.
+
+**SL-to-BE threaded-callback fix** (observed on first ETH partial-TP run):
+- **Problem:** `PositionMonitor.poll()` runs in a worker thread via `asyncio.to_thread`. When TP1 fires and the monitor calls the injected `_on_sl_moved(inst_id, pos_side, new_algo_ids)` callback, the callback tried `asyncio.create_task(journal.update_algo_ids(...))` from that worker thread → `RuntimeError: no running event loop`. Log signature: `on_sl_moved_callback_failed … File "src/execution/position_monitor.py", line 155 … _on_sl_moved(…) … RuntimeError: no running event loop`. OKX-side SL replacement itself still succeeded (`sl_moved_to_be_via_replace inst=ETH-USDT-SWAP side=long new_algo=…`), only the journal's `algo_ids` column update was lost.
+- **Fix:** `BotContext.main_loop: Any = None` field. `BotRunner.run()` captures `asyncio.get_running_loop()` at startup and stashes it on `ctx.main_loop`. `_on_sl_moved` reads `c.main_loop` and schedules via `asyncio.run_coroutine_threadsafe(coro, loop)` — threadsafe dispatch to the right loop. Fallback to `create_task` for in-loop callers (tests).
+
+**Fee-drag observation (not a bug, documented for RL training):**
+- ETH partial-TP trade at 75x / $100k notional fully round-tripped via TP1 + TP2 (OKX `pnl: +$95.91`) but fees on 3 fills (entry + TP1 + TP2) at 0.05% taker = `fee: -$100.20` → `realizedPnl: -$4.29` → journal marks LOSS (`pnl_r=-0.08`). Gross-price movement was a ~+1.77R win.
+- Takeaway: at 75x + tight SL/TP, three-fill partial-TP structure can be fee-negative. Future: consider maker limit orders (taker 0.05% → maker 0.02%), wider TP2, or leverage cap per symbol when planned TP distance is small.
+
+**Total tests:** 418 passing (411 → 418, +7).
 
 ## Phase 7 — Reinforcement learning
 

@@ -211,6 +211,10 @@ class BotContext:
     contract_sizes: dict[str, float] = field(default_factory=dict)
     # Per-symbol OKX max leverage (BTC/ETH=100, SOL=50). Above this trips 59102.
     max_leverage_per_symbol: dict[str, int] = field(default_factory=dict)
+    # Main event loop captured at `run()` start — threaded callbacks (from
+    # `PositionMonitor.poll` running under `asyncio.to_thread`) schedule
+    # coroutines on this loop via `run_coroutine_threadsafe`.
+    main_loop: Any = None
 
 
 # ── Runner ──────────────────────────────────────────────────────────────────
@@ -280,10 +284,15 @@ class BotRunner:
 
         # The monitor needs a way to update algo_ids in the journal when
         # it moves SL to BE — inject a callback that uses open_trade_ids
-        # on the context to find the matching trade row.
-        ctx_holder: dict[str, BotContext] = {}
+        # on the context to find the matching trade row. `loop` is stashed
+        # by `run()` at startup so threaded callbacks (from monitor.poll in
+        # a worker thread) can schedule coroutines on the main loop.
+        ctx_holder: dict[str, Any] = {}
 
         def _on_sl_moved(inst_id: str, pos_side: str, new_algo_ids: list[str]) -> None:
+            # Called from `PositionMonitor.poll()` running in a worker thread
+            # via `asyncio.to_thread`, so the thread has no running loop.
+            # Schedule the DB write on the main loop via run_coroutine_threadsafe.
             c = ctx_holder.get("ctx")
             if c is None:
                 return
@@ -291,9 +300,15 @@ class BotRunner:
             if trade_id is None:
                 return
             import asyncio as _asyncio
-            _asyncio.create_task(
-                c.journal.update_algo_ids(trade_id, new_algo_ids)
-            )
+            coro = c.journal.update_algo_ids(trade_id, new_algo_ids)
+            loop = getattr(c, "main_loop", None)
+            if loop is not None:
+                _asyncio.run_coroutine_threadsafe(coro, loop)
+            else:
+                try:
+                    _asyncio.create_task(coro)
+                except RuntimeError:
+                    coro.close()
 
         monitor = PositionMonitor(
             client,
@@ -355,6 +370,10 @@ class BotRunner:
             install_shutdown_handlers(self.shutdown)
         except Exception:
             logger.exception("signal_install_failed")
+
+        # Capture the main loop so threaded callbacks (PositionMonitor.poll runs
+        # under asyncio.to_thread) can schedule DB writes on the right loop.
+        self.ctx.main_loop = asyncio.get_running_loop()
 
         try:
             async with self.ctx.journal:
