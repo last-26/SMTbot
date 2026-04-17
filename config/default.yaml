@@ -41,6 +41,13 @@ trading:
     ETH-USDT-SWAP: 30
     DOGE-USDT-SWAP: 30
     XRP-USDT-SWAP: 30
+  # Phase 6.9 B3 — per-symbol swing_lookback override for SL sourcing. Thin-
+  # book pairs (DOGE/XRP) need a wider lookback window before fallback swing
+  # SL kicks in — 18 `no_sl_source` rejects over 35 trades traced to here.
+  # Unlisted symbols fall back to analysis.swing_lookback (20).
+  swing_lookback_per_symbol:
+    DOGE-USDT-SWAP: 30
+    XRP-USDT-SWAP: 30
   # Multi-pair settle budgets — wait after set_symbol / set_timeframe so
   # the heavy SMT Overlay Pine has time to recompute before we read.
   symbol_settle_seconds: 6.0
@@ -62,7 +69,12 @@ circuit_breakers:
   cooldown_hours: 24
 
 analysis:
-  min_confluence_score: 2
+  # 2026-04-18 data (35 trades): score-5 bucket went 0/11, scores 6+ went
+  # 5/6 (83%), scores 3-4 went 5/11 (45%), score 2 tripped once. Raising
+  # the floor from 2 → 3 drops the worst bucket while keeping the sweet
+  # spot (4+) intact. If reject flow cratered, drop back to 2 and instead
+  # gate on analysis.require_structural_factor (not yet implemented).
+  min_confluence_score: 3
   candle_buffer_size: 500
   swing_lookback: 20
   sr_min_touches: 3
@@ -70,8 +82,24 @@ analysis:
   session_filter:
     - london
     - new_york
+  # Phase 6.9 B4 — per-symbol session override. NY + ASIAN went 0/6 post-
+  # cutoff; thin-book pairs (SOL/DOGE/XRP) only produce reliable entries
+  # during LONDON liquidity. BTC/ETH inherit the global filter above.
+  # Override REPLACES (not merges) — a pair listed here ignores the global.
+  session_filter_per_symbol:
+    SOL-USDT-SWAP: [london]
+    DOGE-USDT-SWAP: [london]
+    XRP-USDT-SWAP: [london]
   htf_sr_ceiling_enabled: true    # Madde D — push SL past HTF zones + cap TP
   htf_sr_buffer_atr: 0.2
+  # Phase 6.9 B2 — per-symbol HTF S/R TP-ceiling buffer. SOL 0/3 post-cutoff
+  # LOSSes all bumped the HTF TP ceiling; the global 0.2×ATR padding clips
+  # SOL's wide-ATR TP too aggressively. Lower = ceiling kicks in closer to
+  # the HTF zone (more room for TP). Unlisted → htf_sr_buffer_atr (0.2).
+  htf_sr_buffer_atr_per_symbol:
+    SOL-USDT-SWAP: 0.10
+    DOGE-USDT-SWAP: 0.15
+    XRP-USDT-SWAP: 0.15
   # Fee-aware min TP distance (fraction of entry price). 0.004 = 0.4% — rejects
   # tp-too-tight plans where 3× 0.05% taker fee + slippage eats the whole R.
   # The ETH 05:49 trade had 0.19% TP and lost -3.91R to fees+wick; 0.4% floor

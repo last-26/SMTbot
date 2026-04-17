@@ -140,3 +140,44 @@ def test_symbol_leverage_caps_lookup_missing_symbol_returns_default():
     assert cfg.trading.symbol_leverage_caps.get(
         "BTC-USDT-SWAP", cfg.trading.max_leverage
     ) == cfg.trading.max_leverage
+
+
+# ── Phase 6.9 B2/B3/B4 — per-symbol overrides ──────────────────────────────
+
+
+def test_swing_lookback_for_symbol_uses_override_when_present():
+    raw = _valid_raw()
+    raw["trading"]["swing_lookback_per_symbol"] = {"DOGE-USDT-SWAP": 30}
+    cfg = BotConfig(**raw)
+    assert cfg.swing_lookback_for("DOGE-USDT-SWAP") == 30
+    # Unlisted → falls back to analysis.swing_lookback (20 in _valid_raw)
+    assert cfg.swing_lookback_for("BTC-USDT-SWAP") == 20
+
+
+def test_htf_sr_buffer_atr_for_symbol_uses_override_when_present():
+    raw = _valid_raw()
+    raw["analysis"]["htf_sr_buffer_atr_per_symbol"] = {"SOL-USDT-SWAP": 0.10}
+    cfg = BotConfig(**raw)
+    assert cfg.htf_sr_buffer_atr_for("SOL-USDT-SWAP") == pytest.approx(0.10)
+    # Unlisted → analysis.htf_sr_buffer_atr default (0.2).
+    assert cfg.htf_sr_buffer_atr_for("BTC-USDT-SWAP") == pytest.approx(0.2)
+
+
+def test_allowed_sessions_for_symbol_override_replaces_global_not_merges():
+    raw = _valid_raw()
+    raw["analysis"]["session_filter"] = ["london", "new_york"]
+    raw["analysis"]["session_filter_per_symbol"] = {"SOL-USDT-SWAP": ["london"]}
+    cfg = BotConfig(**raw)
+    # Override is total — SOL doesn't inherit new_york from the global.
+    assert cfg.allowed_sessions_for("SOL-USDT-SWAP") == [Session.LONDON]
+    # Unlisted symbol gets the global list.
+    assert cfg.allowed_sessions_for("BTC-USDT-SWAP") == [
+        Session.LONDON, Session.NEW_YORK,
+    ]
+
+
+def test_per_symbol_overrides_default_to_empty_dicts():
+    cfg = BotConfig(**_valid_raw())
+    assert cfg.trading.swing_lookback_per_symbol == {}
+    assert cfg.analysis.htf_sr_buffer_atr_per_symbol == {}
+    assert cfg.analysis.session_filter_per_symbol == {}

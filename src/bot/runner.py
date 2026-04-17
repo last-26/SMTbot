@@ -927,11 +927,11 @@ class BotRunner:
                 contract_size=self.ctx.contract_sizes.get(
                     symbol, cfg.trading.contract_size),
                 margin_balance=margin_balance,
-                swing_lookback=cfg.analysis.swing_lookback,
-                allowed_sessions=cfg.allowed_sessions() or None,
+                swing_lookback=cfg.swing_lookback_for(symbol),
+                allowed_sessions=cfg.allowed_sessions_for(symbol) or None,
                 htf_sr_zones=self.ctx.htf_sr_cache.get(symbol),
                 htf_sr_ceiling_enabled=cfg.analysis.htf_sr_ceiling_enabled,
-                htf_sr_buffer_atr=cfg.analysis.htf_sr_buffer_atr,
+                htf_sr_buffer_atr=cfg.htf_sr_buffer_atr_for(symbol),
                 crowded_skip_enabled=cfg.derivatives.crowded_skip_enabled,
                 crowded_skip_z_threshold=cfg.derivatives.crowded_skip_z_threshold,
                 ltf_state=self.ctx.ltf_cache.get(symbol),
@@ -955,7 +955,7 @@ class BotRunner:
                 conf = calculate_confluence(
                     state,
                     ltf_candles=candles,
-                    allowed_sessions=cfg.allowed_sessions() or None,
+                    allowed_sessions=cfg.allowed_sessions_for(symbol) or None,
                     ltf_state=self.ctx.ltf_cache.get(symbol),
                     weights=cfg.analysis.confluence_weights or None,
                     min_rsi_mfi_magnitude=cfg.analysis.min_rsi_mfi_magnitude,

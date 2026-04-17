@@ -51,6 +51,12 @@ class TradingConfig(BaseModel):
     # Useful when e.g. ETH's OKX cap is 100x but demo wicks make anything
     # above 30x unsafe. Unlisted symbols fall back to the global max.
     symbol_leverage_caps: dict[str, int] = Field(default_factory=dict)
+    # Phase 6.9 B3 — per-symbol swing_lookback override for SL sourcing.
+    # DOGE/XRP had 18 no_sl_source rejects across 35 trades because 3m
+    # swing_lookback=20 doesn't reach far enough on thin-book pairs. Widen
+    # to 30 for those two; BTC/ETH/SOL keep the analysis.swing_lookback.
+    # Unlisted symbols fall back to analysis.swing_lookback.
+    swing_lookback_per_symbol: dict[str, int] = Field(default_factory=dict)
     # Round-trip taker reserve added to SL % when sizing notional, so a
     # stop-out stays inside the USDT risk budget AFTER paying entry + exit
     # taker fees. 0 = off (price-only sizing, back-compat for tests); runtime
@@ -119,8 +125,18 @@ class AnalysisConfig(BaseModel):
     sr_min_touches: int = 3
     sr_zone_atr_mult: float = 0.5
     session_filter: list[str] = Field(default_factory=list)
+    # Phase 6.9 B4 — per-symbol session filter override. 2026-04-17/18 data:
+    # NY + ASIAN sessions went 0/6 post-cutoff, LONDON went 3/5 (60%). Let
+    # thinner-book pairs (SOL/DOGE/XRP) opt into london-only while BTC/ETH
+    # keep the global list. Missing key → global session_filter applied.
+    session_filter_per_symbol: dict[str, list[str]] = Field(default_factory=dict)
     htf_sr_ceiling_enabled: bool = True      # Madde D
     htf_sr_buffer_atr: float = 0.2
+    # Phase 6.9 B2 — per-symbol HTF S/R buffer. SOL 0/3 post-cutoff losses
+    # cluster at the HTF TP ceiling; the global 0.2 × ATR padding clips
+    # SOL's wide-ATR TP too aggressively. Lower means the ceiling kicks in
+    # closer to the HTF zone, freeing more R. Unlisted → htf_sr_buffer_atr.
+    htf_sr_buffer_atr_per_symbol: dict[str, float] = Field(default_factory=dict)
     # Fee-aware min TP distance — a TP closer than this fraction of entry
     # price cannot survive the partial-TP 3-fill lifecycle net of taker fees
     # + slippage. Default 0 = off for test back-compat; runtime YAML sets it.
@@ -336,8 +352,36 @@ class BotConfig(BaseModel):
 
     def allowed_sessions(self) -> list[Session]:
         """Translate ['london', 'new_york'] → [Session.LONDON, Session.NEW_YORK]."""
+        return self._translate_sessions(self.analysis.session_filter)
+
+    def allowed_sessions_for(self, symbol: str) -> list[Session]:
+        """Per-symbol session filter (Phase 6.9 B4).
+
+        Falls back to the global `allowed_sessions()` when `symbol` has no
+        override. Overrides are total — they replace, not merge. A symbol
+        opting into `[london]` does NOT inherit `new_york` from the global.
+        """
+        override = self.analysis.session_filter_per_symbol.get(symbol)
+        if override is None:
+            return self.allowed_sessions()
+        return self._translate_sessions(override)
+
+    def swing_lookback_for(self, symbol: str) -> int:
+        """Per-symbol swing_lookback override (Phase 6.9 B3), else global."""
+        return self.trading.swing_lookback_per_symbol.get(
+            symbol, self.analysis.swing_lookback,
+        )
+
+    def htf_sr_buffer_atr_for(self, symbol: str) -> float:
+        """Per-symbol HTF S/R buffer override (Phase 6.9 B2), else global."""
+        return self.analysis.htf_sr_buffer_atr_per_symbol.get(
+            symbol, self.analysis.htf_sr_buffer_atr,
+        )
+
+    @staticmethod
+    def _translate_sessions(raw_list: list[str]) -> list[Session]:
         out: list[Session] = []
-        for raw in self.analysis.session_filter:
+        for raw in raw_list:
             mapped = _SESSION_MAP.get(raw.strip().lower())
             if mapped is not None and mapped not in out:
                 out.append(mapped)
