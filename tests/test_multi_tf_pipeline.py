@@ -117,7 +117,7 @@ def test_signal_table_last_bar_absent_is_none():
 
 
 async def test_wait_for_pine_settle_success(make_ctx):
-    """last_bar: 100, 100, 101 → True on the third read (change detected)."""
+    """baseline=100; last_bar reads 100, 100, 101 → True on the third (change)."""
     reader = _ScriptedReader([
         _state_with_last_bar(100),
         _state_with_last_bar(100),
@@ -127,27 +127,28 @@ async def test_wait_for_pine_settle_success(make_ctx):
                       pine_settle_poll_interval_s=0.0)
     ctx, _ = make_ctx(reader=reader, config=cfg)
     runner = BotRunner(ctx)
-    assert await runner._wait_for_pine_settle() is True
+    assert await runner._wait_for_pine_settle(baseline=100) is True
 
 
 async def test_wait_for_pine_settle_timeout(make_ctx):
-    """last_bar stays at 100 → False on timeout."""
+    """baseline=100; last_bar stays at 100 → False on timeout."""
     reader = _ScriptedReader([_state_with_last_bar(100)])
     cfg = make_config(pine_settle_max_wait_s=0.1,
                       pine_settle_poll_interval_s=0.01)
     ctx, _ = make_ctx(reader=reader, config=cfg)
     runner = BotRunner(ctx)
-    assert await runner._wait_for_pine_settle() is False
+    assert await runner._wait_for_pine_settle(baseline=100) is False
 
 
-async def test_wait_for_pine_settle_none_first_read_returns_true(make_ctx):
-    """If first readable last_bar is None (old Pine / test fake) → True."""
+async def test_wait_for_pine_settle_baseline_none_returns_true(make_ctx):
+    """baseline=None → True immediately (legacy fallback: Pine didn't expose
+    last_bar before the switch, so we can't detect re-render)."""
     reader = _ScriptedReader([_state_with_last_bar(None)])
     cfg = make_config(pine_settle_max_wait_s=1.0,
                       pine_settle_poll_interval_s=0.0)
     ctx, _ = make_ctx(reader=reader, config=cfg)
     runner = BotRunner(ctx)
-    assert await runner._wait_for_pine_settle() is True
+    assert await runner._wait_for_pine_settle(baseline=None) is True
 
 
 # ── TF switch order ─────────────────────────────────────────────────────────

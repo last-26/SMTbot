@@ -577,35 +577,34 @@ class BotRunner:
         logger.info("defensive_close_triggered symbol={} side={} reason={}",
                     symbol, side, reason)
 
-    async def _wait_for_pine_settle(self) -> bool:
-        """Poll the signal table until `last_bar` changes, meaning Pine has
-        re-rendered for the new symbol / timeframe. Returns True on change.
+    async def _read_last_bar(self) -> Optional[int]:
+        """Best-effort read of the signal-table last_bar. None on any failure."""
+        try:
+            state = await self.ctx.reader.read_market_state()
+            return state.signal_table.last_bar if state.signal_table else None
+        except Exception:
+            return None
+
+    async def _wait_for_pine_settle(self, baseline: Optional[int]) -> bool:
+        """Poll the signal table until `last_bar` differs from *baseline*,
+        meaning Pine has re-rendered for the new symbol / timeframe. Returns
+        True on change.
 
         Fallbacks:
-          * First readable `last_bar == None` → Pine version doesn't emit
-            the field (or we're in a unit test with a fake reader). The
-            static `tf_settle_seconds` sleep is assumed sufficient; return
-            True immediately so the caller keeps going.
+          * `baseline is None` → Pine didn't expose a last_bar before the
+            change (first boot, or Pine version without the field, or fake
+            reader in tests). The static `tf_settle_seconds` sleep is assumed
+            sufficient; return True immediately so the caller keeps going.
           * Timeout → False (caller skips the symbol cycle).
         """
+        if baseline is None:
+            return True
         cfg = self.ctx.config.trading
         deadline = time.monotonic() + cfg.pine_settle_max_wait_s
-        baseline: Optional[int] = None
-        first_read = True
         while time.monotonic() < deadline:
-            try:
-                state = await self.ctx.reader.read_market_state()
-                lb = state.signal_table.last_bar if state.signal_table else None
-                if first_read and lb is None:
-                    return True  # Pine doesn't emit last_bar on this chart
-                first_read = False
-                if lb is not None:
-                    if baseline is None:
-                        baseline = lb
-                    elif lb != baseline:
-                        return True
-            except Exception:
-                pass
+            lb = await self._read_last_bar()
+            if lb is not None and lb != baseline:
+                return True
             await asyncio.sleep(cfg.pine_settle_poll_interval_s)
         return False
 
@@ -614,16 +613,31 @@ class BotRunner:
 
         Returns True when Pine data reflects the new TF. False on timeout
         or bridge failure — caller skips the current symbol cycle.
+
+        Short-circuit: if TV is already on the requested resolution, the
+        ``set_timeframe`` call would be a no-op and Pine would not re-render,
+        so the freshness poll can't observe a change. Detect that up front
+        and succeed immediately.
         """
         if self.ctx.bridge is None:
             return True            # tests skip — reader fake already correct
+        normalized = TVBridge._normalize_tf(tf)
+        try:
+            status = await self.ctx.bridge.status()
+            if status.get("chart_resolution") == normalized:
+                return True
+        except Exception:
+            pass  # fall through to the full switch+poll path
+        # Capture the pre-switch last_bar so we can detect Pine re-rendering
+        # for the new TF (same-value = still-old-chart, any-change = re-rendered).
+        baseline = await self._read_last_bar()
         try:
             await self.ctx.bridge.set_timeframe(tf)
         except Exception:
             logger.exception("set_timeframe_failed tf={}", tf)
             return False
         await asyncio.sleep(self.ctx.config.trading.tf_settle_seconds)
-        return await self._wait_for_pine_settle()
+        return await self._wait_for_pine_settle(baseline)
 
     async def _run_one_symbol(self, symbol: str) -> None:
         cfg = self.ctx.config
