@@ -210,6 +210,8 @@ class BotContext:
     # OKX per-symbol ctVal (underlying per contract). BTC=0.01, ETH=0.1, SOL=1.
     # Populated at bootstrap; one hardcoded value for all symbols trips 51008.
     contract_sizes: dict[str, float] = field(default_factory=dict)
+    # Per-symbol OKX max leverage (BTC/ETH=100, SOL=50). Above this trips 59102.
+    max_leverage_per_symbol: dict[str, int] = field(default_factory=dict)
 
 
 # ── Runner ──────────────────────────────────────────────────────────────────
@@ -792,7 +794,11 @@ class BotRunner:
                 risk_pct=cfg.risk_pct_fraction(),
                 rr_ratio=cfg.trading.default_rr_ratio,
                 min_rr_ratio=cfg.trading.min_rr_ratio,
-                max_leverage=cfg.trading.max_leverage,
+                max_leverage=min(
+                    cfg.trading.max_leverage,
+                    self.ctx.max_leverage_per_symbol.get(
+                        symbol, cfg.trading.max_leverage),
+                ),
                 contract_size=self.ctx.contract_sizes.get(
                     symbol, cfg.trading.contract_size),
                 swing_lookback=cfg.analysis.swing_lookback,
@@ -933,26 +939,32 @@ class BotRunner:
         await self._load_contract_sizes()
 
     async def _load_contract_sizes(self) -> None:
-        """Pre-fetch OKX ctVal for every configured symbol. Falls back to the
-        YAML default on error so the bot still runs (will trip 51008 for
-        non-BTC but logs the failure so the operator sees it)."""
+        """Pre-fetch OKX ctVal + max leverage for every configured symbol.
+        Falls back to YAML defaults on error so the bot still runs; logs
+        the failure so the operator sees it."""
         cfg = self.ctx.config
-        fallback = cfg.trading.contract_size
+        ct_fallback = cfg.trading.contract_size
+        lev_fallback = cfg.trading.max_leverage
         for symbol in cfg.trading.symbols:
             try:
-                ct = await asyncio.to_thread(
-                    self.ctx.okx_client.get_contract_size, symbol)
-                if ct > 0:
-                    self.ctx.contract_sizes[symbol] = ct
-                else:
-                    self.ctx.contract_sizes[symbol] = fallback
-                    logger.warning("ctval_zero_using_fallback symbol={} fallback={}",
-                                   symbol, fallback)
+                spec = await asyncio.to_thread(
+                    self.ctx.okx_client.get_instrument_spec, symbol)
+                ct = float(spec.get("ct_val") or 0.0)
+                mx = int(spec.get("max_leverage") or 0)
+                self.ctx.contract_sizes[symbol] = ct if ct > 0 else ct_fallback
+                self.ctx.max_leverage_per_symbol[symbol] = (
+                    mx if mx > 0 else lev_fallback)
+                if ct <= 0 or mx <= 0:
+                    logger.warning("instrument_spec_partial symbol={} spec={}",
+                                   symbol, spec)
             except Exception:
-                self.ctx.contract_sizes[symbol] = fallback
-                logger.exception("ctval_fetch_failed symbol={} fallback={}",
-                                 symbol, fallback)
-        logger.info("contract_sizes_loaded {}", self.ctx.contract_sizes)
+                self.ctx.contract_sizes[symbol] = ct_fallback
+                self.ctx.max_leverage_per_symbol[symbol] = lev_fallback
+                logger.exception("instrument_spec_failed symbol={}", symbol)
+        logger.info(
+            "instrument_specs_loaded ctvals={} max_lev={}",
+            self.ctx.contract_sizes, self.ctx.max_leverage_per_symbol,
+        )
 
     async def _process_closes(self) -> None:
         try:

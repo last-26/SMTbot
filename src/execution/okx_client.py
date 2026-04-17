@@ -184,6 +184,19 @@ class OKXClient:
         data = _check(resp, "get_instruments")
         return float(data.get("ctVal") or 0.0)
 
+    def get_instrument_spec(self, inst_id: str) -> dict:
+        """Return `{ctVal, max_leverage}` for sizing + leverage-cap math.
+
+        Max leverage is per-instrument (BTC/ETH=100x, SOL=50x). Setting a
+        higher lever than the instrument permits rejects with sCode 59102.
+        """
+        resp = self.public.get_instruments(instType="SWAP", instId=inst_id)
+        data = _check(resp, "get_instruments")
+        return {
+            "ct_val": float(data.get("ctVal") or 0.0),
+            "max_leverage": int(float(data.get("lever") or 0)),
+        }
+
     # ── Orders ──────────────────────────────────────────────────────────────
 
     def place_market_order(
