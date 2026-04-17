@@ -72,6 +72,23 @@ def _parse_float(s: str) -> Optional[float]:
         return None
 
 
+def _parse_leading_float(s: Optional[str]) -> float:
+    """Parse the leading float from a compound cell like '67450.21 (above)'.
+
+    Returns 0.0 for missing / dash / unparsable cells. Used by VWAP rows
+    where the suffix is human-eyeball metadata that the bot ignores.
+    """
+    if not s:
+        return 0.0
+    s = s.strip()
+    if s in ("", "—", "-"):
+        return 0.0
+    m = re.match(r"-?\d+(?:\.\d+)?", s)
+    if not m:
+        return 0.0
+    return float(m.group(0))
+
+
 def _parse_int(s: Optional[str]) -> Optional[int]:
     """Parse an int from string, return None on failure / missing."""
     if s is None:
@@ -168,6 +185,12 @@ def _build_signal_data(kv: dict[str, str]) -> SignalTableData:
     wt_bias_raw = kv.get("vmc_wt_bias", "NEUTRAL")
     wt_bias_state, wt_bias_value = _parse_state_with_value(wt_bias_raw, "NEUTRAL", 0.0)
 
+    # Parse vwap_*: "67450.21 (above)" -> 67450.21. The "(above)" suffix is
+    # eyeball confirmation only; the bot derives side from price comparison.
+    vwap_1m_val  = _parse_leading_float(kv.get("vwap_1m"))
+    vwap_3m_val  = _parse_leading_float(kv.get("vwap_3m"))
+    vwap_15m_val = _parse_leading_float(kv.get("vwap_15m"))
+
     return SignalTableData(
         # Price Action
         trend_htf=_parse_direction(kv.get("trend_htf", "")),
@@ -192,6 +215,9 @@ def _build_signal_data(kv: dict[str, str]) -> SignalTableData:
         confluence=confluence,
         atr_14=_parse_float(kv.get("atr_14", "0")) or 0.0,
         price=_parse_float(kv.get("price", "0")) or 0.0,
+        vwap_1m=vwap_1m_val,
+        vwap_3m=vwap_3m_val,
+        vwap_15m=vwap_15m_val,
         last_bar=_parse_int(kv.get("last_bar")),
     )
 

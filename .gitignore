@@ -48,3 +48,6 @@ logs/
 
 # Claude Code memory (personal)
 .claude/
+
+# Project notes (personal — locally tracked, not shared)
+CLAUDE.md

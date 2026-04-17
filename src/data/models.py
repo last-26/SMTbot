@@ -114,6 +114,13 @@ class SignalTableData(BaseModel):
     confluence: int = 0  # 0-7 with VMC Cipher A
     atr_14: float = 0.0
     price: float = 0.0
+
+    # Multi-TF session-anchored VWAP (overlay request.security on 1m/3m/15m).
+    # 0.0 means missing/unparsed; consumers must guard with > 0.
+    vwap_1m: float = 0.0
+    vwap_3m: float = 0.0
+    vwap_15m: float = 0.0
+
     last_bar: Optional[int] = None  # bar_index of last Pine update — used
                                     # by the runner's freshness-poll to
                                     # detect when a symbol / timeframe

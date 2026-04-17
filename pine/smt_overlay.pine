@@ -140,6 +140,20 @@ rsiMFImultA    = input.float(150, "RSI+MFI Multiplier",         group="VMC Ciphe
 atrVal = ta.atr(14)
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// MULTI-TF VWAP — session-anchored VWAP queried from 1m / 3m / 15m
+//   Pulled regardless of the chart TF so the bot always sees the same triplet.
+//   Surfaced into the SMT Signals table for downstream confluence scoring.
+// ═══════════════════════════════════════════════════════════════════════════════
+showVWAPLines = input.bool(false, "Plot Multi-TF VWAP lines", group="VWAP")
+vwapSrc       = hlc3
+vwap1m  = request.security(syminfo.tickerid, "1",  ta.vwap(vwapSrc), lookahead=barmerge.lookahead_off)
+vwap3m  = request.security(syminfo.tickerid, "3",  ta.vwap(vwapSrc), lookahead=barmerge.lookahead_off)
+vwap15m = request.security(syminfo.tickerid, "15", ta.vwap(vwapSrc), lookahead=barmerge.lookahead_off)
+plot(showVWAPLines ? vwap1m  : na, "VWAP 1m",  color=color.new(color.aqua,   0), linewidth=1)
+plot(showVWAPLines ? vwap3m  : na, "VWAP 3m",  color=color.new(color.yellow, 0), linewidth=1)
+plot(showVWAPLines ? vwap15m : na, "VWAP 15m", color=color.new(color.orange, 0), linewidth=2)
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // SECTION 1 — MARKET STRUCTURE (MSS / BOS / Swings)
 // ═══════════════════════════════════════════════════════════════════════════════
 swingHigh = ta.pivothigh(high, swingLen, swingLen)
@@ -1020,7 +1034,7 @@ if (bar_index - lastYellowCrossBar <= 3 and trend == 1) or (bar_index - lastBloo
 // SECTION 9 — MASTER SIGNAL TABLE
 //   Bot reads via:  tv stream tables --filter "SMT Signals"
 // ═══════════════════════════════════════════════════════════════════════════════
-var table sigTable = table.new(position.top_right, 2, 20, bgcolor=color.new(color.black, 75), border_width=1)
+var table sigTable = table.new(position.top_right, 2, 23, bgcolor=color.new(color.black, 75), border_width=1)
 
 if enableTable and barstate.islast
     bullCol = color.new(#00C853, 0)
@@ -1123,7 +1137,29 @@ if enableTable and barstate.islast
     table.cell(sigTable, 1, row, str.tostring(close, "#.##"), text_color=color.white, text_size=size.small)
     row += 1
 
-    // Row 18 = sanity marker (confirms full table rendered)
+    // ─── Multi-TF VWAP block ─────────────────────────────────────────────────
+    // Format: "<value> (above|below)" where the side is close vs that VWAP.
+    // Bot parses the leading float; the suffix is human-eyeballable confirmation.
+    vwap1mSide  = na(vwap1m)  ? "—" : (close > vwap1m  ? "above" : "below")
+    vwap3mSide  = na(vwap3m)  ? "—" : (close > vwap3m  ? "above" : "below")
+    vwap15mSide = na(vwap15m) ? "—" : (close > vwap15m ? "above" : "below")
+    vwap1mCol   = na(vwap1m)  ? neutCol : (close > vwap1m  ? bullCol : bearCol)
+    vwap3mCol   = na(vwap3m)  ? neutCol : (close > vwap3m  ? bullCol : bearCol)
+    vwap15mCol  = na(vwap15m) ? neutCol : (close > vwap15m ? bullCol : bearCol)
+
+    table.cell(sigTable, 0, row, "vwap_1m", text_color=neutCol, text_size=size.small)
+    table.cell(sigTable, 1, row, na(vwap1m)  ? "—" : str.tostring(vwap1m,  "#.##") + " (" + vwap1mSide  + ")", text_color=vwap1mCol,  text_size=size.small)
+    row += 1
+
+    table.cell(sigTable, 0, row, "vwap_3m", text_color=neutCol, text_size=size.small)
+    table.cell(sigTable, 1, row, na(vwap3m)  ? "—" : str.tostring(vwap3m,  "#.##") + " (" + vwap3mSide  + ")", text_color=vwap3mCol,  text_size=size.small)
+    row += 1
+
+    table.cell(sigTable, 0, row, "vwap_15m", text_color=neutCol, text_size=size.small)
+    table.cell(sigTable, 1, row, na(vwap15m) ? "—" : str.tostring(vwap15m, "#.##") + " (" + vwap15mSide + ")", text_color=vwap15mCol, text_size=size.small)
+    row += 1
+
+    // Sanity marker (must remain LAST row — runner uses it as freshness beacon)
     table.cell(sigTable, 0, row, "last_bar", text_color=neutCol, text_size=size.small)
     table.cell(sigTable, 1, row, str.tostring(bar_index), text_color=color.white, text_size=size.small)
 

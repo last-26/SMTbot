@@ -88,6 +88,10 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "derivatives_contrarian": 0.7,
     "derivatives_capitulation": 0.6,
     "derivatives_heatmap_target": 0.5,
+    # Multi-TF VWAP stack alignment. Full weight when price sits on the
+    # favorable side of all three (1m/3m/15m) VWAPs, half weight when 2/3 do.
+    # Missing values (0.0) are skipped — never block scoring.
+    "vwap_alignment": 0.6,
 }
 
 
@@ -355,6 +359,37 @@ def score_direction(
                     direction=direction,
                     detail=f"ltf_signal={sig_raw} bars_ago={bars_ago}",
                 ))
+
+    # 12.5 Multi-TF VWAP alignment — count how many of {1m, 3m, 15m} VWAPs
+    # the price sits on the favorable side of (above for BULLISH, below for
+    # BEARISH). Skip any zero-valued (missing) VWAP.
+    sig = state.signal_table
+    vwap_vals = [(tf, v) for tf, v in
+                 (("1m", sig.vwap_1m), ("3m", sig.vwap_3m), ("15m", sig.vwap_15m))
+                 if v > 0]
+    if vwap_vals and price > 0:
+        if direction == Direction.BULLISH:
+            aligned = [tf for tf, v in vwap_vals if price > v]
+        else:
+            aligned = [tf for tf, v in vwap_vals if price < v]
+        n_avail = len(vwap_vals)
+        n_aligned = len(aligned)
+        # Need at least 2/3 (or all-of-N if fewer available) to fire.
+        if n_avail >= 2 and n_aligned == n_avail:
+            factors.append(ConfluenceFactor(
+                name="vwap_alignment",
+                weight=w["vwap_alignment"],
+                direction=direction,
+                detail=f"price {'>' if direction == Direction.BULLISH else '<'} all "
+                       f"VWAPs ({','.join(aligned)})",
+            ))
+        elif n_avail == 3 and n_aligned == 2:
+            factors.append(ConfluenceFactor(
+                name="vwap_alignment",
+                weight=w["vwap_alignment"] * 0.5,
+                direction=direction,
+                detail=f"price aligned with 2/3 VWAPs ({','.join(aligned)})",
+            ))
 
     # 13. Derivatives (Phase 1.5 Madde 6) — one slot max per cycle.
     deriv_state = getattr(state, "derivatives", None)
