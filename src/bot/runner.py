@@ -34,6 +34,8 @@ from src.analysis.support_resistance import detect_sr_zones
 from src.bot.config import BotConfig
 from src.bot.lifecycle import install_shutdown_handlers
 from src.data.candle_buffer import MultiTFBuffer
+from src.data.derivatives_api import CoinalyzeClient
+from src.data.derivatives_cache import DerivativesCache
 from src.data.liquidation_stream import LiquidationStream
 from src.data.ltf_reader import LTFReader, LTFState
 from src.data.models import Direction, MarketState, Session
@@ -50,6 +52,7 @@ from src.execution.okx_client import OKXClient
 from src.execution.order_router import OrderRouter, RouterConfig, dry_run_report
 from src.execution.position_monitor import PositionMonitor
 from src.journal.database import TradeJournal
+from src.journal.derivatives_journal import DerivativesJournal
 from src.strategy.entry_signals import build_trade_plan_from_state
 from src.strategy.risk_manager import RiskManager, TradeResult
 
@@ -256,13 +259,32 @@ class BotRunner:
         ctx_holder["ctx"] = ctx
 
         # Phase 1.5 — derivatives subsystem. Instances are created here so
-        # shutdown cascade is deterministic; the actual WS task is started
-        # from `BotRunner.run()` (keeps `from_config` sync-safe).
+        # shutdown cascade is deterministic; the actual WS task + cache
+        # refresh loop are started from `BotRunner.run()`.
         if cfg.derivatives.enabled:
-            ctx.liquidation_stream = LiquidationStream(
+            deriv_journal = DerivativesJournal(cfg.journal.db_path)
+            liq_stream = LiquidationStream(
                 watched_symbols=list(cfg.trading.symbols),
                 buffer_size_per_symbol=cfg.derivatives.liquidation_buffer_size,
             )
+            liq_stream.attach_journal(deriv_journal)
+            coinalyze = CoinalyzeClient(
+                timeout_s=cfg.derivatives.coinalyze_timeout_s,
+                max_retries=cfg.derivatives.coinalyze_max_retries,
+            )
+            cache = DerivativesCache(
+                watched=list(cfg.trading.symbols),
+                liq_stream=liq_stream,
+                coinalyze=coinalyze,
+                journal=deriv_journal,
+                refresh_interval_s=cfg.derivatives.coinalyze_refresh_interval_s,
+            )
+            ctx.liquidation_stream = liq_stream
+            ctx.coinalyze_client = coinalyze
+            ctx.derivatives_cache = cache
+            # Stash the journal on the cache for the start-sequence; the
+            # runner calls `ensure_schema` through `_start_derivatives`.
+            cache._deriv_journal_bootstrap = deriv_journal
 
         return cls(ctx, stop_after_closed_trades=stop_after_closed_trades)
 
@@ -303,11 +325,24 @@ class BotRunner:
 
     async def _start_derivatives(self) -> None:
         """Boot the Phase 1.5 derivatives tasks. Safe to call when disabled."""
+        cache = self.ctx.derivatives_cache
+        if cache is not None:
+            deriv_journal = getattr(cache, "_deriv_journal_bootstrap", None)
+            if deriv_journal is not None:
+                try:
+                    await deriv_journal.ensure_schema()
+                except Exception:
+                    logger.exception("derivatives_schema_failed")
         if self.ctx.liquidation_stream is not None:
             try:
                 await self.ctx.liquidation_stream.start()
             except Exception:
                 logger.exception("liquidation_stream_start_failed")
+        if cache is not None:
+            try:
+                await cache.start()
+            except Exception:
+                logger.exception("derivatives_cache_start_failed")
 
     async def _stop_derivatives(self) -> None:
         """Cascade stop (cache → stream → client). Best-effort, never raises."""

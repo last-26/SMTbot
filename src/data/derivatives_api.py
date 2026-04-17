@@ -43,6 +43,10 @@ class DerivativesSnapshot:
     short_share: float = 0.5
     aggregated_long_liq_1h_usd: float = 0.0
     aggregated_short_liq_1h_usd: float = 0.0
+    # Enriched by DerivativesCache (Madde 3) before persist — default 0 keeps
+    # the dataclass zero-arg constructible for unit tests.
+    oi_change_1h_pct: float = 0.0
+    oi_change_24h_pct: float = 0.0
 
 
 class CoinalyzeClient:
