@@ -5,9 +5,13 @@ bot:
   starting_balance: 3200.0  # post-loss OKX demo balance — drives 1R ≈ $32
 
 trading:
-  # 3 majors — round-robin her cycle. 3 parite × 3 slot = max_concurrent ile
-  # birebir örtüşür; 3dk entry TF'te mum başına ~2 tarama sığar.
-  symbols: [BTC-USDT-SWAP, ETH-USDT-SWAP, SOL-USDT-SWAP]
+  # 5 majors — round-robin her cycle. 5 parite × 4 slot = max_concurrent 4 ile
+  # queue karakterli (her cycle 1 parite beklemede, confluence filter'ı daha
+  # iyi sinyal seçer). 3dk entry TF'te typical cycle ~125-155s, worst ~247s
+  # (TV TF-switch'lerin hepsi max timeout'a gidip cycle'ı 180s'in üstüne
+  # taşırsa sadece o cycle skip olur; bir sonraki yakalar). Coinalyze
+  # 25/40 calls-per-min = güvenli (37.5% margin).
+  symbols: [BTC-USDT-SWAP, ETH-USDT-SWAP, SOL-USDT-SWAP, DOGE-USDT-SWAP, XRP-USDT-SWAP]
   entry_timeframe: 3m
   htf_timeframe: 15m
   ltf_timeframe: 1m
@@ -20,15 +24,19 @@ trading:
   max_leverage: 75
   default_rr_ratio: 3.0
   min_rr_ratio: 2.0
-  max_concurrent_positions: 3
+  max_concurrent_positions: 4
   contract_size: 0.01
   # Operator-side per-symbol leverage caps (on top of OKX instrument caps).
   # Effective ceiling = min(trading.max_leverage, okx_cap, symbol_cap).
   # ETH demo wicks burn high-leverage positions even when SL discipline holds,
   # so cap it at 30x regardless of the global 75x. BTC stays wide (tighter
   # liq behavior, deeper book). SOL inherits the OKX 50x cap automatically.
+  # DOGE + XRP capped at 30x — momentum-driven pairs have sharp 3m wicks
+  # that blow high-leverage positions even when SL structure holds.
   symbol_leverage_caps:
     ETH-USDT-SWAP: 30
+    DOGE-USDT-SWAP: 30
+    XRP-USDT-SWAP: 30
   # Multi-pair settle budgets — wait after set_symbol / set_timeframe so
   # the heavy SMT Overlay Pine has time to recompute before we read.
   symbol_settle_seconds: 6.0
@@ -162,6 +170,10 @@ derivatives:
       capitulation_liq_notional: 20000000   # $20M — ETH moves bigger liq rounds
     SOL-USDT-SWAP:
       capitulation_liq_notional: 8000000    # $8M — thinner book, smaller washes
+    DOGE-USDT-SWAP:
+      capitulation_liq_notional: 8000000    # $8M — momentum-driven, SOL-class book depth
+    XRP-USDT-SWAP:
+      capitulation_liq_notional: 8000000    # $8M — similar characteristic to DOGE
   # Entry signal integration (Madde 6).
   confluence_slot_enabled: true
   crowded_skip_enabled: true

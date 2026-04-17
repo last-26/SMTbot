@@ -26,8 +26,12 @@ from src.data.liquidation_stream import (
 def test_symbol_mapping_round_trip():
     assert okx_to_binance_symbol("BTC-USDT-SWAP") == "BTCUSDT"
     assert okx_to_binance_symbol("ETH-USDT-SWAP") == "ETHUSDT"
+    assert okx_to_binance_symbol("DOGE-USDT-SWAP") == "DOGEUSDT"
+    assert okx_to_binance_symbol("XRP-USDT-SWAP") == "XRPUSDT"
     assert binance_to_okx_symbol("BTCUSDT") == "BTC-USDT-SWAP"
     assert binance_to_okx_symbol("SOLUSDT") == "SOL-USDT-SWAP"
+    assert binance_to_okx_symbol("DOGEUSDT") == "DOGE-USDT-SWAP"
+    assert binance_to_okx_symbol("XRPUSDT") == "XRP-USDT-SWAP"
 
 
 def test_symbol_mapping_rejects_non_usdt():

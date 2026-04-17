@@ -186,6 +186,7 @@ async def test_legacy_symbol_config_backward_compat():
     ("SOL-USDT-SWAP", "OKX:SOLUSDT.P"),
     ("AVAX-USDT-SWAP", "OKX:AVAXUSDT.P"),
     ("XRP-USDT-SWAP", "OKX:XRPUSDT.P"),
+    ("DOGE-USDT-SWAP", "OKX:DOGEUSDT.P"),
     ("BTC-USDT", "OKX:BTCUSDT"),            # spot — no .P
 ])
 def test_okx_to_tv_symbol(okx, tv):

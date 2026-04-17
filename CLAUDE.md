@@ -461,11 +461,24 @@ Three interlocking policy changes so the nominal `$30 R / $90 TP` (1:3 @ 1% of 3
 
 **Cycle:** `python scripts/train_rl.py --min-trades 50 --walk-forward`. Improved params → `config/strategies/active.yaml`.
 
+**Pre-RL workflow (mandatory before first training run):**
+
+1. **Filter dirty data.** Early API-test trades + pre-fix trades poison the training set — RL learns the noise as signal. Define a `clean_since` cutoff (entry_timestamp after the last meaningful policy change) and feed only trades after it. Old rows stay in DB for old-vs-new regime comparison; never delete.
+2. **Read the reporter first.** `.venv/Scripts/python.exe scripts/report.py --last 7d` shows `win_rate_by_session`, `win_rate_by_factor`, `regime_breakdown`. Open-eye obvious losers (e.g. session with <%20 WR, factor that drags expectancy negative) get fixed manually in YAML — RL is not for catching things you can already see.
+3. **Hand-tune the baseline.** Disable bad sessions, drop/zero pattern weights that lose money, tighten thresholds. Goal: baseline should be at least break-even on the clean window before RL touches it. RL is fine-tuning on a working strategy, not rescue surgery on a broken one.
+4. **Then RL.** Walk-forward only after baseline is positive on ≥50 clean trades. RL's job is squeezing the last 10-30% out of `confluence_threshold`, `pattern_weights` ratios, `min_rr_ratio`, etc. — not flipping signs.
+
+**What RL actually does (mental model):** reads each trade's feature columns (`confluence_score`, `confluence_factors`, `session`, `regime_at_entry`, `funding_z_at_entry`, `htf_bias`, …) and pairs them with `pnl_r`. Gradient updates parameters so the *trades that pass the filters* maximize average `pnl_r`. **It does NOT do root-cause analysis** — 16 losses from 5 different causes all look like "this feature combination = LOSS" to the optimizer. This is why step 2-3 above (human pattern-spotting on aggregate stats) cannot be skipped.
+
 ## Currency pair strategy
 
-**3 OKX perps — BTC / ETH / SOL** (trimmed from 5 at Phase 1.5 for Coinalyze free-tier budget + balanced RL dataset). `trading.symbols` is single source of truth; legacy single-`symbol` form still loads with `DeprecationWarning`. `max_concurrent_positions=3` caps total exposure across all symbols.
+**5 OKX perps — BTC / ETH / SOL / DOGE / XRP.** Phase 1.5'te 5 → 3'e inilmişti (Coinalyze free-tier budget + dengeli RL dataset için). 2026-04-17'de DOGE + XRP eklendi — BTC/ETH/SOL genelde correlated, momentum-driven iki parite uncorrelated alpha ekler. Coinalyze free-tier budget hâlâ güvenli: 5 × 5 call / 60s = 25/40 min. `trading.symbols` tek kaynak; legacy single-`symbol` form `DeprecationWarning` ile yüklenir.
 
-**Adding a 4th+ pair:** drop into `trading.symbols`, confirm `okx_to_tv_symbol()` (add parametrized test), add `derivatives.regime_per_symbol_overrides` (smaller OI pools → smaller `capitulation_liq_notional`), watch first 20-30 cycles for `htf_settle_timeout`/`set_symbol_failed` — illiquid pairs flunk freshness-poll more.
+**`max_concurrent_positions=4`** (5 parite 4 slot için yarışır — her cycle 1 parite beklemede kalır, confluence gate daha iyi sinyal seçer; 4. pozisyon queue karakteri). `per_slot = total_eq / 4 ≈ $800` margin budget (cross margin mode ile shared pool). R hâlâ total_eq'nun %1'i sabit, sadece notional tavan %25 küçülür.
+
+**Cycle timing (5 parite, 3m entry TF = 180s cycle):** typical ~125-155s (freshness-poll erken döner), worst ~247s (her TF switch max timeout'a giderse). Worst-case bazen oluşursa sadece o cycle skip olur, bir sonraki yakalar. DOGE + XRP 30x leverage cap'li (`symbol_leverage_caps`) ve SOL-sınıfı thin book sayılıp `$8M capitulation_liq_notional` override aldılar.
+
+**Adding a 6th+ pair:** drop into `trading.symbols`, confirm `okx_to_tv_symbol()` (add parametrized test), add `derivatives.regime_per_symbol_overrides` (smaller OI pools → smaller `capitulation_liq_notional`), watch first 20-30 cycles for `htf_settle_timeout`/`set_symbol_failed` — illiquid pairs flunk freshness-poll more. 6 pair + 4 slot'ta Coinalyze 30/40 min, cycle typical ~150-180s → worst-case pressure başlar; `pine_settle_max_wait_s` düşürmek gerekebilir.
 
 ## Configuration
 
