@@ -100,6 +100,18 @@ class TradeRecord(BaseModel):
     # Why the position was closed — "EARLY_CLOSE_LTF_REVERSAL" etc. (Madde F).
     close_reason: Optional[str] = None
 
+    # Derivatives snapshot at entry (Phase 1.5 Madde 7) — feed for Phase 7
+    # RL features. All optional so legacy rows stay readable.
+    regime_at_entry: Optional[str] = None
+    funding_z_at_entry: Optional[float] = None
+    ls_ratio_at_entry: Optional[float] = None
+    oi_change_24h_at_entry: Optional[float] = None
+    liq_imbalance_1h_at_entry: Optional[float] = None
+    nearest_liq_cluster_above_price: Optional[float] = None
+    nearest_liq_cluster_below_price: Optional[float] = None
+    nearest_liq_cluster_above_notional: Optional[float] = None
+    nearest_liq_cluster_below_notional: Optional[float] = None
+
     # Notes / screenshots (manual or future automation)
     notes: Optional[str] = None
     screenshot_entry: Optional[str] = None

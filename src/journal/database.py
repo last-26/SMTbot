@@ -77,6 +77,16 @@ CREATE TABLE IF NOT EXISTS trades (
     algo_ids            TEXT NOT NULL DEFAULT '[]',
     close_reason        TEXT,
 
+    regime_at_entry                     TEXT,
+    funding_z_at_entry                  REAL,
+    ls_ratio_at_entry                   REAL,
+    oi_change_24h_at_entry              REAL,
+    liq_imbalance_1h_at_entry           REAL,
+    nearest_liq_cluster_above_price     REAL,
+    nearest_liq_cluster_below_price     REAL,
+    nearest_liq_cluster_above_notional  REAL,
+    nearest_liq_cluster_below_notional  REAL,
+
     notes               TEXT,
     screenshot_entry    TEXT,
     screenshot_exit     TEXT
@@ -100,6 +110,10 @@ _COLUMNS = [
     "entry_timeframe", "htf_timeframe", "htf_bias", "session", "market_structure",
     "exit_price", "pnl_usdt", "pnl_r", "fees_usdt",
     "algo_ids", "close_reason",
+    "regime_at_entry", "funding_z_at_entry", "ls_ratio_at_entry",
+    "oi_change_24h_at_entry", "liq_imbalance_1h_at_entry",
+    "nearest_liq_cluster_above_price", "nearest_liq_cluster_below_price",
+    "nearest_liq_cluster_above_notional", "nearest_liq_cluster_below_notional",
     "notes", "screenshot_entry", "screenshot_exit",
 ]
 
@@ -109,6 +123,16 @@ _COLUMNS = [
 _MIGRATIONS = [
     "ALTER TABLE trades ADD COLUMN algo_ids TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE trades ADD COLUMN close_reason TEXT",
+    # Phase 1.5 Madde 7 — derivatives snapshot at entry time.
+    "ALTER TABLE trades ADD COLUMN regime_at_entry TEXT",
+    "ALTER TABLE trades ADD COLUMN funding_z_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN ls_ratio_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN oi_change_24h_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN liq_imbalance_1h_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN nearest_liq_cluster_above_price REAL",
+    "ALTER TABLE trades ADD COLUMN nearest_liq_cluster_below_price REAL",
+    "ALTER TABLE trades ADD COLUMN nearest_liq_cluster_above_notional REAL",
+    "ALTER TABLE trades ADD COLUMN nearest_liq_cluster_below_notional REAL",
 ]
 
 
@@ -132,6 +156,10 @@ def _record_to_row(rec: TradeRecord) -> tuple:
         rec.entry_timeframe, rec.htf_timeframe, rec.htf_bias, rec.session, rec.market_structure,
         rec.exit_price, rec.pnl_usdt, rec.pnl_r, rec.fees_usdt,
         json.dumps(rec.algo_ids), rec.close_reason,
+        rec.regime_at_entry, rec.funding_z_at_entry, rec.ls_ratio_at_entry,
+        rec.oi_change_24h_at_entry, rec.liq_imbalance_1h_at_entry,
+        rec.nearest_liq_cluster_above_price, rec.nearest_liq_cluster_below_price,
+        rec.nearest_liq_cluster_above_notional, rec.nearest_liq_cluster_below_notional,
         rec.notes, rec.screenshot_entry, rec.screenshot_exit,
     )
 
@@ -172,6 +200,15 @@ def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
         fees_usdt=row["fees_usdt"] or 0.0,
         algo_ids=json.loads(_safe_col(row, "algo_ids") or "[]"),
         close_reason=_safe_col(row, "close_reason"),
+        regime_at_entry=_safe_col(row, "regime_at_entry"),
+        funding_z_at_entry=_safe_col(row, "funding_z_at_entry"),
+        ls_ratio_at_entry=_safe_col(row, "ls_ratio_at_entry"),
+        oi_change_24h_at_entry=_safe_col(row, "oi_change_24h_at_entry"),
+        liq_imbalance_1h_at_entry=_safe_col(row, "liq_imbalance_1h_at_entry"),
+        nearest_liq_cluster_above_price=_safe_col(row, "nearest_liq_cluster_above_price"),
+        nearest_liq_cluster_below_price=_safe_col(row, "nearest_liq_cluster_below_price"),
+        nearest_liq_cluster_above_notional=_safe_col(row, "nearest_liq_cluster_above_notional"),
+        nearest_liq_cluster_below_notional=_safe_col(row, "nearest_liq_cluster_below_notional"),
         notes=row["notes"],
         screenshot_entry=row["screenshot_entry"],
         screenshot_exit=row["screenshot_exit"],
@@ -263,6 +300,15 @@ class TradeJournal:
         htf_bias: Optional[str] = None,
         session: Optional[str] = None,
         market_structure: Optional[str] = None,
+        regime_at_entry: Optional[str] = None,
+        funding_z_at_entry: Optional[float] = None,
+        ls_ratio_at_entry: Optional[float] = None,
+        oi_change_24h_at_entry: Optional[float] = None,
+        liq_imbalance_1h_at_entry: Optional[float] = None,
+        nearest_liq_cluster_above_price: Optional[float] = None,
+        nearest_liq_cluster_below_price: Optional[float] = None,
+        nearest_liq_cluster_above_notional: Optional[float] = None,
+        nearest_liq_cluster_below_notional: Optional[float] = None,
     ) -> TradeRecord:
         """Insert an OPEN row describing a freshly-placed trade.
 
@@ -301,6 +347,15 @@ class TradeJournal:
             htf_bias=htf_bias,
             session=session,
             market_structure=market_structure,
+            regime_at_entry=regime_at_entry,
+            funding_z_at_entry=funding_z_at_entry,
+            ls_ratio_at_entry=ls_ratio_at_entry,
+            oi_change_24h_at_entry=oi_change_24h_at_entry,
+            liq_imbalance_1h_at_entry=liq_imbalance_1h_at_entry,
+            nearest_liq_cluster_above_price=nearest_liq_cluster_above_price,
+            nearest_liq_cluster_below_price=nearest_liq_cluster_below_price,
+            nearest_liq_cluster_above_notional=nearest_liq_cluster_above_notional,
+            nearest_liq_cluster_below_notional=nearest_liq_cluster_below_notional,
         )
         placeholders = ", ".join("?" * len(_COLUMNS))
         cols = ", ".join(_COLUMNS)

@@ -124,6 +124,41 @@ def _structure_str(state: MarketState) -> Optional[str]:
         return None
 
 
+def _derive_enrichment(state: MarketState) -> dict:
+    """Pull derivatives + heatmap snapshot fields out of MarketState for
+    journal persistence. All keys are None when a source is missing — the
+    journal's ALTER TABLE columns default to NULL so that's safe."""
+    out: dict = {
+        "regime_at_entry": None,
+        "funding_z_at_entry": None,
+        "ls_ratio_at_entry": None,
+        "oi_change_24h_at_entry": None,
+        "liq_imbalance_1h_at_entry": None,
+        "nearest_liq_cluster_above_price": None,
+        "nearest_liq_cluster_below_price": None,
+        "nearest_liq_cluster_above_notional": None,
+        "nearest_liq_cluster_below_notional": None,
+    }
+    deriv = getattr(state, "derivatives", None)
+    if deriv is not None:
+        out["regime_at_entry"] = getattr(deriv, "regime", None)
+        out["funding_z_at_entry"] = getattr(deriv, "funding_rate_zscore_30d", None)
+        out["ls_ratio_at_entry"] = getattr(deriv, "long_short_ratio", None)
+        out["oi_change_24h_at_entry"] = getattr(deriv, "oi_change_24h_pct", None)
+        out["liq_imbalance_1h_at_entry"] = getattr(deriv, "liq_imbalance_1h", None)
+    hm = getattr(state, "liquidity_heatmap", None)
+    if hm is not None:
+        na = getattr(hm, "nearest_above", None)
+        nb = getattr(hm, "nearest_below", None)
+        if na is not None:
+            out["nearest_liq_cluster_above_price"] = getattr(na, "price", None)
+            out["nearest_liq_cluster_above_notional"] = getattr(na, "notional_usd", None)
+        if nb is not None:
+            out["nearest_liq_cluster_below_price"] = getattr(nb, "price", None)
+            out["nearest_liq_cluster_below_notional"] = getattr(nb, "notional_usd", None)
+    return out
+
+
 # ── Context ─────────────────────────────────────────────────────────────────
 
 
@@ -760,6 +795,7 @@ class BotRunner:
                 htf_bias=_bias_str(state),
                 session=_session_str(state),
                 market_structure=_structure_str(state),
+                **_derive_enrichment(state),
             )
             self.ctx.open_trade_ids[(symbol, pos_side)] = rec.trade_id
             self.ctx.open_trade_opened_at[(symbol, pos_side)] = _utc_now()

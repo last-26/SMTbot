@@ -60,6 +60,27 @@ def win_rate_by_factor(closed: list[TradeRecord]) -> dict[str, float]:
     return {k: win_rate(v) for k, v in buckets.items()}
 
 
+def regime_breakdown(
+    closed: list[TradeRecord],
+) -> dict[str, dict[str, float]]:
+    """Per-derivatives-regime stats. Keys: regime label; values: dict with
+    num_trades / win_rate / avg_r / expectancy_r. Trades with no regime tag
+    bucket into 'UNKNOWN' so they stay visible rather than silently dropping."""
+    buckets: dict[str, list[TradeRecord]] = {}
+    for t in closed:
+        key = (t.regime_at_entry or "UNKNOWN")
+        buckets.setdefault(key, []).append(t)
+    return {
+        regime: {
+            "num_trades": len(records),
+            "win_rate": win_rate(records),
+            "avg_r": avg_r(records),
+            "expectancy_r": expectancy_r(records),
+        }
+        for regime, records in buckets.items()
+    }
+
+
 # ── R-multiples ─────────────────────────────────────────────────────────────
 
 
@@ -209,6 +230,7 @@ def summary(closed: list[TradeRecord], starting_balance: float) -> dict:
         ),
         "win_rate_by_session": win_rate_by_session(closed),
         "win_rate_by_factor": win_rate_by_factor(closed),
+        "regime_breakdown": regime_breakdown(closed),
     }
 
 
@@ -251,5 +273,14 @@ def format_summary(s: dict) -> str:
         lines.append("  Win rate by confluence factor:")
         for name, rate in sorted(s["win_rate_by_factor"].items()):
             lines.append(f"    {name:<20} {_fmt_pct(rate)}")
+    if s.get("regime_breakdown"):
+        lines.append("")
+        lines.append("  Derivatives regime breakdown:")
+        for name, stats in sorted(s["regime_breakdown"].items()):
+            lines.append(
+                f"    {name:<14} n={stats['num_trades']:<3}  "
+                f"win={_fmt_pct(stats['win_rate'])}  "
+                f"avg_r={stats['avg_r']:+.3f}R"
+            )
     lines.append("=" * 60)
     return "\n".join(lines)
