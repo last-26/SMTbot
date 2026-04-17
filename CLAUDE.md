@@ -183,6 +183,17 @@ Gotchas and rationales not self-evident from the code. Inline comments cover the
 
 ---
 
+## Sprint 3 baseline run — active
+
+**Started 2026-04-17T23:50Z** with $5k demo balance, $50 R (1%), 4 concurrent-slot cap, cross margin. All Phase 6.9 changes (BLOK A factors, BLOK B per-symbol overrides, min_confluence=3.0, A4 VWAP veto off by default) are live. Pre-sprint snapshot preserved:
+
+- `data/trades.db.backup_2026-04-18_pre-sprint3` — full DB copy (32 closed trades + 4 OPEN pre-close).
+- `logs/bot.log.pre-sprint3_2026-04-17` — pre-restart log, 1.4MB.
+- 4 pre-restart OPEN rows flipped to `outcome=CANCELED` + `close_reason=manual_reset_pre_sprint3` in-place, so reporter never counts them.
+- `rl.clean_since=2026-04-17T23:50:00Z` → reporter/RL only see post-restart rows. `scripts/report.py --ignore-clean-since` reads the full history.
+
+**Gate for RL:** ≥50 closed trades post-cutoff AND net `pnl_r ≥ 0` before invoking `train_rl.py`. Until then, iterate YAML manually using reporter output. If baseline stays negative after 50, the next lever is the opt-in A4 VWAP hard veto (flip `analysis.vwap_hard_veto_enabled: true`) — BLOK B5 volatility-adaptive widening and BLOK C shadow timeframes come after that only if the veto alone doesn't fix WR.
+
 ## Phase 7 — Reinforcement learning (Next)
 
 **Architecture:** parameter tuner, NOT raw decision maker. Rule-based strategy generates signals; RL tunes:
