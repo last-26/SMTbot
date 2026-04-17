@@ -321,17 +321,24 @@ def test_min_sl_distance_gate_disabled_by_default():
     assert reason in ("", "zero_contracts")
 
 
-def test_min_sl_distance_gate_rejects_tight_sl():
-    """A sub-threshold SL distance returns (None, 'sl_too_tight')."""
-    # SL at 99.95 → sl_dist_pct = 0.0005 (0.05%) → below 0.003 threshold.
+def test_min_sl_distance_gate_widens_tight_sl():
+    """A sub-threshold SL distance is widened to the floor, not rejected.
+
+    With a tight OB-derived SL (~0.05% from entry) and a 0.003 floor, the
+    gate should widen SL to exactly 0.3% below entry (bullish case) and
+    return a valid plan. Sizing auto-shrinks to keep R constant.
+    """
     ob = OrderBlock(direction=Direction.BULLISH, bottom=99.9, top=99.94)
     state = _state(order_blocks=[ob], price=100.0, atr=0.01)
     plan, reason = build_trade_plan_with_reason(
         state, account_balance=10_000.0,
         min_sl_distance_pct=0.003,
     )
-    assert plan is None
-    assert reason == "sl_too_tight"
+    assert plan is not None
+    assert reason == ""
+    sl_dist_pct = (plan.entry_price - plan.sl_price) / plan.entry_price
+    # Floor applied exactly — not widened beyond the threshold.
+    assert sl_dist_pct == pytest.approx(0.003, abs=1e-6)
 
 
 def test_min_sl_distance_gate_allows_wide_sl():
@@ -348,8 +355,8 @@ def test_min_sl_distance_gate_allows_wide_sl():
     assert sl_dist_pct >= 0.003
 
 
-def test_min_sl_distance_gate_short_side():
-    """Gate uses abs(entry - sl) so it fires on bearish too."""
+def test_min_sl_distance_gate_widens_short_side():
+    """Bearish side: a tight SL above entry is widened above the floor."""
     ob = OrderBlock(direction=Direction.BEARISH, bottom=100.06, top=100.10)
     state = _state(
         order_blocks=[ob], price=100.0, atr=0.01,
@@ -360,8 +367,10 @@ def test_min_sl_distance_gate_short_side():
         state, account_balance=10_000.0,
         min_sl_distance_pct=0.003,
     )
-    assert plan is None
-    assert reason == "sl_too_tight"
+    assert plan is not None
+    assert reason == ""
+    sl_dist_pct = (plan.sl_price - plan.entry_price) / plan.entry_price
+    assert sl_dist_pct == pytest.approx(0.003, abs=1e-6)
 
 
 def test_min_tp_distance_runs_after_htf_ceiling_squeeze():

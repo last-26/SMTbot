@@ -844,7 +844,7 @@ class BotRunner:
         if plan is None:
             # reject_reason is one of: below_confluence / session_filter /
             # no_sl_source / crowded_skip / zero_contracts / htf_tp_ceiling /
-            # tp_too_tight / sl_too_tight.
+            # tp_too_tight. Sub-floor SL distances are widened, not rejected.
             try:
                 conf = calculate_confluence(
                     state,

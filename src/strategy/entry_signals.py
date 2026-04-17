@@ -429,7 +429,9 @@ def build_trade_plan_with_reason(
       - "zero_contracts"   — contract rounding wiped position to zero
       - "htf_tp_ceiling"   — HTF S/R ceiling squeezed R:R below min_rr_ratio
       - "tp_too_tight"     — TP distance below min_tp_distance_pct (fee drag)
-      - "sl_too_tight"     — SL distance below min_sl_distance_pct (noise floor)
+
+    Note: sub-floor SL distances are widened to min_sl_distance_pct rather
+    than rejected (fee-noise stops get wicked at high leverage).
     """
     if rr_ratio < min_rr_ratio:
         raise ValueError(
@@ -483,9 +485,11 @@ def build_trade_plan_with_reason(
             htf_sr_zones, htf_sr_buffer_atr, atr,
         )
 
-    # Min SL distance floor — an SL closer than N× typical spread + wick
-    # width is just noise-triggered. Evaluated AFTER the HTF push (which can
-    # only widen the SL) so we gate the final planned stop.
+    # Min SL distance floor — widen tight stops to at least this distance
+    # instead of rejecting. A sub-floor Pine OB/FVG stop at high leverage
+    # gets wicked out instantly; widening gives the fill real breathing room
+    # while position size auto-shrinks (risk_amount / sl_pct) to keep R flat.
+    # Evaluated AFTER the HTF push (which can also widen the SL).
     if (
         min_sl_distance_pct > 0.0
         and intent.entry_price > 0.0
@@ -493,7 +497,11 @@ def build_trade_plan_with_reason(
     ):
         sl_dist_pct = abs(intent.entry_price - sl_price) / intent.entry_price
         if sl_dist_pct < min_sl_distance_pct:
-            return None, "sl_too_tight"
+            min_dist = intent.entry_price * min_sl_distance_pct
+            if intent.direction == Direction.BULLISH:
+                sl_price = intent.entry_price - min_dist
+            else:
+                sl_price = intent.entry_price + min_dist
 
     plan = calculate_trade_plan(
         direction=intent.direction,
