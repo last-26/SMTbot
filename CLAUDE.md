@@ -555,6 +555,8 @@ Three gates added after the third live-demo cycle showed positions round-trippin
 
 **Total tests:** 431 passing (418 → 431, +13).
 
+**Runtime restart note:** After landing these 3 commits the running bot was restarted (old PID 6904 → new PID live from 06:16:17Z) to pick up the new gates. 3 live-demo positions were open at the moment of restart (BTC / ETH / SOL, all BEARISH) — their OCO algos on OKX kept SL/TP enforcement during the restart window, and `_rehydrate_open_positions()` reloaded them into the monitor + `open_trade_ids` without triggering any `orphan_live_position_no_journal_row` or `journal_open_but_no_live_position` warnings. Confirms the restart-while-live path works end-to-end.
+
 ## Phase 7 — Reinforcement learning
 
 **Architecture:** parameter tuner, NOT raw decision maker. Rule-based strategy generates signals; RL tunes:
