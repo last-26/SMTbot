@@ -74,6 +74,21 @@ analysis:
   # BTC/ETH. Live session 04:17–11:25Z rejected 264 BTC/ETH signals at 0.003
   # (tight OB/FVG) — widening instead of rejecting restores flow.
   min_sl_distance_pct: 0.005
+  # Confluence weight overrides — empty = DEFAULT_WEIGHTS from
+  # src/analysis/multi_timeframe.py (Moderate rebalance baseline below is
+  # already baked into code). Only keys set here override; others stay at
+  # their defaults. Unknown keys trigger a warning at load time.
+  confluence_weights: {}
+  # Example override block (uncomment + edit to hand-tune before Phase 7 RL):
+  # confluence_weights:
+  #   htf_trend_alignment: 0.75
+  #   mss_alignment: 0.75
+  #   oscillator_momentum: 0.75
+  #   oscillator_signal: 0.75
+  #   ltf_momentum_alignment: 0.75
+  #   vwap_1m_alignment: 0.3
+  #   vwap_3m_alignment: 0.3
+  #   vwap_15m_alignment: 0.4
 
 okx:
   base_url: https://www.okx.com

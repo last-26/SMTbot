@@ -68,30 +68,38 @@ class ConfluenceScore:
 
 
 DEFAULT_WEIGHTS: dict[str, float] = {
-    "htf_trend_alignment": 1.0,
-    "mss_alignment": 1.0,
+    # HTF bias — softened so LTF momentum can flip confluence when structure
+    # hasn't turned yet. HTF still leads (sum ~4.0 when fully aligned vs
+    # LTF sum ~3.0) but no longer dominates 2:1.
+    "htf_trend_alignment": 0.75,
+    "mss_alignment": 0.75,
     "at_order_block": 1.0,
     "at_fvg": 1.0,
     "at_sr_zone": 0.75,
     "recent_sweep": 1.0,
     "ltf_pattern": 0.75,
-    "oscillator_momentum": 0.5,
-    "oscillator_signal": 0.5,
+    # LTF momentum — boosted so fresh reversals carry real weight. The
+    # `bars_ago <= 3` freshness gate in score_direction keeps stale signals out.
+    "oscillator_momentum": 0.75,
+    "oscillator_signal": 0.75,
     "vmc_ribbon": 0.5,
     "session_filter": 0.25,
     # LTF momentum confirmation: full weight when the LTF trend agrees with
     # the candidate direction, partial weight when the last LTF signal is
     # fresh and agrees. Keeps it a single principled slot, not stacked.
-    "ltf_momentum_alignment": 0.5,
+    "ltf_momentum_alignment": 0.75,
     # Derivatives (Phase 1.5 Madde 6) — at most one of these three fires per
     # cycle; the elif chain in score_direction enforces that.
     "derivatives_contrarian": 0.7,
     "derivatives_capitulation": 0.6,
     "derivatives_heatmap_target": 0.5,
-    # Multi-TF VWAP stack alignment. Full weight when price sits on the
-    # favorable side of all three (1m/3m/15m) VWAPs, half weight when 2/3 do.
-    # Missing values (0.0) are skipped — never block scoring.
-    "vwap_alignment": 0.6,
+    # Multi-TF VWAP — each TF votes independently so 1m can flip before 15m.
+    # Sum (1.0) is slightly higher than the old single-factor max (0.6) since
+    # VWAP is a primary anchor for intraday price. 15m gets the largest slice
+    # as the HTF anchor; 1m is the fastest signal for short-term flips.
+    "vwap_1m_alignment": 0.3,
+    "vwap_3m_alignment": 0.3,
+    "vwap_15m_alignment": 0.4,
 }
 
 
@@ -360,36 +368,30 @@ def score_direction(
                     detail=f"ltf_signal={sig_raw} bars_ago={bars_ago}",
                 ))
 
-    # 12.5 Multi-TF VWAP alignment — count how many of {1m, 3m, 15m} VWAPs
-    # the price sits on the favorable side of (above for BULLISH, below for
-    # BEARISH). Skip any zero-valued (missing) VWAP.
+    # 12.5 Multi-TF VWAP alignment — each TF fires as its own independent
+    # factor so 1m can flip before 15m. Zero-valued (missing) VWAPs skipped.
     sig = state.signal_table
-    vwap_vals = [(tf, v) for tf, v in
-                 (("1m", sig.vwap_1m), ("3m", sig.vwap_3m), ("15m", sig.vwap_15m))
-                 if v > 0]
-    if vwap_vals and price > 0:
-        if direction == Direction.BULLISH:
-            aligned = [tf for tf, v in vwap_vals if price > v]
-        else:
-            aligned = [tf for tf, v in vwap_vals if price < v]
-        n_avail = len(vwap_vals)
-        n_aligned = len(aligned)
-        # Need at least 2/3 (or all-of-N if fewer available) to fire.
-        if n_avail >= 2 and n_aligned == n_avail:
-            factors.append(ConfluenceFactor(
-                name="vwap_alignment",
-                weight=w["vwap_alignment"],
-                direction=direction,
-                detail=f"price {'>' if direction == Direction.BULLISH else '<'} all "
-                       f"VWAPs ({','.join(aligned)})",
-            ))
-        elif n_avail == 3 and n_aligned == 2:
-            factors.append(ConfluenceFactor(
-                name="vwap_alignment",
-                weight=w["vwap_alignment"] * 0.5,
-                direction=direction,
-                detail=f"price aligned with 2/3 VWAPs ({','.join(aligned)})",
-            ))
+    vwap_entries = (
+        ("vwap_1m_alignment",  sig.vwap_1m),
+        ("vwap_3m_alignment",  sig.vwap_3m),
+        ("vwap_15m_alignment", sig.vwap_15m),
+    )
+    if price > 0:
+        for fname, vwap_val in vwap_entries:
+            if vwap_val <= 0:
+                continue
+            side_ok = (
+                (direction == Direction.BULLISH and price > vwap_val) or
+                (direction == Direction.BEARISH and price < vwap_val)
+            )
+            if side_ok:
+                factors.append(ConfluenceFactor(
+                    name=fname,
+                    weight=w[fname],
+                    direction=direction,
+                    detail=f"price {'>' if direction == Direction.BULLISH else '<'} "
+                           f"{vwap_val:.4f}",
+                ))
 
     # 13. Derivatives (Phase 1.5 Madde 6) — one slot max per cycle.
     deriv_state = getattr(state, "derivatives", None)

@@ -54,7 +54,10 @@ def test_htf_alignment_adds_weight():
     state = _state(trend_htf=Direction.BULLISH)
     result = score_direction(state, Direction.BULLISH)
     assert "htf_trend_alignment" in result.factor_names
-    assert result.score >= 1.0
+    # Compare against the live default rather than a hard-coded number so
+    # the assertion tracks weight rebalances automatically.
+    from src.analysis.multi_timeframe import DEFAULT_WEIGHTS
+    assert result.score >= DEFAULT_WEIGHTS["htf_trend_alignment"]
 
 
 def test_htf_alignment_ignored_for_opposite_direction():

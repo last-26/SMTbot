@@ -130,6 +130,27 @@ class AnalysisConfig(BaseModel):
     # = large notional = fee drag. Default 0 = off (back-compat); runtime
     # YAML sets ~0.003 so stops sit at least ~3× spread + typical wick width.
     min_sl_distance_pct: float = 0.0
+    # Confluence weight overrides. Empty dict = DEFAULT_WEIGHTS from
+    # src/analysis/multi_timeframe.py. Only the keys you specify override;
+    # the rest stay at their defaults (shallow merge). Unknown keys trigger
+    # a warning at load time — typo guard, not a hard fail.
+    confluence_weights: dict[str, float] = Field(default_factory=dict)
+
+    @field_validator("confluence_weights")
+    @classmethod
+    def _warn_unknown_weight_keys(cls, v: dict[str, float]) -> dict[str, float]:
+        if not v:
+            return v
+        from src.analysis.multi_timeframe import DEFAULT_WEIGHTS
+        unknown = [k for k in v.keys() if k not in DEFAULT_WEIGHTS]
+        for k in unknown:
+            warnings.warn(
+                f"unknown confluence_weights key '{k}' — will be ignored "
+                f"(known keys: {sorted(DEFAULT_WEIGHTS.keys())})",
+                UserWarning,
+                stacklevel=2,
+            )
+        return v
 
 
 class OKXConfigBlock(BaseModel):

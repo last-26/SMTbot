@@ -902,6 +902,7 @@ class BotRunner:
                 state, risk_balance,
                 candles=candles,
                 min_confluence_score=cfg.analysis.min_confluence_score,
+                weights=cfg.analysis.confluence_weights or None,
                 risk_pct=cfg.risk_pct_fraction(),
                 rr_ratio=cfg.trading.default_rr_ratio,
                 min_rr_ratio=cfg.trading.min_rr_ratio,
@@ -943,6 +944,7 @@ class BotRunner:
                     ltf_candles=candles,
                     allowed_sessions=cfg.allowed_sessions() or None,
                     ltf_state=self.ctx.ltf_cache.get(symbol),
+                    weights=cfg.analysis.confluence_weights or None,
                 )
                 logger.info(
                     "symbol_decision symbol={} NO_TRADE reason={} price={:.4f} "
