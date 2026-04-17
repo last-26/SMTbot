@@ -1,5 +1,6 @@
 # SMTbot — AI-Powered Crypto Futures Trading Bot
 
+[![SafeSkill 60/100](https://img.shields.io/badge/SafeSkill-60%2F100_Use%20with%20Caution-orange)](https://safeskill.dev/scan/last-26-smtbot)
 An AI-powered cryptocurrency futures trading bot that analyzes price action and liquidity patterns using custom Pine Scripts on TradingView, executes trades on OKX via R:R-based risk management, and continuously improves through reinforcement learning.
 
 ## How It Works
