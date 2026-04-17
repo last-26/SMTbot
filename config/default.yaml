@@ -2,7 +2,7 @@ bot:
   mode: demo
   poll_interval_seconds: 5
   timezone: UTC
-  starting_balance: 3200.0  # post-loss OKX demo balance — drives 1R ≈ $32
+  starting_balance: 5000.0  # Sprint 3 demo reset balance — 1% risk → 1R = $50
 
 trading:
   # 5 majors — round-robin her cycle. 5 parite × 4 slot = max_concurrent 4 ile

@@ -1061,7 +1061,10 @@ class BotRunner:
     # ── Helpers ─────────────────────────────────────────────────────────────
 
     async def _prime(self) -> None:
-        await self.ctx.journal.replay_for_risk_manager(self.ctx.risk_mgr)
+        await self.ctx.journal.replay_for_risk_manager(
+            self.ctx.risk_mgr,
+            since=self.ctx.config.rl_clean_since(),
+        )
         if self.clear_halt:
             self._apply_clear_halt()
         await self._rehydrate_open_positions()

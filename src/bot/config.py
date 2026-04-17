@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import warnings
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -325,9 +326,17 @@ _SESSION_MAP = {
 }
 
 
+class RLConfig(BaseModel):
+    """Phase 7 RL section — currently only the dirty-data cutoff is wired.
+    Unknown keys tolerated so Phase 7 can add `hyperparameters`, `walk_forward`,
+    etc. without a back-compat YAML shim."""
+    model_config = ConfigDict(extra="ignore")
+    clean_since: Optional[str] = None
+
+
 class BotConfig(BaseModel):
     """Top-level config mirroring config/default.yaml structure."""
-    model_config = ConfigDict(extra="ignore")   # tolerate `rl:` etc.
+    model_config = ConfigDict(extra="ignore")
 
     bot: RuntimeConfig
     trading: TradingConfig
@@ -340,6 +349,7 @@ class BotConfig(BaseModel):
     derivatives: DerivativesConfig = Field(default_factory=DerivativesConfig)
     economic_calendar: EconomicCalendarConfig = Field(
         default_factory=EconomicCalendarConfig)
+    rl: RLConfig = Field(default_factory=RLConfig)
 
     @field_validator("okx")
     @classmethod
@@ -382,6 +392,18 @@ class BotConfig(BaseModel):
         return self.analysis.htf_sr_buffer_atr_per_symbol.get(
             symbol, self.analysis.htf_sr_buffer_atr,
         )
+
+    def rl_clean_since(self) -> Optional[datetime]:
+        """Parse `rl.clean_since` (ISO-8601 string or null) as a UTC datetime.
+        Returned value is passed to `replay_for_risk_manager` and reporter so
+        pre-cutoff trades don't poison peak/DD math or win-rate stats."""
+        raw = self.rl.clean_since
+        if not raw:
+            return None
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
 
     @staticmethod
     def _translate_sessions(raw_list: list[str]) -> list[Session]:

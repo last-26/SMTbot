@@ -181,3 +181,40 @@ def test_per_symbol_overrides_default_to_empty_dicts():
     assert cfg.trading.swing_lookback_per_symbol == {}
     assert cfg.analysis.htf_sr_buffer_atr_per_symbol == {}
     assert cfg.analysis.session_filter_per_symbol == {}
+
+
+# ── Phase 6.9 D1 — rl.clean_since parsing ──────────────────────────────────
+
+
+def test_rl_clean_since_none_when_unset():
+    """`_valid_raw` has `rl: {foo: bar}` — no `clean_since`, resolver returns None."""
+    cfg = BotConfig(**_valid_raw())
+    assert cfg.rl_clean_since() is None
+
+
+def test_rl_clean_since_parsed_as_utc_datetime():
+    from datetime import datetime, timezone
+    raw = _valid_raw()
+    raw["rl"] = {"clean_since": "2026-04-17T23:50:00Z"}
+    cfg = BotConfig(**raw)
+    assert cfg.rl_clean_since() == datetime(
+        2026, 4, 17, 23, 50, tzinfo=timezone.utc,
+    )
+
+
+def test_rl_clean_since_naive_iso_assumed_utc():
+    from datetime import datetime, timezone
+    raw = _valid_raw()
+    raw["rl"] = {"clean_since": "2026-04-17T23:50:00"}  # no tz
+    cfg = BotConfig(**raw)
+    assert cfg.rl_clean_since() == datetime(
+        2026, 4, 17, 23, 50, tzinfo=timezone.utc,
+    )
+
+
+def test_rl_unknown_keys_still_tolerated():
+    """RLConfig has `extra=ignore` so Phase 7 additions don't break load."""
+    raw = _valid_raw()
+    raw["rl"] = {"clean_since": None, "foo": "bar", "hyperparams": {"lr": 0.01}}
+    cfg = BotConfig(**raw)
+    assert cfg.rl_clean_since() is None

@@ -485,15 +485,23 @@ class TradeJournal:
 
     # ── Replay ──────────────────────────────────────────────────────────────
 
-    async def replay_for_risk_manager(self, mgr: RiskManager) -> None:
+    async def replay_for_risk_manager(
+        self,
+        mgr: RiskManager,
+        since: Optional[datetime] = None,
+    ) -> None:
         """Walk closed trades in order and replay them into `mgr` so its
         peak/DD/streak counters match reality before the loop resumes.
+
+        `since` (typically `rl.clean_since`) filters out pre-cutoff rows so a
+        dirty-regime loss streak can't poison the fresh-start peak/DD math.
+        Old rows stay in the DB for comparison but never touch the manager.
 
         We call `register_trade_opened` + `register_trade_closed` for each
         closed row — the open→close pairing matters because the manager tracks
         `open_positions` which must end at zero once we've replayed everything.
         """
-        closed = await self.list_closed_trades()
+        closed = await self.list_closed_trades(since=since)
         for rec in closed:
             if rec.pnl_usdt is None or rec.exit_timestamp is None:
                 continue
