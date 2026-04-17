@@ -129,3 +129,39 @@ def test_partial_mode_bearish_tp1_direction():
     router.place(_plan(num_contracts=10, direction=Direction.BEARISH))
     assert client.algo_calls[0]["tp"] == pytest.approx(98.5)
     assert client.algo_calls[1]["tp"] == pytest.approx(97.0)
+
+
+# ── Weighted-reward invariant (YAML contract) ──────────────────────────────
+
+
+def test_default_yaml_partial_tp_weighted_reward_is_3r():
+    """Guard: config/default.yaml must produce a weighted max reward of 3.0R
+    when both TPs hit. Formula:
+      weighted_R = partial_tp_ratio × partial_tp_rr
+                 + (1 − partial_tp_ratio) × default_rr_ratio
+
+    Breaks if someone tweaks partial_tp_rr, partial_tp_ratio, or
+    default_rr_ratio without re-balancing for true 1:3 on full-win.
+    Tune the three values together, not individually.
+    """
+    import pathlib
+    import yaml
+
+    cfg_path = pathlib.Path(__file__).parent.parent / "config" / "default.yaml"
+    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+
+    partial_tp_enabled = raw["execution"]["partial_tp_enabled"]
+    partial_tp_ratio = float(raw["execution"]["partial_tp_ratio"])
+    partial_tp_rr = float(raw["execution"]["partial_tp_rr"])
+    default_rr_ratio = float(raw["trading"]["default_rr_ratio"])
+
+    assert partial_tp_enabled, "test assumes partial_tp_enabled=true"
+    weighted = (
+        partial_tp_ratio * partial_tp_rr
+        + (1.0 - partial_tp_ratio) * default_rr_ratio
+    )
+    assert weighted == pytest.approx(3.0), (
+        f"weighted reward = {weighted:.3f}R, expected 3.0R. "
+        f"partial_tp_ratio={partial_tp_ratio}, partial_tp_rr={partial_tp_rr}, "
+        f"default_rr_ratio={default_rr_ratio}"
+    )
