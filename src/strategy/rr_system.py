@@ -81,6 +81,7 @@ def calculate_trade_plan(
     max_leverage: int = 20,
     contract_size: float = 0.01,
     margin_balance: Optional[float] = None,
+    fee_reserve_pct: float = 0.0,
     sl_source: str = "",
     confluence_score: float = 0.0,
     confluence_factors: list[str] | None = None,
@@ -103,6 +104,10 @@ def calculate_trade_plan(
             this trade. When omitted, falls back to `account_balance`. Split
             out so R is sized off total equity while notional/leverage still
             respect the live free-margin ceiling (sCode 51008 avoidance).
+        fee_reserve_pct: round-trip taker fee + slippage reserve added to
+            sl_pct when computing notional, so the stop-out loss stays inside
+            the risk budget *after* fees. Set to 2 × taker_pct (≈0.001) for
+            OKX demo taker orders. 0 disables (legacy behavior).
         sl_source: label for journal/telemetry ("order_block", "fvg", …).
         confluence_score: score that led to this trade (for journal).
         confluence_factors: names of factors that contributed (for journal).
@@ -113,6 +118,8 @@ def calculate_trade_plan(
     """
     _validate(direction, entry_price, sl_price, account_balance,
               risk_pct, rr_ratio, max_leverage, contract_size)
+    if fee_reserve_pct < 0:
+        raise ValueError("fee_reserve_pct must be >= 0")
 
     effective_margin = (margin_balance
                         if margin_balance is not None else account_balance)
@@ -129,8 +136,13 @@ def calculate_trade_plan(
     else:
         tp_price = entry_price - sl_distance * rr_ratio
 
-    # Ideal notional so that SL hit loses exactly max_risk_usdt.
-    ideal_notional = max_risk_usdt / sl_pct
+    # Effective loss fraction covers the price move AND round-trip fees; sizing
+    # off this shrinks notional enough that a stop-out still lands at ≈R *after*
+    # taker fees. TP is unchanged (price-only), so fee compensation comes from
+    # size, not from widening TP.
+    effective_sl_pct = sl_pct + fee_reserve_pct
+    # Ideal notional so that SL hit loses exactly max_risk_usdt, net of fees.
+    ideal_notional = max_risk_usdt / effective_sl_pct
     required_leverage = ideal_notional / effective_margin
 
     # Hard ceiling on notional: leverage cap AND margin safety buffer. Without
@@ -183,6 +195,7 @@ def calculate_trade_plan(
         risk_amount_usdt=actual_risk_usdt,
         max_risk_usdt=max_risk_usdt,
         capped=capped,
+        fee_reserve_pct=fee_reserve_pct,
         sl_source=sl_source,
         confluence_score=confluence_score,
         confluence_factors=list(confluence_factors or []),

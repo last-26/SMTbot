@@ -401,3 +401,56 @@ def test_min_tp_distance_runs_after_htf_ceiling_squeeze():
     assert plan is None
     # The HTF ceiling gate fires first because it's the stricter/earlier check.
     assert reason == "htf_tp_ceiling"
+
+
+# ── partial_tp_enabled split feasibility ────────────────────────────────────
+
+
+def test_reject_when_partial_tp_split_would_be_degenerate():
+    """partial_tp_enabled + num_contracts that cannot split into two
+    positive legs → reject with `insufficient_contracts_for_split`.
+    Guarantees TP1/TP2 fires on every trade rather than silently
+    degrading to single OCO."""
+    # price=500, contracts_unit = 0.01*500 = 5 USDT; OB at 470-480 → SL near
+    # 470, sl_dist≈30, sl_pct≈0.06. Balance 60 USDT, 1% risk = 0.6 USDT.
+    # Ideal notional = 0.6/0.06 = 10 USDT → num_contracts = 10//5 = 2 — still
+    # splits. Shrink risk_pct to 0.5% → risk=0.3 → notional=5 → contracts=1.
+    ob = OrderBlock(direction=Direction.BULLISH, bottom=470, top=480)
+    state = _state(order_blocks=[ob], price=500.0, atr=5.0)
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=100.0, max_leverage=20,
+        risk_pct=0.005,
+        partial_tp_enabled=True, partial_tp_ratio=0.5,
+    )
+    assert plan is None
+    assert reason == "insufficient_contracts_for_split"
+
+
+def test_partial_tp_disabled_skips_split_gate():
+    """With partial_tp_enabled=False the split-feasibility gate is inert,
+    so a single-contract plan still opens (single-OCO path)."""
+    ob = OrderBlock(direction=Direction.BULLISH, bottom=470, top=480)
+    state = _state(order_blocks=[ob], price=500.0, atr=5.0)
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=100.0, max_leverage=20,
+        risk_pct=0.005,
+        partial_tp_enabled=False,
+    )
+    # May still reject for `zero_contracts`, but never for the split reason.
+    assert reason != "insufficient_contracts_for_split"
+
+
+def test_partial_tp_passes_with_splittable_plan():
+    """A plan with enough contracts for a clean 50/50 split passes the gate."""
+    ob = OrderBlock(direction=Direction.BULLISH, bottom=95, top=97)
+    state = _state(order_blocks=[ob])
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0, max_leverage=20,
+        partial_tp_enabled=True, partial_tp_ratio=0.5,
+    )
+    assert plan is not None
+    assert reason == ""
+    # Both legs must be strictly positive.
+    size1 = int(plan.num_contracts * 0.5)
+    size2 = plan.num_contracts - size1
+    assert size1 > 0 and size2 > 0

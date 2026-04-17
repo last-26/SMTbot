@@ -90,16 +90,19 @@ def test_partial_mode_ratio_truncation():
     assert client.algo_calls[1]["size"] == 4
 
 
-def test_partial_fallback_single_contract():
-    # With num_contracts=1, size1 rounds to 0 → fall back to one algo.
+def test_partial_single_contract_raises_loudly():
+    # With num_contracts=1, size1 rounds to 0. entry_signals is supposed to
+    # reject these plans up-front; if one still reaches the router we fail
+    # loud rather than silently placing a single OCO (which would break the
+    # TP1/TP2 guarantee the operator expects on every trade).
+    from src.execution.errors import AlgoOrderError
     client = _FakeClient()
     router = OrderRouter(client, RouterConfig(
         partial_tp_enabled=True, partial_tp_ratio=0.5, partial_tp_rr=1.5,
+        close_on_algo_failure=False,
     ))
-    report = router.place(_plan(num_contracts=1))
-    assert len(client.algo_calls) == 1
-    assert client.algo_calls[0]["size"] == 1
-    assert len(report.algos) == 1
+    with pytest.raises(AlgoOrderError, match="insufficient_contracts_for_split"):
+        router.place(_plan(num_contracts=1))
 
 
 # ── Disabled path still works ──────────────────────────────────────────────

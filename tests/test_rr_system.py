@@ -323,3 +323,58 @@ def test_negative_margin_balance_rejected():
             Direction.BULLISH, 100, 99, account_balance=10_000,
             margin_balance=-1,
         )
+
+
+# ── fee_reserve_pct: fee-aware sizing ───────────────────────────────────────
+
+
+def test_fee_reserve_shrinks_notional_but_keeps_tp_price():
+    """Reserving round-trip fees in sizing shrinks notional so a stop-out
+    still lands inside the USDT risk budget after taker fees. TP price is
+    unchanged — fee compensation comes from size, not widened TP."""
+    base = calculate_trade_plan(
+        direction=Direction.BULLISH,
+        entry_price=100.0, sl_price=99.0,
+        account_balance=10_000.0, risk_pct=0.01,
+        rr_ratio=3.0, max_leverage=20, contract_size=0.01,
+    )
+    with_fee = calculate_trade_plan(
+        direction=Direction.BULLISH,
+        entry_price=100.0, sl_price=99.0,
+        account_balance=10_000.0, risk_pct=0.01,
+        rr_ratio=3.0, max_leverage=20, contract_size=0.01,
+        fee_reserve_pct=0.001,
+    )
+    # TP price unchanged (price-only math).
+    assert with_fee.tp_price == base.tp_price
+    # Notional shrinks by sl_pct / (sl_pct + fee_reserve_pct) = 0.01/0.011.
+    expected_ratio = 0.01 / 0.011
+    assert with_fee.num_contracts < base.num_contracts
+    assert (with_fee.position_size_usdt / base.position_size_usdt
+            == pytest.approx(expected_ratio, rel=0.01))
+    assert with_fee.fee_reserve_pct == pytest.approx(0.001)
+
+
+def test_fee_reserve_zero_matches_legacy_sizing():
+    """Default fee_reserve_pct=0 must match prior behavior for back-compat."""
+    base = calculate_trade_plan(
+        direction=Direction.BULLISH, entry_price=100.0, sl_price=99.0,
+        account_balance=10_000.0, risk_pct=0.01, rr_ratio=3.0,
+        max_leverage=20, contract_size=0.01,
+    )
+    same = calculate_trade_plan(
+        direction=Direction.BULLISH, entry_price=100.0, sl_price=99.0,
+        account_balance=10_000.0, risk_pct=0.01, rr_ratio=3.0,
+        max_leverage=20, contract_size=0.01,
+        fee_reserve_pct=0.0,
+    )
+    assert same.num_contracts == base.num_contracts
+    assert same.position_size_usdt == base.position_size_usdt
+
+
+def test_fee_reserve_negative_rejected():
+    with pytest.raises(ValueError):
+        calculate_trade_plan(
+            Direction.BULLISH, 100.0, 99.0, account_balance=10_000.0,
+            fee_reserve_pct=-0.001,
+        )

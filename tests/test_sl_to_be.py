@@ -161,3 +161,53 @@ def test_full_close_does_not_trigger_sl_move():
     assert isinstance(fills[0], CloseFill)
     assert client.cancelled == []
     assert client.placed == []
+
+
+# ── BE offset (fee buffer past entry) ─────────────────────────────────────
+
+
+def test_be_offset_long_places_stop_above_entry():
+    # Long: BE stop should sit ABOVE entry so a touch-back closes net-zero
+    # after the exit taker fee on the surviving leg.
+    client = _FakeClient(positions=[_snap(size=5.0, entry=100.0)])
+    monitor = PositionMonitor(
+        client, move_sl_to_be_enabled=True, sl_be_offset_pct=0.001,
+    )
+    monitor.register_open(
+        "BTC-USDT-SWAP", "long", 10.0, 100.0,
+        algo_ids=["ALG1", "ALG2"], tp2_price=105.0,
+    )
+    monitor.poll()
+    assert client.placed[0]["sl"] == pytest.approx(100.0 + 100.0 * 0.001)
+
+
+def test_be_offset_short_places_stop_below_entry():
+    # Short: BE stop sits BELOW entry for the same net-zero-on-touchback
+    # invariant (short profits as price falls).
+    client = _FakeClient(positions=[PositionSnapshot(
+        inst_id="BTC-USDT-SWAP", pos_side="short",
+        size=5.0, entry_price=100.0, mark_price=100.0,
+        unrealized_pnl=0.0, leverage=10,
+    )])
+    monitor = PositionMonitor(
+        client, move_sl_to_be_enabled=True, sl_be_offset_pct=0.001,
+    )
+    monitor.register_open(
+        "BTC-USDT-SWAP", "short", 10.0, 100.0,
+        algo_ids=["ALG1", "ALG2"], tp2_price=95.0,
+    )
+    monitor.poll()
+    assert client.placed[0]["sl"] == pytest.approx(100.0 - 100.0 * 0.001)
+
+
+def test_be_offset_zero_preserves_exact_entry_behavior():
+    # sl_be_offset_pct=0 (default) keeps the legacy "SL = entry" semantics,
+    # so existing tests + pre-change restart paths stay intact.
+    client = _FakeClient(positions=[_snap(size=5.0, entry=100.0)])
+    monitor = PositionMonitor(client, move_sl_to_be_enabled=True)
+    monitor.register_open(
+        "BTC-USDT-SWAP", "long", 10.0, 100.0,
+        algo_ids=["ALG1", "ALG2"], tp2_price=105.0,
+    )
+    monitor.poll()
+    assert client.placed[0]["sl"] == pytest.approx(100.0)

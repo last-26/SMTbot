@@ -325,6 +325,10 @@ class OKXClient:
 
         exit_price = float(row.get("closeAvgPx") or row.get("avgPx") or fill.exit_price)
         pnl = float(row.get("realizedPnl") or row.get("pnl") or fill.pnl_usdt)
+        # OKX returns `fee` as a negative USDT number (cost paid). We store
+        # the signed value so aggregates can be summed and formatted directly.
+        fee_raw = row.get("fee")
+        fee = float(fee_raw) if fee_raw not in (None, "") else fill.fee_usdt
         ts_ms = _ts(row)
         closed_at = (datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
                      if ts_ms else fill.closed_at)
@@ -336,5 +340,6 @@ class OKXClient:
             exit_price=exit_price,
             size=fill.size,
             pnl_usdt=pnl,
+            fee_usdt=fee,
             closed_at=closed_at,
         )

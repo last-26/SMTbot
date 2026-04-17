@@ -337,6 +337,7 @@ def build_trade_plan_from_state(
     max_leverage: int = 20,
     contract_size: float = 0.01,
     margin_balance: Optional[float] = None,
+    fee_reserve_pct: float = 0.0,
     sl_buffer_mult: float = 0.2,
     swing_lookback: int = 20,
     atr_fallback_mult: float = 2.0,
@@ -348,6 +349,8 @@ def build_trade_plan_from_state(
     ltf_state: Optional[object] = None,
     min_tp_distance_pct: float = 0.0,
     min_sl_distance_pct: float = 0.0,
+    partial_tp_enabled: bool = False,
+    partial_tp_ratio: float = 0.5,
 ) -> Optional[TradePlan]:
     """End-to-end: MarketState → TradePlan. Returns None when no trade.
 
@@ -375,6 +378,7 @@ def build_trade_plan_from_state(
         max_leverage=max_leverage,
         contract_size=contract_size,
         margin_balance=margin_balance,
+        fee_reserve_pct=fee_reserve_pct,
         sl_buffer_mult=sl_buffer_mult,
         swing_lookback=swing_lookback,
         atr_fallback_mult=atr_fallback_mult,
@@ -386,6 +390,8 @@ def build_trade_plan_from_state(
         ltf_state=ltf_state,
         min_tp_distance_pct=min_tp_distance_pct,
         min_sl_distance_pct=min_sl_distance_pct,
+        partial_tp_enabled=partial_tp_enabled,
+        partial_tp_ratio=partial_tp_ratio,
     )
     return plan
 
@@ -407,6 +413,7 @@ def build_trade_plan_with_reason(
     max_leverage: int = 20,
     contract_size: float = 0.01,
     margin_balance: Optional[float] = None,
+    fee_reserve_pct: float = 0.0,
     sl_buffer_mult: float = 0.2,
     swing_lookback: int = 20,
     atr_fallback_mult: float = 2.0,
@@ -418,6 +425,8 @@ def build_trade_plan_with_reason(
     ltf_state: Optional[object] = None,
     min_tp_distance_pct: float = 0.0,
     min_sl_distance_pct: float = 0.0,
+    partial_tp_enabled: bool = False,
+    partial_tp_ratio: float = 0.5,
 ) -> tuple[Optional[TradePlan], str]:
     """Same as `build_trade_plan_from_state` but returns `(plan, reason)`.
 
@@ -429,6 +438,8 @@ def build_trade_plan_with_reason(
       - "zero_contracts"   — contract rounding wiped position to zero
       - "htf_tp_ceiling"   — HTF S/R ceiling squeezed R:R below min_rr_ratio
       - "tp_too_tight"     — TP distance below min_tp_distance_pct (fee drag)
+      - "insufficient_contracts_for_split" — partial-TP enabled but
+        int(num_contracts * partial_tp_ratio) would produce a zero leg
 
     Note: sub-floor SL distances are widened to min_sl_distance_pct rather
     than rejected (fee-noise stops get wicked at high leverage).
@@ -513,6 +524,7 @@ def build_trade_plan_with_reason(
         max_leverage=max_leverage,
         contract_size=contract_size,
         margin_balance=margin_balance,
+        fee_reserve_pct=fee_reserve_pct,
         sl_source=intent.sl_source,
         confluence_score=intent.confluence.score,
         confluence_factors=intent.confluence.factor_names,
@@ -521,6 +533,17 @@ def build_trade_plan_with_reason(
 
     if plan.num_contracts <= 0:
         return None, "zero_contracts"
+
+    # Partial-TP split feasibility — when the router is configured for two-leg
+    # TP1/TP2 placement, a plan that floors to a single contract (or any count
+    # where int(n * ratio) == 0 or == n) cannot be split. Reject here instead
+    # of silently degrading to a single OCO downstream, so the TP1/TP2 policy
+    # actually holds on every live trade.
+    if partial_tp_enabled:
+        size1 = int(plan.num_contracts * partial_tp_ratio)
+        size2 = plan.num_contracts - size1
+        if size1 <= 0 or size2 <= 0:
+            return None, "insufficient_contracts_for_split"
 
     if htf_sr_ceiling_enabled and htf_sr_zones:
         new_tp = _apply_htf_tp_ceiling(

@@ -107,4 +107,5 @@ class CloseFill:
     exit_price: float
     size: float
     pnl_usdt: float
+    fee_usdt: float = 0.0
     closed_at: datetime = field(default_factory=_utc_now)

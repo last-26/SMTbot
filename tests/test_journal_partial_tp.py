@@ -76,6 +76,25 @@ async def test_update_algo_ids_rewrites_column():
         assert fetched.algo_ids == ["ALG1", "NEW_BE"]
 
 
+async def test_update_algo_ids_stamps_sl_moved_to_be():
+    """After TP1 fills and SL-to-BE replace runs, `update_algo_ids` must also
+    flip `sl_moved_to_be=True` so a restart can skip the already-done dance."""
+    async with TradeJournal(":memory:") as j:
+        rec = await j.record_open(
+            _plan(), _report_two_algos(),
+            symbol="BTC-USDT-SWAP",
+            signal_timestamp=datetime(2026, 4, 17, tzinfo=UTC),
+        )
+        # Freshly-opened trade: flag is False.
+        fetched = await j.get_trade(rec.trade_id)
+        assert fetched.sl_moved_to_be is False
+
+        await j.update_algo_ids(rec.trade_id, ["ALG1", "NEW_BE"])
+        fetched = await j.get_trade(rec.trade_id)
+        assert fetched.sl_moved_to_be is True
+        assert fetched.algo_ids == ["ALG1", "NEW_BE"]
+
+
 async def test_close_reason_persists_on_record_close():
     async with TradeJournal(":memory:") as j:
         rec = await j.record_open(
@@ -92,6 +111,26 @@ async def test_close_reason_persists_on_record_close():
         await j.record_close(rec.trade_id, fill, close_reason="EARLY_CLOSE_LTF_REVERSAL")
         fetched = await j.get_trade(rec.trade_id)
         assert fetched.close_reason == "EARLY_CLOSE_LTF_REVERSAL"
+
+
+async def test_fees_usdt_persists_on_record_close():
+    """Runner now passes `fees_usdt=abs(close_fill.fee_usdt)` so the
+    journal audit trail captures actual taker cost per trade."""
+    async with TradeJournal(":memory:") as j:
+        rec = await j.record_open(
+            _plan(), _report_two_algos(),
+            symbol="BTC-USDT-SWAP",
+            signal_timestamp=datetime(2026, 4, 17, tzinfo=UTC),
+        )
+        fill = CloseFill(
+            inst_id="BTC-USDT-SWAP", pos_side="long",
+            entry_price=100.0, exit_price=102.0, size=5.0,
+            pnl_usdt=10.0, fee_usdt=-0.45,
+            closed_at=datetime(2026, 4, 17, 1, tzinfo=UTC),
+        )
+        await j.record_close(rec.trade_id, fill, fees_usdt=abs(fill.fee_usdt))
+        fetched = await j.get_trade(rec.trade_id)
+        assert fetched.fees_usdt == pytest.approx(0.45)
 
 
 # ── Idempotent migration ────────────────────────────────────────────────────

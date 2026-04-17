@@ -41,7 +41,6 @@ class RouterConfig:
     partial_tp_ratio: float = 0.5         # fraction of contracts exited at TP1
     partial_tp_rr: float = 1.5            # TP1 RR relative to SL distance
     move_sl_to_be_after_tp1: bool = True
-    trail_after_partial: bool = False     # disabled in v1 — reserved for later
 
 
 def _pos_side(direction: Direction) -> str:
@@ -125,8 +124,10 @@ class OrderRouter:
 
         Partial mode splits `plan.num_contracts` into `size1 + size2` where
         `size1 = int(num_contracts * partial_tp_ratio)` and `size2 = remainder`.
-        If either split would be 0 (e.g. `num_contracts == 1`), we fall back
-        to a single algo on the full size.
+        When partial TP is enabled, the entry_signals layer rejects any plan
+        that cannot be split (reason: `insufficient_contracts_for_split`), so
+        reaching this method with a zero leg is a programming error — we
+        raise rather than silently degrade to a single OCO.
         """
         cfg = self.config
         sign = 1 if plan.direction == Direction.BULLISH else -1
@@ -135,24 +136,27 @@ class OrderRouter:
         if cfg.partial_tp_enabled:
             size1 = int(plan.num_contracts * cfg.partial_tp_ratio)
             size2 = plan.num_contracts - size1
-            if size1 > 0 and size2 > 0:
-                tp1 = plan.entry_price + sl_dist * cfg.partial_tp_rr * sign
-                algo1 = self.client.place_oco_algo(
-                    inst_id=inst, pos_side=pos_side, size_contracts=size1,
-                    sl_trigger_px=plan.sl_price, tp_trigger_px=tp1,
-                    td_mode=cfg.margin_mode,
+            if size1 <= 0 or size2 <= 0:
+                raise RuntimeError(
+                    f"partial_tp_enabled but contract split is degenerate: "
+                    f"num_contracts={plan.num_contracts} "
+                    f"ratio={cfg.partial_tp_ratio} "
+                    f"size1={size1} size2={size2}. "
+                    f"entry_signals should have rejected this plan with "
+                    f"'insufficient_contracts_for_split'."
                 )
-                algo2 = self.client.place_oco_algo(
-                    inst_id=inst, pos_side=pos_side, size_contracts=size2,
-                    sl_trigger_px=plan.sl_price, tp_trigger_px=plan.tp_price,
-                    td_mode=cfg.margin_mode,
-                )
-                return [algo1, algo2]
-            # Contract count too small to split — fall through to single algo.
-            logger.info(
-                "partial_tp_fallback_to_single contracts={} ratio={}",
-                plan.num_contracts, cfg.partial_tp_ratio,
+            tp1 = plan.entry_price + sl_dist * cfg.partial_tp_rr * sign
+            algo1 = self.client.place_oco_algo(
+                inst_id=inst, pos_side=pos_side, size_contracts=size1,
+                sl_trigger_px=plan.sl_price, tp_trigger_px=tp1,
+                td_mode=cfg.margin_mode,
             )
+            algo2 = self.client.place_oco_algo(
+                inst_id=inst, pos_side=pos_side, size_contracts=size2,
+                sl_trigger_px=plan.sl_price, tp_trigger_px=plan.tp_price,
+                td_mode=cfg.margin_mode,
+            )
+            return [algo1, algo2]
 
         algo = self.client.place_oco_algo(
             inst_id=inst, pos_side=pos_side, size_contracts=plan.num_contracts,

@@ -38,6 +38,11 @@ from src.bot.lifecycle import install_shutdown_handlers
 from src.data.candle_buffer import MultiTFBuffer
 from src.data.derivatives_api import CoinalyzeClient
 from src.data.derivatives_cache import DerivativesCache
+from src.data.economic_calendar import (
+    EconomicCalendarService,
+    FairEconomyClient,
+    FinnhubClient,
+)
 from src.data.liquidation_stream import LiquidationStream
 from src.data.ltf_reader import LTFReader, LTFState
 from src.data.models import Direction, MarketState, Session
@@ -206,6 +211,8 @@ class BotContext:
     liquidation_stream: Any = None         # LiquidationStream
     derivatives_cache: Any = None          # DerivativesCache (Madde 3)
     coinalyze_client: Any = None           # CoinalyzeClient (Madde 2)
+    # Macro event blackout — opt-in via EconomicCalendarConfig.enabled
+    economic_calendar: Any = None          # EconomicCalendarService
     # OKX per-symbol ctVal (underlying per contract). BTC=0.01, ETH=0.1, SOL=1.
     # Populated at bootstrap; one hardcoded value for all symbols trips 51008.
     contract_sizes: dict[str, float] = field(default_factory=dict)
@@ -282,7 +289,6 @@ class BotRunner:
             partial_tp_ratio=cfg.execution.partial_tp_ratio,
             partial_tp_rr=cfg.execution.partial_tp_rr,
             move_sl_to_be_after_tp1=cfg.execution.move_sl_to_be_after_tp1,
-            trail_after_partial=cfg.execution.trail_after_partial,
         )
         router = _DryRunRouter(router_cfg) if dry_run else OrderRouter(client, router_cfg)
         journal = TradeJournal(cfg.journal.db_path)
@@ -319,6 +325,7 @@ class BotRunner:
             client,
             margin_mode=router_cfg.margin_mode,
             move_sl_to_be_enabled=cfg.execution.move_sl_to_be_after_tp1,
+            sl_be_offset_pct=cfg.execution.sl_be_offset_pct,
             on_sl_moved=_on_sl_moved,
         )
         risk_mgr = RiskManager(cfg.bot.starting_balance, cfg.breakers())
@@ -360,6 +367,29 @@ class BotRunner:
             # runner calls `ensure_schema` through `_start_derivatives`.
             cache._deriv_journal_bootstrap = deriv_journal
 
+        # Macro event blackout — independent of the derivatives subsystem.
+        if cfg.economic_calendar.enabled:
+            finnhub = (
+                FinnhubClient(
+                    api_key=cfg.economic_calendar.finnhub_api_key,
+                    timeout_s=cfg.economic_calendar.finnhub_timeout_s,
+                    max_retries=cfg.economic_calendar.finnhub_max_retries,
+                )
+                if cfg.economic_calendar.finnhub_enabled else None
+            )
+            faireconomy = (
+                FairEconomyClient(
+                    timeout_s=cfg.economic_calendar.faireconomy_timeout_s,
+                    max_retries=cfg.economic_calendar.faireconomy_max_retries,
+                )
+                if cfg.economic_calendar.faireconomy_enabled else None
+            )
+            ctx.economic_calendar = EconomicCalendarService(
+                config=cfg.economic_calendar,
+                finnhub=finnhub,
+                faireconomy=faireconomy,
+            )
+
         return cls(
             ctx,
             stop_after_closed_trades=stop_after_closed_trades,
@@ -385,6 +415,7 @@ class BotRunner:
             async with self.ctx.journal:
                 await self._prime()
                 await self._start_derivatives()
+                await self._start_economic_calendar()
                 interval = self.ctx.config.bot.poll_interval_seconds
                 deadline = (
                     time.monotonic() + self.duration_seconds
@@ -424,6 +455,7 @@ class BotRunner:
                     except asyncio.TimeoutError:
                         pass
         finally:
+            await self._stop_economic_calendar()
             await self._stop_derivatives()
 
     async def _start_derivatives(self) -> None:
@@ -471,6 +503,32 @@ class BotRunner:
                         await result
             except Exception:
                 logger.exception("coinalyze_client_close_failed")
+
+    async def _start_economic_calendar(self) -> None:
+        """Warm the cache + spawn the periodic refresh task. No-op when
+        the service is disabled. Best-effort: failure here never blocks
+        the trading loop (blackout just stays inactive)."""
+        svc = self.ctx.economic_calendar
+        if svc is None:
+            return
+        try:
+            await svc.refresh()
+        except Exception:
+            logger.exception("economic_calendar_initial_refresh_failed")
+        try:
+            svc._refresh_task = asyncio.create_task(
+                svc.run_refresh_loop(self.shutdown))
+        except Exception:
+            logger.exception("economic_calendar_refresh_task_spawn_failed")
+
+    async def _stop_economic_calendar(self) -> None:
+        svc = self.ctx.economic_calendar
+        if svc is None:
+            return
+        try:
+            await svc.close()
+        except Exception:
+            logger.exception("economic_calendar_close_failed")
 
     async def run_once_then_exit(self) -> None:
         """Smoke-test entry point: one full tick, then clean shutdown."""
@@ -681,6 +739,28 @@ class BotRunner:
         cfg = self.ctx.config
         logger.info("symbol_cycle_start symbol={}", symbol)
 
+        # 0. Macro event blackout — skip new entries inside ±window of a
+        # scheduled HIGH-impact USD event (CPI/FOMC/NFP/PCE). Open positions
+        # are untouched (their OCO algos already manage exit). Cheap sync
+        # check, runs before the expensive TV symbol/TF switching.
+        if self.ctx.economic_calendar is not None:
+            try:
+                blackout = self.ctx.economic_calendar.is_in_blackout(_utc_now())
+            except Exception:
+                logger.exception("economic_calendar_check_failed symbol={}", symbol)
+                blackout = None
+            if blackout is not None and blackout.active and blackout.event is not None:
+                evt = blackout.event
+                logger.info(
+                    "symbol_decision symbol={} NO_TRADE reason=macro_event_blackout "
+                    "event={!r} country={} impact={} secs_to_event={} "
+                    "secs_after_event={} source={}",
+                    symbol, evt.title, evt.country, evt.impact.value,
+                    blackout.seconds_until_event, blackout.seconds_after_event,
+                    evt.source,
+                )
+                return
+
         # 1. Switch the TV chart to this symbol (production has a bridge;
         # tests pass bridge=None and the reader fake already knows the symbol).
         if self.ctx.bridge is not None:
@@ -845,6 +925,9 @@ class BotRunner:
                 ltf_state=self.ctx.ltf_cache.get(symbol),
                 min_tp_distance_pct=cfg.analysis.min_tp_distance_pct,
                 min_sl_distance_pct=cfg.analysis.min_sl_distance_pct,
+                fee_reserve_pct=cfg.trading.fee_reserve_pct,
+                partial_tp_enabled=cfg.execution.partial_tp_enabled,
+                partial_tp_ratio=cfg.execution.partial_tp_ratio,
             )
         except Exception:
             logger.exception("plan_build_failed symbol={}", symbol)
@@ -1063,7 +1146,9 @@ class BotRunner:
 
         try:
             updated = await self.ctx.journal.record_close(
-                trade_id, enriched, close_reason=close_reason,
+                trade_id, enriched,
+                fees_usdt=abs(enriched.fee_usdt),
+                close_reason=close_reason,
             )
         except Exception:
             logger.exception("journal_close_failed trade_id={}", trade_id)
@@ -1103,6 +1188,7 @@ class BotRunner:
                 float(rec.num_contracts), rec.entry_price,
                 algo_ids=list(rec.algo_ids),
                 tp2_price=rec.tp_price,
+                be_already_moved=rec.sl_moved_to_be,
             )
             self.ctx.open_trade_ids[(rec.symbol, pos_side)] = rec.trade_id
             self.ctx.open_trade_opened_at[(rec.symbol, pos_side)] = rec.entry_timestamp

@@ -38,6 +38,7 @@ class TradePlan:
     max_risk_usdt: float          # USDT risk target before any capping
     capped: bool                  # True when required_leverage > max_leverage
 
+    fee_reserve_pct: float = 0.0  # round-trip taker reserve baked into sizing
     sl_source: str = ""           # "order_block" / "fvg" / "swing" / "atr_fallback"
     confluence_score: float = 0.0
     confluence_factors: list[str] = field(default_factory=list)

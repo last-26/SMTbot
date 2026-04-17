@@ -51,6 +51,12 @@ class TradingConfig(BaseModel):
     # Useful when e.g. ETH's OKX cap is 100x but demo wicks make anything
     # above 30x unsafe. Unlisted symbols fall back to the global max.
     symbol_leverage_caps: dict[str, int] = Field(default_factory=dict)
+    # Round-trip taker reserve added to SL % when sizing notional, so a
+    # stop-out stays inside the USDT risk budget AFTER paying entry + exit
+    # taker fees. 0 = off (price-only sizing, back-compat for tests); runtime
+    # YAML sets ~0.001 (≈ 2× OKX demo taker 0.05%). TP price is unchanged —
+    # fee compensation comes from size, not from widening TP.
+    fee_reserve_pct: float = 0.0
     symbol_settle_seconds: float = 4.0            # wait after set_symbol (Madde A/B)
     tf_settle_seconds: float = 2.5                # wait after set_timeframe (Madde B)
     pine_settle_max_wait_s: float = 6.0           # freshness-poll timeout (Madde B)
@@ -157,7 +163,12 @@ class ExecutionConfig(BaseModel):
     partial_tp_ratio: float = 0.5
     partial_tp_rr: float = 1.5
     move_sl_to_be_after_tp1: bool = True
-    trail_after_partial: bool = False
+    # Buffer past entry used when moving SL to breakeven after TP1 fills.
+    # `be_price = entry ± entry × sl_be_offset_pct` (sign follows direction),
+    # so a touch-back to "near entry" closes at a true net-zero after the
+    # remaining exit taker fee + slippage. 0 = off (legacy exact-entry behavior).
+    # Runtime YAML sets ~0.001 (matches one round-trip taker on the remainder).
+    sl_be_offset_pct: float = 0.0
     # Madde F — LTF reversal defensive close (wired in Commit 6).
     ltf_reversal_close_enabled: bool = False
     ltf_reversal_min_confluence: int = 3
@@ -214,6 +225,30 @@ class DerivativesConfig(BaseModel):
     crowded_skip_z_threshold: float = 3.0
 
 
+class EconomicCalendarConfig(BaseModel):
+    """Macro event blackout — skip new entries around scheduled HIGH-impact
+    USD releases (CPI, FOMC, NFP, PCE, FED minutes). Two-provider union with
+    failure isolation. Default OFF so existing setups don't break.
+
+    `finnhub_api_key` is populated from `FINNHUB_API_KEY` env var by
+    `load_config`; setting it directly in YAML is allowed for tests.
+    """
+    enabled: bool = False
+    finnhub_api_key: str = ""
+    finnhub_enabled: bool = True
+    faireconomy_enabled: bool = True
+    blackout_minutes_before: int = 30
+    blackout_minutes_after: int = 15
+    impact_filter: list[str] = Field(default_factory=lambda: ["High"])
+    currencies: list[str] = Field(default_factory=lambda: ["USD"])
+    refresh_interval_s: int = 21600     # 6h — events are scheduled
+    lookahead_days: int = 7
+    finnhub_timeout_s: float = 10.0
+    finnhub_max_retries: int = 3
+    faireconomy_timeout_s: float = 10.0
+    faireconomy_max_retries: int = 3
+
+
 class ReentryConfig(BaseModel):
     """Per-side reentry gate (Madde C).
 
@@ -255,6 +290,8 @@ class BotConfig(BaseModel):
     reentry: ReentryConfig = Field(default_factory=ReentryConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     derivatives: DerivativesConfig = Field(default_factory=DerivativesConfig)
+    economic_calendar: EconomicCalendarConfig = Field(
+        default_factory=EconomicCalendarConfig)
 
     @field_validator("okx")
     @classmethod
@@ -319,5 +356,14 @@ def load_config(path: str | Path, *, env_path: Optional[str | Path] = None) -> B
     okx_section["demo_flag"] = os.environ.get(
         "OKX_DEMO_FLAG", okx_section.get("demo_flag", "1"))
     raw["okx"] = okx_section
+
+    # Macro event blackout — pull FINNHUB_API_KEY from env into the section
+    # so the YAML never has to carry the secret. YAML can still pre-set it
+    # for tests; env wins (matches OKX behavior above).
+    cal_section = dict(raw.get("economic_calendar") or {})
+    env_finnhub = os.environ.get("FINNHUB_API_KEY", "")
+    if env_finnhub:
+        cal_section["finnhub_api_key"] = env_finnhub
+    raw["economic_calendar"] = cal_section
 
     return BotConfig(**raw)

@@ -49,16 +49,21 @@ class PositionMonitor:
         *,
         margin_mode: str = "isolated",
         move_sl_to_be_enabled: bool = False,
+        sl_be_offset_pct: float = 0.0,
         on_sl_moved: Optional[Callable[[str, str, list[str]], None]] = None,
     ):
         self.client = client
         self.margin_mode = margin_mode
         self.move_sl_to_be_enabled = move_sl_to_be_enabled
+        self.sl_be_offset_pct = sl_be_offset_pct
         self._on_sl_moved = on_sl_moved
         self._tracked: dict[tuple[str, str], _Tracked] = {}
 
     # Called by the router after it places an order, so the monitor
-    # "knows" to expect this position on the next poll.
+    # "knows" to expect this position on the next poll. On restart,
+    # `_rehydrate_open_positions` also calls this with `be_already_moved=True`
+    # for positions whose SL-to-BE dance completed pre-restart, so the
+    # monitor does not try to cancel the (already-replaced) TP2 again.
     def register_open(
         self,
         inst_id: str,
@@ -68,10 +73,12 @@ class PositionMonitor:
         *,
         algo_ids: Optional[list[str]] = None,
         tp2_price: Optional[float] = None,
+        be_already_moved: bool = False,
     ) -> None:
         self._tracked[(inst_id, pos_side)] = _Tracked(
             inst_id=inst_id, pos_side=pos_side, size=size, entry_price=entry_price,
             initial_size=size, algo_ids=list(algo_ids or []), tp2_price=tp2_price,
+            be_already_moved=be_already_moved,
         )
 
     def poll(self, inst_id: Optional[str] = None) -> list[CloseFill]:
@@ -128,12 +135,14 @@ class PositionMonitor:
             return
 
         tp2_algo_id = t.algo_ids[1]
+        sign = 1 if t.pos_side == "long" else -1
+        be_price = t.entry_price + (t.entry_price * self.sl_be_offset_pct * sign)
         try:
             self.client.cancel_algo(t.inst_id, tp2_algo_id)
             new_algo = self.client.place_oco_algo(
                 inst_id=t.inst_id, pos_side=t.pos_side,
                 size_contracts=int(snap.size),
-                sl_trigger_px=t.entry_price,
+                sl_trigger_px=be_price,
                 tp_trigger_px=t.tp2_price,
                 td_mode=self.margin_mode,
             )
@@ -147,8 +156,10 @@ class PositionMonitor:
         t.algo_ids = [t.algo_ids[0], new_algo.algo_id]
         t.be_already_moved = True
         logger.info(
-            "sl_moved_to_be_via_replace inst={} side={} remaining_size={} new_algo={}",
-            t.inst_id, t.pos_side, snap.size, new_algo.algo_id,
+            "sl_moved_to_be_via_replace inst={} side={} remaining_size={} "
+            "be_price={} offset_pct={} new_algo={}",
+            t.inst_id, t.pos_side, snap.size,
+            be_price, self.sl_be_offset_pct, new_algo.algo_id,
         )
         if self._on_sl_moved is not None:
             try:
