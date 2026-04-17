@@ -174,6 +174,16 @@ class OKXClient:
         data = _check(resp, "get_mark_price")
         return float(data.get("markPx") or 0.0)
 
+    def get_contract_size(self, inst_id: str) -> float:
+        """Fetch OKX `ctVal` (underlying per contract) for sizing math.
+
+        BTC-USDT-SWAP=0.01, ETH=0.1, SOL=1 — hardcoding one value for all
+        symbols over-sizes ETH/SOL orders and trips sCode 51008.
+        """
+        resp = self.public.get_instruments(instType="SWAP", instId=inst_id)
+        data = _check(resp, "get_instruments")
+        return float(data.get("ctVal") or 0.0)
+
     # ── Orders ──────────────────────────────────────────────────────────────
 
     def place_market_order(

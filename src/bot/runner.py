@@ -207,6 +207,9 @@ class BotContext:
     liquidation_stream: Any = None         # LiquidationStream
     derivatives_cache: Any = None          # DerivativesCache (Madde 3)
     coinalyze_client: Any = None           # CoinalyzeClient (Madde 2)
+    # OKX per-symbol ctVal (underlying per contract). BTC=0.01, ETH=0.1, SOL=1.
+    # Populated at bootstrap; one hardcoded value for all symbols trips 51008.
+    contract_sizes: dict[str, float] = field(default_factory=dict)
 
 
 # ── Runner ──────────────────────────────────────────────────────────────────
@@ -790,7 +793,8 @@ class BotRunner:
                 rr_ratio=cfg.trading.default_rr_ratio,
                 min_rr_ratio=cfg.trading.min_rr_ratio,
                 max_leverage=cfg.trading.max_leverage,
-                contract_size=cfg.trading.contract_size,
+                contract_size=self.ctx.contract_sizes.get(
+                    symbol, cfg.trading.contract_size),
                 swing_lookback=cfg.analysis.swing_lookback,
                 allowed_sessions=cfg.allowed_sessions() or None,
                 htf_sr_zones=self.ctx.htf_sr_cache.get(symbol),
@@ -838,11 +842,17 @@ class BotRunner:
                 logger.debug("no_trade_log_failed symbol={}", symbol)
             return
 
+        margin_locked = (plan.position_size_usdt / plan.leverage
+                         if plan.leverage else 0.0)
         logger.info(
             "symbol_decision symbol={} PLANNED direction={} entry={:.4f} "
-            "sl={:.4f} tp={:.4f} rr={:.2f} confluence={:.2f} factors={}",
+            "sl={:.4f} tp={:.4f} rr={:.2f} confluence={:.2f} "
+            "contracts={} notional={:.2f} lev={}x margin={:.2f} "
+            "risk={:.2f} sizing_bal={:.2f} factors={}",
             symbol, plan.direction.value, plan.entry_price, plan.sl_price,
             plan.tp_price, plan.rr_ratio, plan.confluence_score,
+            plan.num_contracts, plan.position_size_usdt, plan.leverage,
+            margin_locked, plan.risk_amount_usdt, sizing_balance,
             ",".join(plan.confluence_factors) or "-",
         )
 
@@ -920,6 +930,29 @@ class BotRunner:
         await self.ctx.journal.replay_for_risk_manager(self.ctx.risk_mgr)
         await self._rehydrate_open_positions()
         await self._reconcile_orphans()
+        await self._load_contract_sizes()
+
+    async def _load_contract_sizes(self) -> None:
+        """Pre-fetch OKX ctVal for every configured symbol. Falls back to the
+        YAML default on error so the bot still runs (will trip 51008 for
+        non-BTC but logs the failure so the operator sees it)."""
+        cfg = self.ctx.config
+        fallback = cfg.trading.contract_size
+        for symbol in cfg.trading.symbols:
+            try:
+                ct = await asyncio.to_thread(
+                    self.ctx.okx_client.get_contract_size, symbol)
+                if ct > 0:
+                    self.ctx.contract_sizes[symbol] = ct
+                else:
+                    self.ctx.contract_sizes[symbol] = fallback
+                    logger.warning("ctval_zero_using_fallback symbol={} fallback={}",
+                                   symbol, fallback)
+            except Exception:
+                self.ctx.contract_sizes[symbol] = fallback
+                logger.exception("ctval_fetch_failed symbol={} fallback={}",
+                                 symbol, fallback)
+        logger.info("contract_sizes_loaded {}", self.ctx.contract_sizes)
 
     async def _process_closes(self) -> None:
         try:
