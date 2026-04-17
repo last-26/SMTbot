@@ -153,6 +153,11 @@ class DerivativesConfig(BaseModel):
     liquidation_lookback_1h_ms: int = 60 * 60 * 1000
     liquidation_lookback_4h_ms: int = 4 * 60 * 60 * 1000
     liquidation_lookback_24h_ms: int = 24 * 60 * 60 * 1000
+    # Coinalyze REST (Madde 2) — off by default; enabled by setting
+    # COINALYZE_API_KEY and `derivatives.enabled: true`.
+    coinalyze_refresh_interval_s: int = 60
+    coinalyze_timeout_s: float = 10.0
+    coinalyze_max_retries: int = 3
 
 
 class ReentryConfig(BaseModel):

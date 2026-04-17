@@ -78,6 +78,9 @@ derivatives:
   liquidation_lookback_1h_ms: 3600000
   liquidation_lookback_4h_ms: 14400000
   liquidation_lookback_24h_ms: 86400000
+  coinalyze_refresh_interval_s: 60
+  coinalyze_timeout_s: 10.0
+  coinalyze_max_retries: 3
 
 rl:
   min_trades_to_train: 50
