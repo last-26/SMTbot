@@ -100,7 +100,34 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "vwap_1m_alignment": 0.3,
     "vwap_3m_alignment": 0.3,
     "vwap_15m_alignment": 0.4,
+    # Money-flow (Phase 6.9 A1). Fires when oscillator RSI+MFI bias agrees
+    # with the trade direction AND the |rsi_mfi| magnitude clears a threshold
+    # (weak bias filtered out). Futures markets are liquidity-driven; MFI is
+    # the primary momentum confirmation alongside WT cross.
+    "money_flow_alignment": 0.6,
+    # Pine standing-liquidity pools (Phase 6.9 A2). Complements
+    # derivatives_heatmap_target (OI-derived liq) by reading Pine's equal-
+    # highs/lows swing-pool levels. Fires when the nearest pool in the trade
+    # direction sits within `liquidity_pool_max_atr_dist` × ATR from price.
+    "liquidity_pool_target": 0.5,
+    # High-conviction oscillator signal (Phase 6.9 A3) — VMC Cipher B's
+    # Gold Buy / Buy Div / Sell Div carry strong statistical edge vs. plain
+    # BUY/SELL. Mutually exclusive with `oscillator_signal` (elif chain).
+    "oscillator_high_conviction_signal": 1.25,
 }
+
+
+# ── Tunable thresholds (non-weight parameters) ──────────────────────────────
+
+
+# A1 — minimum |rsi_mfi| magnitude before money_flow_alignment fires.
+# Below this the bias tag is noise. Overridable via score_direction kwarg.
+DEFAULT_MIN_RSI_MFI_MAGNITUDE: float = 2.0
+
+# A2 — maximum distance (in ATR multiples) to the nearest Pine liquidity pool
+# for liquidity_pool_target to fire. 3.0 ≈ reachable-within-a-few-bars on
+# 3m TF without being so far away the pool is irrelevant.
+DEFAULT_LIQUIDITY_POOL_MAX_ATR_DIST: float = 3.0
 
 
 # ── Helpers to read MarketState ─────────────────────────────────────────────
@@ -180,6 +207,8 @@ def score_direction(
     weights: Optional[dict[str, float]] = None,
     allowed_sessions: Optional[list[Session]] = None,
     ltf_state: Optional[object] = None,
+    min_rsi_mfi_magnitude: float = DEFAULT_MIN_RSI_MFI_MAGNITUDE,
+    liquidity_pool_max_atr_dist: float = DEFAULT_LIQUIDITY_POOL_MAX_ATR_DIST,
 ) -> ConfluenceScore:
     """Compute a confluence score for `direction` from the current market state.
 
@@ -273,6 +302,33 @@ def score_direction(
             detail=state.signal_table.last_sweep or "",
         ))
 
+    # 6b. Standing liquidity pool in trade direction (Phase 6.9 A2).
+    # Pine emits equal-highs/lows as pools in `liquidity_above/below`; price
+    # heading into one is a classic "liquidity hunt" setup. Complements
+    # `derivatives_heatmap_target` (OI-derived) — they fire independently.
+    atr = state.atr
+    if price > 0 and atr > 0:
+        reach = atr * liquidity_pool_max_atr_dist
+        sig_tbl = state.signal_table
+        if direction == Direction.BULLISH and sig_tbl.liquidity_above:
+            nearest = min(sig_tbl.liquidity_above, key=lambda lvl: abs(lvl - price))
+            if nearest > price and (nearest - price) <= reach:
+                factors.append(ConfluenceFactor(
+                    name="liquidity_pool_target",
+                    weight=w["liquidity_pool_target"],
+                    direction=direction,
+                    detail=f"pool@{nearest:.4f} dist={(nearest - price) / atr:.2f}×ATR",
+                ))
+        elif direction == Direction.BEARISH and sig_tbl.liquidity_below:
+            nearest = min(sig_tbl.liquidity_below, key=lambda lvl: abs(lvl - price))
+            if nearest < price and (price - nearest) <= reach:
+                factors.append(ConfluenceFactor(
+                    name="liquidity_pool_target",
+                    weight=w["liquidity_pool_target"],
+                    direction=direction,
+                    detail=f"pool@{nearest:.4f} dist={(price - nearest) / atr:.2f}×ATR",
+                ))
+
     # 7. LTF candlestick pattern in direction
     if ltf_candles:
         patterns = detect_all_patterns(ltf_candles)
@@ -304,21 +360,53 @@ def score_direction(
             detail="WT cross DOWN",
         ))
 
-    # 9. Last oscillator signal ("BUY"/"SELL") aligned with direction
+    # 9. Last oscillator signal aligned with direction. VMC Cipher B's
+    # high-conviction signals (GOLD_BUY / BUY_DIV / SELL_DIV) score under a
+    # separate name with heavier weight so observability distinguishes them
+    # from plain BUY/SELL. Mutually exclusive — one slot per cycle.
     sig = osc.last_signal.upper() if osc.last_signal else ""
-    if direction == Direction.BULLISH and ("BUY" in sig and osc.last_signal_bars_ago <= 3):
+    fresh = osc.last_signal_bars_ago <= 3
+    high_conviction_tokens_bull = ("GOLD_BUY", "BUY_DIV")
+    high_conviction_tokens_bear = ("SELL_DIV",)
+    is_bull_high = direction == Direction.BULLISH and fresh and any(
+        t in sig for t in high_conviction_tokens_bull
+    )
+    is_bear_high = direction == Direction.BEARISH and fresh and any(
+        t in sig for t in high_conviction_tokens_bear
+    )
+    if is_bull_high or is_bear_high:
+        factors.append(ConfluenceFactor(
+            name="oscillator_high_conviction_signal",
+            weight=w["oscillator_high_conviction_signal"],
+            direction=direction,
+            detail=f"{osc.last_signal} {osc.last_signal_bars_ago} bars ago",
+        ))
+    elif direction == Direction.BULLISH and ("BUY" in sig and fresh):
         factors.append(ConfluenceFactor(
             name="oscillator_signal",
             weight=w["oscillator_signal"],
             direction=direction,
             detail=f"{osc.last_signal} {osc.last_signal_bars_ago} bars ago",
         ))
-    elif direction == Direction.BEARISH and ("SELL" in sig and osc.last_signal_bars_ago <= 3):
+    elif direction == Direction.BEARISH and ("SELL" in sig and fresh):
         factors.append(ConfluenceFactor(
             name="oscillator_signal",
             weight=w["oscillator_signal"],
             direction=direction,
             detail=f"{osc.last_signal} {osc.last_signal_bars_ago} bars ago",
+        ))
+
+    # 9b. Money flow alignment (Phase 6.9 A1). RSI+MFI bias from the
+    # oscillator table agrees with direction AND its magnitude clears the
+    # noise floor. Futures are liquidity-driven, so this is a primary
+    # momentum teyidi alongside WT.
+    mfi_bias = _parse_direction_prefix(osc.rsi_mfi_bias)
+    if mfi_bias == direction and abs(osc.rsi_mfi) >= min_rsi_mfi_magnitude:
+        factors.append(ConfluenceFactor(
+            name="money_flow_alignment",
+            weight=w["money_flow_alignment"],
+            direction=direction,
+            detail=f"bias={osc.rsi_mfi_bias} val={osc.rsi_mfi:+.2f}",
         ))
 
     # 10. VMC ribbon alignment (EMA trend bias)
@@ -451,6 +539,8 @@ def calculate_confluence(
     weights: Optional[dict[str, float]] = None,
     allowed_sessions: Optional[list[Session]] = None,
     ltf_state: Optional[object] = None,
+    min_rsi_mfi_magnitude: float = DEFAULT_MIN_RSI_MFI_MAGNITUDE,
+    liquidity_pool_max_atr_dist: float = DEFAULT_LIQUIDITY_POOL_MAX_ATR_DIST,
 ) -> ConfluenceScore:
     """Compute confluence for BOTH directions and return the winning side.
 
@@ -466,6 +556,8 @@ def calculate_confluence(
         order_blocks=order_blocks, sr_zones=sr_zones,
         weights=weights, allowed_sessions=allowed_sessions,
         ltf_state=ltf_state,
+        min_rsi_mfi_magnitude=min_rsi_mfi_magnitude,
+        liquidity_pool_max_atr_dist=liquidity_pool_max_atr_dist,
     )
     bear = score_direction(
         state, Direction.BEARISH,
@@ -473,6 +565,8 @@ def calculate_confluence(
         order_blocks=order_blocks, sr_zones=sr_zones,
         weights=weights, allowed_sessions=allowed_sessions,
         ltf_state=ltf_state,
+        min_rsi_mfi_magnitude=min_rsi_mfi_magnitude,
+        liquidity_pool_max_atr_dist=liquidity_pool_max_atr_dist,
     )
 
     if bull.score == 0 and bear.score == 0:

@@ -940,6 +940,8 @@ class BotRunner:
                 fee_reserve_pct=cfg.trading.fee_reserve_pct,
                 partial_tp_enabled=cfg.execution.partial_tp_enabled,
                 partial_tp_ratio=cfg.execution.partial_tp_ratio,
+                min_rsi_mfi_magnitude=cfg.analysis.min_rsi_mfi_magnitude,
+                liquidity_pool_max_atr_dist=cfg.analysis.liquidity_pool_max_atr_dist,
             )
         except Exception:
             logger.exception("plan_build_failed symbol={}", symbol)
@@ -956,6 +958,8 @@ class BotRunner:
                     allowed_sessions=cfg.allowed_sessions() or None,
                     ltf_state=self.ctx.ltf_cache.get(symbol),
                     weights=cfg.analysis.confluence_weights or None,
+                    min_rsi_mfi_magnitude=cfg.analysis.min_rsi_mfi_magnitude,
+                    liquidity_pool_max_atr_dist=cfg.analysis.liquidity_pool_max_atr_dist,
                 )
                 logger.info(
                     "symbol_decision symbol={} NO_TRADE reason={} price={:.4f} "

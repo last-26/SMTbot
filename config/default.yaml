@@ -105,6 +105,15 @@ analysis:
   #   vwap_1m_alignment: 0.3
   #   vwap_3m_alignment: 0.3
   #   vwap_15m_alignment: 0.4
+  #   money_flow_alignment: 0.6           # Phase 6.9 A1
+  #   liquidity_pool_target: 0.5          # Phase 6.9 A2
+  #   oscillator_high_conviction_signal: 1.25  # Phase 6.9 A3 (GOLD_BUY / *_DIV)
+  # Phase 6.9 A1 — MFI bias magnitude floor. Below this the BULLISH/BEARISH
+  # tag is noise. Raise (e.g. 3.0) to only take strong money-flow skews.
+  min_rsi_mfi_magnitude: 2.0
+  # Phase 6.9 A2 — nearest Pine liquidity pool must sit within this ×ATR
+  # from price for `liquidity_pool_target` to fire. Lower = pickier.
+  liquidity_pool_max_atr_dist: 3.0
 
 okx:
   base_url: https://www.okx.com

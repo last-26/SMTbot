@@ -135,6 +135,12 @@ class AnalysisConfig(BaseModel):
     # the rest stay at their defaults (shallow merge). Unknown keys trigger
     # a warning at load time — typo guard, not a hard fail.
     confluence_weights: dict[str, float] = Field(default_factory=dict)
+    # Phase 6.9 A1 — magnitude floor for money_flow_alignment. MFI bias tags
+    # (BULLISH / BEARISH) near zero are noise; require |rsi_mfi| >= this.
+    min_rsi_mfi_magnitude: float = 2.0
+    # Phase 6.9 A2 — max distance (× ATR) to nearest Pine liquidity pool for
+    # liquidity_pool_target to fire. 3×ATR ≈ reachable within a few 3m bars.
+    liquidity_pool_max_atr_dist: float = 3.0
 
     @field_validator("confluence_weights")
     @classmethod

@@ -252,6 +252,8 @@ def generate_entry_intent(
     swing_lookback: int = 20,
     atr_fallback_mult: float = 2.0,
     ltf_state: Optional[object] = None,
+    min_rsi_mfi_magnitude: float = 2.0,
+    liquidity_pool_max_atr_dist: float = 3.0,
 ) -> Optional[EntryIntent]:
     """Compute confluence + pick an SL. Returns None when not tradable."""
     if state.current_price <= 0:
@@ -266,6 +268,8 @@ def generate_entry_intent(
         weights=weights,
         allowed_sessions=allowed_sessions,
         ltf_state=ltf_state,
+        min_rsi_mfi_magnitude=min_rsi_mfi_magnitude,
+        liquidity_pool_max_atr_dist=liquidity_pool_max_atr_dist,
     )
     if not confluence.is_tradable(min_confluence_score):
         return None
@@ -351,6 +355,8 @@ def build_trade_plan_from_state(
     min_sl_distance_pct: float = 0.0,
     partial_tp_enabled: bool = False,
     partial_tp_ratio: float = 0.5,
+    min_rsi_mfi_magnitude: float = 2.0,
+    liquidity_pool_max_atr_dist: float = 3.0,
 ) -> Optional[TradePlan]:
     """End-to-end: MarketState → TradePlan. Returns None when no trade.
 
@@ -392,6 +398,8 @@ def build_trade_plan_from_state(
         min_sl_distance_pct=min_sl_distance_pct,
         partial_tp_enabled=partial_tp_enabled,
         partial_tp_ratio=partial_tp_ratio,
+        min_rsi_mfi_magnitude=min_rsi_mfi_magnitude,
+        liquidity_pool_max_atr_dist=liquidity_pool_max_atr_dist,
     )
     return plan
 
@@ -427,6 +435,8 @@ def build_trade_plan_with_reason(
     min_sl_distance_pct: float = 0.0,
     partial_tp_enabled: bool = False,
     partial_tp_ratio: float = 0.5,
+    min_rsi_mfi_magnitude: float = 2.0,
+    liquidity_pool_max_atr_dist: float = 3.0,
 ) -> tuple[Optional[TradePlan], str]:
     """Same as `build_trade_plan_from_state` but returns `(plan, reason)`.
 
@@ -462,6 +472,8 @@ def build_trade_plan_with_reason(
         swing_lookback=swing_lookback,
         atr_fallback_mult=atr_fallback_mult,
         ltf_state=ltf_state,
+        min_rsi_mfi_magnitude=min_rsi_mfi_magnitude,
+        liquidity_pool_max_atr_dist=liquidity_pool_max_atr_dist,
     )
     if intent is None:
         # Distinguish the three upstream `generate_entry_intent` None paths.
@@ -470,6 +482,8 @@ def build_trade_plan_with_reason(
             fvgs=python_fvgs, order_blocks=python_order_blocks,
             sr_zones=sr_zones, weights=weights,
             allowed_sessions=allowed_sessions, ltf_state=ltf_state,
+            min_rsi_mfi_magnitude=min_rsi_mfi_magnitude,
+            liquidity_pool_max_atr_dist=liquidity_pool_max_atr_dist,
         )
         if not conf.is_tradable(min_confluence_score):
             return None, "below_confluence"

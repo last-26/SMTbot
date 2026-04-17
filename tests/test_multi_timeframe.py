@@ -166,6 +166,112 @@ def test_ltf_pattern_adds_when_direction_matches():
     assert "ltf_pattern" in result.factor_names
 
 
+# ── Phase 6.9 — orphan-field activations ───────────────────────────────────
+
+
+def test_money_flow_alignment_bullish_fires_when_bias_matches_and_magnitude_clears():
+    state = MarketState(
+        signal_table=SignalTableData(price=100),
+        oscillator=OscillatorTableData(rsi_mfi=5.0, rsi_mfi_bias="BULLISH"),
+    )
+    result = score_direction(state, Direction.BULLISH)
+    assert "money_flow_alignment" in result.factor_names
+
+
+def test_money_flow_alignment_bearish_fires_when_bias_matches():
+    state = MarketState(
+        signal_table=SignalTableData(price=100),
+        oscillator=OscillatorTableData(rsi_mfi=-4.0, rsi_mfi_bias="BEARISH"),
+    )
+    result = score_direction(state, Direction.BEARISH)
+    assert "money_flow_alignment" in result.factor_names
+
+
+def test_money_flow_alignment_silenced_below_magnitude_floor():
+    state = MarketState(
+        signal_table=SignalTableData(price=100),
+        oscillator=OscillatorTableData(rsi_mfi=1.0, rsi_mfi_bias="BULLISH"),
+    )
+    result = score_direction(state, Direction.BULLISH, min_rsi_mfi_magnitude=2.0)
+    assert "money_flow_alignment" not in result.factor_names
+
+
+def test_money_flow_alignment_ignored_when_bias_neutral():
+    state = MarketState(
+        signal_table=SignalTableData(price=100),
+        oscillator=OscillatorTableData(rsi_mfi=5.0, rsi_mfi_bias="NEUTRAL"),
+    )
+    result = score_direction(state, Direction.BULLISH)
+    assert "money_flow_alignment" not in result.factor_names
+
+
+def test_liquidity_pool_target_bullish_fires_when_pool_above_within_reach():
+    state = _state(price=100, atr_14=1.0, liquidity_above=[102.0, 110.0])
+    result = score_direction(state, Direction.BULLISH)
+    assert "liquidity_pool_target" in result.factor_names
+
+
+def test_liquidity_pool_target_bearish_fires_when_pool_below_within_reach():
+    state = _state(price=100, atr_14=1.0, liquidity_below=[98.0, 90.0])
+    result = score_direction(state, Direction.BEARISH)
+    assert "liquidity_pool_target" in result.factor_names
+
+
+def test_liquidity_pool_target_silenced_when_pool_out_of_reach():
+    state = _state(price=100, atr_14=1.0, liquidity_above=[110.0])
+    # 10 ATR away — beyond default 3.0 max
+    result = score_direction(state, Direction.BULLISH)
+    assert "liquidity_pool_target" not in result.factor_names
+
+
+def test_liquidity_pool_target_ignores_wrong_side_pool():
+    # bullish entry but only pools below price — standing pool is on the
+    # wrong side for this direction, must not fire.
+    state = _state(price=100, atr_14=1.0, liquidity_below=[99.0])
+    result = score_direction(state, Direction.BULLISH)
+    assert "liquidity_pool_target" not in result.factor_names
+
+
+def test_oscillator_high_conviction_signal_gold_buy():
+    state = MarketState(
+        signal_table=SignalTableData(price=100),
+        oscillator=OscillatorTableData(last_signal="GOLD_BUY", last_signal_bars_ago=0),
+    )
+    result = score_direction(state, Direction.BULLISH)
+    assert "oscillator_high_conviction_signal" in result.factor_names
+    # Plain oscillator_signal must NOT also fire for the same event.
+    assert "oscillator_signal" not in result.factor_names
+
+
+def test_oscillator_high_conviction_signal_sell_div():
+    state = MarketState(
+        signal_table=SignalTableData(price=100),
+        oscillator=OscillatorTableData(last_signal="SELL_DIV", last_signal_bars_ago=2),
+    )
+    result = score_direction(state, Direction.BEARISH)
+    assert "oscillator_high_conviction_signal" in result.factor_names
+    assert "oscillator_signal" not in result.factor_names
+
+
+def test_regular_buy_signal_does_not_trigger_high_conviction_slot():
+    state = MarketState(
+        signal_table=SignalTableData(price=100),
+        oscillator=OscillatorTableData(last_signal="BUY", last_signal_bars_ago=1),
+    )
+    result = score_direction(state, Direction.BULLISH)
+    assert "oscillator_high_conviction_signal" not in result.factor_names
+    assert "oscillator_signal" in result.factor_names
+
+
+def test_stale_gold_buy_does_not_fire():
+    state = MarketState(
+        signal_table=SignalTableData(price=100),
+        oscillator=OscillatorTableData(last_signal="GOLD_BUY", last_signal_bars_ago=10),
+    )
+    result = score_direction(state, Direction.BULLISH)
+    assert "oscillator_high_conviction_signal" not in result.factor_names
+
+
 # ── Session filter ──────────────────────────────────────────────────────────
 
 
