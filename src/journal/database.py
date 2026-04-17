@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS trades (
     fees_usdt           REAL NOT NULL DEFAULT 0,
 
     algo_ids            TEXT NOT NULL DEFAULT '[]',
+    sl_moved_to_be      INTEGER NOT NULL DEFAULT 0,
     close_reason        TEXT,
 
     regime_at_entry                     TEXT,
@@ -109,7 +110,7 @@ _COLUMNS = [
     "order_id", "algo_id", "client_order_id", "client_algo_id",
     "entry_timeframe", "htf_timeframe", "htf_bias", "session", "market_structure",
     "exit_price", "pnl_usdt", "pnl_r", "fees_usdt",
-    "algo_ids", "close_reason",
+    "algo_ids", "sl_moved_to_be", "close_reason",
     "regime_at_entry", "funding_z_at_entry", "ls_ratio_at_entry",
     "oi_change_24h_at_entry", "liq_imbalance_1h_at_entry",
     "nearest_liq_cluster_above_price", "nearest_liq_cluster_below_price",
@@ -122,6 +123,7 @@ _COLUMNS = [
 # a try/except so re-running on a DB that already has the column is a no-op.
 _MIGRATIONS = [
     "ALTER TABLE trades ADD COLUMN algo_ids TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE trades ADD COLUMN sl_moved_to_be INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE trades ADD COLUMN close_reason TEXT",
     # Phase 1.5 Madde 7 — derivatives snapshot at entry time.
     "ALTER TABLE trades ADD COLUMN regime_at_entry TEXT",
@@ -155,7 +157,7 @@ def _record_to_row(rec: TradeRecord) -> tuple:
         rec.order_id, rec.algo_id, rec.client_order_id, rec.client_algo_id,
         rec.entry_timeframe, rec.htf_timeframe, rec.htf_bias, rec.session, rec.market_structure,
         rec.exit_price, rec.pnl_usdt, rec.pnl_r, rec.fees_usdt,
-        json.dumps(rec.algo_ids), rec.close_reason,
+        json.dumps(rec.algo_ids), int(rec.sl_moved_to_be), rec.close_reason,
         rec.regime_at_entry, rec.funding_z_at_entry, rec.ls_ratio_at_entry,
         rec.oi_change_24h_at_entry, rec.liq_imbalance_1h_at_entry,
         rec.nearest_liq_cluster_above_price, rec.nearest_liq_cluster_below_price,
@@ -199,6 +201,7 @@ def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
         pnl_r=row["pnl_r"],
         fees_usdt=row["fees_usdt"] or 0.0,
         algo_ids=json.loads(_safe_col(row, "algo_ids") or "[]"),
+        sl_moved_to_be=bool(_safe_col(row, "sl_moved_to_be") or 0),
         close_reason=_safe_col(row, "close_reason"),
         regime_at_entry=_safe_col(row, "regime_at_entry"),
         funding_z_at_entry=_safe_col(row, "funding_z_at_entry"),
@@ -408,12 +411,16 @@ class TradeJournal:
         return updated
 
     async def update_algo_ids(self, trade_id: str, algo_ids: list[str]) -> None:
-        """Rewrite the `algo_ids` column — used by the SL-to-BE path when
-        the monitor replaces TP2 with a new algo and needs the new ID in
-        the journal."""
+        """Rewrite the `algo_ids` column AND stamp `sl_moved_to_be = 1`.
+
+        Used by the SL-to-BE path when the monitor replaces TP2 with a new
+        OCO (SL at entry + remainder TP). Persisting the flag is what lets
+        `_rehydrate_open_positions` skip the re-move after a restart — see
+        `PositionMonitor._detect_tp1_and_move_sl` for the consumer side.
+        """
         conn = self._require_conn()
         cur = await conn.execute(
-            "UPDATE trades SET algo_ids = ? WHERE trade_id = ?",
+            "UPDATE trades SET algo_ids = ?, sl_moved_to_be = 1 WHERE trade_id = ?",
             (json.dumps(list(algo_ids)), trade_id),
         )
         await conn.commit()

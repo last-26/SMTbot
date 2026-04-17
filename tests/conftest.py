@@ -178,10 +178,12 @@ class FakeMonitor:
     def register_open(self, inst_id: str, pos_side: str,
                       size: float, entry_price: float,
                       *, algo_ids: Optional[list[str]] = None,
-                      tp2_price: Optional[float] = None) -> None:
+                      tp2_price: Optional[float] = None,
+                      be_already_moved: bool = False) -> None:
         self.registered.append((inst_id, pos_side, size, entry_price))
         self.register_extras.append(
-            {"algo_ids": list(algo_ids or []), "tp2_price": tp2_price}
+            {"algo_ids": list(algo_ids or []), "tp2_price": tp2_price,
+             "be_already_moved": be_already_moved}
         )
 
     def poll(self, inst_id: Optional[str] = None) -> list[CloseFill]:

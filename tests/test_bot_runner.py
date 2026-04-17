@@ -250,6 +250,32 @@ async def test_startup_rehydrates_open_positions_to_monitor(monkeypatch, tmp_pat
     assert ("BTC-USDT-SWAP", "long") in ctx.open_trade_ids
 
 
+async def test_rehydrate_passes_be_already_moved_from_journal(monkeypatch, tmp_path, make_ctx):
+    """If the journal row shows SL-to-BE already completed pre-restart, the
+    rehydrate path must forward `be_already_moved=True` to the monitor so it
+    doesn't re-cancel the already-replaced TP2 on the next poll."""
+    db = tmp_path / "trades.db"
+    t0 = datetime(2026, 4, 16, 9, tzinfo=UTC)
+    async with TradeJournal(str(db)) as seed:
+        rec = await seed.record_open(make_plan(), make_report(),
+                                     symbol="BTC-USDT-SWAP",
+                                     signal_timestamp=t0, entry_timestamp=t0)
+        # Simulate TP1 firing pre-restart: algo_ids rewritten + flag stamped.
+        await seed.update_algo_ids(rec.trade_id, ["ALG-1", "NEW_BE"])
+
+    cfg = make_config()
+    journal = TradeJournal(str(db))
+    ctx, fakes = make_ctx(journal=journal, config=cfg)
+    runner = BotRunner(ctx)
+    async with ctx.journal:
+        await runner._prime()
+
+    assert len(fakes.monitor.register_extras) == 1
+    extras = fakes.monitor.register_extras[0]
+    assert extras["be_already_moved"] is True
+    assert extras["algo_ids"] == ["ALG-1", "NEW_BE"]
+
+
 async def test_reconcile_logs_orphan_live_without_journal(monkeypatch, caplog, make_ctx):
     # Intercept loguru into pytest's caplog via a one-off sink.
     from loguru import logger

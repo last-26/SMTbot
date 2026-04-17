@@ -161,6 +161,7 @@ Gotchas and rationales not self-evident from the code. Inline comments cover the
 
 - **Risk manager replay.** `journal.replay_for_risk_manager(mgr)` rebuilds `peak_balance`, `consecutive_losses`, `current_balance` from closed trades on startup — durable truth over in-memory state. Drawdown breaker is **permanent halt** (manual restart required).
 - **Orphan reconcile is log-only.** `_reconcile_orphans` diffs live OKX positions vs journal OPEN and logs mismatches; operator decides. Restart-while-live verified end-to-end (OCO algos on OKX keep SL/TP enforcement across bot restart; `_rehydrate_open_positions` reloads monitor state).
+- **SL-to-BE survives restart.** `trades.sl_moved_to_be` is stamped by `journal.update_algo_ids` when the monitor replaces TP2 with the BE OCO. On restart, `_rehydrate_open_positions` forwards it as `be_already_moved=True` to `PositionMonitor.register_open`, so `_detect_tp1_and_move_sl` short-circuits and does NOT re-cancel + re-place the remainder's already-BE'd OCO. Without this, every restart after TP1 would double-move the SL (or worse, cancel the live BE algo and fail to re-place).
 - **Reentry gate** (four sequential, first-fail-wins, per `(symbol, side)`):
   1. Cooldown `min_bars_after_close * tf_seconds(entry_tf)`
   2. ATR move `|price - last.price| / atr >= min_atr_move`

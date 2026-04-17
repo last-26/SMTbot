@@ -8,7 +8,7 @@ which stamps exit fields onto this record.
 
 Why Pydantic (not dataclass): matches the data-layer convention in
 `src.data.models`, gives us JSON round-tripping for `confluence_factors` and
-`patterns_detected`, and validates datetimes on the way back out of SQLite.
+`algo_ids`, and validates datetimes on the way back out of SQLite.
 """
 
 from __future__ import annotations
@@ -97,6 +97,10 @@ class TradeRecord(BaseModel):
     # Partial-TP bookkeeping (Madde E) — list of algo IDs attached to the
     # position; rewritten by the monitor after SL-to-BE replaces TP2.
     algo_ids: list[str] = Field(default_factory=list)
+    # True once TP1 has filled and the SL has been replaced at break-even.
+    # Persisted so that after a restart the monitor does not re-attempt the
+    # (already done) cancel-and-replace dance on the still-open remainder.
+    sl_moved_to_be: bool = False
     # Why the position was closed — "EARLY_CLOSE_LTF_REVERSAL" etc. (Madde F).
     close_reason: Optional[str] = None
 
