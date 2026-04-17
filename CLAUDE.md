@@ -150,6 +150,7 @@ Gotchas and rationales not self-evident from the code. Inline comments cover the
 
 ### Data quality
 
+- **Pine table-cell precision (`"#.########"`, not `"#.##"`).** `smt_overlay.pine` writes `atr_14`, `price` and `vwap_*m` into the Signal table with `str.tostring(val, "#.########")`. `"#.##"` (2 decimals) truncates DOGE ATR (~0.0008) and XRP ATR (~0.005) to `"0"`, which `structured_reader` parses as 0.0, which makes `select_sl_price` short-circuit on `atr <= 0` and return `no_sl_source` every cycle — even when OB/FVG factors are live. `#` is an optional digit in Pine, so BTC 60000 still renders as `"60000"`; the wide format is safe for all scales. OB/FVG zone coordinates are unaffected (parsed from `box.new()` floats, not tooltip strings).
 - **Country→currency normalization in economic calendar.** Finnhub returns ISO-3166 alpha-2 (`"US"`, `"GB"`); FairEconomy returns currency codes (`"USD"`, `"GBP"`). Without normalization, `currencies: ["USD"]` filter silently drops every Finnhub event. `_country_to_currency()` normalizes at parse time; 3-char codes pass through idempotently.
 - **FairEconomy thisweek + nextweek.** Both fetched in parallel via `asyncio.gather`. **404 on nextweek.json is normal** (file published mid-week) → demoted to DEBUG log. Without nextweek the bot is blind to next-Mon/Tue events when run late in the week.
 - **Blackout decision point is BEFORE TV settle.** `is_in_blackout(now)` runs before symbol/TF switch — saves ~46s of settle per blacked-out symbol. Open positions untouched; OCO algos manage exit.
