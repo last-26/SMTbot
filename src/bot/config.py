@@ -158,6 +158,14 @@ class DerivativesConfig(BaseModel):
     coinalyze_refresh_interval_s: int = 60
     coinalyze_timeout_s: float = 10.0
     coinalyze_max_retries: int = 3
+    # Liquidity heatmap (Madde 4).
+    heatmap_enabled: bool = True
+    heatmap_bucket_pct: float = 0.002
+    heatmap_historical_lookback_ms: int = 48 * 60 * 60 * 1000
+    heatmap_max_clusters_each_side: int = 10
+    leverage_buckets: list[tuple[int, float]] = Field(
+        default_factory=lambda: [(10, 0.30), (25, 0.35), (50, 0.20), (100, 0.15)]
+    )
 
 
 class ReentryConfig(BaseModel):

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Direction(str, Enum):
@@ -185,6 +185,13 @@ class MarketState(BaseModel):
     liquidity_levels: list[LiquidityLevel] = Field(default_factory=list)
     sweep_events: list[SweepEvent] = Field(default_factory=list)
     session_levels: list[SessionLevel] = Field(default_factory=list)
+
+    # Phase 1.5 — attached by runner when derivatives layer is enabled.
+    # Typed as Any so the Pydantic model doesn't need to import the dataclasses.
+    derivatives: Optional[Any] = None           # DerivativesState
+    liquidity_heatmap: Optional[Any] = None     # LiquidityHeatmap
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     # Convenience accessors — overlay
 

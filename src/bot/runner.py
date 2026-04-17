@@ -30,6 +30,7 @@ from typing import Any, Optional
 
 from loguru import logger
 
+from src.analysis.liquidity_heatmap import build_heatmap
 from src.analysis.support_resistance import detect_sr_zones
 from src.bot.config import BotConfig
 from src.bot.lifecycle import install_shutdown_handlers
@@ -618,6 +619,28 @@ class BotRunner:
             return
         buf = self.ctx.multi_tf.get_buffer(tf_key)
         candles = buf.last(50) if buf is not None else []
+
+        # 2c-bis. Attach derivatives state + liquidity heatmap (Phase 1.5).
+        # Failure here must never crash the symbol cycle.
+        if self.ctx.derivatives_cache is not None:
+            try:
+                deriv = self.ctx.derivatives_cache.get(symbol)
+                state.derivatives = deriv
+                if cfg.derivatives.heatmap_enabled and state.current_price > 0:
+                    state.liquidity_heatmap = build_heatmap(
+                        symbol=symbol,
+                        current_price=state.current_price,
+                        deriv_state=deriv,
+                        liq_stream=self.ctx.liquidation_stream,
+                        bucket_pct=cfg.derivatives.heatmap_bucket_pct,
+                        historical_lookback_ms=cfg.derivatives.heatmap_historical_lookback_ms,
+                        max_clusters_each_side=cfg.derivatives.heatmap_max_clusters_each_side,
+                        leverage_buckets=cfg.derivatives.leverage_buckets,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "deriv_attach_failed symbol={} err={!r}", symbol, e,
+                )
 
         # 2d. LTF reversal defensive close (Madde F) — if we already hold a
         # position and the LTF oscillator just flipped against us, close it

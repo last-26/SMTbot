@@ -81,6 +81,17 @@ derivatives:
   coinalyze_refresh_interval_s: 60
   coinalyze_timeout_s: 10.0
   coinalyze_max_retries: 3
+  # Liquidity heatmap (Madde 4) — estimated long/short liq levels bucketed
+  # by leverage + merged with historical Binance liq events.
+  heatmap_enabled: true
+  heatmap_bucket_pct: 0.002
+  heatmap_historical_lookback_ms: 172800000   # 48h
+  heatmap_max_clusters_each_side: 10
+  leverage_buckets:
+    - [10, 0.30]
+    - [25, 0.35]
+    - [50, 0.20]
+    - [100, 0.15]
 
 rl:
   min_trades_to_train: 50
