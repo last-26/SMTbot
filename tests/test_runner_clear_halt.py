@@ -18,12 +18,15 @@ from src.strategy.risk_manager import RiskManager
 
 
 def _seed_halt(rm: RiskManager) -> None:
-    """Simulate post-replay state: halt set, daily PnL deeply red, streak high."""
+    """Simulate post-replay state: cooldown halt + deeply red day + streak +
+    peak above current (max_drawdown over the limit)."""
     rm.halted_until = datetime.now(tz=timezone.utc) + timedelta(hours=12)
     rm.halt_reason = "daily_loss=17.90%"
     rm.daily_realized_pnl = -750.0
-    rm.day_start_balance = 4000.0     # → daily_loss_pct = 18.75%
+    rm.day_start_balance = 4000.0      # → daily_loss_pct = 18.75%
     rm.consecutive_losses = 6
+    rm.peak_balance = 4525.0           # current ≈ 4255 → drawdown ≈ 5.97%
+    rm.current_balance = 3349.0        # against peak 4525 → drawdown ≈ 26.0%
 
 
 async def test_prime_without_clear_halt_keeps_halt(make_ctx, monkeypatch):
@@ -40,9 +43,14 @@ async def test_prime_without_clear_halt_keeps_halt(make_ctx, monkeypatch):
 
     allowed, reason = ctx.risk_mgr.can_trade()
     assert allowed is False
-    # Halt OR daily-loss gate fires; either way the bot is blocked.
-    assert ctx.risk_mgr.halted_until is not None or "daily_loss" in reason
+    # Drawdown OR halt OR daily-loss/streak gate fires; the bot is blocked.
+    assert (
+        "max_drawdown" in reason
+        or ctx.risk_mgr.halted_until is not None
+        or "daily_loss" in reason
+    )
     assert ctx.risk_mgr.consecutive_losses == 6
+    assert ctx.risk_mgr.peak_balance > ctx.risk_mgr.current_balance
 
 
 async def test_prime_with_clear_halt_resumes_trading(make_ctx, monkeypatch):
@@ -62,8 +70,11 @@ async def test_prime_with_clear_halt_resumes_trading(make_ctx, monkeypatch):
     assert rm.halt_reason == ""
     assert rm.daily_realized_pnl == 0.0
     assert rm.consecutive_losses == 0
-    # day_start_balance follows current_balance so daily_loss_pct=0 going forward.
+    # day_start_balance + peak_balance both re-anchor to current_balance so
+    # daily_loss_pct=0 AND drawdown_pct=0 going forward.
     assert rm.day_start_balance == pytest.approx(rm.current_balance)
+    assert rm.peak_balance == pytest.approx(rm.current_balance)
+    assert rm.drawdown_pct == 0.0
     allowed, reason = rm.can_trade()
     assert allowed is True
     assert reason == ""

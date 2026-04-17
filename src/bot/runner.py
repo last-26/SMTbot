@@ -965,24 +965,36 @@ class BotRunner:
         await self._load_contract_sizes()
 
     def _apply_clear_halt(self) -> None:
-        """Operator override (--clear-halt): wipe halt + daily counters that
-        the journal replay rebuilt. Without resetting daily_realized_pnl /
-        consecutive_losses the next loss after restart re-trips the same halt
-        immediately, which defeats the purpose of the flag."""
+        """Operator override (--clear-halt): wipe halt + daily counters + peak
+        that the journal replay rebuilt. Three resets are needed because each
+        breaker has its own state:
+          * halted_until/reason  — daily-loss / consecutive-loss cooldown
+          * daily_realized_pnl + day_start_balance — without this the next
+            loss after restart re-trips the same daily-loss threshold
+          * consecutive_losses   — same logic for the streak breaker
+          * peak_balance         — max_drawdown is "manual restart required";
+            without re-anchoring peak to current_balance the bot stays
+            permanently halted as soon as drawdown_pct ≥ max_drawdown_pct
+        """
         rm = self.ctx.risk_mgr
         prev_until = rm.halted_until
         prev_reason = rm.halt_reason
         prev_daily = rm.daily_realized_pnl
         prev_streak = rm.consecutive_losses
+        prev_peak = rm.peak_balance
+        prev_dd = rm.drawdown_pct
         rm.clear_halt()
         rm.daily_realized_pnl = 0.0
         rm.day_start_balance = rm.current_balance
         rm.consecutive_losses = 0
+        rm.peak_balance = rm.current_balance
         logger.warning(
             "clear_halt_applied prev_halt={} prev_reason={!r} "
-            "reset_daily_pnl={:.2f} reset_streak={}",
+            "reset_daily_pnl={:.2f} reset_streak={} "
+            "reset_peak={:.2f}->{:.2f} prev_dd={:.2f}%",
             prev_until.isoformat() if prev_until else None,
             prev_reason, prev_daily, prev_streak,
+            prev_peak, rm.peak_balance, prev_dd,
         )
 
     async def _load_contract_sizes(self) -> None:
