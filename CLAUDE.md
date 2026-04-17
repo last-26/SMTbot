@@ -119,6 +119,7 @@ References: `pine/vmc_a.txt`, `pine/vmc_b.txt` (original VMC source). Standalone
 | 6. Bot runtime loop | ✅ Complete | `src/bot/` async runner wiring TV → analysis → strategy → risk → execution → journal. `OKXClient.enrich_close_fill` added. 23 new tests (247 total). See below. |
 | 6.5 Multi-pair + Multi-TF + Smart Entry/Exit | ✅ Complete | 6-part refactor (Madde A-F): multi-pair round-robin, freshness-polled multi-TF, reentry cooldown/quality gate, HTF S/R ceiling, partial TP + SL-to-BE, LTF reversal defensive close. 63 new tests (310 total). See below. |
 | 1.5 Derivatives Data Layer | ✅ Complete | 7-part build (Madde 1-7) + CLI modes: Binance liquidation WS, Coinalyze REST client, derivatives cache + journal, estimated liquidity heatmap, 4-regime classifier, entry signal integration (contrarian/capitulation/heatmap factors + crowded-skip gate), journal enrichment + regime breakdown reporter, `--derivatives-only` / `--duration` runtime modes. 73 new tests (383 total). See below. |
+| Multi-pair live-demo hardening | ✅ Complete (2026-04-17) | Post-Phase-1.5 production fixes observed during first live demo run: LTF momentum factor, clean logging, per-cycle decision visibility log, per-slot sizing + max-feasible leverage, per-symbol OKX `ctVal` + max-leverage lookup (51008/59102 fixes), `scripts/logs.py` viewer. 411 tests total (+28). See below. |
 | 7. RL parameter tuner | 🔜 Next | PPO via Stable Baselines3, walk-forward validated. Needs ≥50 logged demo trades with derivatives snapshots from Phase 1.5 first. |
 
 ### Phase 1 — Completed (2026-04-16)
@@ -448,6 +449,40 @@ Seven-part derivatives data layer ("Madde 1-7") + a CLI data-collection mode (Co
 .venv/Scripts/python.exe scripts/report.py --last 7d
 ```
 
+### Multi-pair live-demo hardening — Completed (2026-04-17)
+
+Post-Phase-1.5, during the first real multi-pair demo run, three groups of production bugs surfaced. Each was diagnosed from the fresh log + an OKX balance/positions query and fixed before letting the bot continue. 28 net new tests (383 → 411).
+
+**Observability (three commits: `12c8223`, `1cc5a86`, plus `scripts/logs.py`):**
+- `src/bot/__main__.py` — clean loguru config at entry: stderr with color + `logs/bot.log` sink with `colorize=False, enqueue=True, rotation="50 MB", retention=10`. Keeps `tail -f` on Windows readable and cycles the file at 50 MB.
+- `_run_one_symbol` emits `symbol_cycle_start symbol=…` at the top of every per-symbol pass, and a terminal `symbol_decision symbol=… [NO_TRADE reason=… | PLANNED …]` line so the operator can reconstruct every tick's decision from the log alone. `NO_TRADE reason` is one of `below_confluence` / `crowded_skip` / `downstream_reject` — reason is inferred by re-running `calculate_confluence` when `build_trade_plan_from_state` returns None.
+- `PLANNED` log includes `contracts=… notional=… lev=…x margin=… risk=… sizing_bal=…` so a future 51008/59102 is diagnosable from the single line above it.
+
+**`ltf_momentum_alignment` confluence factor** (`12c8223`):
+- New factor in `src/analysis/multi_timeframe.py`: when the LTF buffer (from `LTFReader`) has a trend matching the proposed direction → full `0.5` weight; when the LTF last_signal is the opposite of the trend but fresh (`last_signal_bars_ago ≤ 3`) and agrees with the direction → 60% partial weight. Eight unit tests in `tests/test_ltf_entry_factor.py`. Threaded through `generate_entry_intent` → `build_trade_plan_from_state` → `_run_one_symbol` via `ltf_state=self.ctx.ltf_cache.get(symbol)`.
+- **Zero-falsy gotcha:** `bars_ago=0` is a legitimate "just now" value, not falsy. Uses explicit `None` check: `raw = getattr(…, None); bars_ago = int(raw) if raw is not None else 99`. The shorter `int(x or 99)` silently clobbered the freshest signal.
+
+**Per-slot sizing + max-feasible leverage** (`7201b9b`):
+- **Problem observed:** BTC opened with the old leverage formula locked ~80% of isolated margin ($3490 / $4348 eq). SOL/ETH then tripped sCode 51008 (`your available margin is too low for borrowing`) on every cycle for 26 min — 18 SOL + 1 ETH rejections.
+- **Fix 1 — per-slot sizing:** `_run_one_symbol` now reads both `okx.get_total_equity("USDT")` (= `eq`, total equity including locked margin) and `okx.get_balance("USDT")` (= `availEq`, free for new orders). `sizing_balance = min(total_eq / max_concurrent_positions, okx_avail, risk_mgr.current_balance)`. Each of N configured slots gets a fair share of the account, independent of what's currently locked.
+- **Fix 2 — max-feasible leverage:** `src/strategy/rr_system.py` no longer picks the minimum leverage that fits margin inside `balance × 0.95`. It picks the maximum feasible = `min(max_leverage, floor(0.6 / sl_pct))` (new `_LIQ_SAFETY_FACTOR = 0.6` constant — SL must sit within 60% of the liquidation distance at chosen leverage, 40% buffer for maintenance + mark drift). With tighter 0.5% SL on 75x max, margin drops from ~$715/trade to ~$57/trade so three concurrent positions coexist inside a $4300 equity.
+- `src/execution/okx_client.py` gains `get_total_equity("USDT")` reading OKX's `eq` field. `get_balance` keeps reading `availEq`.
+- Three new tests in `tests/test_rr_system.py` (`test_leverage_picks_max_feasible_for_concurrent_sizing`, `test_leverage_ceiling_scales_with_sl_width`) and one updated expectation in `test_long_basic_sizing` (chosen leverage = 20, not 2).
+
+**Per-symbol OKX instrument spec** (`b13cd4a`, `bc07c85`):
+- **Problem 1 — 51008 on SOL/ETH even after sizing fix:** YAML hardcoded `trading.contract_size: 0.01` for all pairs, but OKX `ctVal` is per-instrument: BTC=0.01, ETH=0.1, **SOL=1**. A "$798 notional" for SOL was actually 904 × 1 SOL × $88.20 ≈ **$79,733** on OKX's books → 100× over-size → margin blown every time.
+- **Problem 2 — 59102 once ctVal was fixed:** OKX caps `max_leverage` per instrument too. BTC/ETH=100x, **SOL=50x**. `cfg.trading.max_leverage=75` worked for BTC/ETH but rejected every SOL order.
+- `OKXClient.get_instrument_spec(inst_id) -> {ct_val, max_leverage}` pulls both fields from `/public/instruments` in one call.
+- `BotContext.contract_sizes: dict[str, float]` + `max_leverage_per_symbol: dict[str, int]` populated in `_prime()` via `_load_contract_sizes()`. Falls back to YAML defaults + logs exception on any OKX fetch error — bot never refuses to start on a transient API hiccup.
+- `_run_one_symbol` forwards the per-symbol values into `build_trade_plan_from_state`: `max_leverage=min(cfg.trading.max_leverage, per_symbol_cap)`, `contract_size=ctx.contract_sizes[symbol]`.
+- First successful SOL fill after the fix cycle landed at 2026-04-17 05:02:54Z: `opened BULLISH SOL-USDT-SWAP 9c @ 88.18 notional=793.62 lev=22x margin=36.07 risk=21.19`.
+
+**`scripts/logs.py` — terminal log viewer:**
+- Small tail-and-filter utility, no new deps. Reads `logs/bot.log`, supports `--decisions` (only `symbol_decision` / `opened` / `order_rejected` / `reentry_blocked` / `defensive_close` / `closed` / `algo_failure`), `--errors` (ERROR+WARNING only), `--filter REGEX`, `--lines N`, `--no-follow`, `--no-color`. ANSI-highlights PLANNED (green), NO_TRADE (dim), fills (bold cyan), rejects (red), reentry/blocked (magenta), cycle-start (blue). Default mode is `tail -F` with 50 lines of history and auto-recovers on log rotation.
+- Ships at `scripts/logs.py`; run from the project root with `.venv/Scripts/python.exe scripts/logs.py [options]`.
+
+**Total tests:** 411 passing (383 → 411, +28).
+
 ## Phase 7 — Reinforcement learning
 
 **Architecture:** parameter tuner, NOT raw decision maker. Rule-based strategy generates signals; RL tunes:
@@ -495,6 +530,10 @@ OKX_DEMO_FLAG=0 python -m src.bot --config ...           # Live (after demo prov
 python scripts/report.py --last 7d                       # Report
 python scripts/train_rl.py --min-trades 50 --walk-forward
 .venv/Scripts/python.exe -m pytest tests/ -v             # Tests
+.venv/Scripts/python.exe scripts/logs.py                 # Follow live log (all)
+.venv/Scripts/python.exe scripts/logs.py --decisions     # Only entry/exit decisions
+.venv/Scripts/python.exe scripts/logs.py --errors        # Only ERROR / WARNING
+.venv/Scripts/python.exe scripts/logs.py --filter SOL    # Filter by regex
 ```
 
 **Pine dev cycle** (Claude via TV MCP): write `.pine` → `tv pine set < file` → `tv pine compile` → fix errors → `tv pine analyze` → `tv screenshot`.
