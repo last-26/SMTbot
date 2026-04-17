@@ -1,92 +1,53 @@
 # SMTbot — AI-Powered Crypto Futures Trading Bot
 
-An AI-powered cryptocurrency futures trading bot that analyzes price action and liquidity patterns using custom Pine Scripts on TradingView, executes trades on OKX via R:R-based risk management, and continuously improves through reinforcement learning.
+Autonomous crypto-futures bot: TradingView Pine Scripts as the eyes, OKX as the
+hands, a Python core as the brain. Rule-based confluence + R:R sizing today;
+RL parameter tuning next.
 
-## How It Works
+## Architecture
 
 ```
-TradingView (Eyes)          Claude Code (Brain)           OKX Exchange (Hands)
-┌──────────────────┐       ┌───────────────────┐        ┌──────────────────┐
-│ Custom Pine       │       │ Orchestrator       │        │ Demo / Live      │
-│ Scripts detect:   │──────▶│                    │───────▶│                  │
-│ - MSS / BOS       │ MCP   │ Writes Pine Scripts│  MCP   │ Place orders     │
-│ - FVG zones       │       │ Builds RL model    │        │ Manage positions │
-│ - Order Blocks    │       │ Debugs strategies  │        │ Algo SL/TP       │
-│ - Liquidity sweeps│       │                    │        │ Account mgmt     │
-│ - Session levels  │       └────────┬───────────┘        └──────────────────┘
-└──────────────────┘                │
-                                    ▼
-                        ┌───────────────────────┐
-                        │ Python Bot (Autonomo.) │
-                        │                        │
-                        │ Analysis Engine         │
-                        │ R:R Strategy Engine     │
-                        │ OKX Execution           │
-                        │ Trade Journal (SQLite)  │
-                        │ RL Parameter Tuning     │
-                        └────────────────────────┘
+TradingView (Eyes)        Python Bot (Brain)         OKX Exchange (Hands)
+┌──────────────────┐      ┌─────────────────┐        ┌──────────────────┐
+│ smt_overlay      │      │ Analysis        │        │ Demo / Live      │
+│ smt_oscillator   │──MCP▶│ Strategy (R:R)  │───MCP─▶│ Market + Algo    │
+│ (Pine v6)        │      │ Execution       │        │ (SL/TP OCO)      │
+│                  │      │ Journal + RL    │        │                  │
+└──────────────────┘      └─────────────────┘        └──────────────────┘
 ```
 
-**Key principle:** Claude orchestrates and builds the system. A Python-based RL agent makes the actual per-candle trade decisions at runtime.
-
-## Pine Script Indicators
-
-| Script | Purpose |
-|---|---|
-| `mss_detector.pine` | Swing H/L detection, HH/HL/LH/LL classification, MSS & BOS signals |
-| `fvg_mapper.pine` | Fair Value Gap detection, mitigation tracking, nearest FVG levels |
-| `order_block.pine` | Order Block identification, test/break lifecycle, ATR-filtered impulse |
-| `liquidity_sweep.pine` | Equal highs/lows pooling, sweep event detection |
-| `session_levels.pine` | Asian/London/NY session H/L, Previous Day & Week levels |
-| `signal_table.pine` | Master aggregator — all signals + confluence score in one table |
-
-All scripts output structured data via tooltips and tables, readable by the bot through TradingView MCP (`tv stream tables --filter "Signals"`).
-
-## Development Phases
-
-| Phase | Description | Status |
-|---|---|---|
-| 1 | Pine Script data layer + Python data bridge | In progress |
-| 2 | Analysis engine (confluence scoring, pattern detection) | Planned |
-| 3 | R:R strategy engine (dynamic SL/TP, position sizing, circuit breakers) | Planned |
-| 4 | OKX execution (order placement, position management) | Planned |
-| 5 | Trade journal (SQLite logging, performance metrics) | Planned |
-| 6 | Reinforcement learning (PPO parameter tuning, walk-forward validation) | Planned |
-
-## Tech Stack
-
-- **Python 3.11+** — bot core, analysis, RL training
-- **Pine Script v6** — TradingView indicators
-- **TradingView MCP** — chart data & Pine Script management (78 tools)
-- **OKX Agent Trade Kit MCP** — trade execution (107 tools)
-- **Stable Baselines3 / PPO** — reinforcement learning
-- **SQLite** — trade journal
+Two production Pine indicators live in `pine/` (overlay + oscillator); the five
+earlier standalone scripts are preserved under `pine/legacy/` as design history.
 
 ## Quick Start
 
 ```bash
-# Clone
 git clone https://github.com/last-26/SMTbot.git
 cd SMTbot
+cp .env.example .env          # fill in OKX demo + Coinalyze keys
 
-# Copy env template
-cp .env.example .env
-# Edit .env with your OKX demo API credentials
+python -m venv .venv
+.venv/Scripts/activate        # Windows; `source .venv/bin/activate` on *nix
+pip install -r requirements.txt
 
-# Install Python dependencies (coming in Phase 2)
-# pip install -r requirements.txt
+# One-shot dry run (no live orders)
+.venv/Scripts/python.exe -m src.bot --config config/default.yaml --dry-run --once
 
-# Pine Scripts: load into TradingView via MCP
-# tv pine set < pine/signal_table.pine && tv pine compile
+# Full demo run
+.venv/Scripts/python.exe -m src.bot --config config/default.yaml
 ```
+
+For MCP setup (TradingView + OKX Agent Trade Kit), Pine Script contents, full
+phase breakdowns, config reference, and operational playbook, see
+[CLAUDE.md](CLAUDE.md).
 
 ## Safety
 
-- Always start in **demo mode** (`OKX_DEMO_FLAG=1`)
-- Circuit breakers: 3% daily loss limit, 10% max drawdown, 5 consecutive loss stop
-- Minimum 1:2 R:R enforced on every trade
-- Never risk more than you can afford to lose
+- Always start in **demo mode** (`OKX_DEMO_FLAG=1`).
+- Never grant withdrawal permission to an API key.
+- Circuit breakers and R:R minimums are enforced in `src/strategy/risk_manager.py`.
+- This is a research project. Not financial advice.
 
 ## License
 
-See [LICENSE](LICENSE) file.
+See [LICENSE](LICENSE).
