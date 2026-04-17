@@ -292,6 +292,32 @@ def generate_entry_intent(
     )
 
 
+def _should_skip_for_derivatives(
+    deriv_state,
+    direction: Direction,
+    crowded_skip_enabled: bool,
+    crowded_skip_z_threshold: float,
+) -> bool:
+    """Crowded-skip gate (Phase 1.5 Madde 6).
+
+    Blocks a BULLISH entry when the market is LONG_CROWDED and funding is
+    historically hot (|z| ≥ threshold). Symmetric for shorts in a
+    SHORT_CROWDED regime. Returns False when derivatives is absent or the
+    gate is disabled — never blocks without data.
+    """
+    if not crowded_skip_enabled or deriv_state is None:
+        return False
+    regime = getattr(deriv_state, "regime", "UNKNOWN")
+    funding_z = float(getattr(deriv_state, "funding_rate_zscore_30d", 0.0) or 0.0)
+    if direction == Direction.BULLISH and regime == "LONG_CROWDED" \
+            and funding_z >= crowded_skip_z_threshold:
+        return True
+    if direction == Direction.BEARISH and regime == "SHORT_CROWDED" \
+            and funding_z <= -crowded_skip_z_threshold:
+        return True
+    return False
+
+
 def build_trade_plan_from_state(
     state: MarketState,
     account_balance: float,
@@ -314,6 +340,8 @@ def build_trade_plan_from_state(
     htf_sr_zones: Optional[list[SRZone]] = None,
     htf_sr_ceiling_enabled: bool = False,
     htf_sr_buffer_atr: float = 0.2,
+    crowded_skip_enabled: bool = False,
+    crowded_skip_z_threshold: float = 3.0,
 ) -> Optional[TradePlan]:
     """End-to-end: MarketState → TradePlan. Returns None when no trade.
 
@@ -345,6 +373,15 @@ def build_trade_plan_from_state(
         atr_fallback_mult=atr_fallback_mult,
     )
     if intent is None or not intent.is_tradable:
+        return None
+
+    # Crowded-skip gate (Madde 6) — applied after intent so we know the side.
+    if _should_skip_for_derivatives(
+        getattr(state, "derivatives", None),
+        intent.direction,
+        crowded_skip_enabled,
+        crowded_skip_z_threshold,
+    ):
         return None
 
     sl_price = intent.sl_price

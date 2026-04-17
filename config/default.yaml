@@ -106,6 +106,10 @@ derivatives:
       capitulation_liq_notional: 20000000   # $20M — ETH moves bigger liq rounds
     SOL-USDT-SWAP:
       capitulation_liq_notional: 8000000    # $8M — thinner book, smaller washes
+  # Entry signal integration (Madde 6).
+  confluence_slot_enabled: true
+  crowded_skip_enabled: true
+  crowded_skip_z_threshold: 3.0
 
 rl:
   min_trades_to_train: 50

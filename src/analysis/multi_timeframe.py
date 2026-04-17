@@ -79,6 +79,11 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "oscillator_signal": 0.5,
     "vmc_ribbon": 0.5,
     "session_filter": 0.25,
+    # Derivatives (Phase 1.5 Madde 6) — at most one of these three fires per
+    # cycle; the elif chain in score_direction enforces that.
+    "derivatives_contrarian": 0.7,
+    "derivatives_capitulation": 0.6,
+    "derivatives_heatmap_target": 0.5,
 }
 
 
@@ -110,6 +115,40 @@ def _sweep_direction(sweep_str: Optional[str]) -> Direction:
     if d == Direction.BULLISH:
         return Direction.BEARISH
     return Direction.UNDEFINED
+
+
+def _heatmap_supports_direction(state: MarketState, direction: Direction) -> bool:
+    """True when a meaningful liquidity cluster sits in the trade's path.
+
+    Bullish → nearest_above cluster within ATR*3 AND its notional ≥ 70% of the
+    largest above cluster. Bearish: symmetric below. Returns False if the
+    heatmap or ATR is missing.
+    """
+    hm = getattr(state, "liquidity_heatmap", None)
+    if hm is None:
+        return False
+    atr = state.atr
+    price = state.current_price
+    if atr <= 0 or price <= 0:
+        return False
+    reach = atr * 3.0
+    if direction == Direction.BULLISH:
+        na = getattr(hm, "nearest_above", None)
+        if na is None:
+            return False
+        if (na.price - price) > reach:
+            return False
+        largest = float(getattr(hm, "largest_above_notional", 0.0) or 0.0)
+        return largest > 0 and na.notional_usd >= largest * 0.7
+    if direction == Direction.BEARISH:
+        nb = getattr(hm, "nearest_below", None)
+        if nb is None:
+            return False
+        if (price - nb.price) > reach:
+            return False
+        largest = float(getattr(hm, "largest_below_notional", 0.0) or 0.0)
+        return largest > 0 and nb.notional_usd >= largest * 0.7
+    return False
 
 
 # ── Scoring ─────────────────────────────────────────────────────────────────
@@ -283,6 +322,51 @@ def score_direction(
             direction=direction,
             detail=state.active_session.value,
         ))
+
+    # 12. Derivatives (Phase 1.5 Madde 6) — one slot max per cycle.
+    deriv_state = getattr(state, "derivatives", None)
+    if deriv_state is not None:
+        regime = getattr(deriv_state, "regime", "UNKNOWN")
+        added_derivatives = False
+        # a) Contrarian: fade a crowded side.
+        if direction == Direction.BULLISH and regime == "SHORT_CROWDED":
+            factors.append(ConfluenceFactor(
+                name="derivatives_contrarian",
+                weight=w["derivatives_contrarian"],
+                direction=direction,
+                detail=f"regime={regime}",
+            ))
+            added_derivatives = True
+        elif direction == Direction.BEARISH and regime == "LONG_CROWDED":
+            factors.append(ConfluenceFactor(
+                name="derivatives_contrarian",
+                weight=w["derivatives_contrarian"],
+                direction=direction,
+                detail=f"regime={regime}",
+            ))
+            added_derivatives = True
+        # b) Capitulation favors the contrarian side by imbalance.
+        elif regime == "CAPITULATION":
+            imbalance = float(getattr(deriv_state, "liq_imbalance_1h", 0.0) or 0.0)
+            # imbalance = (short - long) / total: >0 means shorts got washed
+            # → bullish bias. <0 means longs washed → bearish bias.
+            if (direction == Direction.BULLISH and imbalance > 0.1) or \
+               (direction == Direction.BEARISH and imbalance < -0.1):
+                factors.append(ConfluenceFactor(
+                    name="derivatives_capitulation",
+                    weight=w["derivatives_capitulation"],
+                    direction=direction,
+                    detail=f"imbalance={imbalance:+.2f}",
+                ))
+                added_derivatives = True
+        # c) Heatmap magnet in the trade direction.
+        if not added_derivatives and _heatmap_supports_direction(state, direction):
+            factors.append(ConfluenceFactor(
+                name="derivatives_heatmap_target",
+                weight=w["derivatives_heatmap_target"],
+                direction=direction,
+                detail="nearest_cluster_matches_target",
+            ))
 
     total = sum(f.weight for f in factors)
     return ConfluenceScore(direction=direction, score=total, factors=factors)

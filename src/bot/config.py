@@ -181,6 +181,12 @@ class DerivativesConfig(BaseModel):
     regime_per_symbol_overrides: dict[str, dict[str, float]] = Field(
         default_factory=dict
     )
+    # Entry signal integration (Madde 6).
+    confluence_slot_enabled: bool = True        # reserved; factors always
+                                                # score, this flag is a switch
+                                                # future tooling can read.
+    crowded_skip_enabled: bool = True
+    crowded_skip_z_threshold: float = 3.0
 
 
 class ReentryConfig(BaseModel):

@@ -693,6 +693,8 @@ class BotRunner:
                 htf_sr_zones=self.ctx.htf_sr_cache.get(symbol),
                 htf_sr_ceiling_enabled=cfg.analysis.htf_sr_ceiling_enabled,
                 htf_sr_buffer_atr=cfg.analysis.htf_sr_buffer_atr,
+                crowded_skip_enabled=cfg.derivatives.crowded_skip_enabled,
+                crowded_skip_z_threshold=cfg.derivatives.crowded_skip_z_threshold,
             )
         except Exception:
             logger.exception("plan_build_failed symbol={}", symbol)
