@@ -55,7 +55,10 @@ from src.execution.order_router import OrderRouter, RouterConfig, dry_run_report
 from src.execution.position_monitor import PositionMonitor
 from src.journal.database import TradeJournal
 from src.journal.derivatives_journal import DerivativesJournal
-from src.strategy.entry_signals import build_trade_plan_from_state
+from src.strategy.entry_signals import (
+    _should_skip_for_derivatives,
+    build_trade_plan_from_state,
+)
 from src.strategy.risk_manager import RiskManager, TradeResult
 
 
@@ -790,8 +793,8 @@ class BotRunner:
             return
 
         if plan is None:
-            # Decision visibility: log why we passed so the operator can watch
-            # live cycles and understand why SOL/ETH didn't trigger.
+            # Decision visibility: infer the reason the plan was rejected so
+            # an operator watching the log can tell why SOL/ETH sat out.
             try:
                 conf = calculate_confluence(
                     state,
@@ -799,10 +802,21 @@ class BotRunner:
                     allowed_sessions=cfg.allowed_sessions() or None,
                     ltf_state=self.ctx.ltf_cache.get(symbol),
                 )
+                if not conf.is_tradable(cfg.analysis.min_confluence_score):
+                    reason = "below_confluence"
+                elif _should_skip_for_derivatives(
+                    getattr(state, "derivatives", None),
+                    conf.direction,
+                    cfg.derivatives.crowded_skip_enabled,
+                    cfg.derivatives.crowded_skip_z_threshold,
+                ):
+                    reason = "crowded_skip"
+                else:
+                    reason = "downstream_reject"  # no SL, contract=0, HTF ceiling
                 logger.info(
-                    "symbol_decision symbol={} NO_TRADE price={:.4f} "
+                    "symbol_decision symbol={} NO_TRADE reason={} price={:.4f} "
                     "session={} direction={} confluence={:.2f}/{} factors={}",
-                    symbol, float(state.current_price or 0.0),
+                    symbol, reason, float(state.current_price or 0.0),
                     getattr(state.active_session, "value", "NONE"),
                     getattr(conf.direction, "value", "UNDEFINED"),
                     conf.score, cfg.analysis.min_confluence_score,
