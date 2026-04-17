@@ -1,52 +1,52 @@
-# Trade Lifecycle — İşlem Akışı Detaylı
+# Trade Lifecycle — End-to-End Walkthrough
 
-Bu doküman bot'un bir tick'i nasıl koştuğunu, indikatör verilerini nasıl okuduğunu, işleme nasıl girdiğini, açık pozisyonu nasıl yönettiğini ve nasıl kapattığını **uçtan uca** anlatır. Kod referansları `dosya:satır` formatında.
+This document explains how the bot runs a single tick, reads indicator data, enters a trade, manages the open position, and exits — **end to end**. Code references use `file:line` format.
 
 ---
 
-## 1. Yüksek seviye mimari
+## 1. High-level architecture
 
 ```
 ┌────────────────┐    ┌─────────────────┐    ┌────────────────┐
 │  TradingView   │ →  │  Python Bot     │ →  │      OKX       │
-│  (gözler)      │    │  (beyin)        │    │  (eller)       │
-│  - Pine        │    │  - confluence   │    │  - market emir │
-│  - SMT Overlay │    │  - R:R sizing   │    │  - OCO algo SL/│
-│  - SMT Osc.    │    │  - risk gates   │    │    TP          │
+│  (eyes)        │    │  (brain)        │    │  (hands)       │
+│  - Pine        │    │  - confluence   │    │  - market ord. │
+│  - SMT Overlay │    │  - R:R sizing   │    │  - OCO algo    │
+│  - SMT Osc.    │    │  - risk gates   │    │    SL/TP       │
 └────────────────┘    └─────────────────┘    └────────────────┘
         ↑                      ↓
         └──── multi-TF cycle ──┘
 ```
 
-- **Claude Code** orkestratör: Pine'ı yazar, RL eğitir, debug eder. **Per-tick karar** Claude değil Python bot'u verir.
-- **TradingView** indikatör motoru: Pine Script'ler her bar'da yeniden hesaplanır, sonuçları `SMT Signals` + `SMT Oscillator` tablolarına yazar.
-- **Python core** verileri okur, confluence skorlar, R:R hesaplar, OKX'e emir atar.
-- **OKX** market entry + OCO algo (SL/TP) ile pozisyonu otomatik yönetir.
+- **Claude Code** is the orchestrator: writes Pine, trains RL, debugs. **Per-tick decisions** are made by the Python bot, not Claude.
+- **TradingView** is the indicator engine: Pine Scripts re-compute on every bar and write results into `SMT Signals` + `SMT Oscillator` tables.
+- **Python core** reads the data, scores confluence, computes R:R, and routes orders to OKX.
+- **OKX** auto-manages the position via market entry + OCO algo (SL/TP).
 
 ---
 
-## 2. Bir tick'te ne olur
+## 2. What happens in one tick
 
-`BotRunner.run_once()` (`src/bot/runner.py:483`) — her `bot.poll_interval_seconds` (default 5s) bir kez çalışır:
+`BotRunner.run_once()` (`src/bot/runner.py:483`) — runs once per `bot.poll_interval_seconds` (default 5s):
 
 ```
 run_once()
-├── _process_closes()                  # 1) önce kapanışları drenajla
-└── for symbol in trading.symbols:     # 2) her parite için round-robin
+├── _process_closes()                  # 1) drain closes first
+└── for symbol in trading.symbols:     # 2) round-robin per symbol
         _run_one_symbol(symbol)
 ```
 
-### Sıra çok önemli:
+### Order matters:
 
-1. **`_process_closes()` önce** — açılmış pozisyonların kapanmış olup olmadığını OKX'e sorar (`PositionMonitor.poll`), kapananları journal'a yazar, R hesaplar, slot'u serbest bırakır.
-2. **Round-robin sembol döngüsü** — `BTC → ETH → SOL`. Her sembol için chart'ı o sembole çevir, tüm TF'leri oku, karar ver, gerekirse emir at.
+1. **`_process_closes()` first** — asks OKX whether tracked positions have closed (`PositionMonitor.poll`), writes closes to journal, computes R, frees the slot.
+2. **Round-robin symbol loop** — `BTC → ETH → SOL`. For each symbol: switch chart to it, read all timeframes, decide, place order if applicable.
 
-Bir sembolün tek bir cycle'ı şöyle ilerler (`_run_one_symbol`, `runner.py:677+`):
+A single symbol cycle (`_run_one_symbol`, `runner.py:677+`):
 
 ```
 _run_one_symbol("BTC-USDT-SWAP"):
 
-  ┌─ TV: chart → "OKX:BTCUSDT.P", uyu (symbol_settle_seconds)
+  ┌─ TV: chart → "OKX:BTCUSDT.P", sleep (symbol_settle_seconds)
   │
   ├─ HTF pass (15m):
   │     switch_timeframe(15m) → settle + freshness poll + post-grace
@@ -59,80 +59,80 @@ _run_one_symbol("BTC-USDT-SWAP"):
   │
   ├─ Entry pass (3m):
   │     switch_timeframe(3m) → settle + freshness poll + post-grace
-  │     read_market_state()                    # Pine tabloları + drawings
+  │     read_market_state()                    # Pine tables + drawings
   │     refresh entry-TF candles
   │     attach derivatives + liquidity_heatmap (best-effort)
   │
-  ├─ Madde F: LTF reversal defensive close   ── (varsa pozisyonu kapatır, return)
-  ├─ Symbol-level dedup (zaten açık varsa skip)
-  ├─ Sizing balance hesabı (total_eq + okx_avail)
-  ├─ build_trade_plan_with_reason()           ── (None ise NO_TRADE log + return)
+  ├─ Madde F: LTF reversal defensive close   ── (closes position if applicable, return)
+  ├─ Symbol-level dedup (skip if already open)
+  ├─ Sizing balance compute (total_eq + okx_avail)
+  ├─ build_trade_plan_with_reason()           ── (None → NO_TRADE log + return)
   ├─ PLANNED log
-  ├─ Reentry gate (Madde C)                    ── (block ise return)
-  ├─ Risk manager can_trade()                  ── (halt ise return)
+  ├─ Reentry gate (Madde C)                    ── (block → return)
+  ├─ Risk manager can_trade()                  ── (halt → return)
   ├─ router.place(plan)                       ── leverage + market + OCO
   ├─ monitor.register_open() + risk_mgr.register_trade_opened()
   └─ journal.record_open()
 ```
 
-### Pine settle koruması (multi-TF geçişlerinde indikatör render bekleme)
+### Pine settle protection (waiting for indicator render across multi-TF switches)
 
-`_switch_timeframe` (`runner.py:646`) her TF değişiminde:
+`_switch_timeframe` (`runner.py:646`) on every TF change:
 
-1. **Statik bekleme** — `tf_settle_seconds` (default `3.5s`) — Pine'ın yeniden hesaplaması başlasın.
-2. **Freshness poll** — `_wait_for_pine_settle` `signal_table.last_bar` flip edene kadar `pine_settle_poll_interval_s` (`0.3s`) ile yokla. Maks `pine_settle_max_wait_s` (`10s`).
-3. **Post-grace** (yeni eklendi, 2026-04-17) — poll geçtikten sonra `pine_post_settle_grace_s` (`1.0s`) daha bekle. Çünkü `last_bar` flip ettiğinde **Oscillator tablosu hâlâ render olmuş olabilir** (özellikle 1m'de `last_bar` her dakika otomatik tikler, o flip "tablolar dolu" anlamına gelmez).
+1. **Static wait** — `tf_settle_seconds` (default `3.5s`) — let Pine begin recomputing.
+2. **Freshness poll** — `_wait_for_pine_settle` polls until `signal_table.last_bar` flips, every `pine_settle_poll_interval_s` (`0.3s`). Max `pine_settle_max_wait_s` (`10s`).
+3. **Post-grace** (added 2026-04-17) — after the poll passes, sleep an extra `pine_post_settle_grace_s` (`1.0s`). Because when `last_bar` flips the **Oscillator table may still be rendering** (especially on 1m where `last_bar` ticks every wall-clock minute regardless of full re-render — that flip doesn't mean "tables are full").
 
-Bütçe: 3 parite × 4 TF switch × ~13s worst-case ≈ 152s. 3m cycle'ının 180s bütçesi içinde rahat sığar.
+Budget: 3 pairs × 4 TF switches × ~13s worst-case ≈ 152s. Still fits inside the 180s 3m-cycle budget.
 
 ---
 
-## 3. İndikatör katmanı (TradingView Pine)
+## 3. Indicator layer (TradingView Pine)
 
-İki Pine indikatörü chart'a yüklü, bot **tablolarından okur** (drawing'lerden değil — drawing'ler ek detay için):
+Two Pine indicators are loaded on the chart. The bot **reads from their tables** (not their drawings — drawings are supplementary):
 
-### `pine/smt_overlay.pine` → "SMT Signals" tablosu (20 satır)
+### `pine/smt_overlay.pine` → "SMT Signals" table (20 rows)
 
-| Field | İçerik |
+| Field | Content |
 |---|---|
-| `trend_htf`, `trend_ltf` | EMA bias yönü |
-| `structure` | HH/HL/LH/LL durumu |
-| `last_mss` | Son market structure shift (BOS/CHoCH) |
-| `active_fvg`, `active_ob` | Yakın aktif FVG/OB var mı |
-| `liquidity_above`, `liquidity_below` | Yakın likidite seviyeleri |
-| `last_sweep` | Son liquidity sweep yönü |
+| `trend_htf`, `trend_ltf` | EMA bias direction |
+| `structure` | HH/HL/LH/LL state |
+| `last_mss` | Latest market structure shift (BOS/CHoCH) |
+| `active_fvg`, `active_ob` | Whether a nearby active FVG/OB exists |
+| `liquidity_above`, `liquidity_below` | Nearest liquidity levels |
+| `last_sweep` | Direction of the latest liquidity sweep |
 | `session` | London/NewYork/Asia/Off |
-| `vmc_ribbon`, `vmc_wt_bias`, `vmc_wt_cross`, `vmc_last_signal`, `vmc_rsi_mfi` | VuManChu Cipher A bileşenleri |
-| `confluence` | 0-7 arası Pine'ın iç skoru (Python'unkinden ayrı) |
-| `atr_14`, `price`, `last_bar` | Anlık metrics + tablo "tazelik beacon"u |
+| `vmc_ribbon`, `vmc_wt_bias`, `vmc_wt_cross`, `vmc_last_signal`, `vmc_rsi_mfi` | VuManChu Cipher A components |
+| `confluence` | Pine's internal 0–7 score (separate from Python's) |
+| `atr_14`, `price`, `last_bar` | Live metrics + the table "freshness beacon" |
 
-### `pine/smt_oscillator.pine` → "SMT Oscillator" tablosu (15 satır)
+### `pine/smt_oscillator.pine` → "SMT Oscillator" table (15 rows)
 
-| Field | İçerik |
+| Field | Content |
 |---|---|
-| `wt1`, `wt2`, `wt_state`, `wt_cross` | WaveTrend ana sinyal |
-| `wt_vwap_fast` | VWAP-bias komponent |
-| `rsi`, `rsi_mfi` | RSI + Money Flow Index karması |
+| `wt1`, `wt2`, `wt_state`, `wt_cross` | WaveTrend main signal |
+| `wt_vwap_fast` | VWAP-bias component |
+| `rsi`, `rsi_mfi` | RSI + Money Flow Index combo |
 | `stoch_k`, `stoch_d`, `stoch_state` | Stochastic RSI |
-| `last_signal`, `last_wt_div` | Son BUY/SELL sinyali + son divergence |
-| `momentum` | 0-5 arası iç momentum skoru |
-| `last_bar` | Tazelik beacon'ı |
+| `last_signal`, `last_wt_div` | Latest BUY/SELL signal + last divergence |
+| `momentum` | Internal 0–5 momentum score |
+| `last_bar` | Freshness beacon |
 
-### Drawings (ek detay)
+### Drawings (supplementary detail)
 
-Pine ayrıca **labels** (MSS, sweep events), **boxes** (FVG, OB), **lines** (liquidity, session levels) çizer — bot bunları da `data labels/boxes/lines` ile okur ve `MarketState` içine paketler.
+Pine also draws **labels** (MSS, sweep events), **boxes** (FVG, OB), and **lines** (liquidity, session levels). The bot reads them via `data labels/boxes/lines` and packs them into `MarketState`.
 
 ### `MarketState` (Pydantic)
 
-`src/data/structured_reader.py:read_market_state()` Pine'dan tüm bunları çekip tek bir dataclass'a paketler:
+`src/data/structured_reader.py:read_market_state()` pulls everything from Pine into a single dataclass:
 
 ```python
 MarketState:
     current_price: float
     atr: float
     active_session: Session
-    signal_table: SignalTableData     # SMT Overlay tablosu
-    oscillator: OscillatorTableData   # SMT Oscillator tablosu
+    signal_table: SignalTableData     # SMT Overlay table
+    oscillator: OscillatorTableData   # SMT Oscillator table
     mss_events: list[MSSEvent]
     fvg_zones: list[FVGZone]
     order_blocks: list[OrderBlock]
@@ -145,137 +145,137 @@ MarketState:
 
 ---
 
-## 4. Confluence skorlama — yön + skor üretimi
+## 4. Confluence scoring — direction + score
 
-`src/analysis/multi_timeframe.py:calculate_confluence` her TF passed sonrası `MarketState`'i tarar ve faktör listesi + toplam skor üretir.
+`src/analysis/multi_timeframe.py:calculate_confluence` scans `MarketState` after each TF pass and produces a list of factors + total score.
 
-### Faktör ağırlıkları (`DEFAULT_WEIGHTS`)
+### Factor weights (`DEFAULT_WEIGHTS`)
 
-| Faktör | Ağırlık | Tetikleyici |
+| Factor | Weight | Trigger |
 |---|---|---|
-| `htf_trend_alignment` | 1.0 | HTF trend yönü ile aday yön aynı |
-| `mss_alignment` | 1.0 | Son MSS aday yönü destekliyor |
-| `at_order_block` | 1.0 | Fiyat aktif OB içinde / bitişiğinde |
-| `at_fvg` | 1.0 | Fiyat aktif FVG içinde |
-| `at_sr_zone` | 0.75 | Python S/R zone bitişiğinde |
-| `recent_sweep` | 1.0 | Son sweep yönü reverse sinyal veriyor |
-| `ltf_pattern` | 0.75 | Doji/hammer/engulfing vs. (Python price-action) |
-| `oscillator_momentum` | 0.5 | Pine momentum skoru ≥ 4 ve aday yönü destekliyor |
-| `oscillator_signal` | 0.5 | Oscillator BUY/SELL fresh ve aday yönü destekliyor |
-| `vmc_ribbon` | 0.5 | VMC ribbon rengi aday yönü destekliyor |
-| `session_filter` | 0.25 | Aktif session izinli (London / NY) |
-| `ltf_momentum_alignment` | 0.5 | 1m oscillator trend/sinyal aday yön ile uyumlu |
-| `derivatives_contrarian` | 0.7 | LONG_CROWDED + bearish aday (veya tersi) |
-| `derivatives_capitulation` | 0.6 | CAPITULATION rejimi + tersi yön |
-| `derivatives_heatmap_target` | 0.5 | Yakın liq cluster aday yönde duruyor |
-| `vwap_alignment` | 0.6 | Multi-TF VWAP stack aday yönü destekliyor |
+| `htf_trend_alignment` | 1.0 | HTF trend matches candidate direction |
+| `mss_alignment` | 1.0 | Latest MSS supports candidate direction |
+| `at_order_block` | 1.0 | Price inside / adjacent to active OB |
+| `at_fvg` | 1.0 | Price inside active FVG |
+| `at_sr_zone` | 0.75 | Adjacent to a Python S/R zone |
+| `recent_sweep` | 1.0 | Latest sweep direction implies a reversal toward our side |
+| `ltf_pattern` | 0.75 | Doji / hammer / engulfing etc. (Python price-action) |
+| `oscillator_momentum` | 0.5 | Pine momentum score ≥ 4 and supports direction |
+| `oscillator_signal` | 0.5 | Oscillator BUY/SELL is fresh and supports direction |
+| `vmc_ribbon` | 0.5 | VMC ribbon color supports direction |
+| `session_filter` | 0.25 | Active session is allowed (London / NY) |
+| `ltf_momentum_alignment` | 0.5 | 1m oscillator trend/signal aligned with candidate |
+| `derivatives_contrarian` | 0.7 | LONG_CROWDED + bearish candidate (or vice versa) |
+| `derivatives_capitulation` | 0.6 | CAPITULATION regime + counter direction |
+| `derivatives_heatmap_target` | 0.5 | Nearby liq cluster sits in the trade's path |
+| `vwap_alignment` | 0.6 | Multi-TF VWAP stack supports direction |
 
-**Önemli:** Derivatives faktörlerinden **en fazla biri** elif zincirinden tetiklenir. Aynı cycle'da hem contrarian hem capitulation aktif olamaz.
+**Important:** **At most one** of the derivatives factors fires from the elif chain. The same cycle cannot have both contrarian and capitulation active.
 
-### Skor + yön
+### Score + direction
 
-`score_direction(state, BULLISH)` ve `score_direction(state, BEARISH)` ayrı ayrı hesaplanır. Yüksek olan kazanır. `min_confluence_score` (default `2.0`) eşiği altındaysa → trade yok.
+`score_direction(state, BULLISH)` and `score_direction(state, BEARISH)` are computed separately. The higher one wins. Below `min_confluence_score` (default `2.0`) → no trade.
 
 ---
 
-## 5. SL seçimi — yapısal seviye öncelik sırası
+## 5. SL selection — structural-level priority order
 
-`src/strategy/entry_signals.py:select_sl_price` (sırayla dener, ilk başarılı = SL):
+`src/strategy/entry_signals.py:select_sl_price` (tries in order, first hit = SL):
 
-1. **Pine OB** (`order_block_pine`) — chart'ta çizili Pine OB box'larından entry'e en yakın geçerli olan.
+1. **Pine OB** (`order_block_pine`) — closest valid Pine OB box drawn on the chart.
 2. **Pine FVG** (`fvg_pine`).
-3. **Python OB** (`order_block_py`) — Python tarafı yeniden tespit ettiyse.
+3. **Python OB** (`order_block_py`) — when Python re-detects on its side.
 4. **Python FVG** (`fvg_py`).
-5. **Swing lookback** (`swing`) — son 20 mum içindeki extreme.
+5. **Swing lookback** (`swing`) — extreme inside the last 20 candles.
 6. **ATR fallback** (`atr_fallback`) — entry ± 2 × ATR.
 
-Her durum **buffer** ile itilir: `sl = level ± buffer_mult × ATR` (`buffer_mult = 0.2`). Yani Pine OB üst kenarı 100, ATR=1, BULLISH için → SL = `100 - 0.2 = 99.8` (entry üstündeyse).
+Each level is pushed past with a **buffer**: `sl = level ± buffer_mult × ATR` (`buffer_mult = 0.2`). E.g. Pine OB top at 100, ATR=1, BULLISH → SL = `100 - 0.2 = 99.8` (when entry sits above).
 
-### HTF S/R zone'ları SL'i sıkıştırır (Madde D)
+### HTF S/R zones tighten the SL (Madde D)
 
-`_push_sl_past_htf_zone` (`entry_signals.py:56`) — 15m S/R zone'u SL ile entry arasında duruyorsa SL'i o zone'un dışına çek. **Sadece sıkıştırır, asla genişletmez** (risk artmaz).
+`_push_sl_past_htf_zone` (`entry_signals.py:56`) — if a 15m S/R zone sits between SL and entry, snap SL just past the far edge of the zone. **Only tightens, never widens** (risk does not increase).
 
-### Min SL distance floor — sıkı stop'ları **genişletir**
+### Min SL distance floor — **widens** tight stops
 
 `min_sl_distance_pct` (default `0.005` = `0.5%`):
-- SL distance %0.5'in altındaysa → SL **genişletilir** (rejected değil) tam %0.5'e.
-- Notional otomatik küçülür (`risk_amount / sl_pct`) → R sabit kalır.
-- Mantık: Yüksek leverage'da %0.05-0.1'lik OB stop'ları anında wick edilir; %0.5 floor wick'e nefes açar, sizing küçüldüğü için R hâlâ planlanan kadardır.
+- If SL distance < 0.5% → SL is **widened** (not rejected) to exactly 0.5%.
+- Notional auto-shrinks (`risk_amount / sl_pct`) → R stays constant.
+- Rationale: at high leverage, a 0.05–0.1% OB stop gets wicked out instantly. The 0.5% floor gives the fill breathing room; sizing shrinks so R is still as planned.
 
-### Min TP distance floor — gerçek **reject**
+### Min TP distance floor — actual **reject**
 
 `min_tp_distance_pct` (default `0.004` = `0.4%`):
-- HTF TP ceiling uygulandıktan sonra TP distance %0.4'ün altındaysa → `tp_too_tight` reject.
-- Mantık: 3-fill partial-TP lifecycle'ı `3 × 0.05% taker fee` = `0.15%` artı slippage harcar. %0.4 minimum ~2× round-trip fee'ye karşılık gelir.
+- After applying the HTF TP ceiling, if TP distance < 0.4% → `tp_too_tight` reject.
+- Rationale: a 3-fill partial-TP lifecycle burns `3 × 0.05% taker fee = 0.15%` plus slippage. The 0.4% floor is ~2× round-trip fees.
 
 ---
 
 ## 6. R:R + sizing — `calculate_trade_plan`
 
-`src/strategy/rr_system.py:calculate_trade_plan` — saf math, side-effect yok.
+`src/strategy/rr_system.py:calculate_trade_plan` — pure math, no side effects.
 
-### Adımlar
+### Steps
 
-1. **Risk amount:** `risk_amount = account_balance × risk_pct`. (Default %1 → 3200 USDT bakiyede ~32 USDT = 1R.)
+1. **Risk amount:** `risk_amount = account_balance × risk_pct`. (Default 1% → ~32 USDT = 1R on a 3200 USDT balance.)
 2. **SL %:** `sl_pct = |entry - sl| / entry`.
-3. **TP fiyatı:** `tp = entry ± (sl_distance × rr_ratio)`. (Default `rr_ratio = 3.0`.)
-4. **İdeal notional:** `ideal_notional = risk_amount / sl_pct`.
+3. **TP price:** `tp = entry ± (sl_distance × rr_ratio)`. (Default `rr_ratio = 3.0`.)
+4. **Ideal notional:** `ideal_notional = risk_amount / sl_pct`.
 5. **Required leverage:** `required_lev = ideal_notional / margin_balance`.
-6. **Max-feasible leverage:** `feasible_lev = floor(_LIQ_SAFETY_FACTOR / sl_pct)` (`_LIQ_SAFETY_FACTOR = 0.6`). Leverage'ı liquidation distance'ın %60'ından öteye çıkarmaz — %40 buffer maintenance + mark drift için.
+6. **Max-feasible leverage:** `feasible_lev = floor(_LIQ_SAFETY_FACTOR / sl_pct)` (`_LIQ_SAFETY_FACTOR = 0.6`). Caps leverage so SL sits within 60% of the liquidation distance — 40% buffer for maintenance + mark drift.
 7. **Effective leverage:** `lev = min(max_leverage, max(ceil(required_lev), feasible_lev), 1)`.
-8. **Margin safety:** `max_notional = margin_balance × lev × 0.95` (5% fee/mark buffer — sCode 51008'i engeller).
-9. **Contract count:** `num_contracts = int(notional // (contract_size × entry))`. OKX integer contract istiyor.
-10. **Actual risk:** Yuvarlandığı için `actual_risk = num_contracts × contract_size × |entry - sl|` — istenenden **biraz az** olabilir, asla fazla.
+8. **Margin safety:** `max_notional = margin_balance × lev × 0.95` (5% fee/mark buffer — prevents sCode 51008).
+9. **Contract count:** `num_contracts = int(notional // (contract_size × entry))`. OKX requires integer contracts.
+10. **Actual risk:** because of rounding, `actual_risk = num_contracts × contract_size × |entry - sl|` — may be **slightly less** than requested, never more.
 
-### Risk vs margin ayrımı (Session 2 düzeltmesi)
+### Risk vs margin split (Session 2 fix)
 
-- **`account_balance`** → R hesaplamak için (total equity'den gelir, drawdown ile orantılı küçülür).
-- **`margin_balance`** → leverage/notional ceiling için (per-slot fair share + okx_avail'in min'i).
+- **`account_balance`** → drives R (derived from total equity, scales naturally with drawdown).
+- **`margin_balance`** → drives the leverage/notional ceiling (min of per-slot fair share and live `okx_avail`).
 
-Bu ayrım `cross` margin modunda 3 slot'un eş zamanlı dolup birinin diğerini sCode 51008 ile çarpmasını engelliyor.
+This split prevents one of three concurrent slots from hitting sCode 51008 just because peers locked margin (under `cross` mode).
 
 ### Per-symbol leverage cap
 
 Effective ceiling = `min(trading.max_leverage, okx_instrument_cap, symbol_leverage_caps[sym])`.
 
-Mesela ETH için YAML'da `30x` cap var (demo wick'leri yüksek leverage'da SL discipline tutsa bile likide eder). BTC `75x`, SOL `50x` (OKX cap).
+E.g. ETH is capped at `30x` in YAML (demo wicks blow ≥30x even when SL discipline holds). BTC `75x`, SOL `50x` (OKX cap).
 
 ---
 
-## 7. Reject sebepleri ve risk gates
+## 7. Reject reasons and risk gates
 
-`build_trade_plan_with_reason` aşağıdaki sebeplerden biriyle `(None, reason)` dönebilir; runner bu reason'ı `NO_TRADE` log'una basar:
+`build_trade_plan_with_reason` may return `(None, reason)` for any of these — the runner logs it as `NO_TRADE`:
 
-| Reason | Anlam |
+| Reason | Meaning |
 |---|---|
-| `below_confluence` | Skor `min_confluence_score` altında |
-| `session_filter` | Aktif session izinli değil (Asia/Off) |
-| `no_sl_source` | Hiçbir SL kaynağı bulunamadı |
+| `below_confluence` | Score below `min_confluence_score` |
+| `session_filter` | Active session not in allowlist (Asia/Off) |
+| `no_sl_source` | No SL source available |
 | `crowded_skip` | Derivatives crowded gate (LONG_CROWDED + bullish + funding_z > 3.0) |
-| `zero_contracts` | Sizing 0 contract verdi (notional çok küçük) |
-| `htf_tp_ceiling` | HTF zone TP'yi öyle kıstı ki yeni RR `min_rr_ratio` altında |
-| `tp_too_tight` | TP distance fee floor'un altında |
+| `zero_contracts` | Sizing produced 0 contracts (notional too small) |
+| `htf_tp_ceiling` | HTF zone shrank TP so much that the new RR < `min_rr_ratio` |
+| `tp_too_tight` | TP distance below the fee floor |
 
-Ek gates (plan kabul edildikten sonra):
+Additional gates (after the plan is accepted):
 
 ### Reentry gate (Madde C, `runner.py:504`)
 
-Aynı sembol+yön için son kapanan trade hatırlanır (`LastCloseInfo`). 4 sıralı gate:
+The last close per (symbol, side) is remembered (`LastCloseInfo`). 4 sequential gates:
 
-1. **Cooldown** — `min_bars_after_close × entry_tf_seconds` geçmemişse → `cooldown_3bars`.
-2. **ATR move** — fiyat son exit'ten `min_atr_move × ATR` (default `0.5×ATR`) hareket etmemişse → `atr_move_insufficient`.
-3. **Post-WIN quality** — son trade WIN ise yeni confluence **strictly higher** olmalı → yoksa `post_win_needs_higher_confluence`.
-4. **Post-LOSS quality** — son trade LOSS ise yeni confluence **eşit veya yüksek** olmalı → yoksa `post_loss_needs_ge_confluence`.
-5. **BREAKEVEN** quality gate'i bypass eder.
+1. **Cooldown** — `min_bars_after_close × entry_tf_seconds` not yet elapsed → `cooldown_3bars`.
+2. **ATR move** — price hasn't moved `min_atr_move × ATR` (default `0.5×ATR`) from the last exit → `atr_move_insufficient`.
+3. **Post-WIN quality** — last trade WIN → new confluence must be **strictly higher** → otherwise `post_win_needs_higher_confluence`.
+4. **Post-LOSS quality** — last trade LOSS → new confluence must be **equal or higher** → otherwise `post_loss_needs_ge_confluence`.
+5. **BREAKEVEN** bypasses the quality gate.
 
-Karşı yönler izole — BTC long kapandıktan sonra BTC short açmak gate'e takılmaz.
+Opposite sides are isolated — closing a BTC long doesn't gate opening a BTC short.
 
 ### Risk manager (`risk_mgr.can_trade(plan)`)
 
-`src/strategy/risk_manager.py` — circuit breaker zinciri (ilk match wins):
+`src/strategy/risk_manager.py` — circuit-breaker chain (first match wins):
 
-1. Drawdown ≥ `max_drawdown_pct` (25%) → **kalıcı halt** (manuel `--clear-halt` lazım).
-2. `halted_until > now` → cooldown halt geçerli.
+1. Drawdown ≥ `max_drawdown_pct` (25%) → **permanent halt** (manual `--clear-halt` required).
+2. `halted_until > now` → cooldown halt active.
 3. Daily realized loss ≥ `max_daily_loss_pct` (15%) → 24h halt.
 4. Consecutive losses ≥ `max_consecutive_losses` (5) → 24h halt.
 5. Open positions ≥ `max_concurrent_positions` (3) → block.
@@ -285,91 +285,91 @@ Karşı yönler izole — BTC long kapandıktan sonra BTC short açmak gate'e ta
 
 ## 8. Order placement — `OrderRouter.place()`
 
-`src/execution/order_router.py:66`. Tek bir TradePlan'ı OKX'e götürür:
+`src/execution/order_router.py:66`. Routes a single TradePlan to OKX:
 
-### Adımlar
+### Steps
 
-1. **Set leverage** — `set_leverage(inst, lever, mgnMode, posSide)`. Hata → `LeverageSetError`, hiçbir pozisyon açılmaz.
-2. **Market entry** — `place_market_order(side, posSide, sz=plan.num_contracts)`. Hata → `OrderRejected` veya `InsufficientMargin`.
-3. **Algo (OCO veya partial)** — aşağıda.
-4. Algo başarısız → `close_on_algo_failure: true` ise pozisyon hemen kapatılır + `AlgoOrderError` raise (pozisyon asla SL/TP'siz kalmaz).
+1. **Set leverage** — `set_leverage(inst, lever, mgnMode, posSide)`. Failure → `LeverageSetError`, no position is opened.
+2. **Market entry** — `place_market_order(side, posSide, sz=plan.num_contracts)`. Failure → `OrderRejected` or `InsufficientMargin`.
+3. **Algo (OCO or partial)** — see below.
+4. Algo fail → if `close_on_algo_failure: true`, position is auto-closed + `AlgoOrderError` raised (position is never left without SL/TP).
 
-### Partial TP modu (Madde E, default ON)
+### Partial TP mode (Madde E, default ON)
 
 `partial_tp_enabled: true`, `partial_tp_ratio: 0.5`, `partial_tp_rr: 1.5`:
 
 - **TP1 OCO** — `size = ceil(num_contracts × 0.5)`, `tpTriggerPx = entry ± (sl_distance × 1.5)`, `slTriggerPx = plan.sl_price`.
 - **TP2 OCO** — `size = num_contracts - tp1_size`, `tpTriggerPx = plan.tp_price` (3R), `slTriggerPx = plan.sl_price`.
-- Her iki algo da OKX'e gider; ikisinden biri fail ederse her ikisi de cancel + position close.
-- Degenerate `num_contracts == 1` → tek OCO fallback (partial yapılamaz).
+- Both algos go to OKX; if either fails, both are cancelled + position closed.
+- Degenerate `num_contracts == 1` → single OCO fallback (partial isn't possible).
 
-### Sonuç
+### Result
 
-`ExecutionReport(order=OrderResult, algos=[AlgoResult, AlgoResult])` döner. `algo_ids` `monitor.register_open` + `journal` ile birlikte kaydedilir.
+Returns `ExecutionReport(order=OrderResult, algos=[AlgoResult, AlgoResult])`. `algo_ids` are persisted via `monitor.register_open` + `journal`.
 
 ---
 
-## 9. Açık pozisyon yaşam döngüsü — `PositionMonitor`
+## 9. Open-position lifecycle — `PositionMonitor`
 
-`src/execution/position_monitor.py`. WS yok, REST poll. Her `run_once` başında bir kez `monitor.poll()` çağrılır.
+`src/execution/position_monitor.py`. No WS, REST poll. `monitor.poll()` is called once at the start of every `run_once`.
 
 ### Tracked state
 
 ```python
 _Tracked:
     inst_id, pos_side, size, entry_price
-    initial_size       # partial detection için referans
+    initial_size       # reference for partial detection
     algo_ids           # [tp1_algo, tp2_algo]
-    tp2_price          # SL→BE replace'inde lazım
+    tp2_price          # needed for the SL→BE replace
     be_already_moved   # idempotency
 ```
 
-### Poll mantığı (`poll()`, `position_monitor.py:77`)
+### Poll logic (`poll()`, `position_monitor.py:77`)
 
-Her poll'da OKX'ten canlı pozisyonlar çekilir. Her tracked key için:
+Every poll fetches live positions from OKX. For each tracked key:
 
-1. **Canlı listede yok** → pozisyon kapanmış. `CloseFill` üret, tracked'den sil.
-2. **Canlı listede var ama size küçülmüş** → TP1 fill (partial). `_detect_tp1_and_move_sl` tetiklenir:
-   - TP2 algo'sunu cancel et.
-   - Yeni OCO yerleştir: `SL = entry_price` (BE), `TP = tp2_price`, `size = remaining_size`.
-   - `algo_ids` güncellenir, `be_already_moved = True`.
-   - `on_sl_moved` callback (journal'da `algo_ids` kolonunu update etmek için).
-3. **Canlı listede var, size aynı** → güncelle (entry_price refresh) ve geç.
+1. **Not in live list** → position closed. Emit `CloseFill`, drop from tracked.
+2. **In live list, size shrunk** → TP1 fill (partial). `_detect_tp1_and_move_sl` triggers:
+   - Cancel the TP2 algo.
+   - Place a new OCO: `SL = entry_price` (BE), `TP = tp2_price`, `size = remaining_size`.
+   - Update `algo_ids`, set `be_already_moved = True`.
+   - Fire `on_sl_moved` callback (so the journal's `algo_ids` column is updated).
+3. **In live list, same size** → refresh (entry_price) and continue.
 
 ### LTF reversal defensive close (Madde F)
 
-Açık pozisyon varken, her cycle'da entry pass başında (`runner.py:769+`):
+When a position is open, at the start of every entry pass (`runner.py:769+`):
 
-- `open_trade_opened_at` ile pozisyonun yaşı kontrol edilir → `ltf_reversal_min_bars_in_position × entry_tf_seconds` (default `2 × 180s = 6dk`) altındaysa → atla (yeni pozisyona reversal sinyali için zaman tanı).
-- `_is_ltf_reversal()` true ise (1m oscillator trend + `last_signal` açık yönün tersine fresh):
-  - `_defensive_close()` → tüm tracked algo'ları cancel + `close_position()` market.
-  - `pending_close_reasons[(sym,side)] = "ltf_reversal"` set edilir → kapanış journal'da `close_reason` olarak işlenir.
-  - Idempotency: `defensive_close_in_flight` set'i tekrar tetiklemeyi engeller.
+- Position age is checked via `open_trade_opened_at` — if below `ltf_reversal_min_bars_in_position × entry_tf_seconds` (default `2 × 180s = 6m`) → skip (give a fresh position time to develop before reacting to a reversal signal).
+- If `_is_ltf_reversal()` is true (1m oscillator trend + `last_signal` fresh against the open side):
+  - `_defensive_close()` → cancel all tracked algos + market `close_position()`.
+  - `pending_close_reasons[(sym,side)] = "ltf_reversal"` is set → close is journaled with `close_reason`.
+  - Idempotency: `defensive_close_in_flight` prevents re-trigger.
 
-### Close enrichment — gerçek PnL (kritik)
+### Close enrichment — real PnL (critical)
 
-`PositionMonitor._close_fill_from` sadece "pozisyon yok oldu" bilgisi döner — `pnl_usdt = 0, exit_price = 0`. **Gerçek PnL** `OKXClient.enrich_close_fill` ile alınır:
+`PositionMonitor._close_fill_from` only knows "the position vanished" — `pnl_usdt = 0, exit_price = 0`. **Real PnL** comes from `OKXClient.enrich_close_fill`:
 
-- `/api/v5/account/positions-history` endpoint'i sorgulanır (last 24h).
-- `realizedPnl`, `closeAvgPx`, `uTime` çekilir.
-- Bu olmazsa **her kapanış BREAKEVEN görünür** ve drawdown / consecutive losses **asla tetiklenmez**.
+- Queries `/api/v5/account/positions-history` (last 24h).
+- Extracts `realizedPnl`, `closeAvgPx`, `uTime`.
+- Without it, **every close looks BREAKEVEN** and drawdown / consecutive losses **never trip**.
 
 ---
 
-## 10. Kapanış akışı — `_handle_close`
+## 10. Close flow — `_handle_close`
 
 `runner.py:1040`:
 
 ```python
 async def _handle_close(fill):
-    enriched = enrich_close_fill(fill)              # gerçek PnL
+    enriched = enrich_close_fill(fill)              # real PnL
     trade_id = open_trade_ids.pop(key, None)        # in-memory cleanup
     close_reason = pending_close_reasons.pop(key)   # Madde F tag
     defensive_close_in_flight.discard(key)
     open_trade_opened_at.pop(key)
 
     if trade_id is None:
-        # orphan — risk_mgr'ı yine de besle
+        # orphan — still feed risk_mgr
         risk_mgr.register_trade_closed(...)
         return
 
@@ -380,83 +380,83 @@ async def _handle_close(fill):
 
 ### Journal `record_close` (`src/journal/database.py`)
 
-- `exit_price`, `pnl_usdt`, `closed_at` doldurulur.
-- `pnl_r = pnl_usdt / risk_amount_usdt` hesaplanır.
-- `outcome` = pnl sign'ına göre: `> 0 → WIN`, `< 0 → LOSS`, `== 0 → BREAKEVEN`.
-- `close_reason` (varsa: `ltf_reversal`) yazılır.
+- Fills `exit_price`, `pnl_usdt`, `closed_at`.
+- Computes `pnl_r = pnl_usdt / risk_amount_usdt`.
+- `outcome` from PnL sign: `> 0 → WIN`, `< 0 → LOSS`, `== 0 → BREAKEVEN`.
+- Writes `close_reason` (e.g. `ltf_reversal`).
 
 ### Risk manager update
 
 - `current_balance += pnl_usdt`.
-- `peak_balance` güncellenir → `drawdown_pct` yeniden hesaplanır.
+- `peak_balance` updated → `drawdown_pct` recomputed.
 - `daily_realized_pnl += pnl_usdt`.
-- WIN ise `consecutive_losses = 0`; LOSS ise `+= 1`.
-- Eşik aşıldıysa `halted_until` set edilir.
+- WIN → `consecutive_losses = 0`; LOSS → `+= 1`.
+- If a threshold tripped, `halted_until` is set.
 
 ### Reentry gate state
 
-`last_close[(symbol, side)]` güncellenir → bir sonraki aynı yön reentry'sinde gate bu bilgiyi kullanır.
+`last_close[(symbol, side)]` is updated → next same-direction reentry uses it via the gate.
 
 ---
 
-## 11. Failure isolation — neyin neyi etkilediği
+## 11. Failure isolation — what affects what
 
-| Hata | Etki |
+| Failure | Effect |
 |---|---|
-| TV bridge timeout | O sembol cycle'ı skip, diğerleri normal |
-| Pine settle timeout | O sembol cycle'ı skip |
-| Coinalyze 401/429 | `state.derivatives = None`, derivatives faktörleri devre dışı, fiyat-yapısı entry'leri devam |
-| Binance WS disconnect | Auto-reconnect (exponential backoff), heatmap historical layer eksik |
-| `set_leverage` fail | Hiçbir pozisyon açılmaz, `LeverageSetError` log |
-| `place_market_order` fail | Hiçbir pozisyon yok, `OrderRejected` log |
-| Algo fail | Pozisyon **otomatik kapatılır** (`close_on_algo_failure: true`), `AlgoOrderError` log |
-| `journal.record_open` fail | **Pozisyon yine de live** (orphan) — restart'ta `_reconcile_orphans` log basar, operatör karar verir |
-| `journal.record_close` fail | Risk manager yine besleniyor (state senkron kalır), journal row update'i kayıp |
-| `enrich_close_fill` fail | Raw fill kullanılır (`pnl_usdt = 0`) — drawdown/streak hesabı kayıp, **dikkat** |
+| TV bridge timeout | Skip that symbol cycle, others continue |
+| Pine settle timeout | Skip that symbol cycle |
+| Coinalyze 401/429 | `state.derivatives = None`, derivatives factors disabled, price-structure entries continue |
+| Binance WS disconnect | Auto-reconnect (exponential backoff), heatmap historical layer missing |
+| `set_leverage` fail | No position opened, `LeverageSetError` log |
+| `place_market_order` fail | No position, `OrderRejected` log |
+| Algo fail | Position **auto-closed** (`close_on_algo_failure: true`), `AlgoOrderError` log |
+| `journal.record_open` fail | **Position is still live** (orphan) — `_reconcile_orphans` logs at next startup, operator decides |
+| `journal.record_close` fail | Risk manager still fed (state stays in sync), journal row update lost |
+| `enrich_close_fill` fail | Raw fill used (`pnl_usdt = 0`) — drawdown/streak accounting lost, **watch out** |
 
 ---
 
-## 12. Restart davranışı
+## 12. Restart behavior
 
 `BotRunner._prime()` (`runner.py:962`):
 
-1. **`journal.replay_for_risk_manager`** — kapalı trade'leri sırayla okuyup `risk_mgr.peak_balance`, `consecutive_losses`, `current_balance`'ı sıfırdan rebuild eder.
-2. **`_apply_clear_halt`** (sadece `--clear-halt` flag'i ile) — halt + daily counters + peak'i reset.
-3. **`_rehydrate_open_positions`** — journal'da OPEN olan trade'leri `monitor._tracked` ve `open_trade_ids`'e geri yükler. OCO algo_ids ve tp2_price korunur.
-4. **`_reconcile_orphans`** — canlı OKX pozisyonları ↔ journal OPEN row'lar diff'i. Sadece **log basar**, otomatik aksiyon yok.
-5. **`_load_contract_sizes`** — her sembol için OKX'ten `ctVal` + `max_leverage` çeker (per-symbol cap).
+1. **`journal.replay_for_risk_manager`** — walks closed trades in entry order to rebuild `risk_mgr.peak_balance`, `consecutive_losses`, `current_balance` from durable truth.
+2. **`_apply_clear_halt`** (only with `--clear-halt` flag) — resets halt + daily counters + peak.
+3. **`_rehydrate_open_positions`** — loads OPEN journal rows into `monitor._tracked` and `open_trade_ids`. OCO `algo_ids` and `tp2_price` are preserved.
+4. **`_reconcile_orphans`** — diffs live OKX positions ↔ journal OPEN rows. **Logs only**, no auto-action.
+5. **`_load_contract_sizes`** — fetches `ctVal` + `max_leverage` per symbol from OKX (per-symbol cap).
 
-OKX tarafında OCO algo'lar bot kapalıyken de aktif olduğu için pozisyonlar SL/TP korumasız kalmaz.
+OCO algos on the OKX side stay active even while the bot is down, so positions never lose SL/TP protection.
 
 ---
 
-## 13. CLI kullanımı
+## 13. CLI usage
 
 ```bash
-# Smoke test — full pipeline, tek tick, gerçek emir yok
+# Smoke test — full pipeline, single tick, no real orders
 .venv/Scripts/python.exe -m src.bot --config config/default.yaml --dry-run --once
 
-# Demo (gerçek emir, OKX demo hesabı)
+# Demo (real orders, OKX demo account)
 .venv/Scripts/python.exe -m src.bot --config config/default.yaml
 
-# Halt tetiklemiş olabilir, sıfırla:
+# Reset a halt that may have tripped
 .venv/Scripts/python.exe -m src.bot --clear-halt --config config/default.yaml
 
-# 50 trade'de auto-stop (Phase 7 veri toplama eşiği)
+# Auto-stop after 50 closed trades (Phase 7 data-collection threshold)
 .venv/Scripts/python.exe -m src.bot --max-closed-trades 50
 
-# Sadece derivatives veri toplama (entry/exit yok)
+# Derivatives data collection only (no entry/exit)
 .venv/Scripts/python.exe -m src.bot --derivatives-only --duration 600
 
-# Rapor
+# Report
 .venv/Scripts/python.exe scripts/report.py --last 7d
 ```
 
 ---
 
-## 14. Loglama — neyi nerede aramalı
+## 14. Logging — where to look for what
 
-### Karar logları (`scripts/logs.py --decisions`)
+### Decision logs (`scripts/logs.py --decisions`)
 
 ```
 symbol_cycle_start symbol=BTC-USDT-SWAP
@@ -467,52 +467,52 @@ sl_moved_to_be_via_replace inst=ETH-USDT-SWAP side=short remaining_size=5.0 new_
 closed trade_id=xxx outcome=WIN pnl_r=2.85
 ```
 
-### Reject mantığı
+### Reject reasoning
 
-`reentry_blocked symbol=… side=… reason=cooldown_3bars` — gate hangi sebeple kestiyse onu görürsün.
+`reentry_blocked symbol=… side=… reason=cooldown_3bars` — shows which gate cut the entry.
 
-`blocked symbol=… reason=…` — risk_mgr halt veya breaker.
+`blocked symbol=… reason=…` — risk_mgr halt or breaker.
 
-### Hatalar
+### Errors
 
-`order_rejected … sCode=51008 …` — margin yetersiz (per-slot sizing patladı veya OKX-side anlık eksiklik).
+`order_rejected … sCode=51008 …` — insufficient margin (per-slot sizing tripped or live OKX shortfall).
 
-`htf_settle_timeout symbol=…` — Pine TF switch'inde 10s'de last_bar flip etmedi → o sembol cycle'ı skip.
+`htf_settle_timeout symbol=…` — Pine `last_bar` didn't flip within 10s after TF switch → that symbol cycle skipped.
 
-`SMT Signals table not found — using empty state` — settle poll içinde Pine henüz render etmemiş (beklenen, runner zarif handle eder).
+`SMT Signals table not found — using empty state` — Pine hasn't rendered yet during the settle poll (expected; runner handles gracefully).
 
-`orphan_close key=…` — kapanan pozisyonun journal'da OPEN row'u yok (bot crash / `--max-closed-trades` exit sonrası tipik).
+`orphan_close key=…` — closed position has no OPEN row in journal (typical after bot crash / `--max-closed-trades` exit).
 
-`journal_open_but_no_live_position key=…` — restart sonrası diff: journal'da OPEN ama OKX'te yok (manuel kapatılmış olabilir, journal stale).
+`journal_open_but_no_live_position key=…` — restart-time diff: journal OPEN but missing on OKX (may have been closed manually; journal stale).
 
 ---
 
-## 15. Phase 7 öncesi durum
+## 15. Pre-Phase 7 status
 
-- **Eşik:** ≥50 kapalı trade.
-- **Şu anki:** ~19 kapalı (W=3 / L=15 / BE=1), 2 açık.
-- **Strateji parametreleri** Phase 7'de RL ile tunable: `confluence_threshold`, `pattern_weights`, `min_rr_ratio`, `risk_pct`, `volatility_scale`, `ob_vs_fvg_preference`.
+- **Threshold:** ≥50 closed trades.
+- **Current:** ~19 closed (W=3 / L=15 / BE=1), 2 open.
+- **Strategy parameters** that Phase 7 will tune via RL: `confluence_threshold`, `pattern_weights`, `min_rr_ratio`, `risk_pct`, `volatility_scale`, `ob_vs_fvg_preference`.
 - **Reward shape:** `pnl_r + setup_penalty + dd_penalty + consistency_bonus`.
-- **Walk-forward zorunlu:** OOS iyileşmediği parametre asla deploy edilmez.
+- **Walk-forward is mandatory:** parameters that don't improve OOS are never deployed.
 
 ---
 
-## Hızlı referans tablosu
+## Quick-reference table
 
-| İş | Dosya | Fonksiyon |
+| Task | File | Function |
 |---|---|---|
-| Bir tick | `src/bot/runner.py` | `BotRunner.run_once` |
-| Tek sembol cycle | `src/bot/runner.py` | `_run_one_symbol` |
+| One tick | `src/bot/runner.py` | `BotRunner.run_once` |
+| Single symbol cycle | `src/bot/runner.py` | `_run_one_symbol` |
 | TF switch + settle | `src/bot/runner.py` | `_switch_timeframe`, `_wait_for_pine_settle` |
-| Pine veri okuma | `src/data/structured_reader.py` | `read_market_state` |
-| Confluence skor | `src/analysis/multi_timeframe.py` | `calculate_confluence`, `score_direction` |
-| Plan inşası | `src/strategy/entry_signals.py` | `build_trade_plan_with_reason` |
-| SL seçim | `src/strategy/entry_signals.py` | `select_sl_price` |
+| Pine data read | `src/data/structured_reader.py` | `read_market_state` |
+| Confluence score | `src/analysis/multi_timeframe.py` | `calculate_confluence`, `score_direction` |
+| Plan build | `src/strategy/entry_signals.py` | `build_trade_plan_with_reason` |
+| SL select | `src/strategy/entry_signals.py` | `select_sl_price` |
 | R:R sizing | `src/strategy/rr_system.py` | `calculate_trade_plan` |
 | Reentry gate | `src/bot/runner.py` | `_check_reentry_gate` |
 | LTF reversal close | `src/bot/runner.py` | `_is_ltf_reversal`, `_defensive_close` |
 | Order placement | `src/execution/order_router.py` | `OrderRouter.place`, `_place_algos` |
-| Pozisyon takip | `src/execution/position_monitor.py` | `PositionMonitor.poll`, `_detect_tp1_and_move_sl` |
-| Kapanış handle | `src/bot/runner.py` | `_handle_close` |
+| Position tracking | `src/execution/position_monitor.py` | `PositionMonitor.poll`, `_detect_tp1_and_move_sl` |
+| Close handling | `src/bot/runner.py` | `_handle_close` |
 | Journal CRUD | `src/journal/database.py` | `record_open`, `record_close`, `replay_for_risk_manager` |
 | Circuit breakers | `src/strategy/risk_manager.py` | `RiskManager.can_trade`, `register_trade_closed` |
