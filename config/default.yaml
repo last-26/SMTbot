@@ -69,6 +69,16 @@ execution:
   ltf_reversal_min_bars_in_position: 2
   ltf_reversal_signal_max_age: 3
 
+derivatives:
+  # Phase 1.5 — derivatives data layer. Disabling this short-circuits the
+  # Binance WS + Coinalyze poll loop but leaves entry/exit logic untouched,
+  # so the bot still trades on pure price structure.
+  enabled: true
+  liquidation_buffer_size: 5000
+  liquidation_lookback_1h_ms: 3600000
+  liquidation_lookback_4h_ms: 14400000
+  liquidation_lookback_24h_ms: 86400000
+
 rl:
   min_trades_to_train: 50
   retrain_every_n_trades: 50

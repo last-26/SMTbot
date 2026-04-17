@@ -34,6 +34,7 @@ from src.analysis.support_resistance import detect_sr_zones
 from src.bot.config import BotConfig
 from src.bot.lifecycle import install_shutdown_handlers
 from src.data.candle_buffer import MultiTFBuffer
+from src.data.liquidation_stream import LiquidationStream
 from src.data.ltf_reader import LTFReader, LTFState
 from src.data.models import Direction, MarketState, Session
 from src.data.structured_reader import StructuredReader
@@ -159,6 +160,10 @@ class BotContext:
     defensive_close_in_flight: set = field(default_factory=set)
     pending_close_reasons: dict[tuple[str, str], str] = field(default_factory=dict)
     open_trade_opened_at: dict[tuple[str, str], datetime] = field(default_factory=dict)
+    # Phase 1.5 — derivatives subsystem (all opt-in via DerivativesConfig.enabled)
+    liquidation_stream: Any = None         # LiquidationStream
+    derivatives_cache: Any = None          # DerivativesCache (Madde 3)
+    coinalyze_client: Any = None           # CoinalyzeClient (Madde 2)
 
 
 # ── Runner ──────────────────────────────────────────────────────────────────
@@ -249,6 +254,16 @@ class BotRunner:
             ltf_reader=ltf_reader,
         )
         ctx_holder["ctx"] = ctx
+
+        # Phase 1.5 — derivatives subsystem. Instances are created here so
+        # shutdown cascade is deterministic; the actual WS task is started
+        # from `BotRunner.run()` (keeps `from_config` sync-safe).
+        if cfg.derivatives.enabled:
+            ctx.liquidation_stream = LiquidationStream(
+                watched_symbols=list(cfg.trading.symbols),
+                buffer_size_per_symbol=cfg.derivatives.liquidation_buffer_size,
+            )
+
         return cls(ctx, stop_after_closed_trades=stop_after_closed_trades)
 
     # ── Entry points ────────────────────────────────────────────────────────
@@ -260,27 +275,64 @@ class BotRunner:
         except Exception:
             logger.exception("signal_install_failed")
 
-        async with self.ctx.journal:
-            await self._prime()
-            interval = self.ctx.config.bot.poll_interval_seconds
-            while not self.shutdown.is_set():
-                try:
-                    await self.run_once()
-                except Exception:
-                    logger.exception("cycle_failed")
-                if self.stop_after_closed_trades is not None:
-                    closed = len(await self.ctx.journal.list_closed_trades())
-                    if closed >= self.stop_after_closed_trades:
-                        logger.info(
-                            "stop_after_closed_trades_reached closed={} limit={}",
-                            closed, self.stop_after_closed_trades,
-                        )
-                        self.shutdown.set()
-                        break
-                try:
-                    await asyncio.wait_for(self.shutdown.wait(), timeout=interval)
-                except asyncio.TimeoutError:
-                    pass
+        try:
+            async with self.ctx.journal:
+                await self._prime()
+                await self._start_derivatives()
+                interval = self.ctx.config.bot.poll_interval_seconds
+                while not self.shutdown.is_set():
+                    try:
+                        await self.run_once()
+                    except Exception:
+                        logger.exception("cycle_failed")
+                    if self.stop_after_closed_trades is not None:
+                        closed = len(await self.ctx.journal.list_closed_trades())
+                        if closed >= self.stop_after_closed_trades:
+                            logger.info(
+                                "stop_after_closed_trades_reached closed={} limit={}",
+                                closed, self.stop_after_closed_trades,
+                            )
+                            self.shutdown.set()
+                            break
+                    try:
+                        await asyncio.wait_for(self.shutdown.wait(), timeout=interval)
+                    except asyncio.TimeoutError:
+                        pass
+        finally:
+            await self._stop_derivatives()
+
+    async def _start_derivatives(self) -> None:
+        """Boot the Phase 1.5 derivatives tasks. Safe to call when disabled."""
+        if self.ctx.liquidation_stream is not None:
+            try:
+                await self.ctx.liquidation_stream.start()
+            except Exception:
+                logger.exception("liquidation_stream_start_failed")
+
+    async def _stop_derivatives(self) -> None:
+        """Cascade stop (cache → stream → client). Best-effort, never raises."""
+        cache = self.ctx.derivatives_cache
+        if cache is not None:
+            try:
+                await cache.stop()
+            except Exception:
+                logger.exception("derivatives_cache_stop_failed")
+        stream = self.ctx.liquidation_stream
+        if stream is not None:
+            try:
+                await stream.stop()
+            except Exception:
+                logger.exception("liquidation_stream_stop_failed")
+        client = self.ctx.coinalyze_client
+        if client is not None:
+            try:
+                close = getattr(client, "close", None)
+                if close is not None:
+                    result = close()
+                    if asyncio.iscoroutine(result):
+                        await result
+            except Exception:
+                logger.exception("coinalyze_client_close_failed")
 
     async def run_once_then_exit(self) -> None:
         """Smoke-test entry point: one full tick, then clean shutdown."""

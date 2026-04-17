@@ -140,6 +140,21 @@ class ExecutionConfig(BaseModel):
     ltf_reversal_signal_max_age: int = 3
 
 
+class DerivativesConfig(BaseModel):
+    """Phase 1.5 — derivatives data layer configuration.
+
+    Defaults are conservative / off so the bot works without a COINALYZE_API_KEY
+    or a live Binance connection. Setting `enabled: true` (done in
+    `config/default.yaml` for Phase 1.5) starts the Binance liquidation WS
+    and the Coinalyze poll loop at startup.
+    """
+    enabled: bool = False
+    liquidation_buffer_size: int = 5000
+    liquidation_lookback_1h_ms: int = 60 * 60 * 1000
+    liquidation_lookback_4h_ms: int = 4 * 60 * 60 * 1000
+    liquidation_lookback_24h_ms: int = 24 * 60 * 60 * 1000
+
+
 class ReentryConfig(BaseModel):
     """Per-side reentry gate (Madde C).
 
@@ -180,6 +195,7 @@ class BotConfig(BaseModel):
     journal: JournalConfig = Field(default_factory=JournalConfig)
     reentry: ReentryConfig = Field(default_factory=ReentryConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    derivatives: DerivativesConfig = Field(default_factory=DerivativesConfig)
 
     @field_validator("okx")
     @classmethod
