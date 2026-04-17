@@ -47,6 +47,11 @@ analysis:
   # The ETH 05:49 trade had 0.19% TP and lost -3.91R to fees+wick; 0.4% floor
   # is ~2× round-trip fee cost, leaves breathing room for slippage.
   min_tp_distance_pct: 0.004
+  # Min SL distance floor (fraction of entry price). 0.003 = 0.3% — rejects
+  # stops sitting inside normal demo-book spread + wick noise. Tight stops also
+  # force high leverage (lev = floor(0.6 / sl_pct)) which blows up notional
+  # and fees. 0.3% leaves ~6× spread (~0.05%) before the stop is at risk.
+  min_sl_distance_pct: 0.003
 
 okx:
   base_url: https://www.okx.com

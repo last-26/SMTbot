@@ -347,6 +347,7 @@ def build_trade_plan_from_state(
     crowded_skip_z_threshold: float = 3.0,
     ltf_state: Optional[object] = None,
     min_tp_distance_pct: float = 0.0,
+    min_sl_distance_pct: float = 0.0,
 ) -> Optional[TradePlan]:
     """End-to-end: MarketState → TradePlan. Returns None when no trade.
 
@@ -384,6 +385,7 @@ def build_trade_plan_from_state(
         crowded_skip_z_threshold=crowded_skip_z_threshold,
         ltf_state=ltf_state,
         min_tp_distance_pct=min_tp_distance_pct,
+        min_sl_distance_pct=min_sl_distance_pct,
     )
     return plan
 
@@ -415,6 +417,7 @@ def build_trade_plan_with_reason(
     crowded_skip_z_threshold: float = 3.0,
     ltf_state: Optional[object] = None,
     min_tp_distance_pct: float = 0.0,
+    min_sl_distance_pct: float = 0.0,
 ) -> tuple[Optional[TradePlan], str]:
     """Same as `build_trade_plan_from_state` but returns `(plan, reason)`.
 
@@ -426,6 +429,7 @@ def build_trade_plan_with_reason(
       - "zero_contracts"   — contract rounding wiped position to zero
       - "htf_tp_ceiling"   — HTF S/R ceiling squeezed R:R below min_rr_ratio
       - "tp_too_tight"     — TP distance below min_tp_distance_pct (fee drag)
+      - "sl_too_tight"     — SL distance below min_sl_distance_pct (noise floor)
     """
     if rr_ratio < min_rr_ratio:
         raise ValueError(
@@ -478,6 +482,18 @@ def build_trade_plan_with_reason(
             sl_price, intent.entry_price, intent.direction,
             htf_sr_zones, htf_sr_buffer_atr, atr,
         )
+
+    # Min SL distance floor — an SL closer than N× typical spread + wick
+    # width is just noise-triggered. Evaluated AFTER the HTF push (which can
+    # only widen the SL) so we gate the final planned stop.
+    if (
+        min_sl_distance_pct > 0.0
+        and intent.entry_price > 0.0
+        and sl_price is not None
+    ):
+        sl_dist_pct = abs(intent.entry_price - sl_price) / intent.entry_price
+        if sl_dist_pct < min_sl_distance_pct:
+            return None, "sl_too_tight"
 
     plan = calculate_trade_plan(
         direction=intent.direction,

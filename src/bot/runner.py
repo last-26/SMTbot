@@ -833,6 +833,7 @@ class BotRunner:
                 crowded_skip_z_threshold=cfg.derivatives.crowded_skip_z_threshold,
                 ltf_state=self.ctx.ltf_cache.get(symbol),
                 min_tp_distance_pct=cfg.analysis.min_tp_distance_pct,
+                min_sl_distance_pct=cfg.analysis.min_sl_distance_pct,
             )
         except Exception:
             logger.exception("plan_build_failed symbol={}", symbol)
@@ -840,7 +841,8 @@ class BotRunner:
 
         if plan is None:
             # reject_reason is one of: below_confluence / session_filter /
-            # no_sl_source / crowded_skip / zero_contracts / htf_tp_ceiling.
+            # no_sl_source / crowded_skip / zero_contracts / htf_tp_ceiling /
+            # tp_too_tight / sl_too_tight.
             try:
                 conf = calculate_confluence(
                     state,

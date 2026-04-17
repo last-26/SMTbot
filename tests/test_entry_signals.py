@@ -306,6 +306,64 @@ def test_min_tp_distance_gate_short_side():
     assert reason == "tp_too_tight"
 
 
+# ── min_sl_distance_pct (noise floor gate) ─────────────────────────────────
+
+
+def test_min_sl_distance_gate_disabled_by_default():
+    """With default min_sl_distance_pct=0, the gate is off."""
+    ob = OrderBlock(direction=Direction.BULLISH, bottom=99.9, top=99.94)
+    state = _state(order_blocks=[ob], price=100.0, atr=0.01)
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0,
+    )
+    # With no fee gate either, the plan itself builds — may fail zero_contracts
+    # below a price=100 / balance relationship. Here it passes as a plan.
+    assert reason in ("", "zero_contracts")
+
+
+def test_min_sl_distance_gate_rejects_tight_sl():
+    """A sub-threshold SL distance returns (None, 'sl_too_tight')."""
+    # SL at 99.95 → sl_dist_pct = 0.0005 (0.05%) → below 0.003 threshold.
+    ob = OrderBlock(direction=Direction.BULLISH, bottom=99.9, top=99.94)
+    state = _state(order_blocks=[ob], price=100.0, atr=0.01)
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0,
+        min_sl_distance_pct=0.003,
+    )
+    assert plan is None
+    assert reason == "sl_too_tight"
+
+
+def test_min_sl_distance_gate_allows_wide_sl():
+    """A wide SL passes through — no reject."""
+    ob = OrderBlock(direction=Direction.BULLISH, bottom=98.5, top=99.0)
+    state = _state(order_blocks=[ob], price=100.0, atr=1.0)
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0,
+        min_sl_distance_pct=0.003,
+    )
+    assert plan is not None
+    assert reason == ""
+    sl_dist_pct = (plan.entry_price - plan.sl_price) / plan.entry_price
+    assert sl_dist_pct >= 0.003
+
+
+def test_min_sl_distance_gate_short_side():
+    """Gate uses abs(entry - sl) so it fires on bearish too."""
+    ob = OrderBlock(direction=Direction.BEARISH, bottom=100.06, top=100.10)
+    state = _state(
+        order_blocks=[ob], price=100.0, atr=0.01,
+        trend_htf=Direction.BEARISH, last_mss="BEARISH@101",
+        active_ob="BEAR@100.06-100.10", vmc_ribbon="BEARISH",
+    )
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0,
+        min_sl_distance_pct=0.003,
+    )
+    assert plan is None
+    assert reason == "sl_too_tight"
+
+
 def test_min_tp_distance_runs_after_htf_ceiling_squeeze():
     """After an HTF ceiling pulls TP in, the fee-aware floor still applies.
 

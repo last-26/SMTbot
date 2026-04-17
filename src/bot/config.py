@@ -107,6 +107,11 @@ class AnalysisConfig(BaseModel):
     # price cannot survive the partial-TP 3-fill lifecycle net of taker fees
     # + slippage. Default 0 = off for test back-compat; runtime YAML sets it.
     min_tp_distance_pct: float = 0.0
+    # Min SL distance floor — a stop closer than this fraction of entry price
+    # sits inside normal bid/ask + demo wick noise. Tight SL = high leverage
+    # = large notional = fee drag. Default 0 = off (back-compat); runtime
+    # YAML sets ~0.003 so stops sit at least ~3× spread + typical wick width.
+    min_sl_distance_pct: float = 0.0
 
 
 class OKXConfigBlock(BaseModel):
