@@ -121,6 +121,7 @@ References: `pine/vmc_a.txt`, `pine/vmc_b.txt` (original VMC source). Standalone
 | 1.5 Derivatives Data Layer | ✅ Complete | 7-part build (Madde 1-7) + CLI modes: Binance liquidation WS, Coinalyze REST client, derivatives cache + journal, estimated liquidity heatmap, 4-regime classifier, entry signal integration (contrarian/capitulation/heatmap factors + crowded-skip gate), journal enrichment + regime breakdown reporter, `--derivatives-only` / `--duration` runtime modes. 73 new tests (383 total). See below. |
 | Multi-pair live-demo hardening | ✅ Complete (2026-04-17) | Post-Phase-1.5 production fixes observed during first live demo run: LTF momentum factor, clean logging, per-cycle decision visibility log, per-slot sizing + max-feasible leverage, per-symbol OKX `ctVal` + max-leverage lookup (51008/59102 fixes), `scripts/logs.py` viewer. 411 tests total (+28). See below. |
 | Cross margin + risk/margin split + threaded-callback fix | ✅ Complete (2026-04-17) | Second live-demo session: `execution.margin_mode: cross`, split `calculate_trade_plan` balance into `account_balance` (R) vs `margin_balance` (notional cap), `ctx.main_loop` threadsafe dispatch so `_on_sl_moved` callback doesn't crash on `asyncio.create_task` from monitor thread, `_defensive_close` td_mode bug fix. 418 tests total (+7). See below. |
+| Fee/slippage-aware entry gates | ✅ Complete (2026-04-17) | Third live-demo session: added `analysis.min_tp_distance_pct: 0.004` (`tp_too_tight` reject — TP needs to clear round-trip fees), `analysis.min_sl_distance_pct: 0.003` (`sl_too_tight` reject — stop must sit above spread + wick noise), and `trading.symbol_leverage_caps` (operator per-symbol cap, defaults ETH=30). 431 tests total (+13). See below. |
 | 7. RL parameter tuner | 🔜 Next | PPO via Stable Baselines3, walk-forward validated. Needs ≥50 logged demo trades with derivatives snapshots from Phase 1.5 first. |
 
 ### Phase 1 — Completed (2026-04-16)
@@ -521,6 +522,38 @@ Post-hardening session fixes observed during the second live-demo run. Cross mod
 - Takeaway: at 75x + tight SL/TP, three-fill partial-TP structure can be fee-negative. Future: consider maker limit orders (taker 0.05% → maker 0.02%), wider TP2, or leverage cap per symbol when planned TP distance is small.
 
 **Total tests:** 418 passing (411 → 418, +7).
+
+### Fee/slippage-aware entry gates — Completed (2026-04-17)
+
+Three gates added after the third live-demo cycle showed positions round-tripping into fee-negative outcomes even when the directional call was right. Root cause: at 75x leverage the entry + TP1 + TP2 fills total ~0.15% in taker fees, so any plan with < 0.4% TP distance and < 0.1% SL distance has its whole R eaten by fees + demo-wick slippage regardless of whether the stop held. 13 new tests (418 → 431).
+
+**Commit 1 — `min_tp_distance_pct` gate** (`a82bb0c`):
+- `AnalysisConfig.min_tp_distance_pct: float = 0.0` (off by default). YAML sets `0.004` (0.4%).
+- `build_trade_plan_with_reason` / `build_trade_plan_from_state` accept the threshold. After the HTF-ceiling squeeze finalizes the plan's TP, if `abs(tp - entry) / entry < min_tp_distance_pct` → `return None, "tp_too_tight"`.
+- Placed **after** `_apply_htf_tp_ceiling` because the ceiling can only shrink TP — we want the final post-ceiling distance to clear the fee floor. The 0.4% floor is ~2× round-trip taker fee, leaves breathing room for slippage.
+- 5 tests: disabled-by-default, tight-reject, wide-allow, bearish side, HTF-ceiling ordering (ceiling's `htf_tp_ceiling` rejection fires first when it trips `min_rr_ratio`).
+
+**Commit 2 — `min_sl_distance_pct` gate** (`0e682fa`):
+- `AnalysisConfig.min_sl_distance_pct: float = 0.0` (off by default). YAML sets `0.003` (0.3%).
+- Evaluated **after** `_push_sl_past_htf_zone` (which can only widen the stop) but **before** `calculate_trade_plan` so zero-margin calc cycles are skipped. If `abs(entry - sl) / entry < min_sl_distance_pct` → `return None, "sl_too_tight"`.
+- Rationale: tight SL forces `leverage = floor(0.6 / sl_pct)` sky-high, which inflates notional and fee drag. A 0.06% SL picks 34x leverage and burns ~$100 in fees to risk $100 — the plan lost before it opened. 0.3% floor ~= 6× the 0.05% demo book spread.
+- 4 tests: disabled-by-default, tight-reject, wide-allow, bearish side.
+- `reject_reason` docstring + runner NO_TRADE comment updated with both new reasons.
+
+**Commit 3 — `trading.symbol_leverage_caps`** (`e101384`):
+- `TradingConfig.symbol_leverage_caps: dict[str, int] = {}` — operator-side per-symbol cap layered on top of OKX's instrument-level cap (fetched at startup).
+- Runner's `_run_one_symbol` merges three sources at plan-build time:
+  ```python
+  max_leverage=min(
+      cfg.trading.max_leverage,                                # global YAML
+      ctx.max_leverage_per_symbol.get(sym, global),            # OKX /public/instruments
+      cfg.trading.symbol_leverage_caps.get(sym, global),       # operator YAML
+  )
+  ```
+- YAML default caps ETH-USDT-SWAP at 30x. Rationale: on demo, ETH wicks move ~0.5% flash-down bursts which blow out anything above ~30x even when SL structure holds. BTC stays at the global 75x (deeper book, tighter liq behavior); SOL inherits the OKX 50x automatically. Unlisted symbols fall back to the global `max_leverage`.
+- 4 tests: default-empty, YAML parse, missing-symbol fallback, runner kwarg-capture (BTC sees 75, ETH sees 30 with all three sources).
+
+**Total tests:** 431 passing (418 → 431, +13).
 
 ## Phase 7 — Reinforcement learning
 
