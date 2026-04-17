@@ -771,29 +771,40 @@ class BotRunner:
                 logger.exception("set_symbol_failed symbol={}", symbol)
                 return
 
+        # Early dedup probe — HTF S/R zones are only consumed by the entry
+        # planner (SL push + TP ceiling). Defensive close (Madde F) only
+        # reads LTF state, and step 3 below will dedup-block the entry
+        # anyway, so skipping the HTF pass for already-open symbols saves
+        # one tf_settle + freshness-poll + grace (~5-14s) per cycle per
+        # held position. Stale cache is fine: next cycle after the position
+        # closes, `already_open` flips False and HTF reloads before the
+        # planner runs.
+        already_open = any(k[0] == symbol for k in self.ctx.open_trade_ids)
+
         # 2a. HTF pass — switch TF, read S/R from HTF candles, cache.
-        if self.ctx.bridge is not None:
-            htf_ok = await self._switch_timeframe(cfg.trading.htf_timeframe)
-            if not htf_ok:
-                logger.warning("htf_settle_timeout symbol={} — skipping symbol",
-                               symbol)
-                return
-        try:
-            htf_key = _timeframe_key(cfg.trading.htf_timeframe)
-            await self.ctx.multi_tf.refresh(htf_key, count=200)
-            htf_buf = self.ctx.multi_tf.get_buffer(htf_key)
-            htf_candles = htf_buf.last(200) if htf_buf is not None else []
-            if htf_candles:
-                self.ctx.htf_sr_cache[symbol] = detect_sr_zones(
-                    htf_candles,
-                    min_touches=cfg.analysis.sr_min_touches,
-                    zone_atr_mult=cfg.analysis.sr_zone_atr_mult,
-                )
-            else:
+        if not already_open:
+            if self.ctx.bridge is not None:
+                htf_ok = await self._switch_timeframe(cfg.trading.htf_timeframe)
+                if not htf_ok:
+                    logger.warning("htf_settle_timeout symbol={} — skipping symbol",
+                                   symbol)
+                    return
+            try:
+                htf_key = _timeframe_key(cfg.trading.htf_timeframe)
+                await self.ctx.multi_tf.refresh(htf_key, count=200)
+                htf_buf = self.ctx.multi_tf.get_buffer(htf_key)
+                htf_candles = htf_buf.last(200) if htf_buf is not None else []
+                if htf_candles:
+                    self.ctx.htf_sr_cache[symbol] = detect_sr_zones(
+                        htf_candles,
+                        min_touches=cfg.analysis.sr_min_touches,
+                        zone_atr_mult=cfg.analysis.sr_zone_atr_mult,
+                    )
+                else:
+                    self.ctx.htf_sr_cache.pop(symbol, None)
+            except Exception:
+                logger.exception("htf_refresh_failed symbol={}", symbol)
                 self.ctx.htf_sr_cache.pop(symbol, None)
-        except Exception:
-            logger.exception("htf_refresh_failed symbol={}", symbol)
-            self.ctx.htf_sr_cache.pop(symbol, None)
 
         # 2b. LTF pass — read oscillator into LTFState, cache for Madde F.
         if self.ctx.bridge is not None and self.ctx.ltf_reader is not None:
