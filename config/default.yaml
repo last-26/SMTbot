@@ -244,3 +244,13 @@ economic_calendar:
   finnhub_max_retries: 3
   faireconomy_timeout_s: 10.0
   faireconomy_max_retries: 3
+
+rl:
+  # Phase 6.9 D1 — dirty-data cutoff for RL training + reporter.
+  # Trades opened BEFORE this ISO-8601 timestamp are ignored by
+  # `scripts/report.py` and (future) `scripts/train_rl.py`. Old rows stay in
+  # the DB for comparison; this is a query-layer filter, not a delete.
+  # Leave `null` to disable. Bump forward whenever a meaningful strategy
+  # change lands (new confluence factor, min_confluence raise, SL logic),
+  # so RL never trains on the pre-change regime.
+  clean_since: null

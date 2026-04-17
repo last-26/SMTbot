@@ -40,15 +40,31 @@ def _parse_window(arg: str) -> Optional[datetime]:
     return datetime.now(tz=timezone.utc) - delta
 
 
+def _load_cfg() -> dict:
+    cfg_path = Path(__file__).resolve().parent.parent / "config" / "default.yaml"
+    if not cfg_path.exists():
+        return {}
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
 def _resolve_db_path(explicit: Optional[str]) -> str:
     if explicit:
         return explicit
-    cfg_path = Path(__file__).resolve().parent.parent / "config" / "default.yaml"
-    if not cfg_path.exists():
-        return "data/trades.db"
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
+    cfg = _load_cfg()
     return (cfg.get("journal") or {}).get("db_path", "data/trades.db")
+
+
+def _resolve_clean_since() -> Optional[datetime]:
+    """Return `rl.clean_since` from YAML as a UTC datetime, or None."""
+    cfg = _load_cfg()
+    raw = (cfg.get("rl") or {}).get("clean_since")
+    if not raw:
+        return None
+    dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 async def _run(db_path: str, since: Optional[datetime], starting_balance: float) -> int:
@@ -70,6 +86,10 @@ def main() -> int:
         "--starting-balance", type=float, default=10_000.0,
         help="Starting balance used for DD/Calmar math (default: 10000)",
     )
+    parser.add_argument(
+        "--ignore-clean-since", action="store_true",
+        help="Include trades before `rl.clean_since` (default: honour cutoff)",
+    )
     args = parser.parse_args()
 
     db_path = _resolve_db_path(args.db)
@@ -78,6 +98,11 @@ def main() -> int:
     except argparse.ArgumentTypeError as e:
         print(f"[ERROR] {e}", file=sys.stderr)
         return 2
+
+    if not args.ignore_clean_since:
+        clean_since = _resolve_clean_since()
+        if clean_since is not None:
+            since = clean_since if since is None else max(since, clean_since)
 
     if not Path(db_path).exists() and db_path != ":memory:":
         print(f"[WARN] DB not found at {db_path} - nothing to report.")
