@@ -259,4 +259,9 @@ rl:
   # Leave `null` to disable. Bump forward whenever a meaningful strategy
   # change lands (new confluence factor, min_confluence raise, SL logic),
   # so RL never trains on the pre-change regime.
-  clean_since: null
+  #
+  # 2026-04-18 — Sprint 3 fresh start. BLOK A (3 new confluence factors) +
+  # BLOK B (min_conf 3.0 + per-symbol session/swing/HTF overrides) landed
+  # on main. Demo balance reset to $5k, $50 R per trade. 35 pre-reset trades
+  # stay in DB for regime comparison; reporter sees only post-cutoff rows.
+  clean_since: "2026-04-18T00:00:00Z"

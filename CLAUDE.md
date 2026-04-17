@@ -113,6 +113,7 @@ Phases 1–6 + 6.5 + 1.5 + live-demo hardening + macro-blackout + fee-aware sizi
 | Live-demo hardening (cross margin, per-slot sizing, per-symbol spec) | ✅ |
 | Macro Event Blackout (Finnhub + FairEconomy, ±30/15-min USD HIGH) | ✅ |
 | Fee-aware sizing + TP1/TP2 guarantee + fee-buffered BE | ✅ |
+| 6.9 Pre-RL baseline (orphan factors + per-symbol overrides + VWAP veto) | ✅ |
 | 7. RL parameter tuner | 🔜 Next |
 
 ---
@@ -176,6 +177,9 @@ Gotchas and rationales not self-evident from the code. Inline comments cover the
 - **`ltf_momentum_alignment`.** LTF trend match = 0.5 weight; last_signal fresh-but-counter-trend (`bars_ago ≤ 3`) agreeing with direction = 60% partial weight.
 - **Derivatives slot — at most one of three fires per cycle** (single elif chain): `derivatives_contrarian` (0.7) | `derivatives_capitulation` (0.6) | `derivatives_heatmap_target` (0.5). `_heatmap_supports_direction` requires nearest cluster within `ATR*3` AND notional ≥ 70% of largest.
 - **`crowded_skip` gate.** Rejects entries aligned with crowded regime when `|funding_z| ≥ crowded_skip_z_threshold` (YAML `3.0`). Missing data never blocks — only trips with evidence.
+- **Phase 6.9 orphan-field activators (3 factors).** Pine emits MFI bias, standing liquidity pools, and Cipher-B gold/divergence flags; pre-6.9 confluence ignored them. Now: `money_flow_alignment` (0.6, requires `|rsi_mfi| ≥ min_rsi_mfi_magnitude`), `liquidity_pool_target` (0.5, nearest Pine pool within `ATR × liquidity_pool_max_atr_dist`), `oscillator_high_conviction_signal` (1.25, fires on `GOLD_BUY` / `BUY_DIV` / `SELL_DIV` with `bars_ago ≤ 3`, mutually exclusive with regular `oscillator_signal` via elif chain).
+- **VWAP hard veto (`analysis.vwap_hard_veto_enabled`, default off).** Strict: rejects bullish when price is below **every** available session VWAP (1m/3m/15m), bearish when above every. Missing (zero) VWAPs are skipped; all-missing is fail-open. Reject reason `vwap_misaligned`, emitted before SL/TP math. Operator-enabled after Sprint 3 demo validation per plan.
+- **Per-symbol overrides.** `trading.swing_lookback_per_symbol` (B3: DOGE/XRP=30 fights `no_sl_source` on thin 3m books), `analysis.htf_sr_buffer_atr_per_symbol` (B2: SOL=0.10 vs global 0.20 — wide-ATR pairs over-clip HTF TP ceiling), `analysis.session_filter_per_symbol` (B4: SOL/DOGE/XRP=[london] after 0/6 NY+ASIAN). BotConfig resolvers fall back to globals when symbol isn't listed.
 
 ---
 
@@ -217,11 +221,11 @@ Gotchas and rationales not self-evident from the code. Inline comments cover the
 
 Full config in `config/default.yaml` (self-documenting with inline comments).
 
-Top-level sections: `bot`, `trading` (symbols, TFs, risk, `symbol_leverage_caps`, `fee_reserve_pct`), `circuit_breakers`, `analysis` (confluence, `min_tp_distance_pct`, `min_sl_distance_pct`, `htf_sr_*`), `execution` (margin_mode, partial_tp_*, `sl_be_offset_pct`, ltf_reversal_*), `reentry`, `derivatives`, `economic_calendar`, `okx`, `rl`.
+Top-level sections: `bot`, `trading` (symbols, TFs, risk, `symbol_leverage_caps`, `swing_lookback_per_symbol`, `fee_reserve_pct`), `circuit_breakers`, `analysis` (confluence, `min_tp_distance_pct`, `min_sl_distance_pct`, `htf_sr_*`, `htf_sr_buffer_atr_per_symbol`, `session_filter_per_symbol`, `vwap_hard_veto_enabled`, `min_rsi_mfi_magnitude`, `liquidity_pool_max_atr_dist`), `execution` (margin_mode, partial_tp_*, `sl_be_offset_pct`, ltf_reversal_*), `reentry`, `derivatives`, `economic_calendar`, `okx`, `rl` (`clean_since` cutoff).
 
 `.env` keys: `OKX_API_KEY`, `OKX_API_SECRET`, `OKX_PASSPHRASE`, `OKX_DEMO_FLAG`, `COINALYZE_API_KEY`, `FINNHUB_API_KEY`, `TV_MCP_PORT`, `LOG_LEVEL`.
 
-**Reject reasons** (joined log family): `below_confluence`, `session_filter`, `no_sl_source`, `crowded_skip`, `zero_contracts`, `htf_tp_ceiling`, `tp_too_tight`, `insufficient_contracts_for_split`, `macro_event_blackout`. Sub-floor SL distances are **widened**, not rejected.
+**Reject reasons** (joined log family): `below_confluence`, `session_filter`, `no_sl_source`, `vwap_misaligned`, `crowded_skip`, `zero_contracts`, `htf_tp_ceiling`, `tp_too_tight`, `insufficient_contracts_for_split`, `macro_event_blackout`. Sub-floor SL distances are **widened**, not rejected.
 
 ## Tech stack
 
