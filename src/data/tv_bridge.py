@@ -164,11 +164,11 @@ class TVBridge:
 
     async def set_symbol(self, symbol: str) -> dict[str, Any]:
         """Change chart symbol."""
-        return await self._run("chart", "symbol", symbol)
+        return await self._run("symbol", symbol)
 
     async def set_timeframe(self, tf: str) -> dict[str, Any]:
         """Change chart timeframe."""
-        return await self._run("chart", "timeframe", tf)
+        return await self._run("timeframe", tf)
 
     # ── Convenience: fetch all Pine data in parallel ─────────────────────
 
