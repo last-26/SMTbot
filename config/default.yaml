@@ -26,9 +26,9 @@ trading:
     ETH-USDT-SWAP: 30
   # Multi-pair settle budgets — wait after set_symbol / set_timeframe so
   # the heavy SMT Overlay Pine has time to recompute before we read.
-  symbol_settle_seconds: 4.0
-  tf_settle_seconds: 2.5
-  pine_settle_max_wait_s: 6.0
+  symbol_settle_seconds: 6.0
+  tf_settle_seconds: 3.5
+  pine_settle_max_wait_s: 10.0
   pine_settle_poll_interval_s: 0.3
 
 circuit_breakers:
