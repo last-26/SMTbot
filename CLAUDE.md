@@ -225,6 +225,32 @@ Sprint 3 first-restart burned 5 LOSS / 1 WIN / 2 open in 4h → `max_consecutive
 
 **Ordering rule:** item 7 can go in mid-sprint if needed (it's purely additive metadata). Items 1-6 must wait until Sprint 3 and the A4 VWAP-veto window have each produced a read on baseline WR — adding them simultaneously destroys attribution.
 
+## Post-Sprint 3 roadmap — BLOK E: scalp-native exit architecture
+
+**Premise:** on 3m entry TF, TP1 hits reasonably and gives a clean profit-lock moment (followed by SL→BE on the remainder). TP2 is aspirational — sustained moves that satisfy a fixed 2-3R TP2 are rare, so the runner mostly exits at BE. Result: bi-modal `pnl_r` distribution (`~+0.75R` TP1+BE winners, `~-1R` losers, rare `~+2.25R` TP2 winners). Runner is effectively dead weight 80%+ of the time, and RL sees a reward surface with an unreachable tail.
+
+**Diagnosis:** the runner's job on a scalp should not be "hit a fixed TP2". It should be "ride the occasional real move if it shows up, otherwise exit cleanly near TP1". Fix is to keep TP1 unchanged (the psychological/math lock works) and replace the static TP2 order with a dynamic runner exit.
+
+**Scope (evaluate only after Sprint 3 + A4 VWAP veto windows have each produced a 50-trade read; do NOT bundle with BLOK D items — this is its own attribution window):**
+
+1. **Remove fixed TP2 order; runner exits dynamically.** Optional soft safety cap (e.g. 5R) as catastrophic-move ceiling only. TP1 order unchanged.
+2. **R-step trail on post-TP1 runner only** — pre-TP1 SL stays at original price (risk is already priced there). After TP1 fill:
+   - trigger at `+1R` past TP1 → SL moves to `+0.5R` past TP1 (on top of `sl_be_offset_pct` fee buffer)
+   - `+2R` → `+1R`, `+3R` → `+2R`
+   - Each step = algo cancel + re-place (same pattern as current SL→BE). Journal each step.
+3. **Time-based runner exit** — if no new HH (long) / LL (short) within N bars (~15-20 bars = 45-60 min on 3m) after TP1 fill, market-close runner at current trail level. Matches scalp horizon — runner that isn't progressing is decaying.
+4. **Structure-based runner exit (extend existing `ltf_reversal_defensive_close`)** — after TP1 hit, loosen `ltf_reversal_min_bars_in_position` for runners (TP1 already locked profit, can be bolder on exits). Runner closes on LTF trend flip against position.
+5. **HTF zone soft-trail alignment** — when runner approaches HTF S/R minus buffer, tighten trail aggressively or market-close. Currently `_apply_htf_tp_ceiling` bakes HTF zone into TP2 price at plan-time; with no TP2 order, HTF zone becomes a runner trail magnet instead. Design shares pattern with BLOK D-4 (heatmap TP ceiling) — consider co-designing.
+6. **`min_rr_ratio` re-basing** — current plan RR uses TP2 distance. With TP2 gone, plan RR should use TP1 (lower floor, e.g. `min_rr_ratio=1.0-1.2` measured against TP1). TP1 is the concrete order; soft runner target is not a filter input.
+
+**Expected RL impact:** `pnl_r` distribution becomes smoother (continuous runner exits between `+0.75R` and `+3R+`), easier reward surface for RL. New tunable knobs for Phase 7: trail step triggers/offsets, time-exit bar count, post-TP1 LTF-reversal gate loosening.
+
+**Fee math check:** trail modifies are algo cancel+replace (maker-side on the new algo), typically cheaper net than letting TP2 go unhit and closing at BE on taker via SL→BE trigger. Worth validating on demo before live.
+
+**Risk — choppy-tape whipsaw.** Trail converts "big winner" into "small winner" on range days. Variance goes up. Mandatory demo window before any live flip. Deployment gate: 50 trades post-cutoff, net `pnl_r` not materially worse than pre-BLOK-E baseline (preferably better).
+
+**Ordering within post-sprint queue:** Sprint 3 baseline → A4 VWAP veto window → BLOK D-7 (additive, can overlap) → BLOK E (this) → BLOK D-1..D-6 (liquidity-aware execution) → Phase 7 RL. BLOK E before BLOK D-4 because D-4 (heatmap TP ceiling) assumes the runner-trail pattern exists.
+
 ## Phase 7 — Reinforcement learning (Next)
 
 **Architecture:** parameter tuner, NOT raw decision maker. Rule-based strategy generates signals; RL tunes:
