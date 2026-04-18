@@ -191,9 +191,13 @@ Gotchas and rationales not self-evident from the code. Inline comments cover the
 
 Sprint 3 first-restart burned 5 LOSS / 1 WIN / 2 open in 4h → `max_consecutive_losses=5` halt tripped at 06:56Z, bot froze for ~20h. During the halt 135 PLANNED signals were blocked. Root-cause: with only 6 closed trades the breaker is too tight to collect RL training volume.
 
-**Two YAML levers loosened for data-gathering pass** (re-tighten post-RL):
+**YAML levers loosened for data-gathering pass** (RE-TIGHTEN POST-RL):
 
-1. **`circuit_breakers.max_consecutive_losses: 5 → 9999`** — effectively disabled. RL needs 50+ closed trades (wins AND losses) for walk-forward; halting on the first 5-loss streak starves the dataset. Drawdown breaker (25%) + daily-loss breaker (15%) still active as hard caps.
+1. **All three circuit breakers eased** so no halt can starve the RL dataset:
+   - `max_consecutive_losses: 5 → 9999` (effectively disabled)
+   - `max_daily_loss_pct: 15.0 → 40.0`
+   - `max_drawdown_pct: 25.0 → 40.0`
+   On $5k demo with $50 R, 40% ≈ $2k equity loss before halt — covers a rough stretch without freezing the bot. POST-RL restore to 5 / 15 / 25 respectively.
 2. **`trading.min_rr_ratio: 2.0 → 1.5`** — `htf_tp_ceiling` was the dominant NO_TRADE reason (370 rejects, 47% on DOGE alone). Mechanism: post-plan TP pulled back to `htf_zone - 0.2×ATR`, if resulting RR < 2.0 → reject. DOGE/SOL/XRP clipped-TP RRs often land 1.6-1.9 on 15m HTF, which is already not a "major" TF — VWAP (1m/3m/15m) and session filters provide direction discipline. Lowering floor lets legitimate clipped setups through.
 
 **Attribution caveat:** These changes alter Sprint 3's post-cutoff stats. If a clean 50-trade baseline is desired for RL, treat 2026-04-18T13Z as the *real* cutoff rather than 23:50Z. Candidate `rl.clean_since` bump is noted but not applied — if reporter output stays noisy, bump it.

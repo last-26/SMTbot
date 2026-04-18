@@ -68,14 +68,16 @@ trading:
   pine_post_settle_grace_s: 1.0
 
 circuit_breakers:
-  # Scaled up for 5% per-trade risk so a single loss doesn't trip halts.
-  max_daily_loss_pct: 15.0       # ≈ 3 losing trades in a day → halt
-  # TEMPORARY 2026-04-18: disabled pre-RL to let the bot accumulate 50+ closed
-  # trades (WINs and LOSSes both) without tripping a 24h halt. Sprint 3 baseline
-  # hit halt at trade #6 (5L/1W). RL training needs volume more than protection.
-  # RE-ENABLE TO 5 post-RL (once walk-forward params are live in active.yaml).
+  # TEMPORARY 2026-04-18: all three breakers loosened pre-RL so the bot can
+  # accumulate 50+ closed trades without tripping a halt. Sprint 3 baseline
+  # hit consecutive-losses halt at trade #6 (5L/1W). RL training needs volume
+  # (WINs AND LOSSes) more than protection at this stage. RE-TIGHTEN post-RL:
+  #   max_daily_loss_pct: 40.0 → 15.0
+  #   max_consecutive_losses: 9999 → 5
+  #   max_drawdown_pct: 40.0 → 25.0
+  max_daily_loss_pct: 40.0
   max_consecutive_losses: 9999
-  max_drawdown_pct: 25.0         # 5R drawdown from peak → permanent halt
+  max_drawdown_pct: 40.0
   cooldown_hours: 24
 
 analysis:
