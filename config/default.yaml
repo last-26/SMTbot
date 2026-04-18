@@ -27,7 +27,13 @@ trading:
   # Weighted max reward when both TPs hit = 0.5×partial_tp_rr + 0.5×default_rr_ratio.
   # 4.5 ⇒ weighted 3.0R (true 1:3). Drop to 3.0 for weighted 2.25R (legacy).
   default_rr_ratio: 4.5
-  min_rr_ratio: 2.0
+  # 2026-04-18: lowered 2.0 → 1.5 to ease `htf_tp_ceiling` rejections on 15m
+  # HTF. With buffer=0.2×ATR the clipped-TP RR often lands 1.6-1.9 on
+  # DOGE/SOL/XRP — legitimate setups that still clear 2× round-trip fees +
+  # slippage. 15m HTF is not a "major" TF; VWAP (1m/3m/15m) already filters
+  # direction. Consider raising back to 2.0 if TP1 hit rate < 40% on clipped
+  # plans post-Sprint-3.
+  min_rr_ratio: 1.5
   max_concurrent_positions: 4
   contract_size: 0.01
   # Operator-side per-symbol leverage caps (on top of OKX instrument caps).
@@ -64,7 +70,11 @@ trading:
 circuit_breakers:
   # Scaled up for 5% per-trade risk so a single loss doesn't trip halts.
   max_daily_loss_pct: 15.0       # ≈ 3 losing trades in a day → halt
-  max_consecutive_losses: 5
+  # TEMPORARY 2026-04-18: disabled pre-RL to let the bot accumulate 50+ closed
+  # trades (WINs and LOSSes both) without tripping a 24h halt. Sprint 3 baseline
+  # hit halt at trade #6 (5L/1W). RL training needs volume more than protection.
+  # RE-ENABLE TO 5 post-RL (once walk-forward params are live in active.yaml).
+  max_consecutive_losses: 9999
   max_drawdown_pct: 25.0         # 5R drawdown from peak → permanent halt
   cooldown_hours: 24
 
