@@ -87,6 +87,8 @@ CREATE TABLE IF NOT EXISTS trades (
     nearest_liq_cluster_below_price     REAL,
     nearest_liq_cluster_above_notional  REAL,
     nearest_liq_cluster_below_notional  REAL,
+    nearest_liq_cluster_above_distance_atr REAL,
+    nearest_liq_cluster_below_distance_atr REAL,
 
     notes               TEXT,
     screenshot_entry    TEXT,
@@ -115,6 +117,7 @@ _COLUMNS = [
     "oi_change_24h_at_entry", "liq_imbalance_1h_at_entry",
     "nearest_liq_cluster_above_price", "nearest_liq_cluster_below_price",
     "nearest_liq_cluster_above_notional", "nearest_liq_cluster_below_notional",
+    "nearest_liq_cluster_above_distance_atr", "nearest_liq_cluster_below_distance_atr",
     "notes", "screenshot_entry", "screenshot_exit",
 ]
 
@@ -135,6 +138,9 @@ _MIGRATIONS = [
     "ALTER TABLE trades ADD COLUMN nearest_liq_cluster_below_price REAL",
     "ALTER TABLE trades ADD COLUMN nearest_liq_cluster_above_notional REAL",
     "ALTER TABLE trades ADD COLUMN nearest_liq_cluster_below_notional REAL",
+    # BLOK D-7 — cluster distance in ATR units, pre-computed at entry.
+    "ALTER TABLE trades ADD COLUMN nearest_liq_cluster_above_distance_atr REAL",
+    "ALTER TABLE trades ADD COLUMN nearest_liq_cluster_below_distance_atr REAL",
 ]
 
 
@@ -162,6 +168,7 @@ def _record_to_row(rec: TradeRecord) -> tuple:
         rec.oi_change_24h_at_entry, rec.liq_imbalance_1h_at_entry,
         rec.nearest_liq_cluster_above_price, rec.nearest_liq_cluster_below_price,
         rec.nearest_liq_cluster_above_notional, rec.nearest_liq_cluster_below_notional,
+        rec.nearest_liq_cluster_above_distance_atr, rec.nearest_liq_cluster_below_distance_atr,
         rec.notes, rec.screenshot_entry, rec.screenshot_exit,
     )
 
@@ -212,6 +219,8 @@ def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
         nearest_liq_cluster_below_price=_safe_col(row, "nearest_liq_cluster_below_price"),
         nearest_liq_cluster_above_notional=_safe_col(row, "nearest_liq_cluster_above_notional"),
         nearest_liq_cluster_below_notional=_safe_col(row, "nearest_liq_cluster_below_notional"),
+        nearest_liq_cluster_above_distance_atr=_safe_col(row, "nearest_liq_cluster_above_distance_atr"),
+        nearest_liq_cluster_below_distance_atr=_safe_col(row, "nearest_liq_cluster_below_distance_atr"),
         notes=row["notes"],
         screenshot_entry=row["screenshot_entry"],
         screenshot_exit=row["screenshot_exit"],
@@ -312,6 +321,8 @@ class TradeJournal:
         nearest_liq_cluster_below_price: Optional[float] = None,
         nearest_liq_cluster_above_notional: Optional[float] = None,
         nearest_liq_cluster_below_notional: Optional[float] = None,
+        nearest_liq_cluster_above_distance_atr: Optional[float] = None,
+        nearest_liq_cluster_below_distance_atr: Optional[float] = None,
     ) -> TradeRecord:
         """Insert an OPEN row describing a freshly-placed trade.
 
@@ -359,6 +370,8 @@ class TradeJournal:
             nearest_liq_cluster_below_price=nearest_liq_cluster_below_price,
             nearest_liq_cluster_above_notional=nearest_liq_cluster_above_notional,
             nearest_liq_cluster_below_notional=nearest_liq_cluster_below_notional,
+            nearest_liq_cluster_above_distance_atr=nearest_liq_cluster_above_distance_atr,
+            nearest_liq_cluster_below_distance_atr=nearest_liq_cluster_below_distance_atr,
         )
         placeholders = ", ".join("?" * len(_COLUMNS))
         cols = ", ".join(_COLUMNS)

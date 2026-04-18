@@ -194,6 +194,22 @@ Gotchas and rationales not self-evident from the code. Inline comments cover the
 
 **Gate for RL:** ≥50 closed trades post-cutoff AND net `pnl_r ≥ 0` before invoking `train_rl.py`. Until then, iterate YAML manually using reporter output. If baseline stays negative after 50, the next lever is the opt-in A4 VWAP hard veto (flip `analysis.vwap_hard_veto_enabled: true`) — BLOK B5 volatility-adaptive widening and BLOK C shadow timeframes come after that only if the veto alone doesn't fix WR.
 
+## Post-Sprint 3 roadmap — BLOK D: liquidity-aware execution (Coinalyze deepening)
+
+**Premise:** we pull 6 Coinalyze endpoints but funnel them into a single confluence slot (`derivatives_heatmap_target` @ 0.5 weight) + regime classification. Heatmap is not consulted for TP/SL placement and lookback windows are mismatched to our 3m scalp horizon (historical liq 48h, LS z-score 14d, funding z-score 30d). Short TFs need short liquidity context.
+
+**Scope (evaluate after Sprint 3 baseline + A4 VWAP veto have each been given their 50-trade window):**
+
+1. **Shorten liquidity-heatmap lookback** — `historical_lookback_ms` default 48h → expose per-TF knob, probably 12h for 3m entries. Old liq events far from current price are noise; clusters from 2 days ago rarely magnet intraday.
+2. **Add short-window funding/LS z-scores alongside long ones** — keep 30d/14d for regime stability, add 6h/24h rolling z for "is *right now* crowded?" signal. Current `crowded_skip` using only 30d z misses short squeezes that build in hours.
+3. **Liq-sweep reversal entry (user's primary ask)** — detect cascade in rolling window (Binance WS aggregated + Coinalyze `/liquidation-history` 1h as cross-check): if total liq notional in last 60-120s > threshold × symbol baseline AND price wicked ≥ 0.5× ATR through a heatmap cluster then reverted, emit a `liq_sweep_reversal` confluence factor (or standalone high-priority entry trigger) for the counter side. Caveat: Binance WS is "largest-per-1s-per-symbol" rate-limited — single events undercount cascades, so Coinalyze aggregated is mandatory for magnitude.
+4. **Heatmap → TP ceiling (HTF-zone analog)** — `rr_system` should treat `nearest_big_liq_cluster ± buffer_atr` as a candidate ceiling alongside HTF S/R. Effective ceiling = min(HTF_zone, heatmap_cluster). Also the upside mirror: if proposed TP is *before* a big cluster and RR allows, extend to cluster (magnet target). Add `heatmap_tp_ceiling_enabled` YAML flag; start with large clusters only (notional ≥ X% of largest symbol-wide) to limit noise.
+5. **Liq-cluster-proximity veto** — currently `derivatives_heatmap_target` rewards a cluster *in path*, which is ambiguous: cluster can be magnet OR wall. When distance < 0.5×ATR AND notional is massive, flip the sign — veto the entry instead of boosting confluence (`reject_reason=liq_cluster_too_close`). Borderline cases stay in confluence.
+6. **Heatmap factor weight scaling** — today binary (0.5 fires/not). Scale by cluster notional (log-proportional to largest) so 500M cluster ≠ 50M cluster. Better RL feature signal.
+7. **Journal feature columns (zero-risk, can do during Sprint 3 without polluting baseline if additive only)** — add `nearest_liq_cluster_above_notional`, `nearest_liq_cluster_below_notional`, `nearest_liq_cluster_distance_atr`, `liq_1h_imbalance_at_entry`, `funding_z_6h`, `funding_z_24h` to trade records. Doesn't change decisions, just enables post-hoc analysis: "do trades with close big clusters win more?" RL can then learn from these features.
+
+**Ordering rule:** item 7 can go in mid-sprint if needed (it's purely additive metadata). Items 1-6 must wait until Sprint 3 and the A4 VWAP-veto window have each produced a read on baseline WR — adding them simultaneously destroys attribution.
+
 ## Phase 7 — Reinforcement learning (Next)
 
 **Architecture:** parameter tuner, NOT raw decision maker. Rule-based strategy generates signals; RL tunes:

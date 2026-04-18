@@ -155,6 +155,26 @@ async def test_regime_breakdown_aggregates_per_regime(monkeypatch):
     assert "LONG_CROWDED" in s["regime_breakdown"]
 
 
+@pytest.mark.asyncio
+async def test_record_open_persists_cluster_distance_atr():
+    """BLOK D-7 — cluster distance_atr round-trips through SQL."""
+    async with TradeJournal(":memory:") as j:
+        rec = await j.record_open(
+            _plan(), _report(),
+            symbol="BTC-USDT-SWAP",
+            signal_timestamp=datetime.now(tz=timezone.utc),
+            nearest_liq_cluster_above_price=102.5,
+            nearest_liq_cluster_above_distance_atr=1.25,
+            nearest_liq_cluster_below_price=97.0,
+            nearest_liq_cluster_below_distance_atr=1.50,
+        )
+        assert rec.nearest_liq_cluster_above_distance_atr == pytest.approx(1.25)
+        back = await j.get_trade(rec.trade_id)
+        assert back is not None
+        assert back.nearest_liq_cluster_above_distance_atr == pytest.approx(1.25)
+        assert back.nearest_liq_cluster_below_distance_atr == pytest.approx(1.50)
+
+
 def test_regime_breakdown_buckets_none_as_unknown():
     from src.journal.models import TradeRecord
 

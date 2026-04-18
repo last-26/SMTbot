@@ -146,6 +146,8 @@ def _derive_enrichment(state: MarketState) -> dict:
         "nearest_liq_cluster_below_price": None,
         "nearest_liq_cluster_above_notional": None,
         "nearest_liq_cluster_below_notional": None,
+        "nearest_liq_cluster_above_distance_atr": None,
+        "nearest_liq_cluster_below_distance_atr": None,
     }
     deriv = getattr(state, "derivatives", None)
     if deriv is not None:
@@ -158,12 +160,18 @@ def _derive_enrichment(state: MarketState) -> dict:
     if hm is not None:
         na = getattr(hm, "nearest_above", None)
         nb = getattr(hm, "nearest_below", None)
+        price = float(getattr(state, "current_price", 0.0) or 0.0)
+        atr = float(getattr(state, "atr", 0.0) or 0.0)
         if na is not None:
             out["nearest_liq_cluster_above_price"] = getattr(na, "price", None)
             out["nearest_liq_cluster_above_notional"] = getattr(na, "notional_usd", None)
+            if atr > 0 and price > 0 and getattr(na, "price", None):
+                out["nearest_liq_cluster_above_distance_atr"] = (na.price - price) / atr
         if nb is not None:
             out["nearest_liq_cluster_below_price"] = getattr(nb, "price", None)
             out["nearest_liq_cluster_below_notional"] = getattr(nb, "notional_usd", None)
+            if atr > 0 and price > 0 and getattr(nb, "price", None):
+                out["nearest_liq_cluster_below_distance_atr"] = (price - nb.price) / atr
     return out
 
 

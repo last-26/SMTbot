@@ -115,6 +115,11 @@ class TradeRecord(BaseModel):
     nearest_liq_cluster_below_price: Optional[float] = None
     nearest_liq_cluster_above_notional: Optional[float] = None
     nearest_liq_cluster_below_notional: Optional[float] = None
+    # BLOK D-7 — pre-computed ATR distance to the nearest cluster on each
+    # side. Avoids post-hoc join against price+ATR (which may not be in the
+    # row for older migrations). None when heatmap or ATR is missing.
+    nearest_liq_cluster_above_distance_atr: Optional[float] = None
+    nearest_liq_cluster_below_distance_atr: Optional[float] = None
 
     # Notes / screenshots (manual or future automation)
     notes: Optional[str] = None
