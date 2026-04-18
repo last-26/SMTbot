@@ -1,7 +1,15 @@
 # Environment & secrets
 .env
-.env.local
-.env.production
+.env.*
+!.env.example
+
+# Secret/key file formats
+*.pem
+*.key
+*.pfx
+credentials.json
+*.session.json
+id_rsa*
 
 # Python
 __pycache__/
@@ -29,11 +37,41 @@ data/trades.db
 data/trades.db.backup*
 data/screenshots/
 
+# SQLite helper files (crash-time artifacts)
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Backups
+*.bak
+*.backup
+*.backup_*
+
+# Data exports
+data/*.csv
+data/*.parquet
+data/exports/
+
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+
+# Test / lint cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Personal config overrides
+config/local.yaml
+config/*.local.yaml
+config/pairs/*.local.yaml
 
 # OS
 .DS_Store
