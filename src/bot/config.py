@@ -147,6 +147,12 @@ class AnalysisConfig(BaseModel):
     # = large notional = fee drag. Default 0 = off (back-compat); runtime
     # YAML sets ~0.003 so stops sit at least ~3× spread + typical wick width.
     min_sl_distance_pct: float = 0.0
+    # Phase 7.A1 — per-symbol SL floor override. Sprint 3 diagnostic: every
+    # trade landed at exactly sl_pct=0.500% because the global 0.005 floor
+    # was too restrictive for wide-ATR pairs (SOL/DOGE/XRP routinely need
+    # more breathing room) and too loose for tight-book BTC. Unlisted
+    # symbols fall back to `min_sl_distance_pct`.
+    min_sl_distance_pct_per_symbol: dict[str, float] = Field(default_factory=dict)
     # Confluence weight overrides. Empty dict = DEFAULT_WEIGHTS from
     # src/analysis/multi_timeframe.py. Only the keys you specify override;
     # the rest stay at their defaults (shallow merge). Unknown keys trigger
@@ -391,6 +397,17 @@ class BotConfig(BaseModel):
         """Per-symbol HTF S/R buffer override (Phase 6.9 B2), else global."""
         return self.analysis.htf_sr_buffer_atr_per_symbol.get(
             symbol, self.analysis.htf_sr_buffer_atr,
+        )
+
+    def min_sl_distance_pct_for(self, symbol: str) -> float:
+        """Per-symbol SL-floor override (Phase 7.A1), else global.
+
+        Wide-ATR pairs (SOL/DOGE/XRP) need larger floors than the tight-book
+        BTC/ETH baseline; a uniform floor forced every trade's sl_pct to
+        exactly 0.5% regardless of symbol volatility during Sprint 3.
+        """
+        return self.analysis.min_sl_distance_pct_per_symbol.get(
+            symbol, self.analysis.min_sl_distance_pct,
         )
 
     def rl_clean_since(self) -> Optional[datetime]:

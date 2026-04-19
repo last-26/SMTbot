@@ -126,15 +126,39 @@ analysis:
   # BTC/ETH. Live session 04:17–11:25Z rejected 264 BTC/ETH signals at 0.003
   # (tight OB/FVG) — widening instead of rejecting restores flow.
   min_sl_distance_pct: 0.005
+  # Phase 7.A1 — per-symbol SL floor override. Sprint 3 diagnostic: every
+  # trade landed at exactly sl_pct=0.500% because the global 0.005 floor
+  # was pegged by nearly every Pine OB/FVG width. Wide-ATR pairs (SOL/DOGE/
+  # XRP) routinely need more breathing room than BTC/ETH. Values below sit
+  # ~1–1.5× typical 3m ATR-as-% per symbol. Unlisted → global.
+  min_sl_distance_pct_per_symbol:
+    BTC-USDT-SWAP: 0.004
+    ETH-USDT-SWAP: 0.006
+    SOL-USDT-SWAP: 0.010
+    DOGE-USDT-SWAP: 0.008
+    XRP-USDT-SWAP: 0.008
   # Confluence weight overrides — empty = DEFAULT_WEIGHTS from
   # src/analysis/multi_timeframe.py (Moderate rebalance baseline below is
   # already baked into code). Only keys set here override; others stay at
   # their defaults. Unknown keys trigger a warning at load time.
-  # htf_trend_alignment hafifçe düşürüldü (0.75 → 0.70): HTF trend bias'ı
-  # LTF momentum'un ezici çoğunluğunu biraz daha rahat flip etmesine izin
-  # verir; 3m entry TF'te HTF (15m) bazen geç kalır.
+  # Phase 7.A2 — ghost factors demoted to 0.0 until re-architected:
+  #   at_order_block: OB on 3m entry TF is noise (mitigation flips too fast);
+  #     plan is to re-add as HTF-only (15m/1h) in Phase 7.C. See CLAUDE.md
+  #     "Strategy Pivot 2026-04-19 — Layer 1 (5-pillar)".
+  #   oscillator_signal: regular BUY/SELL from Cipher-B overlapped with
+  #     momentum factors and triggered at MA crosses; keeping only the
+  #     GOLD_BUY / *_DIV high-conviction variant (still weighted).
+  #   liquidity_pool_target: Pine pool detection emits too many "hairline"
+  #     pools; to be replaced by ATR-scaled S/R cluster target in 7.A.
+  #
+  # htf_trend_alignment kept around but its confluence credit will be
+  # zeroed in Phase 7.A3 (direction-picker only); leaving the weight here
+  # acts as a fallback until A3 ships in the same sprint.
   confluence_weights:
     htf_trend_alignment: 0.70
+    at_order_block: 0.0
+    oscillator_signal: 0.0
+    liquidity_pool_target: 0.0
   # Example override block (uncomment + edit to hand-tune before Phase 7 RL):
   # confluence_weights:
   #   htf_trend_alignment: 0.75

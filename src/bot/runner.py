@@ -944,7 +944,7 @@ class BotRunner:
                 crowded_skip_z_threshold=cfg.derivatives.crowded_skip_z_threshold,
                 ltf_state=self.ctx.ltf_cache.get(symbol),
                 min_tp_distance_pct=cfg.analysis.min_tp_distance_pct,
-                min_sl_distance_pct=cfg.analysis.min_sl_distance_pct,
+                min_sl_distance_pct=cfg.min_sl_distance_pct_for(symbol),
                 fee_reserve_pct=cfg.trading.fee_reserve_pct,
                 partial_tp_enabled=cfg.execution.partial_tp_enabled,
                 partial_tp_ratio=cfg.execution.partial_tp_ratio,
