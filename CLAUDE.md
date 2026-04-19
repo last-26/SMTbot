@@ -85,7 +85,7 @@ Legacy single-purpose scripts under `pine/legacy/` (not loaded).
 
 - **Overlay Pine split (~1200 lines → 2 parts)** — symbol-switch settle (~3-5s) is dominant multi-pair cycle cost. Split into `_structure.pine` + `_levels.pine` could parallelize TV recompute. Low priority — tackle if freshness-poll latency becomes problematic.
 - **HTF Order Block re-add (post-pivot)** — Pivot 2026-04-19 removed `at_order_block` because Pine 3m OBs showed 0% WR in Sprint 3 (vs 35.7% pre-sprint — regime-fragile). Re-introduce as 15m-sourced `at_order_block_htf` once zone-planner is stable; gate on factor-audit evidence that HTF OBs outperform current zone sources.
-- **Pine overlay refactor (post-pivot, after Phase D)** — once 5-pillar factor stack is final, strip overlay to Pillar visuals only (drop OB rendering, unused tooltip fields, redundant session labels). Oscillator stays largely intact.
+- **Pine overlay full rendering strip (post-Phase-8 data)** — Phase 7.D4 removed the unread `confluenceScore` block and the `active_ob` table row (factor weighted 0). Full OB/FVG box-rendering removal is deferred until the factor-audit (Phase 8) shows Python-side OB/FVG fallbacks handle SL selection without widening drawdowns. Oscillator stays largely intact.
 
 ## Architecture (code layout)
 
@@ -357,8 +357,8 @@ Short-TF trap filter: long signals blocked when 21-EMA < 55-EMA and spread widen
 - D1: `displacement_candle` + `premium_discount_zone` factors.
 - D2: Divergence factor formalization (hidden + regular, bar-ago decay).
 - D3: ADX-based `trend_regime` classifier + conditional factor scoring.
-- D4: Pine overlay trim (drop OB rendering + unused tooltip rows once Pillar stack is final).
-- D5: Runner trail / post-TP1 exit re-evaluation (former BLOK E). Zone-based entries may hit TP2 more often; revisit necessity with data.
+- D4: Pine overlay trim — drop dead `confluenceScore` block + `active_ob` row (Python recomputes confluence; `at_order_block` factor weighted 0). OB/FVG box rendering preserved for SL fallback; full strip gated on Phase 8 factor audit.
+- D5: Runner trail / post-TP1 exit re-evaluation (former BLOK E). **Deferred** — zone-based entries may hit TP2 more often; revisit only after 50+ post-pivot closed trades so variance direction is data-driven, not speculative.
 
 **Phase 8 — Analytics & optional RL (after 50+ clean post-pivot trades)**
 - E1: `scripts/analyze.py` — GBT (xgboost) feature importance + partial dependence plots on clean trades.

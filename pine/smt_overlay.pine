@@ -993,42 +993,21 @@ wtBiasStr  = wtA2 >= obLevelA ? "OVERBOUGHT" : wtA2 <= osLevelA ? "OVERSOLD" : "
 wtCrossStr = wtCrossA ? (wtCrossUp ? "UP" : "DOWN") : "—"
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SECTION 8 — CONFLUENCE SCORE (0–7, enhanced with VMC)
+// SECTION 8 — (deferred) Pine confluence score
 // ═══════════════════════════════════════════════════════════════════════════════
-int confluenceScore = 0
-// 1. HTF trend aligned with LTF
-if (htfTrend == "BULLISH" and trend == 1) or (htfTrend == "BEARISH" and trend == -1)
-    confluenceScore += 1
-// 2. Price near an OB or FVG in trend direction
-priceNearBullOB  = nearestBullOBdist  < atrVal * 2 and trend == 1
-priceNearBearOB  = nearestBearOBdist  < atrVal * 2 and trend == -1
-priceNearBullFVG = nearestBullFVGdist < atrVal * 2 and trend == 1
-priceNearBearFVG = nearestBearFVGdist < atrVal * 2 and trend == -1
-if priceNearBullOB or priceNearBearOB or priceNearBullFVG or priceNearBearFVG
-    confluenceScore += 1
-// 3. Recent MSS in signal direction
-if not na(lastMSSDir) and bar_index - lastMSSBar < 50
-    if (lastMSSDir == "BULLISH" and trend == 1) or (lastMSSDir == "BEARISH" and trend == -1)
-        confluenceScore += 1
-// 4. Last sweep aligned with trend
-if (str.startswith(lastSweepInfo, "BULL") and trend == 1) or (str.startswith(lastSweepInfo, "BEAR") and trend == -1)
-    confluenceScore += 1
-// 5. Active session (London or NY)
-if isLondon or isNY
-    confluenceScore += 1
-// 6. EMA ribbon bias aligned with trend (VMC A)
-if (ribbonDir and trend == 1) or (not ribbonDir and trend == -1)
-    confluenceScore += 1
-// 7. VMC high-probability signal fired in last 3 bars
-//    Initialize to -999 so the first 3 bars don't trigger a false positive
+// Removed 2026-04-19 (Phase 7.D4). Python recomputes confluence independently
+// via `src/analysis/multi_timeframe.py` with the 5-pillar weight stack; Pine's
+// `confluenceScore` was never read downstream. Deleting saves ~35 lines of Pine
+// and one table row (see Section 9).
+
+// VMC high-probability signal trackers are still used for alertcondition()s
+// at the bottom of the file, so keep them but decoupled from the scoring block.
 var int lastYellowCrossBar  = -999
 var int lastBloodDiamondBar = -999
 if yellowCross
     lastYellowCrossBar := bar_index
 if bloodDiamond
     lastBloodDiamondBar := bar_index
-if (bar_index - lastYellowCrossBar <= 3 and trend == 1) or (bar_index - lastBloodDiamondBar <= 3 and trend == -1)
-    confluenceScore += 1
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SECTION 9 — MASTER SIGNAL TABLE
@@ -1043,7 +1022,6 @@ if enableTable and barstate.islast
 
     trendCol = trend == 1 ? bullCol : trend == -1 ? bearCol : neutCol
     htfCol   = htfTrend == "BULLISH" ? bullCol : htfTrend == "BEARISH" ? bearCol : neutCol
-    confCol  = confluenceScore >= 5 ? bullCol : confluenceScore >= 3 ? color.yellow : bearCol
     ribbonCol = ribbonDir ? bullCol : bearCol
 
     int row = 0
@@ -1076,10 +1054,9 @@ if enableTable and barstate.islast
     table.cell(sigTable, 1, row, fvgStr, text_color=color.white, text_size=size.small)
     row += 1
 
-    table.cell(sigTable, 0, row, "active_ob", text_color=neutCol, text_size=size.small)
-    obStr = nearestBullOBstr != "" ? nearestBullOBstr : nearestBearOBstr != "" ? nearestBearOBstr : "—"
-    table.cell(sigTable, 1, row, obStr, text_color=color.white, text_size=size.small)
-    row += 1
+    // Phase 7.D4 — `active_ob` row dropped; `at_order_block` factor is weighted 0
+    // (see analysis.factor_weight_overrides). OB boxes still render for SL
+    // selection fallback in entry_signals.select_sl_price.
 
     table.cell(sigTable, 0, row, "liquidity_above", text_color=neutCol, text_size=size.small)
     table.cell(sigTable, 1, row, liqAboveStr == "" ? "—" : liqAboveStr, text_color=bearCol, text_size=size.small)
@@ -1125,9 +1102,8 @@ if enableTable and barstate.islast
     row += 1
 
     // ─── Summary ──────────────────────────────────────────────────────────────
-    table.cell(sigTable, 0, row, "confluence", text_color=neutCol, text_size=size.small)
-    table.cell(sigTable, 1, row, str.tostring(confluenceScore) + "/7", text_color=confCol, text_size=size.small)
-    row += 1
+    // Phase 7.D4 — Pine `confluence` row dropped; Python recomputes with the
+    // 5-pillar weight stack (multi_timeframe.score_direction).
 
     // Precision: "#.########" drops trailing zeros (so BTC 60000 still reads
     // "60000") while preserving decimals for low-price pairs. With "#.##",

@@ -118,27 +118,31 @@ def _parse_float_list(s: str) -> list[float]:
 def parse_signal_table(tables_data: dict[str, Any]) -> Optional[SignalTableData]:
     """Parse the SMT Signals table from tv data tables output.
 
-    Expected table format (from smt_overlay.pine):
+    Expected table format (from smt_overlay.pine, post-7.D4 trim):
     Row 0:  === SMT Signals === | BTCUSDT.P
     Row 1:  trend_htf       | BULLISH
     Row 2:  trend_ltf       | BEARISH
     Row 3:  structure       | HH_HL_bullish
     Row 4:  last_mss        | BULLISH@69450
     Row 5:  active_fvg      | BULL@68900-69100
-    Row 6:  active_ob       | BULL@68500-68700
-    Row 7:  liquidity_above | 70200,70350
-    Row 8:  liquidity_below | 68100,67950
-    Row 9:  last_sweep      | BEAR@70350
-    Row 10: session         | LONDON
-    Row 11: vmc_ribbon      | BULLISH
-    Row 12: vmc_wt_bias     | OVERSOLD (-67.42)
-    Row 13: vmc_wt_cross    | UP
-    Row 14: vmc_last_signal | YELLOW_X_BUY@69450
-    Row 15: vmc_rsi_mfi     | -2.50
-    Row 16: confluence      | 5/7
-    Row 17: atr_14          | 450.5
-    Row 18: price           | 69500.0
-    Row 19: last_bar        | 12345
+    Row 6:  liquidity_above | 70200,70350
+    Row 7:  liquidity_below | 68100,67950
+    Row 8:  last_sweep      | BEAR@70350
+    Row 9:  session         | LONDON
+    Row 10: vmc_ribbon      | BULLISH
+    Row 11: vmc_wt_bias     | OVERSOLD (-67.42)
+    Row 12: vmc_wt_cross    | UP
+    Row 13: vmc_last_signal | YELLOW_X_BUY@69450
+    Row 14: vmc_rsi_mfi     | -2.50
+    Row 15: atr_14          | 450.5
+    Row 16: price           | 69500.0
+    Row 17: vwap_1m         | 69480.5 (above)
+    Row 18: vwap_3m         | 69450.0 (above)
+    Row 19: vwap_15m        | 69400.0 (above)
+    Row 20: last_bar        | 12345
+
+    Phase 7.D4 dropped `active_ob` and `confluence` rows. `_none_if_dash`
+    defaults keep this parser backward-compatible with older Pine versions.
     """
     if not tables_data.get("success") or not tables_data.get("studies"):
         return None
