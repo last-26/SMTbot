@@ -23,6 +23,7 @@ from typing import Literal, Optional
 
 from src.analysis.liquidity_heatmap import LiquidityHeatmap
 from src.data.models import Direction, MarketState
+from src.strategy.trade_plan import TradePlan
 
 
 ZoneSource = Literal["liq_pool", "fvg_htf", "vwap_retest", "sweep_retest"]
@@ -219,3 +220,70 @@ def build_zone_setup(
             zone_source=source,
         )
     return None
+
+
+def zone_limit_price(direction: Direction, zone: tuple[float, float]) -> float:
+    """Limit-entry price for `direction` inside `zone`.
+
+    Long: near edge (low) — buy-limit must rest below market.
+    Short: near edge (high) — sell-limit must rest above market.
+    """
+    low, high = zone
+    return low if _is_long(direction) else high
+
+
+def apply_zone_to_plan(
+    plan: TradePlan, zone: "ZoneSetup", contract_size: float,
+) -> TradePlan:
+    """Return a new TradePlan with entry/SL/TP taken from *zone*, re-sized
+    so total USDT risk on the structural SL equals `plan.risk_amount_usdt`.
+
+    Why re-size: the original plan was sized against the minimum-% SL floor.
+    The zone's structural SL can be wider or narrower, so leaving contracts
+    unchanged would drift risk. Leverage + risk budget are preserved; TP is
+    overridden with the zone's primary target (usually an HTF liquidity
+    cluster), which shifts realized RR — logged via `plan.rr_ratio`.
+    """
+    if plan.direction != zone.direction:
+        raise ValueError(
+            f"direction mismatch: plan={plan.direction} zone={zone.direction}"
+        )
+    new_entry = zone_limit_price(zone.direction, zone.entry_zone)
+    new_sl = zone.sl_beyond_zone
+    new_tp = zone.tp_primary
+    new_sl_distance = abs(new_entry - new_sl)
+    if new_entry <= 0 or new_sl_distance <= 0:
+        raise ValueError(
+            f"degenerate zone: entry={new_entry} sl={new_sl} dist={new_sl_distance}"
+        )
+    new_sl_pct = new_sl_distance / new_entry
+    risk = plan.risk_amount_usdt
+    denom = new_sl_pct + plan.fee_reserve_pct
+    notional = risk / denom if denom > 0 else risk / new_sl_pct
+    num_contracts = max(1, int(notional / (new_entry * contract_size)))
+    actual_notional = num_contracts * new_entry * contract_size
+    actual_risk = actual_notional * new_sl_pct
+    tp_distance = abs(new_tp - new_entry)
+    new_rr = tp_distance / new_sl_distance if new_sl_distance > 0 else 0.0
+
+    return TradePlan(
+        direction=plan.direction,
+        entry_price=new_entry,
+        sl_price=new_sl,
+        tp_price=new_tp,
+        rr_ratio=new_rr,
+        sl_distance=new_sl_distance,
+        sl_pct=new_sl_pct,
+        position_size_usdt=actual_notional,
+        leverage=plan.leverage,
+        required_leverage=plan.required_leverage,
+        num_contracts=num_contracts,
+        risk_amount_usdt=actual_risk,
+        max_risk_usdt=plan.max_risk_usdt,
+        capped=plan.capped,
+        fee_reserve_pct=plan.fee_reserve_pct,
+        sl_source=f"zone_{zone.zone_source}",
+        confluence_score=plan.confluence_score,
+        confluence_factors=list(plan.confluence_factors),
+        reason=f"{plan.reason} | zone={zone.zone_source}",
+    )

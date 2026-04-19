@@ -247,6 +247,19 @@ class ExecutionConfig(BaseModel):
     ltf_reversal_min_bars_in_position: int = 2
     ltf_reversal_signal_max_age: int = 3
 
+    # Phase 7.C4 — zone-based limit entry. When False the runner keeps the
+    # legacy market-order path (safer default while the pivot stabilises).
+    # When True the planner builds a ZoneSetup from HTF FVG / liq pool /
+    # VWAP / sweep sources, rewrites the plan's entry/SL/TP to structural
+    # levels, and places a maker-preferred limit order. Pending entries
+    # time out after `zone_max_wait_bars` (entry-TF bars) if unfilled.
+    zone_entry_enabled: bool = False
+    zone_max_wait_bars: int = 10
+    zone_buffer_atr: float = 0.25
+    zone_sl_buffer_atr: float = 0.5
+    zone_default_rr: float = 2.0
+    zone_require_setup: bool = False   # True → reject when no zone source
+
 
 class DerivativesConfig(BaseModel):
     """Phase 1.5 — derivatives data layer configuration.

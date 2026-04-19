@@ -178,6 +178,21 @@ class OrderRouter:
             inst_id or self.config.inst_id, order_id,
         )
 
+    def attach_algos(
+        self, plan: TradePlan, inst_id: Optional[str] = None,
+    ) -> list[AlgoResult]:
+        """Place OCO SL/TP algo(s) on an already-filled entry.
+
+        Phase 7.C4 — when a pending limit entry fills, the runner calls
+        this to attach the OCO protection using the original plan's SL/TP.
+        Partial-TP mode places 2 algos; single mode places 1.
+        """
+        if plan.num_contracts <= 0:
+            raise ValueError(f"plan.num_contracts={plan.num_contracts} <= 0")
+        inst = inst_id or self.config.inst_id
+        pos_side = _pos_side(plan.direction)
+        return self._place_algos(inst, plan, pos_side)
+
     # ── Internal helpers ────────────────────────────────────────────────────
 
     def _place_algos(

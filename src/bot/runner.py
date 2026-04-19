@@ -54,16 +54,29 @@ from src.execution.errors import (
     LeverageSetError,
     OrderRejected,
 )
-from src.execution.models import CloseFill
+from src.execution.models import (
+    AlgoResult,
+    CloseFill,
+    ExecutionReport,
+    OrderResult,
+    OrderStatus,
+    PositionState,
+)
 from src.execution.okx_client import OKXClient
 from src.execution.order_router import OrderRouter, RouterConfig, dry_run_report
-from src.execution.position_monitor import PositionMonitor
+from src.execution.position_monitor import PendingEvent, PositionMonitor
 from src.journal.database import TradeJournal
 from src.journal.derivatives_journal import DerivativesJournal
 from src.strategy.entry_signals import (
     build_trade_plan_with_reason,
 )
 from src.strategy.risk_manager import RiskManager, TradeResult
+from src.strategy.setup_planner import (
+    ZoneSetup,
+    apply_zone_to_plan,
+    build_zone_setup,
+)
+from src.strategy.trade_plan import TradePlan
 
 
 def _utc_now() -> datetime:
@@ -265,6 +278,22 @@ class LastCloseInfo:
 
 
 @dataclass
+class PendingSetupMeta:
+    """Phase 7.C4 — state a limit-entry pending needs at fill time.
+
+    The PositionMonitor only tracks order_id → state; the runner stashes
+    the plan (for OCO placement + journal record_open) and the MarketState
+    snapshot (for journal enrichment) here so the FILLED event path can
+    reconstruct everything without re-reading.
+    """
+    plan: TradePlan
+    zone: ZoneSetup
+    order_id: str
+    signal_state: MarketState
+    placed_at: datetime
+
+
+@dataclass
 class BotContext:
     """Everything the runner needs, wired together.
 
@@ -293,6 +322,11 @@ class BotContext:
     ltf_cache: dict[str, LTFState] = field(default_factory=dict)
     # Last close per (symbol, side) — reentry gate (Madde C)
     last_close: dict[tuple[str, str], LastCloseInfo] = field(default_factory=dict)
+    # Phase 7.C4 — pending limit-entry metadata keyed by (symbol, pos_side).
+    # Populated when `place_limit_entry` succeeds, cleared on FILLED
+    # (after OCO attach) or CANCELED (timeout/invalidation). Runner uses
+    # the stashed plan to attach OCO algos once the fill event arrives.
+    pending_setups: dict[tuple[str, str], PendingSetupMeta] = field(default_factory=dict)
     # Madde F — LTF reversal defensive close bookkeeping
     defensive_close_in_flight: set = field(default_factory=set)
     pending_close_reasons: dict[tuple[str, str], str] = field(default_factory=dict)
@@ -638,6 +672,11 @@ class BotRunner:
         # Monitor polls all tracked (inst_id, pos_side) pairs regardless of
         # which symbol the chart currently shows, so this is symbol-agnostic.
         await self._process_closes()
+
+        # Phase 7.C4 — drain pending limit-entry events next. Filled pendings
+        # transition into OPEN (OCO attach + journal); canceled pendings clear
+        # the pending_setups slot so the symbol can re-plan the next cycle.
+        await self._process_pending()
 
         # Data-collection mode: stream + cache still run in the background via
         # _start_derivatives; here we just skip the entry/exit pipeline. Close
@@ -1108,8 +1147,11 @@ class BotRunner:
                     await self._defensive_close(symbol, open_side, "ltf_reversal")
                     return
 
-        # 3. Symbol-level dedup — skip open if we still hold anything.
+        # 3. Symbol-level dedup — skip open if we still hold anything OR
+        # already have a pending limit entry waiting for fill (Phase 7.C4).
         if any(k[0] == symbol for k in self.ctx.open_trade_ids):
+            return
+        if any(k[0] == symbol for k in self.ctx.pending_setups):
             return
 
         # 4. Plan. Risk budget (R = risk_pct × balance) is derived from TOTAL
@@ -1256,7 +1298,45 @@ class BotRunner:
             logger.info("blocked symbol={} reason={}", symbol, reason)
             return
 
-        # 5. Place order (sync SDK → to_thread).
+        # 5. Place order. Phase 7.C4: zone-entry path places a limit order
+        # at a structural zone and registers a pending; fill processing
+        # runs in `_process_pending` on a later cycle. Legacy market path
+        # remains the default (fallback when zone-entry disabled or no
+        # setup is available and `zone_require_setup=False`).
+        pos_side = _direction_to_pos_side(plan.direction)
+        if cfg.execution.zone_entry_enabled:
+            placed = await self._try_place_zone_entry(
+                symbol=symbol,
+                pos_side=pos_side,
+                plan=plan,
+                state=state,
+            )
+            if placed:
+                return  # wait for fill event
+            if cfg.execution.zone_require_setup:
+                logger.info(
+                    "symbol_decision symbol={} NO_TRADE reason=no_setup_zone "
+                    "direction={}", symbol, plan.direction.value,
+                )
+                try:
+                    conf = calculate_confluence(
+                        state,
+                        ltf_candles=candles,
+                        allowed_sessions=cfg.allowed_sessions_for(symbol) or None,
+                        ltf_state=self.ctx.ltf_cache.get(symbol),
+                        weights=cfg.analysis.confluence_weights or None,
+                        min_rsi_mfi_magnitude=cfg.analysis.min_rsi_mfi_magnitude,
+                        liquidity_pool_max_atr_dist=cfg.analysis.liquidity_pool_max_atr_dist,
+                    )
+                    await self._record_reject(
+                        symbol=symbol, reject_reason="no_setup_zone",
+                        state=state, conf=conf,
+                    )
+                except Exception:
+                    logger.debug("no_setup_zone_reject_log_failed symbol={}", symbol)
+                return
+            # else: fall through to legacy market path
+
         try:
             report = await asyncio.to_thread(self.ctx.router.place, plan, symbol)
         except AlgoOrderError as exc:
@@ -1274,7 +1354,6 @@ class BotRunner:
 
         # 6. In-memory FIRST — can't meaningfully fail; keeps us honest even
         # if the journal write below errors out.
-        pos_side = _direction_to_pos_side(plan.direction)
         algo_ids = [a.algo_id for a in report.algos if a.algo_id]
         self.ctx.monitor.register_open(
             symbol, pos_side, float(plan.num_contracts), plan.entry_price,
@@ -1387,6 +1466,283 @@ class BotRunner:
             return
         for fill in fills:
             await self._handle_close(fill)
+
+    # ── Pending-entry lifecycle (Phase 7.C4) ────────────────────────────────
+
+    async def _try_place_zone_entry(
+        self,
+        *,
+        symbol: str,
+        pos_side: str,
+        plan: TradePlan,
+        state: MarketState,
+    ) -> bool:
+        """Try to place a zone-based limit entry. Return True if a pending
+        was registered, False otherwise (caller falls back to market path).
+        """
+        cfg = self.ctx.config
+        htf_state = self.ctx.htf_state_cache.get(symbol)
+        try:
+            zone = build_zone_setup(
+                direction=plan.direction,
+                state=state,
+                htf_state=htf_state,
+                heatmap=state.liquidity_heatmap,
+                zone_buffer_atr=cfg.execution.zone_buffer_atr,
+                sl_buffer_atr=cfg.execution.zone_sl_buffer_atr,
+                max_wait_bars=cfg.execution.zone_max_wait_bars,
+                default_rr=cfg.execution.zone_default_rr,
+            )
+        except Exception:
+            logger.exception("zone_setup_build_failed symbol={}", symbol)
+            return False
+        if zone is None:
+            logger.info(
+                "zone_setup_none symbol={} direction={} — no source available",
+                symbol, plan.direction.value,
+            )
+            return False
+
+        contract_size = self.ctx.contract_sizes.get(
+            symbol, cfg.trading.contract_size)
+        try:
+            zoned_plan = apply_zone_to_plan(plan, zone, contract_size)
+        except Exception:
+            logger.exception(
+                "zone_apply_failed symbol={} zone_source={}",
+                symbol, zone.zone_source,
+            )
+            return False
+
+        # Re-gate risk against the re-sized plan (R budget may have shifted
+        # slightly with the structural SL).
+        allowed, reason = self.ctx.risk_mgr.can_trade(zoned_plan)
+        if not allowed:
+            logger.info(
+                "zone_plan_risk_blocked symbol={} reason={}", symbol, reason,
+            )
+            return False
+
+        try:
+            result = await asyncio.to_thread(
+                self.ctx.router.place_limit_entry,
+                zoned_plan, zoned_plan.entry_price, symbol,
+            )
+        except (LeverageSetError, OrderRejected, InsufficientMargin, ValueError) as exc:
+            code = getattr(exc, "code", None)
+            payload = getattr(exc, "payload", None)
+            logger.error(
+                "zone_limit_rejected symbol={}: {} | code={} | payload={}",
+                symbol, exc, code, payload,
+            )
+            return False
+        except Exception:
+            logger.exception(
+                "zone_limit_unexpected_error symbol={}", symbol,
+            )
+            return False
+
+        tf_sec = _tf_seconds(cfg.trading.entry_timeframe)
+        max_wait_s = float(zone.max_wait_bars * tf_sec)
+        placed_at = _utc_now()
+        self.ctx.monitor.register_pending(
+            inst_id=symbol, pos_side=pos_side, order_id=result.order_id,
+            num_contracts=float(zoned_plan.num_contracts),
+            entry_px=zoned_plan.entry_price,
+            max_wait_s=max_wait_s, placed_at=placed_at,
+        )
+        self.ctx.pending_setups[(symbol, pos_side)] = PendingSetupMeta(
+            plan=zoned_plan,
+            zone=zone,
+            order_id=result.order_id,
+            signal_state=state,
+            placed_at=placed_at,
+        )
+        logger.info(
+            "zone_limit_placed symbol={} side={} order_id={} entry={:.4f} "
+            "sl={:.4f} tp={:.4f} zone_source={} max_wait_bars={}",
+            symbol, pos_side, result.order_id, zoned_plan.entry_price,
+            zoned_plan.sl_price, zoned_plan.tp_price, zone.zone_source,
+            zone.max_wait_bars,
+        )
+        return True
+
+    async def _process_pending(self) -> None:
+        """Drain pending-limit events from the monitor.
+
+        FILLED (reason="fill") or FILLED (reason="timeout_partial_fill")
+        → attach OCO protection, register open position, journal the row.
+        CANCELED (reason="external" / "timeout") → clear the pending slot.
+        """
+        try:
+            events = await asyncio.to_thread(self.ctx.monitor.poll_pending)
+        except Exception:
+            logger.exception("pending_poll_failed")
+            return
+        for ev in events:
+            try:
+                if ev.event_type == "FILLED":
+                    await self._handle_pending_filled(ev)
+                elif ev.event_type == "CANCELED":
+                    await self._handle_pending_canceled(ev)
+            except Exception:
+                logger.exception(
+                    "pending_event_failed inst={} side={} type={} reason={}",
+                    ev.inst_id, ev.pos_side, ev.event_type, ev.reason,
+                )
+
+    async def _handle_pending_filled(self, ev: PendingEvent) -> None:
+        """Promote a filled pending entry to an open, protected position.
+
+        Steps:
+          1. Pop the stashed PendingSetupMeta (plan + zone + signal_state).
+          2. Attach OCO algos via OrderRouter.attach_algos. Failure here
+             leaves the position UNPROTECTED — log CRITICAL, leave the
+             `open_trade_ids` empty so the reconciler surfaces it.
+          3. register_open on the monitor so the close-poll path takes over.
+          4. journal.record_open for persistence + risk accounting.
+        """
+        key = (ev.inst_id, ev.pos_side)
+        meta = self.ctx.pending_setups.pop(key, None)
+        if meta is None:
+            logger.warning(
+                "pending_filled_no_meta inst={} side={} order_id={}",
+                ev.inst_id, ev.pos_side, ev.order_id,
+            )
+            return
+        plan = meta.plan
+        # Partial-fill on timeout: honour the actual filled size so the OCO
+        # doesn't over-commit and sCode 51020 on close.
+        if ev.reason == "timeout_partial_fill" and ev.filled_size > 0:
+            filled_int = max(1, int(ev.filled_size))
+            if filled_int < plan.num_contracts:
+                logger.warning(
+                    "pending_partial_fill inst={} side={} planned={} filled={}",
+                    ev.inst_id, ev.pos_side, plan.num_contracts, filled_int,
+                )
+                from dataclasses import replace
+                plan = replace(plan, num_contracts=filled_int)
+
+        fill_px = ev.avg_price if ev.avg_price > 0 else plan.entry_price
+        algos: list[AlgoResult]
+        try:
+            algos = await asyncio.to_thread(
+                self.ctx.router.attach_algos, plan, ev.inst_id,
+            )
+        except Exception as exc:
+            logger.critical(
+                "pending_fill_algo_attach_failed_position_UNPROTECTED "
+                "inst={} side={} order_id={} err={!r}",
+                ev.inst_id, ev.pos_side, ev.order_id, exc,
+            )
+            return
+
+        algo_ids = [a.algo_id for a in algos if a.algo_id]
+        self.ctx.monitor.register_open(
+            ev.inst_id, ev.pos_side, float(plan.num_contracts), fill_px,
+            algo_ids=algo_ids, tp2_price=plan.tp_price,
+        )
+        self.ctx.risk_mgr.register_trade_opened()
+
+        entry_result = OrderResult(
+            order_id=ev.order_id,
+            client_order_id=ev.order_id,
+            status=OrderStatus.FILLED,
+            filled_sz=float(plan.num_contracts),
+            avg_price=fill_px,
+        )
+        report = ExecutionReport(
+            entry=entry_result,
+            algos=algos,
+            state=PositionState.OPEN,
+            leverage_set=True,
+            plan_reason=plan.reason,
+        )
+
+        state = meta.signal_state
+        cfg = self.ctx.config
+        try:
+            rec = await self.ctx.journal.record_open(
+                plan, report,
+                symbol=ev.inst_id,
+                signal_timestamp=meta.placed_at,
+                entry_timeframe=cfg.trading.entry_timeframe,
+                htf_timeframe=cfg.trading.htf_timeframe,
+                htf_bias=_bias_str(state),
+                session=_session_str(state),
+                market_structure=_structure_str(state),
+                **_derive_enrichment(state),
+            )
+            self.ctx.open_trade_ids[key] = rec.trade_id
+            self.ctx.open_trade_opened_at[key] = _utc_now()
+            logger.info(
+                "pending_filled_promoted inst={} side={} contracts={} "
+                "fill_px={:.4f} zone={} trade_id={}",
+                ev.inst_id, ev.pos_side, plan.num_contracts, fill_px,
+                meta.zone.zone_source, rec.trade_id,
+            )
+        except Exception:
+            logger.exception(
+                "pending_fill_journal_write_failed_live_position_orphaned "
+                "inst={} side={}",
+                ev.inst_id, ev.pos_side,
+            )
+
+    async def _handle_pending_canceled(self, ev: PendingEvent) -> None:
+        """Clear the pending slot when the limit was cancelled (timeout or
+        external). Log a rejected_signal row for counter-factual analysis."""
+        key = (ev.inst_id, ev.pos_side)
+        meta = self.ctx.pending_setups.pop(key, None)
+        reason_map = {
+            "timeout": "zone_timeout_cancel",
+            "external": "pending_invalidated",
+            "manual": "pending_invalidated",
+            "invalidated": "pending_invalidated",
+        }
+        reject_reason = reason_map.get(ev.reason, "pending_invalidated")
+        logger.info(
+            "pending_canceled inst={} side={} order_id={} reason={}",
+            ev.inst_id, ev.pos_side, ev.order_id, ev.reason,
+        )
+        if meta is None:
+            return
+        plan = meta.plan
+        state = meta.signal_state
+        enrichment = _derive_enrichment(state)
+        try:
+            await self.ctx.journal.record_rejected_signal(
+                symbol=ev.inst_id,
+                direction=plan.direction,
+                reject_reason=reject_reason,
+                signal_timestamp=meta.placed_at,
+                price=float(state.current_price) if state.current_price else None,
+                atr=float(state.atr) if state.atr else None,
+                confluence_score=float(plan.confluence_score or 0.0),
+                confluence_factors=list(plan.confluence_factors),
+                entry_timeframe=self.ctx.config.trading.entry_timeframe,
+                htf_timeframe=self.ctx.config.trading.htf_timeframe,
+                htf_bias=_bias_str(state),
+                session=_session_str(state),
+                market_structure=_structure_str(state),
+                regime_at_entry=enrichment["regime_at_entry"],
+                funding_z_at_entry=enrichment["funding_z_at_entry"],
+                ls_ratio_at_entry=enrichment["ls_ratio_at_entry"],
+                oi_change_24h_at_entry=enrichment["oi_change_24h_at_entry"],
+                liq_imbalance_1h_at_entry=enrichment["liq_imbalance_1h_at_entry"],
+                nearest_liq_cluster_above_price=enrichment["nearest_liq_cluster_above_price"],
+                nearest_liq_cluster_below_price=enrichment["nearest_liq_cluster_below_price"],
+                nearest_liq_cluster_above_notional=enrichment["nearest_liq_cluster_above_notional"],
+                nearest_liq_cluster_below_notional=enrichment["nearest_liq_cluster_below_notional"],
+                nearest_liq_cluster_above_distance_atr=enrichment["nearest_liq_cluster_above_distance_atr"],
+                nearest_liq_cluster_below_distance_atr=enrichment["nearest_liq_cluster_below_distance_atr"],
+                pillar_btc_bias=self._pillar_bias_label("BTC-USDT-SWAP"),
+                pillar_eth_bias=self._pillar_bias_label("ETH-USDT-SWAP"),
+            )
+        except Exception:
+            logger.debug(
+                "pending_cancel_reject_log_failed inst={} side={}",
+                ev.inst_id, ev.pos_side,
+            )
 
     async def _handle_close(self, fill: CloseFill) -> None:
         try:
