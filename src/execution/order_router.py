@@ -19,7 +19,7 @@ from typing import Optional
 from loguru import logger
 
 from src.data.models import Direction
-from src.execution.errors import AlgoOrderError, LeverageSetError
+from src.execution.errors import AlgoOrderError, LeverageSetError, OrderRejected
 from src.execution.models import (
     AlgoResult,
     ExecutionReport,
@@ -113,6 +113,69 @@ class OrderRouter:
             state=PositionState.OPEN,
             leverage_set=leverage_set,
             plan_reason=plan.reason,
+        )
+
+    # ── Limit entry (Phase 7.C2 — zone-based entry) ─────────────────────────
+
+    def place_limit_entry(
+        self,
+        plan: TradePlan,
+        entry_px: float,
+        inst_id: Optional[str] = None,
+        ord_type: str = "post_only",
+        fallback_to_limit: bool = True,
+    ) -> OrderResult:
+        """Place a limit (post-only by default) entry order at `entry_px`.
+
+        Returns a PENDING OrderResult. Does NOT place the OCO algo — that
+        happens after the limit fills, wired by the Phase 7.C3 monitor
+        state + 7.C4 runner lifecycle. Leverage is set here because the
+        account-level call must precede any order on the instrument.
+
+        On post-only rejection (OrderRejected — price would have crossed
+        the spread and taken liquidity), the router optionally retries as
+        a regular limit. Disable via `fallback_to_limit=False` if you want
+        strict maker-only behavior (e.g. during integration tests).
+        """
+        if plan.num_contracts <= 0:
+            raise ValueError(f"plan.num_contracts={plan.num_contracts} <= 0")
+        inst = inst_id or self.config.inst_id
+        pos_side = _pos_side(plan.direction)
+
+        self.client.set_leverage(
+            inst_id=inst,
+            leverage=plan.leverage,
+            mgn_mode=self.config.margin_mode,
+            pos_side=pos_side if self.config.margin_mode == "isolated" else None,
+        )
+
+        try:
+            return self.client.place_limit_order(
+                inst_id=inst, side=_entry_side(plan.direction),
+                pos_side=pos_side, size_contracts=plan.num_contracts,
+                px=entry_px, td_mode=self.config.margin_mode,
+                ord_type=ord_type,
+            )
+        except OrderRejected as exc:
+            if fallback_to_limit and ord_type == "post_only":
+                logger.warning(
+                    "post_only_rejected_falling_back_to_limit inst={} px={} err={}",
+                    inst, entry_px, exc,
+                )
+                return self.client.place_limit_order(
+                    inst_id=inst, side=_entry_side(plan.direction),
+                    pos_side=pos_side, size_contracts=plan.num_contracts,
+                    px=entry_px, td_mode=self.config.margin_mode,
+                    ord_type="limit",
+                )
+            raise
+
+    def cancel_pending_entry(
+        self, order_id: str, inst_id: Optional[str] = None,
+    ) -> dict:
+        """Cancel a resting limit entry (timeout / zone-invalidation)."""
+        return self.client.cancel_order(
+            inst_id or self.config.inst_id, order_id,
         )
 
     # ── Internal helpers ────────────────────────────────────────────────────

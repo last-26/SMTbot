@@ -222,6 +222,47 @@ class OKXClient:
             raw=resp,
         )
 
+    def place_limit_order(
+        self,
+        inst_id: str,
+        side: str,                 # "buy" / "sell"
+        pos_side: str,             # "long" / "short"
+        size_contracts: int,
+        px: float,
+        td_mode: str = "isolated",
+        ord_type: str = "post_only",  # "post_only" | "limit"
+        client_order_id: Optional[str] = None,
+    ) -> OrderResult:
+        """Place a limit (or post-only) entry. Returns OrderResult(PENDING).
+
+        Phase 7.C2 — the zone-entry orchestrator uses this in place of
+        `place_market_order`. On `ord_type="post_only"` OKX rejects the
+        order if it would take liquidity (sCode 51124 family); the router
+        wraps the fallback-to-limit decision.
+        """
+        cl_ord_id = client_order_id or f"smtbot{uuid.uuid4().hex[:20]}"
+        resp = self.trade.place_order(
+            instId=inst_id, tdMode=td_mode,
+            side=side, posSide=pos_side, ordType=ord_type,
+            sz=str(size_contracts), px=str(px),
+            clOrdId=cl_ord_id,
+        )
+        data = _check(resp, "place_limit_order")
+        return OrderResult(
+            order_id=str(data.get("ordId", "")),
+            client_order_id=str(data.get("clOrdId", cl_ord_id)),
+            status=OrderStatus.PENDING,
+            raw=resp,
+        )
+
+    def cancel_order(self, inst_id: str, order_id: str) -> dict:
+        """Cancel a resting entry order (Phase 7.C2 — pending setup timeout /
+        invalidation). OKX returns sCode 51400/1/2 when the order has
+        already filled or been cancelled — callers should treat those as
+        idempotent success rather than hard errors."""
+        resp = self.trade.cancel_order(instId=inst_id, ordId=order_id)
+        return _check(resp, "cancel_order")
+
     def place_oco_algo(
         self,
         inst_id: str,
