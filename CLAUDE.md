@@ -21,6 +21,26 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 
 ## Changelog
 
+### 2026-04-19 (late night, cont.) — Partial TP disabled
+
+- **`execution.partial_tp_enabled: true → false`** (`config/default.yaml:332`).
+- **Trigger:** post-hard-1:3-cap review of expected USDT reward per winning trade. Operator's mental model: "$55 SL risk → $165 TP reward" per position at 1% R on a $5.5k demo. With `partial_tp_enabled=true`, **full-win geometry = 2.25R** (50% @ 1.5R + 50% @ 3R = 0.75R + 1.5R). Plus int-contract rounding already shrinks actual_risk below nominal $55, so effective full-win USDT reward landed around **$97-$110**, not **$165**. Operator quote: *"tp1 tp2 olarak böldüğümüz kısımı da kaldıralım. bu sayede... beklediğim o 3R lık karı elde etmiş olurum."*
+- **Effect:** `OrderRouter._place_algos` (`src/execution/order_router.py:218-251`) already branches on the flag — with `false`, it places a single OCO covering `plan.num_contracts` at `plan.tp_price = entry ± 3 × sl_distance`. TP1 leg no longer exists; SL-to-BE callback is inert (no TP1 fill ever triggers). `move_sl_to_be_after_tp1` kept as `true` (no-op while partial is off; flipping partial back on later reinstates original BE behavior without a second toggle).
+- **Trade-off — expectancy shift, not pure upside:**
+  - *Before (partial on):* full-win = 2.25R; "almost-win" (TP1 hits, TP2 reverses to BE) = +0.75R. Loss = -1R. So a 50% WR with 50% "almost-wins" = 0.5×2.25 + 0.5×0.75 - 0 = **1.5R avg**, or 33% WR + 33% almost + 33% loss = **0.75R avg**.
+  - *After (partial off):* full-win = 3R; no "almost-win" bucket — TP1-touched-then-reverse is now a full -1R loss. 50% WR → 0.5×3 - 0.5 = **1.25R avg**, 33% WR → 0.33×3 - 0.67 = **0.33R avg**.
+  - **Break-even WR (pre-fees):** was 1/(1+rr_effective) ≈ 22% at 2.25R + 0.75R bucket; now 1/(1+3) = **25%** at pure 3R. 3-point WR threshold increase. Winners earn more; "survives without winning" paths no longer exist.
+- **Mechanical side-effects:**
+  - `_runner_size` (`src/bot/runner.py:133-145`) returns full `num_contracts` (not the TP2 slice), so dynamic TP revision (`_maybe_revise_tp_dynamic`) now covers the whole position — intended.
+  - `entry_signals._apply_partial_tp_split_feasibility` (`entry_signals.py:794`) bypassed — the `insufficient_contracts_for_split` reject reason no longer fires. No YAML/CLAUDE.md changes to the reject list needed (it stays in the unified list for historical trades; fresh trades just don't hit it).
+  - `OCOAttachResult.algo_ids` becomes a 1-element list instead of 2. `PositionMonitor._Tracked.algo_ids[-1]` still points to the (now sole) OCO, so `revise_runner_tp` cancel+place flow works unchanged.
+- **Open-positions impact:** 5 positions currently open were built with partial TP on, so each has TWO OCOs on OKX (TP1 at 1.5R + TP2/runner at 3R). This YAML flip **does not** migrate them — they keep their split structure until closed. Dynamic TP revise will continue to rewrite **only the runner leg** (TP2) to 3R per the hard cap; TP1 at 1.5R stays live on the book. Operator can manually cancel TP1 legs on OKX if they want the full 3R payout on the existing 5, but that's a destructive action and isn't automated here.
+- **Dataset:** `rl.clean_since` bumped `2026-04-19T17:30:00Z → 2026-04-19T17:35:00Z`. Rationale: single-leg 3R expectancy regime is a meaningful OCO-geometry shift from split-OCO; mixing the two in reporter or RL windows would confuse avg-R metrics. Cost: 5 mins of pre-flip clean-window is re-dirtied; no closed trades in that window (the 5 open positions opened earlier).
+- **Re-evaluation:** after ≥30 post-flip closed trades, factor-audit checks:
+  1. Post-flip WR vs. 25% break-even. If < 25% net of fees, the partial-TP "almost-win" bucket was load-bearing — flip back on.
+  2. Distribution of "max-favorable-excursion hit 1.5R then reversed" trades — if significant, that's the -0.75R swing that partial mode used to bank. Data will tell if dropping this bucket is net-positive.
+- **Tests:** no code changes; YAML-only flip. Full suite **729 passed** with new default. Tests that explicitly pass `partial_tp_enabled=True`/`=False` as kwargs (`test_partial_tp.py`, `test_entry_signals.py:551-600`) remain valid — they exercise both branches regardless of YAML default.
+
 ### 2026-04-19 (late night) — TP-revise hardening + demo-wick artefact cross-check
 
 Bundled follow-up to the 2026-04-19 fixes. Two incidents drove this:

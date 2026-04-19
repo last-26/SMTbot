@@ -329,7 +329,16 @@ execution:
   # single-position book).
   margin_mode: cross
   # Madde E — partial TP + move SL to breakeven on TP1 fill.
-  partial_tp_enabled: true
+  # 2026-04-19 (late night): operator flipped to false. Rationale: with hard
+  # 1:3 RR cap, partial TP at 1.5R caps max win at 2.25R (0.75R + 1.5R) on
+  # full-win scenarios, and int-contract rounding already shrinks actual
+  # risk below the $55 nominal. Single-leg OCO at 3R keeps the full
+  # planned reward on winners. Trade-off: "almost-wins" (TP1 touched, TP2
+  # reverses) no longer bank the 0.75R — they become full losses under the
+  # non-BE plan SL. Re-evaluate via factor-audit after ≥30 post-flip
+  # closed trades. `move_sl_to_be_after_tp1` left as-is; inert when
+  # partial_tp_enabled=false (no TP1 fill → no BE callback).
+  partial_tp_enabled: false
   partial_tp_ratio: 0.5               # 50% of contracts exit at TP1
   partial_tp_rr: 1.5                  # TP1 at 1.5R
   move_sl_to_be_after_tp1: true
@@ -530,4 +539,8 @@ rl:
   # disable. Pre-disable trades (incl. the BNB 14:58Z open position from
   # the same demo run) fall out of clean window so post-disable data
   # trains on the new gate regime only.
-  clean_since: "2026-04-19T17:30:00Z"
+  # 2026-04-19T17:35Z — bumped after `partial_tp_enabled: true → false`.
+  # Single-leg 3R OCO regime — expectancy geometry shifts vs partial mode
+  # (2.25R full-win cap → 3R full-win), so post-flip trades must not mix
+  # with split-OCO trades in reporter/RL windows.
+  clean_since: "2026-04-19T17:35:00Z"
