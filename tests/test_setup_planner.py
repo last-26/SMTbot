@@ -1,12 +1,14 @@
-"""Phase 7.C1 — zone-based setup planner.
+"""Zone-based setup planner — 2026-04-19 scalp rebalance.
 
-Direction is an input (decided upstream by confluence + HTF trend
-picker); the planner's job is to find the best zone to limit-order
-into. Sources are tried in priority order: liq pool → HTF FVG →
-VWAP retest → sweep retest. First hit wins.
+Source priority:
+    vwap_retest > ema21_pullback > fvg_entry > sweep_retest > liq_pool_near
+HTF 15m FVG is available as an opt-in entry source
+(`htf_fvg_entry_enabled=True`); by default it is TP-only.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import pytest
 
@@ -18,13 +20,24 @@ from src.data.models import (
     SignalTableData,
     SweepEvent,
 )
-from src.strategy.setup_planner import ZoneSetup, build_zone_setup
+from src.strategy.setup_planner import (
+    ZoneSetup,
+    apply_zone_to_plan,
+    build_zone_setup,
+)
+from src.strategy.trade_plan import TradePlan
 
 
-def _state(price: float, atr: float, **signal_overrides) -> MarketState:
+# ── Fixtures ────────────────────────────────────────────────────────────────
+
+
+def _state(price: float, atr: float, *,
+           fvg_zones: list[FVGZone] | None = None,
+           **signal_overrides) -> MarketState:
     return MarketState(
         symbol="BTC-USDT-SWAP", timeframe="3m",
         signal_table=SignalTableData(price=price, atr_14=atr, **signal_overrides),
+        fvg_zones=fvg_zones or [],
     )
 
 
@@ -47,6 +60,26 @@ def _cluster(price: float, notional: float = 5_000_000.0,
     return Cluster(price=price, notional_usd=notional, side=side)
 
 
+@dataclass
+class _FakeCandle:
+    close: float
+
+
+def _candles_for_stack(n: int = 100, *, bull: bool = True,
+                       current_price: float = 100.0) -> list[_FakeCandle]:
+    """Build a monotonic candle series that yields a clean EMA stack at
+    ``current_price``. Linear ramp keeps EMA21 above EMA55 for bull and
+    below for bear.
+    """
+    if bull:
+        start = current_price - 8.0
+        step = (current_price - start) / (n - 1)
+        return [_FakeCandle(close=start + step * i) for i in range(n)]
+    start = current_price + 8.0
+    step = (start - current_price) / (n - 1)
+    return [_FakeCandle(close=start - step * i) for i in range(n)]
+
+
 # ── Rejection paths ─────────────────────────────────────────────────────────
 
 
@@ -61,122 +94,26 @@ def test_zero_atr_returns_none():
 
 
 def test_no_sources_returns_none():
-    """Bare state with no heatmap, no HTF FVGs, no VWAPs, no sweeps — None."""
+    """Bare state with no heatmap, no FVGs, no VWAPs, no sweeps — None."""
     state = _state(100.0, 1.0)
     assert build_zone_setup(direction=Direction.BULLISH, state=state) is None
 
 
-# ── Source 1 — liquidity pool ───────────────────────────────────────────────
+# ── Priority: VWAP retest wins ──────────────────────────────────────────────
 
 
-def test_liq_pool_beats_other_sources_when_available():
-    """Priority order: a liq pool should win even if a VWAP retest is also
-    available. This pins the documented priority chain."""
-    state = _state(100.0, 1.0, vwap_3m=99.5)       # VWAP retest option
-    hm = _heatmap(price=100.0,
-                  below=[_cluster(price=98.0)])     # long liq pool below
-    setup = build_zone_setup(
-        direction=Direction.BULLISH, state=state, heatmap=hm,
-    )
-    assert setup is not None
-    assert setup.zone_source == "liq_pool"
-    low, high = setup.entry_zone
-    assert low < 98.0 < high
-
-
-def test_liq_pool_respects_direction_side():
-    """Bearish setup takes the nearest_above cluster, not nearest_below."""
-    state = _state(100.0, 1.0)
-    hm = _heatmap(price=100.0,
-                  below=[_cluster(price=98.0)],
-                  above=[_cluster(price=102.0, side="SHORT_LIQ")])
-    setup = build_zone_setup(
-        direction=Direction.BEARISH, state=state, heatmap=hm,
-    )
-    assert setup is not None
-    assert setup.zone_source == "liq_pool"
-    low, high = setup.entry_zone
-    assert low < 102.0 < high
-
-
-def test_liq_pool_zero_notional_skipped():
-    """A cluster with zero notional (missing-data sentinel) is ignored,
-    falling through to the next source."""
+def test_vwap_retest_beats_liq_pool_when_both_available():
+    """Post-pivot priority: VWAP retest wins over liq_pool_near even when
+    both fire. Liquidity is a TP instrument, not the primary entry."""
     state = _state(100.0, 1.0, vwap_3m=99.5)
-    hm = _heatmap(price=100.0,
-                  below=[_cluster(price=98.0, notional=0.0)])
+    # Abnormal-looking cluster: 5M notional with no peers → would clear
+    # the magnitude gate on its own, but VWAP still wins by priority.
+    hm = _heatmap(price=100.0, below=[_cluster(price=99.2)])
     setup = build_zone_setup(
         direction=Direction.BULLISH, state=state, heatmap=hm,
     )
     assert setup is not None
     assert setup.zone_source == "vwap_retest"
-
-
-def test_liq_pool_on_wrong_side_of_price_skipped():
-    """nearest_below for a long, but with price=98 — cluster is now above,
-    so the source guards and falls through."""
-    state = _state(97.0, 1.0, vwap_3m=96.5)
-    hm = _heatmap(price=97.0,
-                  below=[_cluster(price=98.0)])   # stale: actually above now
-    setup = build_zone_setup(
-        direction=Direction.BULLISH, state=state, heatmap=hm,
-    )
-    assert setup is not None
-    assert setup.zone_source == "vwap_retest"
-
-
-# ── Source 2 — HTF FVG ──────────────────────────────────────────────────────
-
-
-def test_htf_fvg_long_picks_bull_fvg_below_price():
-    """Bull FVG below price → long entry zone."""
-    state = _state(100.0, 1.0)
-    htf = MarketState(
-        symbol="BTC-USDT-SWAP", timeframe="15",
-        fvg_zones=[FVGZone(direction=Direction.BULLISH, bottom=97.5, top=98.5)],
-    )
-    setup = build_zone_setup(
-        direction=Direction.BULLISH, state=state, htf_state=htf,
-    )
-    assert setup is not None
-    assert setup.zone_source == "fvg_htf"
-    assert setup.entry_zone == (97.5, 98.5)
-
-
-def test_htf_fvg_ignores_wrong_side_or_wrong_direction():
-    """A BEARISH FVG for a BULLISH setup is skipped; a BULLISH FVG above
-    current price is also skipped (can't limit-buy above market)."""
-    state = _state(100.0, 1.0)
-    htf = MarketState(
-        symbol="BTC-USDT-SWAP", timeframe="15",
-        fvg_zones=[
-            FVGZone(direction=Direction.BEARISH, bottom=97.0, top=97.5),
-            FVGZone(direction=Direction.BULLISH, bottom=101.0, top=102.0),
-        ],
-    )
-    setup = build_zone_setup(
-        direction=Direction.BULLISH, state=state, htf_state=htf,
-    )
-    assert setup is None
-
-
-def test_htf_fvg_picks_nearest_when_multiple():
-    state = _state(100.0, 1.0)
-    htf = MarketState(
-        symbol="BTC-USDT-SWAP", timeframe="15",
-        fvg_zones=[
-            FVGZone(direction=Direction.BULLISH, bottom=90.0, top=91.0),   # far
-            FVGZone(direction=Direction.BULLISH, bottom=97.5, top=98.5),   # near
-        ],
-    )
-    setup = build_zone_setup(
-        direction=Direction.BULLISH, state=state, htf_state=htf,
-    )
-    assert setup is not None
-    assert setup.entry_zone == (97.5, 98.5)
-
-
-# ── Source 3 — VWAP retest ──────────────────────────────────────────────────
 
 
 def test_vwap_retest_picks_nearest_below_for_long():
@@ -189,44 +126,197 @@ def test_vwap_retest_picks_nearest_below_for_long():
 
 
 def test_vwap_retest_ignores_zero_and_wrong_side():
-    """vwap=0 is unparsed; a VWAP *above* price for a long is wrong side."""
+    """vwap=0 is unparsed; a VWAP *above* price for a long is wrong side.
+    Falls through to later sources — None here (none configured)."""
     state = _state(100.0, 1.0, vwap_1m=0.0, vwap_3m=101.0, vwap_15m=0.0)
     setup = build_zone_setup(direction=Direction.BULLISH, state=state)
     assert setup is None
 
 
-# ── Source 4 — sweep retest ─────────────────────────────────────────────────
+# ── EMA21 pullback ──────────────────────────────────────────────────────────
 
 
-def test_sweep_retest_bearish_sweep_gives_bullish_zone():
-    """Bearish sweep (swept highs) → reversal long at the reclaimed level."""
+def test_ema21_pullback_fires_when_price_near_ema_in_stack():
+    """Bull stack (price > EMA21 > EMA55) with price inside the EMA21 band."""
+    candles = _candles_for_stack(bull=True, current_price=100.0)
+    # No VWAP, no FVG — EMA21 pullback must be the first hit.
     state = _state(100.0, 1.0)
-    state.sweep_events.append(
-        SweepEvent(direction=Direction.BEARISH, level=98.0)
+    setup = build_zone_setup(
+        direction=Direction.BULLISH, state=state, ltf_candles=candles,
     )
+    assert setup is not None
+    assert setup.zone_source == "ema21_pullback"
+    low, high = setup.entry_zone
+    # Zone centres on EMA21 (below price); ATR buffer widens ±0.25.
+    assert high < 100.0
+
+
+def test_ema21_pullback_rejects_contra_stack():
+    """Bear stack + LONG direction → EMA21 pullback returns None; falls
+    through to later sources (also empty here)."""
+    candles = _candles_for_stack(bull=False, current_price=100.0)
+    state = _state(100.0, 1.0)
+    setup = build_zone_setup(
+        direction=Direction.BULLISH, state=state, ltf_candles=candles,
+    )
+    assert setup is None
+
+
+def test_ema21_pullback_disabled_skips_source():
+    """When flag is off the EMA21 source returns None by construction."""
+    candles = _candles_for_stack(bull=True, current_price=100.0)
+    state = _state(100.0, 1.0)
+    setup = build_zone_setup(
+        direction=Direction.BULLISH, state=state, ltf_candles=candles,
+        ema21_pullback_enabled=False,
+    )
+    assert setup is None
+
+
+# ── Entry-TF FVG ────────────────────────────────────────────────────────────
+
+
+def test_entry_tf_fvg_fires_without_htf_state():
+    """Entry-TF FVGs live on MarketState.fvg_zones — no htf_state needed."""
+    fvg = FVGZone(direction=Direction.BULLISH, bottom=97.5, top=98.5)
+    state = _state(100.0, 1.0, fvg_zones=[fvg])
     setup = build_zone_setup(direction=Direction.BULLISH, state=state)
     assert setup is not None
-    assert setup.zone_source == "sweep_retest"
-    assert setup.trigger_type == "sweep_reversal"
-    low, high = setup.entry_zone
-    assert low < 98.0 < high
+    assert setup.zone_source == "fvg_entry"
+    assert setup.entry_zone == (97.5, 98.5)
 
 
-def test_sweep_retest_opposite_direction_skipped():
-    """A bullish sweep does not create a BULLISH (long) setup."""
-    state = _state(100.0, 1.0)
-    state.sweep_events.append(
-        SweepEvent(direction=Direction.BULLISH, level=98.0)
-    )
+def test_entry_tf_fvg_ignores_wrong_side_or_wrong_direction():
+    state = _state(100.0, 1.0, fvg_zones=[
+        FVGZone(direction=Direction.BEARISH, bottom=97.0, top=97.5),
+        FVGZone(direction=Direction.BULLISH, bottom=101.0, top=102.0),
+    ])
     setup = build_zone_setup(direction=Direction.BULLISH, state=state)
     assert setup is None
 
 
-# ── SL + TP integration ─────────────────────────────────────────────────────
+# ── Sweep retest ────────────────────────────────────────────────────────────
+
+
+def test_sweep_retest_bearish_sweep_gives_bullish_zone():
+    state = _state(100.0, 1.0)
+    state.sweep_events.append(SweepEvent(direction=Direction.BEARISH, level=98.0))
+    setup = build_zone_setup(direction=Direction.BULLISH, state=state)
+    assert setup is not None
+    assert setup.zone_source == "sweep_retest"
+    assert setup.trigger_type == "sweep_reversal"
+
+
+def test_sweep_retest_opposite_direction_skipped():
+    state = _state(100.0, 1.0)
+    state.sweep_events.append(SweepEvent(direction=Direction.BULLISH, level=98.0))
+    setup = build_zone_setup(direction=Direction.BULLISH, state=state)
+    assert setup is None
+
+
+# ── Liq pool (near + abnormal gates) ────────────────────────────────────────
+
+
+def test_liq_pool_near_accepts_abnormal_cluster_near_price():
+    """BTC-75000 / 74800 case: near + 5× bigger than peers → entry zone at
+    the cluster. All higher-priority sources empty."""
+    big = _cluster(price=99.3, notional=5_000_000.0)          # ~0.7×ATR away
+    peers = [_cluster(price=99.0, notional=1_000_000.0),
+             _cluster(price=98.8, notional=900_000.0)]
+    hm = _heatmap(price=100.0, below=[big, *peers])
+    state = _state(100.0, 1.0)
+    setup = build_zone_setup(
+        direction=Direction.BULLISH, state=state, heatmap=hm,
+    )
+    assert setup is not None
+    assert setup.zone_source == "liq_pool_near"
+
+
+def test_liq_pool_near_rejects_far_cluster():
+    """Cluster outside `liq_entry_near_max_atr × ATR` is not an entry."""
+    big = _cluster(price=95.0, notional=5_000_000.0)          # ~5×ATR away
+    peers = [_cluster(price=94.5, notional=1_000_000.0)]
+    hm = _heatmap(price=100.0, below=[big, *peers])
+    state = _state(100.0, 1.0)
+    setup = build_zone_setup(
+        direction=Direction.BULLISH, state=state, heatmap=hm,
+        liq_entry_near_max_atr=1.5,
+    )
+    assert setup is None
+
+
+def test_liq_pool_near_rejects_small_magnitude():
+    """Nearest cluster has no special notional advantage → not abnormal."""
+    c1 = _cluster(price=99.3, notional=1_000_000.0)
+    c2 = _cluster(price=99.0, notional=1_000_000.0)
+    hm = _heatmap(price=100.0, below=[c1, c2])
+    state = _state(100.0, 1.0)
+    setup = build_zone_setup(
+        direction=Direction.BULLISH, state=state, heatmap=hm,
+        liq_entry_magnitude_mult=2.5,
+    )
+    assert setup is None
+
+
+def test_liq_pool_near_wrong_side_skipped():
+    """Long with a cluster above price fails the side guard."""
+    hm = _heatmap(price=97.0, below=[_cluster(price=98.0)])   # stale above
+    state = _state(97.0, 1.0)
+    setup = build_zone_setup(
+        direction=Direction.BULLISH, state=state, heatmap=hm,
+    )
+    assert setup is None
+
+
+def test_liq_pool_near_entry_price_is_zone_mid():
+    """Unlike edge-entry sources, liq_pool_near entry sits at zone mid
+    (buy/sell AT the cluster, not on the far edge)."""
+    from src.strategy.setup_planner import zone_limit_price
+    zone = (99.0, 99.5)
+    assert zone_limit_price(
+        Direction.BULLISH, zone, zone_source="liq_pool_near",
+    ) == pytest.approx(99.25)
+    # Sanity: default (near-edge) behaviour unchanged for other sources.
+    assert zone_limit_price(
+        Direction.BULLISH, zone, zone_source="vwap_retest",
+    ) == 99.0
+
+
+# ── HTF FVG (opt-in entry source) ───────────────────────────────────────────
+
+
+def test_htf_fvg_entry_off_by_default():
+    """By default HTF FVG is TP-only; no entry fires even with a valid FVG."""
+    htf = MarketState(
+        symbol="BTC-USDT-SWAP", timeframe="15",
+        fvg_zones=[FVGZone(direction=Direction.BULLISH, bottom=97.5, top=98.5)],
+    )
+    state = _state(100.0, 1.0)
+    setup = build_zone_setup(
+        direction=Direction.BULLISH, state=state, htf_state=htf,
+    )
+    assert setup is None
+
+
+def test_htf_fvg_entry_enabled_fires_last():
+    """With the opt-in flag, HTF FVG sits after liq_pool_near in priority."""
+    htf = MarketState(
+        symbol="BTC-USDT-SWAP", timeframe="15",
+        fvg_zones=[FVGZone(direction=Direction.BULLISH, bottom=97.5, top=98.5)],
+    )
+    state = _state(100.0, 1.0)
+    setup = build_zone_setup(
+        direction=Direction.BULLISH, state=state, htf_state=htf,
+        htf_fvg_entry_enabled=True,
+    )
+    assert setup is not None
+    assert setup.zone_source == "fvg_htf"
+
+
+# ── SL / TP + ladder ────────────────────────────────────────────────────────
 
 
 def test_sl_sits_beyond_zone_on_structural_side():
-    """SL is `sl_buffer_atr × ATR` beyond the far edge."""
     state = _state(100.0, 1.0, vwap_3m=99.5)
     setup = build_zone_setup(
         direction=Direction.BULLISH, state=state, sl_buffer_atr=0.5,
@@ -238,7 +328,7 @@ def test_sl_sits_beyond_zone_on_structural_side():
 
 
 def test_tp_primary_uses_nearest_cluster_in_direction():
-    """Long: TP pulls from nearest_above cluster (beyond the zone mid)."""
+    """Long: TP pulls from nearest_above cluster beyond the zone mid."""
     state = _state(100.0, 1.0, vwap_3m=99.5)
     hm = _heatmap(
         price=100.0,
@@ -252,10 +342,129 @@ def test_tp_primary_uses_nearest_cluster_in_direction():
 
 
 def test_tp_falls_back_to_rr_when_heatmap_missing():
-    """Without a heatmap, TP is projected as RR × (zone width + ATR)."""
     state = _state(100.0, 1.0, vwap_3m=99.5)
     setup = build_zone_setup(
         direction=Direction.BULLISH, state=state, default_rr=2.0,
     )
     assert setup is not None
-    assert setup.tp_primary > 100.0        # above entry zone mid
+    assert setup.tp_primary > 100.0
+
+
+def test_tp_ladder_builds_from_multiple_clusters():
+    """Three above-side clusters all pass the min-notional filter → ladder
+    returns three (price, share) pairs in nearest→far order."""
+    state = _state(100.0, 1.0, vwap_3m=99.5)
+    above = [
+        _cluster(price=102.0, notional=5_000_000.0, side="SHORT_LIQ"),
+        _cluster(price=104.0, notional=4_000_000.0, side="SHORT_LIQ"),
+        _cluster(price=108.0, notional=3_000_000.0, side="SHORT_LIQ"),
+    ]
+    hm = _heatmap(price=100.0, above=above)
+    setup = build_zone_setup(
+        direction=Direction.BULLISH, state=state, heatmap=hm,
+        tp_ladder_shares=(0.40, 0.35, 0.25),
+        tp_ladder_min_notional_frac=0.30,
+    )
+    assert setup is not None
+    assert len(setup.tp_ladder) == 3
+    prices = [p for p, _ in setup.tp_ladder]
+    assert prices == [102.0, 104.0, 108.0]
+    shares = [s for _, s in setup.tp_ladder]
+    assert sum(shares) == pytest.approx(1.0)
+
+
+def test_tp_ladder_falls_back_to_single_leg_when_no_heatmap():
+    state = _state(100.0, 1.0, vwap_3m=99.5)
+    setup = build_zone_setup(direction=Direction.BULLISH, state=state)
+    assert setup is not None
+    assert setup.tp_ladder == ((setup.tp_primary, 1.0),)
+
+
+def test_tp_ladder_disabled_returns_single_leg():
+    state = _state(100.0, 1.0, vwap_3m=99.5)
+    above = [_cluster(price=102.0, notional=5_000_000.0, side="SHORT_LIQ"),
+             _cluster(price=105.0, notional=4_000_000.0, side="SHORT_LIQ")]
+    hm = _heatmap(price=100.0, above=above)
+    setup = build_zone_setup(
+        direction=Direction.BULLISH, state=state, heatmap=hm,
+        tp_ladder_enabled=False,
+    )
+    assert setup is not None
+    assert setup.tp_ladder == ((setup.tp_primary, 1.0),)
+
+
+def test_tp_ladder_renormalises_when_fewer_clusters_pass():
+    """Only one cluster clears the min_notional_frac × largest filter →
+    ladder shrinks to 1 leg, share renormalises to 1.0."""
+    state = _state(100.0, 1.0, vwap_3m=99.5)
+    above = [
+        _cluster(price=102.0, notional=10_000_000.0, side="SHORT_LIQ"),
+        _cluster(price=104.0, notional=500_000.0, side="SHORT_LIQ"),   # filtered
+    ]
+    hm = _heatmap(price=100.0, above=above)
+    setup = build_zone_setup(
+        direction=Direction.BULLISH, state=state, heatmap=hm,
+        tp_ladder_min_notional_frac=0.30,
+    )
+    assert setup is not None
+    assert len(setup.tp_ladder) == 1
+    assert setup.tp_ladder[0][0] == 102.0
+    assert setup.tp_ladder[0][1] == pytest.approx(1.0)
+
+
+# ── apply_zone_to_plan ──────────────────────────────────────────────────────
+
+
+def _plan(direction: Direction = Direction.BULLISH) -> TradePlan:
+    return TradePlan(
+        direction=direction, entry_price=100.0, sl_price=99.0, tp_price=102.0,
+        rr_ratio=2.0, sl_distance=1.0, sl_pct=0.01,
+        position_size_usdt=5000.0, leverage=10, required_leverage=10.0,
+        num_contracts=50, risk_amount_usdt=50.0, max_risk_usdt=50.0,
+        capped=False, fee_reserve_pct=0.001,
+    )
+
+
+def test_apply_zone_to_plan_copies_ladder_from_zone():
+    zone = ZoneSetup(
+        direction=Direction.BULLISH,
+        entry_zone=(99.0, 99.5),
+        trigger_type="zone_touch",
+        sl_beyond_zone=98.5,
+        tp_primary=105.0,
+        max_wait_bars=10,
+        zone_source="vwap_retest",
+        tp_ladder=((105.0, 0.6), (108.0, 0.4)),
+    )
+    new_plan = apply_zone_to_plan(_plan(), zone, contract_size=0.01)
+    assert new_plan.tp_ladder == [(105.0, 0.6), (108.0, 0.4)]
+
+
+def test_apply_zone_to_plan_defaults_ladder_to_primary_when_empty():
+    zone = ZoneSetup(
+        direction=Direction.BULLISH,
+        entry_zone=(99.0, 99.5),
+        trigger_type="zone_touch",
+        sl_beyond_zone=98.5,
+        tp_primary=105.0,
+        max_wait_bars=10,
+        zone_source="vwap_retest",
+        tp_ladder=(),
+    )
+    new_plan = apply_zone_to_plan(_plan(), zone, contract_size=0.01)
+    assert new_plan.tp_ladder == [(105.0, 1.0)]
+
+
+def test_apply_zone_to_plan_uses_zone_mid_for_liq_pool_near():
+    """Liq-pool near entry lands at zone mid, not low edge."""
+    zone = ZoneSetup(
+        direction=Direction.BULLISH,
+        entry_zone=(99.0, 99.5),
+        trigger_type="zone_touch",
+        sl_beyond_zone=98.5,
+        tp_primary=105.0,
+        max_wait_bars=10,
+        zone_source="liq_pool_near",
+    )
+    new_plan = apply_zone_to_plan(_plan(), zone, contract_size=0.01)
+    assert new_plan.entry_price == pytest.approx(99.25)

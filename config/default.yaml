@@ -163,18 +163,37 @@ analysis:
   #     close-score decisions while preserving the tie-break role and
   #     the factor tag on trade records (weight=0 still appends).
   confluence_weights:
-    htf_trend_alignment: 0.0
-    at_order_block: 0.0
-    oscillator_signal: 0.0
-    liquidity_pool_target: 0.0
-    # Phase 7.A4 — per-TF VWAP slots demoted in favour of
-    # vwap_composite_alignment. Legacy tags still appear in trade-record
-    # factor lists (weight=0 emits for RL post-hoc) but the composite
-    # carries the scoring credit.
+    # 2026-04-19 rebalance — scalp-native emphasis (oscillator + VWAP +
+    # money-flow + divergence dominate; structural pillars demoted). These
+    # YAML entries match DEFAULT_WEIGHTS in src/analysis/multi_timeframe.py
+    # so an operator sees the full stack here; empty dict would also pick
+    # up the same numbers via the default merge.
+    htf_trend_alignment: 0.5
+    mss_alignment: 0.75
+    at_order_block: 0.6
+    at_fvg: 0.75
+    at_sr_zone: 0.75
+    recent_sweep: 1.0
+    ltf_pattern: 0.75
+    oscillator_momentum: 0.75
+    oscillator_signal: 0.75
+    oscillator_high_conviction_signal: 1.5
+    vmc_ribbon: 0.5
+    ltf_momentum_alignment: 0.75
+    money_flow_alignment: 1.0
+    divergence_signal: 1.25
+    displacement_candle: 0.6
+    liquidity_pool_target: 0.5
+    # Per-TF VWAP slots demoted — composite carries the score.
     vwap_1m_alignment: 0.0
     vwap_3m_alignment: 0.0
     vwap_15m_alignment: 0.0
-    vwap_composite_alignment: 1.0
+    vwap_composite_alignment: 1.25
+    # Derivatives one-slot group (elif-chained at most one fires per cycle).
+    derivatives_contrarian: 0.7
+    derivatives_capitulation: 0.6
+    derivatives_heatmap_target: 0.5
+    session_filter: 0.25
   # Example override block (uncomment + edit to hand-tune before Phase 7 RL):
   # confluence_weights:
   #   htf_trend_alignment: 0.75
@@ -303,6 +322,28 @@ execution:
   zone_buffer_atr: 0.25
   zone_sl_buffer_atr: 0.5
   zone_default_rr: 2.0
+  # 2026-04-19 rebalance — zone-source priority is now
+  # vwap_retest > ema21_pullback > fvg_entry > sweep_retest > liq_pool_near.
+  # EMA21 pullback reuses analysis.ema_veto_{fast,slow}_period for the stack.
+  ema21_pullback_enabled: true
+  # HTF 15m FVG as ENTRY source — off by default (poor fit for 3m scalp TF).
+  # It remains in `_tp_primary`'s alignment logic regardless.
+  htf_fvg_entry_enabled: false
+  # Near-liq entry gates. The old source placed limit orders AT the top
+  # cluster (sweep-reversal thesis). Rewritten so liq-pool only fires when
+  # the nearest cluster on the correct side is (a) within
+  # `liq_entry_near_max_atr × ATR` of price AND (b) notional is
+  # `liq_entry_magnitude_mult × median(side_clusters)`. Operator's
+  # BTC-75000 / 74800-abnormal-support example.
+  liq_entry_near_max_atr: 1.5
+  liq_entry_magnitude_mult: 2.5
+  # Partial-TP ladder from liquidity clusters on the target side.
+  # Shares renormalise when fewer clusters pass the notional filter
+  # (`tp_ladder_min_notional_frac × largest_side`). Empty list / single
+  # [1.0] disables the ladder and keeps legacy single-leg TP behaviour.
+  tp_ladder_enabled: true
+  tp_ladder_shares: [0.40, 0.35, 0.25]
+  tp_ladder_min_notional_frac: 0.30
 
 derivatives:
   # Phase 1.5 — derivatives data layer. Disabling this short-circuits the

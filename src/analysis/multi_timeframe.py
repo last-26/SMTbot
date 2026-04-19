@@ -69,74 +69,36 @@ class ConfluenceScore:
 
 
 DEFAULT_WEIGHTS: dict[str, float] = {
-    # HTF bias — softened so LTF momentum can flip confluence when structure
-    # hasn't turned yet. HTF still leads (sum ~4.0 when fully aligned vs
-    # LTF sum ~3.0) but no longer dominates 2:1.
-    "htf_trend_alignment": 0.75,
+    # Rebalanced 2026-04-19: scalp-native emphasis — oscillator + VWAP +
+    # money-flow + divergence dominate; structural pillars demoted so the
+    # bot stops waiting for clean HTF structure on every cycle.
+    "htf_trend_alignment": 0.5,
     "mss_alignment": 0.75,
-    "at_order_block": 1.0,
-    "at_fvg": 1.0,
+    "at_order_block": 0.6,
+    "at_fvg": 0.75,
     "at_sr_zone": 0.75,
     "recent_sweep": 1.0,
     "ltf_pattern": 0.75,
-    # LTF momentum — boosted so fresh reversals carry real weight. The
-    # `bars_ago <= 3` freshness gate in score_direction keeps stale signals out.
     "oscillator_momentum": 0.75,
     "oscillator_signal": 0.75,
     "vmc_ribbon": 0.5,
     "session_filter": 0.25,
-    # LTF momentum confirmation: full weight when the LTF trend agrees with
-    # the candidate direction, partial weight when the last LTF signal is
-    # fresh and agrees. Keeps it a single principled slot, not stacked.
     "ltf_momentum_alignment": 0.75,
     # Derivatives (Phase 1.5 Madde 6) — at most one of these three fires per
     # cycle; the elif chain in score_direction enforces that.
     "derivatives_contrarian": 0.7,
     "derivatives_capitulation": 0.6,
     "derivatives_heatmap_target": 0.5,
-    # Multi-TF VWAP — each TF votes independently so 1m can flip before 15m.
-    # Sum (1.0) is slightly higher than the old single-factor max (0.6) since
-    # VWAP is a primary anchor for intraday price. 15m gets the largest slice
-    # as the HTF anchor; 1m is the fastest signal for short-term flips.
-    # NOTE (Phase 7.A4): these per-TF slots are superseded by the single
-    # `vwap_composite_alignment` factor below. Per-TF factors still fire for
-    # RL feature visibility / back-compat tests, but YAML zeroes their weight
-    # so the composite carries the score. Flip YAML to re-enable split mode.
+    # Multi-TF VWAP — legacy per-TF slots zeroed in YAML; composite carries.
     "vwap_1m_alignment": 0.3,
     "vwap_3m_alignment": 0.3,
     "vwap_15m_alignment": 0.4,
-    # Phase 7.A4 — VWAP composite: single factor whose weight scales with
-    # how many available TFs align. w × (aligned / present) where `present`
-    # is the count of non-zero VWAPs. 3-of-3 aligned = full weight; 2-of-3
-    # = 0.667×w; 1-of-3 = 0.333×w. Missing VWAPs don't count against.
-    "vwap_composite_alignment": 1.0,
-    # Money-flow (Phase 6.9 A1). Fires when oscillator RSI+MFI bias agrees
-    # with the trade direction AND the |rsi_mfi| magnitude clears a threshold
-    # (weak bias filtered out). Futures markets are liquidity-driven; MFI is
-    # the primary momentum confirmation alongside WT cross.
-    "money_flow_alignment": 0.6,
-    # Pine standing-liquidity pools (Phase 6.9 A2). Complements
-    # derivatives_heatmap_target (OI-derived liq) by reading Pine's equal-
-    # highs/lows swing-pool levels. Fires when the nearest pool in the trade
-    # direction sits within `liquidity_pool_max_atr_dist` × ATR from price.
+    "vwap_composite_alignment": 1.25,
+    "money_flow_alignment": 1.0,
     "liquidity_pool_target": 0.5,
-    # High-conviction oscillator signal (Phase 6.9 A3) — VMC Cipher B's
-    # Gold Buy / Buy Div / Sell Div carry strong statistical edge vs. plain
-    # BUY/SELL. Mutually exclusive with `oscillator_signal` (elif chain).
-    "oscillator_high_conviction_signal": 1.25,
-    # Displacement candle (Phase 7.D1). A large-body, fast-move candle in
-    # the trade direction within the last N bars ≈ "real imbalance". FVGs
-    # / inefficiencies created without displacement are low quality. Weight
-    # below core pillars because it's momentum confirmation, not structure.
+    "oscillator_high_conviction_signal": 1.5,
     "displacement_candle": 0.6,
-    # Divergence signal (Phase 7.D2) — Pine oscillator's native divergence
-    # stream (`last_wt_div`: BULL_REG / BEAR_REG / BULL_HIDDEN / BEAR_HIDDEN).
-    # Weight 1.0 at peak (bars_ago ≤ 3) with monotonic bar-ago decay so a
-    # stale divergence doesn't carry the same edge as a fresh one. Distinct
-    # from `oscillator_high_conviction_signal` which reads the `last_signal`
-    # summary string (BUY_DIV / SELL_DIV firings on the Pine side). The D2
-    # factor captures every divergence regardless of the summary signal.
-    "divergence_signal": 1.0,
+    "divergence_signal": 1.25,
 }
 
 

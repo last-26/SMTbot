@@ -14,8 +14,24 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 - **Scoring:** 5 pillars (Market Structure, Liquidity, Money Flow, VWAP, Divergence) + hard gates (premium/discount, displacement, EMA momentum, VWAP, cross-asset opposition) + ADX regime-conditional weights.
 - **Execution:** post-only limit → regular limit → market-at-edge fallback. OCO SL/TP, partial TP at 1.5R with fee-buffered SL-to-BE on TP1 fill.
 - **Journal:** async SQLite, schema v2 (zone source, wait/fill latency, trend regime, funding Z-scores). `rejected_signals` table with counter-factual outcome pegging.
-- **Tests:** ~669, all green. Demo-runnable end-to-end.
+- **Tests:** ~682, all green. Demo-runnable end-to-end.
 - **Data cutoff (`rl.clean_since`):** `2026-04-19T06:30:00Z`. Reporter and future RL see only post-pivot trades.
+
+---
+
+## Changelog
+
+### 2026-04-19 — Scalp-native rewire
+
+- **Zone priority reordered** (`src/strategy/setup_planner.py`): `vwap_retest → ema21_pullback → fvg_entry (entry-TF) → sweep_retest → liq_pool_near`. HTF FVG demoted to opt-in (`htf_fvg_entry_enabled=false`).
+- **New source `ema21_pullback`**: fires when EMA21/55 stack aligns with direction and price is within `zone_atr × ATR` of EMA21 (half-ATR band around EMA21).
+- **New source `fvg_entry`**: entry-TF (3m) unfilled FVG from `state.active_*_fvgs()`. HTF 15m FVG stays available but behind the flag.
+- **Liquidity role flipped**: primary use is TP, not entry. `liq_pool_near` now gated by two filters — `liq_entry_near_max_atr=1.5` (distance) AND `liq_entry_magnitude_mult=2.5` (notional ≥ 2.5× side-median). Entry price = zone mid, not edge.
+- **TP ladder from liquidity heatmap** (`tp_ladder_enabled=true`, shares `[0.40, 0.35, 0.25]`, `min_notional_frac=0.30`). `TradePlan.tp_ladder` + `ZoneSetup.tp_ladder` added; falls back to single-leg when heatmap absent.
+- **Weights rebalanced** (`src/analysis/multi_timeframe.py` DEFAULT_WEIGHTS): oscillator/overlay dominant — `vwap_composite_alignment=1.25`, `money_flow_alignment=1.0`, `oscillator_high_conviction_signal=1.5`, `divergence_signal=1.25`; structure weights trimmed (`htf_trend_alignment=0.5`, `at_order_block=0.6`, `at_fvg=0.75`).
+- **Runner**: candle buffer bumped `last(50) → last(100)` so EMA55 SMA-seed has clean history.
+- **Config surface**: `execution.ema21_pullback_enabled`, `execution.htf_fvg_entry_enabled`, `execution.liq_entry_near_max_atr`, `execution.liq_entry_magnitude_mult`, `execution.tp_ladder_*`.
+- **Tests**: `tests/test_setup_planner.py` rewritten (30 cases covering new priority, gates, ladder). Full suite 682/682.
 
 ---
 

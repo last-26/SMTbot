@@ -43,6 +43,12 @@ class TradePlan:
     confluence_score: float = 0.0
     confluence_factors: list[str] = field(default_factory=list)
     reason: str = ""              # human-readable summary
+    # Partial-TP ladder from the zone builder: list of (price, share_fraction)
+    # ordered near→far, summing to 1.0. Default `[(tp_price, 1.0)]` preserves
+    # single-leg behaviour for legacy callers. Populated by `apply_zone_to_plan`
+    # from `ZoneSetup.tp_ladder`. Consumers (partial-TP executor, journal,
+    # RL feature builder) can iterate safely without a None guard.
+    tp_ladder: list[tuple[float, float]] = field(default_factory=list)
 
     @property
     def tp_distance(self) -> float:

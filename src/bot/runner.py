@@ -1092,7 +1092,9 @@ class BotRunner:
             logger.exception("fetch_failed symbol={}", symbol)
             return
         buf = self.ctx.multi_tf.get_buffer(tf_key)
-        candles = buf.last(50) if buf is not None else []
+        # 100 candles is enough for EMA55 seeding in the zone builder's
+        # ema21_pullback source; legacy confluence consumers only read the tail.
+        candles = buf.last(100) if buf is not None else []
 
         # 2c-alt. Cross-asset pillar bias (Phase 7.A6).
         # Snapshot BTC/ETH EMA stacks as they pass through their own cycle;
@@ -1348,6 +1350,7 @@ class BotRunner:
                 pos_side=pos_side,
                 plan=plan,
                 state=state,
+                candles=candles,
                 trend_regime=trend_regime,
             )
             if placed:
@@ -1528,6 +1531,7 @@ class BotRunner:
         pos_side: str,
         plan: TradePlan,
         state: MarketState,
+        candles: Optional[list] = None,
         trend_regime: Optional[TrendRegime] = None,
     ) -> bool:
         """Try to place a zone-based limit entry. Return True if a pending
@@ -1541,10 +1545,20 @@ class BotRunner:
                 state=state,
                 htf_state=htf_state,
                 heatmap=state.liquidity_heatmap,
+                ltf_candles=candles,
                 zone_buffer_atr=cfg.execution.zone_buffer_atr,
                 sl_buffer_atr=cfg.execution.zone_sl_buffer_atr,
                 max_wait_bars=cfg.execution.zone_max_wait_bars,
                 default_rr=cfg.execution.zone_default_rr,
+                liq_entry_near_max_atr=cfg.execution.liq_entry_near_max_atr,
+                liq_entry_magnitude_mult=cfg.execution.liq_entry_magnitude_mult,
+                ema21_pullback_enabled=cfg.execution.ema21_pullback_enabled,
+                ema_fast_period=cfg.analysis.ema_veto_fast_period,
+                ema_slow_period=cfg.analysis.ema_veto_slow_period,
+                htf_fvg_entry_enabled=cfg.execution.htf_fvg_entry_enabled,
+                tp_ladder_enabled=cfg.execution.tp_ladder_enabled,
+                tp_ladder_shares=tuple(cfg.execution.tp_ladder_shares),
+                tp_ladder_min_notional_frac=cfg.execution.tp_ladder_min_notional_frac,
             )
         except Exception:
             logger.exception("zone_setup_build_failed symbol={}", symbol)

@@ -1,32 +1,44 @@
-"""Zone-based entry planner (Phase 7.C1).
+"""Zone-based entry planner (rebalanced 2026-04-19).
 
 Converts a directional signal (confluence + HTF trend-picker) into a
 concrete `ZoneSetup`: a price range to limit-order into, a structural SL
-beyond the zone, and a TP target from the surrounding liquidity
-landscape. The entry orchestrator (Phase 7.C4) consumes the ZoneSetup
-and places a maker-preferred limit order.
+beyond the zone, and a TP target (plus optional partial-TP ladder) from
+the surrounding liquidity landscape.
 
-Four zone sources, priority order — first hit wins:
-  1. Coinalyze liquidity pool (heatmap cluster on the correct side)
-  2. HTF 15m unfilled FVG (Pine-sourced via htf_state_cache)
-  3. Session VWAP retest (pullback to 1m/3m/15m session-anchored VWAP)
-  4. Recent-swing sweep retest (last sweep reclaimed, now a retest zone)
+Scalp-native source priority (first hit wins):
+  1. VWAP retest           — pullback to 1m/3m/15m session VWAP
+  2. EMA21 pullback        — price revisits fast EMA with aligned stack
+  3. FVG (entry TF)        — 3m unfilled FVG matching direction
+  4. Sweep retest          — reclaimed opposite-side sweep
+  5. Liq pool (near)       — only when an abnormally-large cluster sits
+                             within ``liq_entry_near_max_atr`` × ATR of
+                             price AND its notional clears the magnitude
+                             gate (``liq_entry_magnitude_mult`` × median).
+                             Entry sits AT the cluster (zone mid), not its
+                             far edge.
+  6. HTF 15m FVG           — opt-in (``htf_fvg_entry_enabled=True``).
 
-Pure function — no I/O, no state. Tests drive it with synthesised
-MarketState and heatmap payloads.
+Liquidity is primarily a TP instrument (``tp_primary`` + optional
+ladder), not an entry instrument. The near-liq entry exists for the
+"BTC 75000 / 74800 abnormal cluster support" case the operator
+specifically asked for.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal, Optional
+import statistics
+from dataclasses import dataclass, field
+from typing import Any, Literal, Optional
 
 from src.analysis.liquidity_heatmap import LiquidityHeatmap
 from src.data.models import Direction, MarketState
 from src.strategy.trade_plan import TradePlan
 
 
-ZoneSource = Literal["liq_pool", "fvg_htf", "vwap_retest", "sweep_retest"]
+ZoneSource = Literal[
+    "vwap_retest", "ema21_pullback", "fvg_entry",
+    "sweep_retest", "liq_pool_near", "fvg_htf",
+]
 TriggerType = Literal["zone_touch", "sweep_reversal", "displacement_return"]
 
 
@@ -37,60 +49,22 @@ class ZoneSetup:
     entry_zone: tuple[float, float]    # (low, high), low <= high
     trigger_type: TriggerType
     sl_beyond_zone: float              # structural stop, not % floor
-    tp_primary: float                  # next liquidity or HTF target
+    tp_primary: float                  # first TP (may be single leg)
     max_wait_bars: int
     zone_source: ZoneSource
+    tp_ladder: tuple[tuple[float, float], ...] = field(
+        default_factory=lambda: tuple()
+    )
+    # Each entry: (tp_price, share_fraction). Shares sum to 1.0. An empty
+    # tuple means the consumer should treat it as a single-leg ladder of
+    # ((tp_primary, 1.0),).
 
 
 def _is_long(direction: Direction) -> bool:
     return direction == Direction.BULLISH
 
 
-def _liq_pool_zone(
-    direction: Direction, price: float, atr: float,
-    heatmap: Optional[LiquidityHeatmap], zone_atr: float,
-) -> Optional[tuple[float, float]]:
-    """Nearest heatmap cluster on the correct side of price, ± zone_atr × ATR.
-
-    - Long: cluster below price (long-liquidation pool = support bid)
-    - Short: cluster above price
-    Skip clusters with zero notional (missing data sentinel).
-    """
-    if heatmap is None:
-        return None
-    cluster = heatmap.nearest_below if _is_long(direction) else heatmap.nearest_above
-    if cluster is None or cluster.notional_usd <= 0:
-        return None
-    # Guard: cluster must be on the correct side (heatmap should enforce but
-    # demo data has shown stale above/below splits after price crosses a level).
-    if _is_long(direction) and cluster.price >= price:
-        return None
-    if not _is_long(direction) and cluster.price <= price:
-        return None
-    half = zone_atr * atr
-    return (cluster.price - half, cluster.price + half)
-
-
-def _htf_fvg_zone(
-    direction: Direction, price: float,
-    htf_state: Optional[MarketState],
-) -> Optional[tuple[float, float]]:
-    """Nearest unfilled HTF 15m FVG on the correct side of price."""
-    if htf_state is None:
-        return None
-    zones = (htf_state.active_bull_fvgs() if _is_long(direction)
-             else htf_state.active_bear_fvgs())
-    candidates: list[tuple[float, float]] = []
-    for z in zones:
-        lo, hi = min(z.bottom, z.top), max(z.bottom, z.top)
-        if _is_long(direction) and hi < price:
-            candidates.append((lo, hi))
-        elif not _is_long(direction) and lo > price:
-            candidates.append((lo, hi))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda lh: abs(price - (lh[0] + lh[1]) / 2.0))
-    return candidates[0]
+# ── Zone sources ───────────────────────────────────────────────────────────
 
 
 def _vwap_zone(
@@ -112,16 +86,101 @@ def _vwap_zone(
     return (target - half, target + half)
 
 
+def _ema(values: list[float], period: int) -> Optional[float]:
+    """EMA of `values` with SMA seed. None when series shorter than period."""
+    if period <= 0 or len(values) < period:
+        return None
+    k = 2.0 / (period + 1.0)
+    ema = sum(values[:period]) / period
+    for v in values[period:]:
+        ema = v * k + ema * (1.0 - k)
+    return ema
+
+
+def _ema21_pullback_zone(
+    direction: Direction, price: float, atr: float,
+    candles: Optional[list[Any]], zone_atr: float,
+    fast_period: int, slow_period: int,
+) -> Optional[tuple[float, float]]:
+    """Price inside ``zone_atr × ATR`` of EMA_fast, with stack aligned.
+
+    Bull stack (price > EMA21 > EMA55) arms a BULLISH pullback.
+    Bear stack (price < EMA21 < EMA55) arms a BEARISH pullback.
+    Returns None when candles are missing, stack is contra, or price is
+    already outside the band.
+    """
+    if not candles:
+        return None
+    closes = [c.close for c in candles if getattr(c, "close", None) is not None]
+    ema_fast = _ema(closes, fast_period)
+    ema_slow = _ema(closes, slow_period)
+    if ema_fast is None or ema_slow is None:
+        return None
+    if _is_long(direction):
+        stack_ok = price > ema_fast > ema_slow
+        if not stack_ok:
+            return None
+        # Long pullback: EMA21 must sit below price (retrace target).
+        if ema_fast >= price:
+            return None
+    else:
+        stack_ok = price < ema_fast < ema_slow
+        if not stack_ok:
+            return None
+        if ema_fast <= price:
+            return None
+    half = zone_atr * atr
+    return (ema_fast - half, ema_fast + half)
+
+
+def _entry_tf_fvg_zone(
+    direction: Direction, price: float, state: MarketState,
+) -> Optional[tuple[float, float]]:
+    """Nearest unfilled ENTRY-TF FVG on the correct side of price."""
+    zones = (state.active_bull_fvgs() if _is_long(direction)
+             else state.active_bear_fvgs())
+    candidates: list[tuple[float, float]] = []
+    for z in zones:
+        lo, hi = min(z.bottom, z.top), max(z.bottom, z.top)
+        if _is_long(direction) and hi < price:
+            candidates.append((lo, hi))
+        elif not _is_long(direction) and lo > price:
+            candidates.append((lo, hi))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda lh: abs(price - (lh[0] + lh[1]) / 2.0))
+    return candidates[0]
+
+
+def _htf_fvg_zone(
+    direction: Direction, price: float,
+    htf_state: Optional[MarketState],
+) -> Optional[tuple[float, float]]:
+    """Nearest unfilled HTF 15m FVG. Off by default post-pivot; entry path
+    only when ``htf_fvg_entry_enabled=True``. Otherwise kept for TP-side
+    alignment use only."""
+    if htf_state is None:
+        return None
+    zones = (htf_state.active_bull_fvgs() if _is_long(direction)
+             else htf_state.active_bear_fvgs())
+    candidates: list[tuple[float, float]] = []
+    for z in zones:
+        lo, hi = min(z.bottom, z.top), max(z.bottom, z.top)
+        if _is_long(direction) and hi < price:
+            candidates.append((lo, hi))
+        elif not _is_long(direction) and lo > price:
+            candidates.append((lo, hi))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda lh: abs(price - (lh[0] + lh[1]) / 2.0))
+    return candidates[0]
+
+
 def _sweep_zone(
     direction: Direction, price: float, atr: float,
     state: MarketState, zone_atr: float,
 ) -> Optional[tuple[float, float]]:
-    """Most recent sweep of the opposite side as a retest zone.
-
-    A bearish sweep (flushed upside liquidity) leaves a bullish setup at
-    the reclaimed level — and vice versa. Sweep must still sit on the
-    correct side of current price.
-    """
+    """Most recent sweep of the opposite side as a retest zone."""
     if not state.sweep_events:
         return None
     wanted = Direction.BEARISH if _is_long(direction) else Direction.BULLISH
@@ -137,11 +196,56 @@ def _sweep_zone(
     return (level - half, level + half)
 
 
+def _liq_pool_near_zone(
+    direction: Direction, price: float, atr: float,
+    heatmap: Optional[LiquidityHeatmap],
+    zone_atr: float,
+    max_dist_atr: float,
+    magnitude_mult: float,
+) -> Optional[tuple[float, float]]:
+    """Abnormally-large liquidity cluster within reach of price.
+
+    Two gates:
+      * Distance: ``|cluster - price| <= max_dist_atr × ATR``.
+      * Magnitude: ``cluster.notional_usd >= magnitude_mult × median_side``.
+
+    Operator's BTC-75000 / 74800-big-cluster case: cluster sits on the
+    correct structural side (support for long, resistance for short) and
+    is genuinely abnormal — not "place a limit at the top cluster and
+    hope for a sweep-reversal".
+    """
+    if heatmap is None:
+        return None
+    cluster = heatmap.nearest_below if _is_long(direction) else heatmap.nearest_above
+    if cluster is None or cluster.notional_usd <= 0:
+        return None
+    if _is_long(direction) and cluster.price >= price:
+        return None
+    if not _is_long(direction) and cluster.price <= price:
+        return None
+    if abs(cluster.price - price) > max_dist_atr * atr:
+        return None
+    side_clusters = (heatmap.clusters_below if _is_long(direction)
+                     else heatmap.clusters_above)
+    notionals = [c.notional_usd for c in side_clusters if c.notional_usd > 0]
+    if not notionals:
+        return None
+    median = statistics.median(notionals)
+    if median <= 0:
+        return None
+    if cluster.notional_usd < magnitude_mult * median:
+        return None
+    half = zone_atr * atr
+    return (cluster.price - half, cluster.price + half)
+
+
+# ── SL / TP helpers ────────────────────────────────────────────────────────
+
+
 def _sl_beyond_zone(
     direction: Direction, zone: tuple[float, float],
     atr: float, sl_buffer_atr: float,
 ) -> float:
-    """SL sits `sl_buffer_atr × ATR` beyond the far edge against direction."""
     low, high = zone
     buf = sl_buffer_atr * atr
     return (low - buf) if _is_long(direction) else (high + buf)
@@ -151,7 +255,7 @@ def _tp_primary(
     direction: Direction, zone: tuple[float, float],
     heatmap: Optional[LiquidityHeatmap], atr: float, default_rr: float,
 ) -> float:
-    """TP = nearest cluster in direction (when on correct side), else RR × zone-width."""
+    """TP = nearest cluster in direction (on correct side), else RR × width."""
     zone_mid = (zone[0] + zone[1]) / 2.0
     if heatmap is not None:
         cluster = (heatmap.nearest_above if _is_long(direction)
@@ -167,24 +271,79 @@ def _tp_primary(
     return zone_mid - default_rr * width
 
 
+def _build_tp_ladder(
+    direction: Direction,
+    zone_mid: float,
+    heatmap: Optional[LiquidityHeatmap],
+    tp_primary: float,
+    shares: tuple[float, ...],
+    min_notional_frac: float,
+) -> tuple[tuple[float, float], ...]:
+    """Build a partial-TP ladder from liquidity clusters on the target side.
+
+    Returns ((price, share_fraction), ...) ordered near→far. Shares are
+    renormalised when fewer than ``len(shares)`` clusters pass the notional
+    filter. Falls back to ``((tp_primary, 1.0),)`` when there is no
+    heatmap, no valid cluster, or ladder is disabled (``shares`` empty /
+    single 1.0).
+    """
+    single = ((tp_primary, 1.0),)
+    if heatmap is None or not shares or len(shares) == 1:
+        return single
+    side_clusters = (heatmap.clusters_above if _is_long(direction)
+                     else heatmap.clusters_below)
+    if not side_clusters:
+        return single
+    largest = (heatmap.largest_above_notional if _is_long(direction)
+               else heatmap.largest_below_notional)
+    if largest <= 0:
+        return single
+    threshold = largest * min_notional_frac
+    valid = []
+    for c in side_clusters:
+        if c.notional_usd < threshold:
+            continue
+        if _is_long(direction) and c.price <= zone_mid:
+            continue
+        if not _is_long(direction) and c.price >= zone_mid:
+            continue
+        valid.append(c)
+    if not valid:
+        return single
+    taken = valid[:len(shares)]
+    used = shares[:len(taken)]
+    total = sum(used)
+    if total <= 0:
+        return single
+    norm = tuple(s / total for s in used)
+    return tuple((c.price, sh) for c, sh in zip(taken, norm))
+
+
+# ── Public API ─────────────────────────────────────────────────────────────
+
+
 def build_zone_setup(
     *,
     direction: Direction,
     state: MarketState,
     htf_state: Optional[MarketState] = None,
     heatmap: Optional[LiquidityHeatmap] = None,
+    ltf_candles: Optional[list[Any]] = None,
     zone_buffer_atr: float = 0.25,
     sl_buffer_atr: float = 0.5,
     max_wait_bars: int = 10,
     default_rr: float = 2.0,
+    liq_entry_near_max_atr: float = 1.5,
+    liq_entry_magnitude_mult: float = 2.5,
+    ema21_pullback_enabled: bool = True,
+    ema_fast_period: int = 21,
+    ema_slow_period: int = 55,
+    htf_fvg_entry_enabled: bool = False,
+    tp_ladder_enabled: bool = True,
+    tp_ladder_shares: tuple[float, ...] = (0.40, 0.35, 0.25),
+    tp_ladder_min_notional_frac: float = 0.30,
 ) -> Optional[ZoneSetup]:
-    """Return the best `ZoneSetup` for *direction*, or None if no source fits.
-
-    - `state`: entry-TF MarketState (sweeps, VWAPs, current price, ATR)
-    - `htf_state`: HTF 15m MarketState (cached via Phase 7.B4) for HTF FVGs
-    - `heatmap`: LiquidityHeatmap from derivatives layer; falls back to
-       `state.liquidity_heatmap` when not explicitly passed
-    """
+    """Return the best `ZoneSetup` for *direction*, or None if no source fits."""
     if direction not in (Direction.BULLISH, Direction.BEARISH):
         return None
     price = state.current_price
@@ -195,21 +354,39 @@ def build_zone_setup(
     hm = heatmap if heatmap is not None else state.liquidity_heatmap
 
     sources: list[tuple[ZoneSource, TriggerType, Optional[tuple[float, float]]]] = [
-        ("liq_pool", "zone_touch",
-            _liq_pool_zone(direction, price, atr, hm, zone_buffer_atr)),
-        ("fvg_htf", "zone_touch",
-            _htf_fvg_zone(direction, price, htf_state)),
         ("vwap_retest", "zone_touch",
             _vwap_zone(direction, price, atr, state, zone_buffer_atr)),
+        ("ema21_pullback", "zone_touch",
+            _ema21_pullback_zone(
+                direction, price, atr, ltf_candles, zone_buffer_atr,
+                ema_fast_period, ema_slow_period,
+            ) if ema21_pullback_enabled else None),
+        ("fvg_entry", "zone_touch",
+            _entry_tf_fvg_zone(direction, price, state)),
         ("sweep_retest", "sweep_reversal",
             _sweep_zone(direction, price, atr, state, zone_buffer_atr)),
+        ("liq_pool_near", "zone_touch",
+            _liq_pool_near_zone(
+                direction, price, atr, hm, zone_buffer_atr,
+                liq_entry_near_max_atr, liq_entry_magnitude_mult,
+            )),
     ]
+    if htf_fvg_entry_enabled:
+        sources.append((
+            "fvg_htf", "zone_touch",
+            _htf_fvg_zone(direction, price, htf_state),
+        ))
 
+    shares = tp_ladder_shares if tp_ladder_enabled else (1.0,)
     for source, trigger, zone in sources:
         if zone is None:
             continue
         sl = _sl_beyond_zone(direction, zone, atr, sl_buffer_atr)
         tp = _tp_primary(direction, zone, hm, atr, default_rr)
+        zone_mid = (zone[0] + zone[1]) / 2.0
+        ladder = _build_tp_ladder(
+            direction, zone_mid, hm, tp, shares, tp_ladder_min_notional_frac,
+        )
         return ZoneSetup(
             direction=direction,
             entry_zone=zone,
@@ -218,17 +395,27 @@ def build_zone_setup(
             tp_primary=tp,
             max_wait_bars=max_wait_bars,
             zone_source=source,
+            tp_ladder=ladder,
         )
     return None
 
 
-def zone_limit_price(direction: Direction, zone: tuple[float, float]) -> float:
+def zone_limit_price(
+    direction: Direction, zone: tuple[float, float],
+    zone_source: Optional[str] = None,
+) -> float:
     """Limit-entry price for `direction` inside `zone`.
 
-    Long: near edge (low) — buy-limit must rest below market.
-    Short: near edge (high) — sell-limit must rest above market.
+    Near-edge for pullback-style sources (VWAP / EMA / FVG / sweep):
+      * Long: zone low (buy-limit below market).
+      * Short: zone high (sell-limit above market).
+
+    Zone mid for ``liq_pool_near``: the cluster IS the support/resistance
+    target, not something to fade — entry sits at the cluster itself.
     """
     low, high = zone
+    if zone_source == "liq_pool_near":
+        return (low + high) / 2.0
     return low if _is_long(direction) else high
 
 
@@ -238,17 +425,18 @@ def apply_zone_to_plan(
     """Return a new TradePlan with entry/SL/TP taken from *zone*, re-sized
     so total USDT risk on the structural SL equals `plan.risk_amount_usdt`.
 
-    Why re-size: the original plan was sized against the minimum-% SL floor.
-    The zone's structural SL can be wider or narrower, so leaving contracts
-    unchanged would drift risk. Leverage + risk budget are preserved; TP is
-    overridden with the zone's primary target (usually an HTF liquidity
-    cluster), which shifts realized RR — logged via `plan.rr_ratio`.
+    Why re-size: the original plan was sized against the minimum-% SL
+    floor. The zone's structural SL can be wider or narrower, so leaving
+    contracts unchanged would drift risk. Leverage + risk budget are
+    preserved; primary TP is overridden with the zone's target, and
+    `tp_ladder` carries the full partial-TP ladder for downstream
+    consumption.
     """
     if plan.direction != zone.direction:
         raise ValueError(
             f"direction mismatch: plan={plan.direction} zone={zone.direction}"
         )
-    new_entry = zone_limit_price(zone.direction, zone.entry_zone)
+    new_entry = zone_limit_price(zone.direction, zone.entry_zone, zone.zone_source)
     new_sl = zone.sl_beyond_zone
     new_tp = zone.tp_primary
     new_sl_distance = abs(new_entry - new_sl)
@@ -265,6 +453,8 @@ def apply_zone_to_plan(
     actual_risk = actual_notional * new_sl_pct
     tp_distance = abs(new_tp - new_entry)
     new_rr = tp_distance / new_sl_distance if new_sl_distance > 0 else 0.0
+    ladder_src = zone.tp_ladder if zone.tp_ladder else ((new_tp, 1.0),)
+    ladder = [(float(p), float(s)) for p, s in ladder_src]
 
     return TradePlan(
         direction=plan.direction,
@@ -286,4 +476,5 @@ def apply_zone_to_plan(
         confluence_score=plan.confluence_score,
         confluence_factors=list(plan.confluence_factors),
         reason=f"{plan.reason} | zone={zone.zone_source}",
+        tp_ladder=ladder,
     )

@@ -293,6 +293,32 @@ class ExecutionConfig(BaseModel):
     zone_default_rr: float = 2.0
     zone_require_setup: bool = False   # True → reject when no zone source
 
+    # 2026-04-19 rebalance — EMA21 pullback entry source (scalp-native).
+    # When True the zone builder checks whether price sits within
+    # `zone_buffer_atr × ATR` of the fast EMA with an aligned EMA stack.
+    ema21_pullback_enabled: bool = True
+
+    # 2026-04-19 rebalance — HTF 15m FVG as an ENTRY source. Off by default:
+    # HTF FVG is a slow drift target, poor fit for the 3m scalp TF. Kept
+    # available so an operator can opt in for structural runs.
+    htf_fvg_entry_enabled: bool = False
+
+    # 2026-04-19 rebalance — near-liq entry gates. The old source placed
+    # limit orders AT the top cluster (sweep-reversal thesis). Rewritten so
+    # a liq-pool entry only fires when the nearest cluster on the correct
+    # side is (a) within `liq_entry_near_max_atr × ATR` of price AND (b)
+    # notional ≥ `liq_entry_magnitude_mult × median(side_clusters)`.
+    liq_entry_near_max_atr: float = 1.5
+    liq_entry_magnitude_mult: float = 2.5
+
+    # 2026-04-19 rebalance — partial-TP ladder. When enabled the zone
+    # builder produces a multi-leg TP list from liquidity clusters on the
+    # target side; shares renormalise when fewer clusters pass the notional
+    # filter (`tp_ladder_min_notional_frac × largest_side`).
+    tp_ladder_enabled: bool = True
+    tp_ladder_shares: list[float] = Field(default_factory=lambda: [0.40, 0.35, 0.25])
+    tp_ladder_min_notional_frac: float = 0.30
+
 
 class DerivativesConfig(BaseModel):
     """Phase 1.5 — derivatives data layer configuration.
