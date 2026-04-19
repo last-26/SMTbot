@@ -73,6 +73,12 @@ class CoinalyzeClient:
         self._rate_capacity = 40.0
         self._rate_last_refill = time.monotonic()
         self._rate_lock = asyncio.Lock()
+        # 429 backoff — populated when Coinalyze returns Retry-After so that
+        # subsequent requests short-circuit (return None) instead of awaiting
+        # asyncio.sleep inside the shared request path and blocking the event
+        # loop for every other coroutine (pending-poll, monitor, per-symbol
+        # cycles). `_rate_pause_until` is a monotonic deadline.
+        self._rate_pause_until = 0.0
 
     # ── Rate limiting ──────────────────────────────────────────────────────
 
@@ -94,16 +100,24 @@ class CoinalyzeClient:
                        cost: int = 1) -> Optional[Any]:
         if not self.api_key:
             return None
+        # Honour Retry-After from a prior 429 without blocking — callers fall
+        # back to stale/None snapshots (already their failure-isolation path)
+        # rather than every coroutine stalling on asyncio.sleep(retry_after).
+        now = time.monotonic()
+        if now < self._rate_pause_until:
+            return None
         for attempt in range(self._max_retries):
             await self._consume_token(cost=cost)
             try:
                 resp = await self._client.get(path, params=params)
                 if resp.status_code == 429:
                     retry_after = float(resp.headers.get("Retry-After", "5"))
-                    logger.warning("coinalyze_429 path={} retry_after={}",
-                                   path, retry_after)
-                    await asyncio.sleep(retry_after)
-                    continue
+                    self._rate_pause_until = time.monotonic() + retry_after
+                    logger.warning(
+                        "coinalyze_429 path={} retry_after={} pausing_derivatives",
+                        path, retry_after,
+                    )
+                    return None
                 if resp.status_code == 401:
                     logger.error("coinalyze_401 invalid_api_key")
                     return None

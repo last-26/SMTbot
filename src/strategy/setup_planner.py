@@ -421,6 +421,7 @@ def zone_limit_price(
 
 def apply_zone_to_plan(
     plan: TradePlan, zone: "ZoneSetup", contract_size: float,
+    min_sl_distance_pct: float = 0.0,
 ) -> TradePlan:
     """Return a new TradePlan with entry/SL/TP taken from *zone*, re-sized
     so total USDT risk on the structural SL equals `plan.risk_amount_usdt`.
@@ -431,6 +432,16 @@ def apply_zone_to_plan(
     preserved; primary TP is overridden with the zone's target, and
     `tp_ladder` carries the full partial-TP ladder for downstream
     consumption.
+
+    `min_sl_distance_pct` floor is re-applied here because the zone's
+    structural SL (buffer × ATR past zone edge) can land well inside the
+    per-symbol floor that entry_signals already widened the original plan
+    to. Without this re-check, an SL right on top of entry gets wicked
+    out immediately — and on 2026-04-19 caused sCode 51277
+    (`place_algo_order: (no message)`) on 3 positions because the mark
+    had crossed the trigger between fill and OCO attach. Widen the SL
+    here, keep the zone's direction/structural intent, resize contracts
+    off the new distance so R stays flat.
     """
     if plan.direction != zone.direction:
         raise ValueError(
@@ -444,6 +455,15 @@ def apply_zone_to_plan(
         raise ValueError(
             f"degenerate zone: entry={new_entry} sl={new_sl} dist={new_sl_distance}"
         )
+    if min_sl_distance_pct > 0.0:
+        sl_dist_pct = new_sl_distance / new_entry
+        if sl_dist_pct < min_sl_distance_pct:
+            min_dist = new_entry * min_sl_distance_pct
+            if zone.direction == Direction.BULLISH:
+                new_sl = new_entry - min_dist
+            else:
+                new_sl = new_entry + min_dist
+            new_sl_distance = abs(new_entry - new_sl)
     new_sl_pct = new_sl_distance / new_entry
     risk = plan.risk_amount_usdt
     denom = new_sl_pct + plan.fee_reserve_pct

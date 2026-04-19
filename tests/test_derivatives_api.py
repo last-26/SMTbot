@@ -143,12 +143,14 @@ async def test_consume_token_multi_cost_deducts_N(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_request_retries_on_429_with_retry_after(monkeypatch):
+async def test_request_429_short_circuits_without_blocking(monkeypatch):
+    """2026-04-19: 429 no longer awaits Retry-After inline. It sets
+    _rate_pause_until and returns None so callers fall back to stale
+    snapshots instead of stalling the event loop for every coroutine."""
     client = _make_client()
     fc: _FakeClient = client._client            # type: ignore
     fc.queue("/foo", _FakeResponse({}, status_code=429,
                                     headers={"Retry-After": "1"}))
-    fc.queue("/foo", _FakeResponse([{"value": 1.0}], status_code=200))
     slept: list[float] = []
 
     async def fake_sleep(sec: float):
@@ -157,8 +159,15 @@ async def test_request_retries_on_429_with_retry_after(monkeypatch):
     import src.data.derivatives_api as mod
     monkeypatch.setattr(mod.asyncio, "sleep", fake_sleep)
     result = await client._request("/foo", {}, cost=1)
-    assert result == [{"value": 1.0}]
-    assert 1.0 in slept
+    assert result is None
+    assert client._rate_pause_until > time.monotonic()
+    # No blocking sleep on the Retry-After duration.
+    assert 1.0 not in slept
+
+    # Subsequent calls short-circuit while the pause is active.
+    fc.queue("/foo", _FakeResponse([{"value": 1.0}], status_code=200))
+    again = await client._request("/foo", {}, cost=1)
+    assert again is None
 
 
 @pytest.mark.asyncio

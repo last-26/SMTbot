@@ -694,6 +694,14 @@ class BotRunner:
         for symbol in self.ctx.config.trading.symbols:
             if self.shutdown.is_set():
                 return
+            # Drain pending events between symbols so a fill during this cycle
+            # attaches its OCO within seconds rather than waiting for the next
+            # run_once tick (~180-240s). Minimises the fill → attach race that
+            # causes sCode 51277 / "(no message)" on tight-SL zone entries.
+            try:
+                await self._process_pending()
+            except Exception:
+                logger.exception("inline_pending_drain_failed symbol={}", symbol)
             try:
                 await self._run_one_symbol(symbol)
             except Exception:
@@ -1573,7 +1581,10 @@ class BotRunner:
         contract_size = self.ctx.contract_sizes.get(
             symbol, cfg.trading.contract_size)
         try:
-            zoned_plan = apply_zone_to_plan(plan, zone, contract_size)
+            zoned_plan = apply_zone_to_plan(
+                plan, zone, contract_size,
+                min_sl_distance_pct=cfg.min_sl_distance_pct_for(symbol),
+            )
         except Exception:
             logger.exception(
                 "zone_apply_failed symbol={} zone_source={}",
@@ -1696,16 +1707,55 @@ class BotRunner:
                 plan = replace(plan, num_contracts=filled_int)
 
         fill_px = ev.avg_price if ev.avg_price > 0 else plan.entry_price
+
+        # Pre-attach SL-crossed guard. OKX rejects place_algo_order with
+        # sCode 51277 / "(no message)" when the trigger price is already
+        # on the wrong side of mark — and without this check the position
+        # stays open UNPROTECTED. If mark has already breached plan.sl_price,
+        # skip the attach and best-effort close immediately.
+        try:
+            mark_px = await asyncio.to_thread(
+                self.ctx.client.get_mark_price, ev.inst_id,
+            )
+        except Exception:
+            mark_px = 0.0
+        if mark_px > 0:
+            crossed = (
+                (ev.pos_side == "long" and mark_px <= plan.sl_price)
+                or (ev.pos_side == "short" and mark_px >= plan.sl_price)
+            )
+            if crossed:
+                logger.critical(
+                    "pending_fill_sl_already_crossed_closing inst={} side={} "
+                    "order_id={} mark={:.6f} sl={:.6f}",
+                    ev.inst_id, ev.pos_side, ev.order_id, mark_px, plan.sl_price,
+                )
+                try:
+                    await asyncio.to_thread(
+                        self.ctx.client.close_position,
+                        ev.inst_id, ev.pos_side,
+                        self.ctx.config.execution.margin_mode,
+                    )
+                except Exception as close_exc:
+                    logger.critical(
+                        "pending_fill_emergency_close_failed_manual_intervention "
+                        "inst={} side={} err={!r}",
+                        ev.inst_id, ev.pos_side, close_exc,
+                    )
+                return
+
         algos: list[AlgoResult]
         try:
             algos = await asyncio.to_thread(
                 self.ctx.router.attach_algos, plan, ev.inst_id,
             )
         except Exception as exc:
+            code = getattr(exc, "code", None)
+            payload = getattr(exc, "payload", None)
             logger.critical(
                 "pending_fill_algo_attach_failed_position_UNPROTECTED "
-                "inst={} side={} order_id={} err={!r}",
-                ev.inst_id, ev.pos_side, ev.order_id, exc,
+                "inst={} side={} order_id={} err={!r} code={} payload={}",
+                ev.inst_id, ev.pos_side, ev.order_id, exc, code, payload,
             )
             return
 

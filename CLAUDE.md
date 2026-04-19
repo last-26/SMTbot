@@ -9,7 +9,7 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 ## Current state (snapshot)
 
 - **Strategy:** zone-based scalper. Confluence ≥ threshold → identify zone → post-only limit order at zone edge → wait N bars → fill | cancel.
-- **Pairs:** 7 OKX perps — `BTC / ETH / SOL / DOGE / XRP / ADA / BNB`. 7 concurrent slots on cross margin (all active, no queue).
+- **Pairs:** 5 OKX perps — `BTC / ETH / SOL / ADA / BNB`. 5 concurrent slots on cross margin (all active, no queue).
 - **Entry TF:** 3m. HTF context 15m, LTF confirmation 1m.
 - **Scoring:** 5 pillars (Market Structure, Liquidity, Money Flow, VWAP, Divergence) + hard gates (displacement, EMA momentum, VWAP, cross-asset opposition) + ADX regime-conditional weights. *Premium/discount gate temporarily disabled 2026-04-19 — see changelog; to be re-enabled as a soft/weighted factor (~10-15%) post-Phase-9.*
 - **Execution:** post-only limit → regular limit → market-at-edge fallback. OCO SL/TP, partial TP at 1.5R with fee-buffered SL-to-BE on TP1 fill.
@@ -20,6 +20,29 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 ---
 
 ## Changelog
+
+### 2026-04-19 (pm) — Unprotected-position hardening + 7→5 pair rollback
+
+- **Trigger:** post-scalp-native demo pass surfaced 3 UNPROTECTED positions (BTC / DOGE / XRP). Log pattern: `pending_fill_algo_attach_failed_position_UNPROTECTED err=OrderRejected('place_algo_order: (no message)')` → OKX sCode 51277 (trigger already on wrong side of mark between fill and OCO attach).
+- **Root causes diagnosed:**
+  1. **Zone SL floor bypass** — `apply_zone_to_plan` overrode entry_signals' widened SL with a tighter structural SL (`zone.sl_beyond_zone` = sl_buffer_atr × ATR past zone edge); sub-floor stops got wicked out instantly.
+  2. **Coinalyze 429 blocked the entire event loop** for up to 57s via `asyncio.sleep(retry_after)` in the shared request path → pending-poll + monitor + all symbol cycles stalled together.
+  3. **Pending poll only ran once per `run_once`** (~180-240s per full cycle), so a fill could sit that long before `attach_algos` fired — long enough for mark to cross the SL trigger.
+  4. **Single-balance-query 51008 race** with 7 concurrent zone entries competing for cross-margin free-margin.
+  5. **Logger stripped `OrderRejected.code` / `.payload`** (`err={!r}`) — failures were unactionable.
+- **Fixes applied:**
+  - **Phase A (quick wins)**
+    - `config/default.yaml` — `trading.symbols` 7→5 (dropped DOGE + XRP, kept BTC/ETH/SOL/ADA/BNB); `max_concurrent_positions` 7→5. Per-slot margin $714 → $1000 (+40%), cycle time comes in under 180s budget.
+    - `src/bot/runner.py` — attach-algo CRITICAL log extended with `getattr(exc, 'code', None)` + `getattr(exc, 'payload', None)`.
+  - **Phase B (safety)**
+    - `src/strategy/setup_planner.py:apply_zone_to_plan` — new `min_sl_distance_pct` parameter; widens zone SL to per-symbol floor when structural SL lands inside it (mirrors `entry_signals.py` widening pattern, R stays flat via notional re-size). Call site `runner.py:1576` threads `cfg.min_sl_distance_pct_for(symbol)`.
+    - `src/bot/runner.py:_handle_pending_filled` — pre-attach mark-vs-SL guard: `client.get_mark_price` before `attach_algos`; if mark already breached `plan.sl_price`, skip attach and best-effort `close_position`. Second `close_position` failure → CRITICAL log, manual intervention (emergency close not automated).
+  - **Phase C (infra)**
+    - `src/data/derivatives_api.py` — 429 no longer awaits `asyncio.sleep(retry_after)`. Sets `self._rate_pause_until = now + retry_after`, returns None immediately; subsequent requests short-circuit while the pause is active. Callers fall back to stale/None snapshots (their existing failure-isolation path).
+    - `src/bot/runner.py:run_once` — `_process_pending()` now drains inline between symbols, not just once per tick. Fill → OCO-attach latency drops from ~180-240s to single-digit seconds.
+- **Tests:** `tests/test_derivatives_api.py::test_request_retries_on_429_with_retry_after` rewritten → `test_request_429_short_circuits_without_blocking` (asserts no inline sleep, `_rate_pause_until` set, subsequent calls short-circuit). Full suite 682/682 still green.
+- **Operator action pre-deploy:** manually closed the 3 UNPROTECTED positions + 5 resting limit orders (~$500 profit). No open positions / no pending orders on restart.
+- **Re-tightening (future):** 7→5 is a mitigation, not a verdict on DOGE/XRP. After 50 post-fix closed trades, revisit adding them back; momentum wick + thin book were never the root cause — the attach race was.
 
 ### 2026-04-19 — Premium/discount gate temporarily disabled
 
@@ -205,19 +228,19 @@ Things that aren't self-evident from the code. Inline comments cover the *what*;
 
 ## Currency pair notes
 
-7 OKX perps — BTC / ETH / SOL / DOGE / XRP / ADA / BNB. BTC + ETH + BNB are market pillars (major-class book depth); SOL/DOGE/XRP/ADA are altcoins gated by the cross-asset veto.
+5 OKX perps — BTC / ETH / SOL / ADA / BNB. BTC + ETH + BNB are market pillars (major-class book depth); SOL + ADA are altcoins gated by the cross-asset veto. DOGE + XRP pulled on 2026-04-19 (pm) after the attach-race incident — their per-symbol override maps remain in YAML (harmless when not watched) so re-adding them is one-line after the fix is proven.
 
-`max_concurrent_positions=7` (every pair can hold a position simultaneously — no slot competition; confluence gate still picks setups, but cycle isn't queue-limited). Cross margin, `per_slot ≈ total_eq / 7 ≈ $714` on a $5k demo. R stays 1% of total equity ($50); only the notional ceiling shrinks proportionally.
+`max_concurrent_positions=5` (every pair can hold a position simultaneously — no slot competition; confluence gate still picks setups, but cycle isn't queue-limited). Cross margin, `per_slot ≈ total_eq / 5 ≈ $1000` on a $5k demo. R stays 1% of total equity ($50); only the notional ceiling shrinks proportionally.
 
-Cycle timing at 3m entry TF = 180s budget: typical 210–240s with 7 pairs (post-2026-04-19 expansion; TF bütçesi aşılıyor, bar zaman zaman atlanır), worst ~330s. Worst-case skips a cycle; next bar catches up. DOGE/XRP/ADA leverage-capped at 30x; SOL/BNB inherit OKX 50x cap.
+Cycle timing at 3m entry TF = 180s budget: typical 150–180s with 5 pairs (comfortable inside the budget after 7→5 rollback). DOGE/XRP (if reinstated) + ADA leverage-capped at 30x; SOL/BNB inherit OKX 50x cap.
 
-Per-symbol overrides (YAML):
-- `swing_lookback_per_symbol`: DOGE/XRP/ADA=30 (thin 3m books).
-- `htf_sr_buffer_atr_per_symbol`: SOL=0.10 (wide-ATR, narrower buffer); DOGE/XRP/ADA=0.15; BNB inherits global 0.2.
-- `session_filter_per_symbol`: SOL/DOGE/XRP/ADA=[london] only. BNB inherits global (london+new_york) as major.
-- `min_sl_distance_pct_per_symbol`: BTC 0.004, ETH 0.006, SOL 0.010, DOGE/XRP/ADA 0.008, BNB 0.005.
+Per-symbol overrides (YAML, DOGE/XRP rows kept for easy reinstatement):
+- `swing_lookback_per_symbol`: ADA=30 (thin 3m book; DOGE/XRP=30 preserved).
+- `htf_sr_buffer_atr_per_symbol`: SOL=0.10 (wide-ATR, narrower buffer); ADA=0.15; BNB inherits global 0.2.
+- `session_filter_per_symbol`: SOL + ADA=[london] only. BNB inherits global (london+new_york) as major.
+- `min_sl_distance_pct_per_symbol`: BTC 0.004, ETH 0.006, SOL 0.010, ADA 0.008, BNB 0.005.
 
-Adding an 8th+ pair: drop into `trading.symbols`, add `okx_to_tv_symbol()` parametrized test, add `derivatives.regime_per_symbol_overrides`, add `min_sl_distance_pct_per_symbol`, watch 20-30 cycles for `htf_settle_timeout` / `set_symbol_failed`. Coinalyze free tier supports ~8 pairs at refresh_interval_s=75s; beyond that needs paid tier or longer interval.
+Adding a 6th+ pair: drop into `trading.symbols`, add `okx_to_tv_symbol()` parametrized test, add `derivatives.regime_per_symbol_overrides`, add `min_sl_distance_pct_per_symbol`, watch 20-30 cycles for `htf_settle_timeout` / `set_symbol_failed`. Coinalyze free tier supports ~8 pairs at refresh_interval_s=75s; beyond that needs paid tier or longer interval.
 
 ---
 
