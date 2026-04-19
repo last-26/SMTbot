@@ -284,6 +284,11 @@ class BotContext:
     open_trade_ids: dict[tuple[str, str], str] = field(default_factory=dict)
     # HTF S/R zones cached per-symbol after the HTF pass (Madde B → D)
     htf_sr_cache: dict[str, list] = field(default_factory=dict)
+    # Full HTF MarketState (Pine tables on 15m) cached per-symbol — Phase 7.B4.
+    # Populated alongside htf_sr_cache while the chart is on the HTF timeframe,
+    # so the zone-entry planner (Phase 7.C1) can source HTF FVGs / OBs / trend
+    # without another TF switch. Cleared on already-open skip or refresh error.
+    htf_state_cache: dict[str, MarketState] = field(default_factory=dict)
     # Latest LTF snapshot per-symbol (Madde B → F)
     ltf_cache: dict[str, LTFState] = field(default_factory=dict)
     # Last close per (symbol, side) — reentry gate (Madde C)
@@ -992,6 +997,24 @@ class BotRunner:
             except Exception:
                 logger.exception("htf_refresh_failed symbol={}", symbol)
                 self.ctx.htf_sr_cache.pop(symbol, None)
+
+            # Phase 7.B4 — snapshot HTF MarketState (Pine tables for 15m) so
+            # the zone-entry planner can read HTF FVG / OB / trend without a
+            # second TF switch. Only meaningful with a live bridge (fakes can
+            # populate this directly); cleared on read failure so consumers
+            # never see a stale entry-TF state mis-labelled as HTF.
+            if self.ctx.bridge is not None:
+                try:
+                    self.ctx.htf_state_cache[symbol] = (
+                        await self.ctx.reader.read_market_state()
+                    )
+                except Exception:
+                    logger.exception("htf_state_read_failed symbol={}", symbol)
+                    self.ctx.htf_state_cache.pop(symbol, None)
+        else:
+            # Already-open skip: stale HTF state must not feed a later setup
+            # planner when this symbol's position closes and the gate reopens.
+            self.ctx.htf_state_cache.pop(symbol, None)
 
         # 2b. LTF pass — read oscillator into LTFState, cache for Madde F.
         if self.ctx.bridge is not None and self.ctx.ltf_reader is not None:
