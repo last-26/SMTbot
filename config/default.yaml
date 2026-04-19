@@ -204,6 +204,13 @@ analysis:
   ema_veto_enabled: true
   ema_veto_fast_period: 21
   ema_veto_slow_period: 55
+  # Phase 7.A6 — cross-asset BTC/ETH veto. When `true`, altcoin entries
+  # are rejected if BOTH BTC and ETH pillars show a fresh opposing EMA
+  # stack. Reuses the ema_veto_* periods above. Fails open when either
+  # pillar is missing / neutral / stale (> max_age_s). Rule #2 of the
+  # pivot strategy: don't fight a united BTC+ETH tape on altcoins.
+  cross_asset_veto_enabled: true
+  cross_asset_veto_max_age_s: 300.0
 
 okx:
   base_url: https://www.okx.com

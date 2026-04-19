@@ -177,6 +177,15 @@ class AnalysisConfig(BaseModel):
     ema_veto_enabled: bool = False
     ema_veto_fast_period: int = 21
     ema_veto_slow_period: int = 55
+    # Phase 7.A6 — cross-asset BTC/ETH veto. When true, altcoin entries are
+    # rejected when BOTH BTC-USDT-SWAP and ETH-USDT-SWAP show opposing EMA
+    # stacks (i.e. an altcoin short fighting a clean bull tape on both
+    # pillars, or a long fighting a clean bear tape). Fails open when
+    # either pillar bias is missing, neutral, or older than
+    # `cross_asset_veto_max_age_s`. BTC / ETH cycles always fall through;
+    # they set the snapshot but the gate skips them by symbol.
+    cross_asset_veto_enabled: bool = False
+    cross_asset_veto_max_age_s: float = 300.0
 
     @field_validator("confluence_weights")
     @classmethod

@@ -309,6 +309,34 @@ def _ema_momentum_veto(
     return False
 
 
+# ── Cross-asset pillar opposition (Phase 7.A6) ─────────────────────────────
+#
+# BTC + ETH set the crypto-market tape; altcoin trades that fight *both*
+# pillars have a poor edge. Veto fires only when both pillars are fresh and
+# opposite to the trade direction. Missing / neutral / stale data fails
+# open. Caller supplies the pillar bias dict; planner stays pure.
+
+
+def _cross_asset_opposes(
+    pillar_opposition: Optional[Direction],
+    direction: Direction,
+) -> bool:
+    """True when caller supplied an opposition signal matching this direction.
+
+    `pillar_opposition` is Direction.BULLISH when both pillars are BULLISH
+    (i.e. blocks a BEARISH entry), Direction.BEARISH when both are BEARISH
+    (blocks a BULLISH entry), or None/UNDEFINED when the caller decided
+    no veto applies.
+    """
+    if pillar_opposition is None or pillar_opposition == Direction.UNDEFINED:
+        return False
+    if direction == Direction.BULLISH and pillar_opposition == Direction.BEARISH:
+        return True
+    if direction == Direction.BEARISH and pillar_opposition == Direction.BULLISH:
+        return True
+    return False
+
+
 # ── Full pipeline ───────────────────────────────────────────────────────────
 
 
@@ -514,6 +542,7 @@ def build_trade_plan_with_reason(
     ema_veto_enabled: bool = False,
     ema_veto_fast_period: int = 21,
     ema_veto_slow_period: int = 55,
+    pillar_opposition: Optional[Direction] = None,
 ) -> tuple[Optional[TradePlan], str]:
     """Same as `build_trade_plan_from_state` but returns `(plan, reason)`.
 
@@ -525,6 +554,8 @@ def build_trade_plan_with_reason(
         side of all available session VWAPs for the proposed direction
       - "ema_momentum_contra" — ema_veto_enabled and EMA stack opposes
         the proposed direction (bull stack + bearish entry, or vice versa)
+      - "cross_asset_opposition" — BTC and ETH pillars both oppose the
+        proposed altcoin direction (pillar_opposition set by caller)
       - "crowded_skip"     — derivatives crowded-skip gate blocked
       - "zero_contracts"   — contract rounding wiped position to zero
       - "htf_tp_ceiling"   — HTF S/R ceiling squeezed R:R below min_rr_ratio
@@ -587,6 +618,9 @@ def build_trade_plan_with_reason(
         slow_period=ema_veto_slow_period,
     ):
         return None, "ema_momentum_contra"
+
+    if _cross_asset_opposes(pillar_opposition, intent.direction):
+        return None, "cross_asset_opposition"
 
     if _should_skip_for_derivatives(
         getattr(state, "derivatives", None),

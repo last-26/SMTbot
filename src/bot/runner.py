@@ -132,6 +132,83 @@ def _structure_str(state: MarketState) -> Optional[str]:
         return None
 
 
+# ── Cross-asset pillar bias (Phase 7.A6) ────────────────────────────────────
+#
+# BTC and ETH move the rest of the crypto book; an altcoin entry that
+# opposes BOTH pillars is fighting the market-wide tape. We snapshot the
+# per-pillar EMA stack each cycle and consult it before altcoin entries.
+#
+# Veto rule (both pillars must concur against the trade):
+#   * BULLISH alt blocked only when BTC and ETH are both BEARISH stacks.
+#   * BEARISH alt blocked only when BTC and ETH are both BULLISH stacks.
+# Single-pillar dissent, missing data, neutral stacks, or stale snapshots
+# → fail-open (no veto). The veto is strict by design: alts diverging
+# *with* one pillar is a normal regime and should pass.
+
+_PILLAR_SYMBOLS: tuple[str, ...] = ("BTC-USDT-SWAP", "ETH-USDT-SWAP")
+_PILLAR_BIAS_MAX_AGE_S: float = 300.0      # 5 min — roughly one full cycle
+
+
+def _ema_pillar(values: list[float], period: int) -> Optional[float]:
+    """EMA over `values`; returns None if the series is shorter than period."""
+    if period <= 0 or len(values) < period:
+        return None
+    k = 2.0 / (period + 1.0)
+    ema = sum(values[:period]) / period
+    for v in values[period:]:
+        ema = v * k + ema * (1.0 - k)
+    return ema
+
+
+def _pillar_bias_from(
+    state: MarketState,
+    candles: list,
+    fast_period: int,
+    slow_period: int,
+) -> Direction:
+    """EMA-stack bias for BTC/ETH snapshot. UNDEFINED on neutral / missing."""
+    price = float(getattr(state, "current_price", 0.0) or 0.0)
+    if price <= 0 or not candles:
+        return Direction.UNDEFINED
+    closes = [c.close for c in candles if getattr(c, "close", None) is not None]
+    ema_fast = _ema_pillar(closes, fast_period)
+    ema_slow = _ema_pillar(closes, slow_period)
+    if ema_fast is None or ema_slow is None:
+        return Direction.UNDEFINED
+    if price > ema_fast > ema_slow:
+        return Direction.BULLISH
+    if price < ema_fast < ema_slow:
+        return Direction.BEARISH
+    return Direction.UNDEFINED
+
+
+def _cross_asset_opposition(
+    pillar_bias: dict[str, tuple[Direction, datetime]],
+    direction: Direction,
+    now: datetime,
+    max_age_s: float = _PILLAR_BIAS_MAX_AGE_S,
+) -> bool:
+    """True when BOTH pillars are fresh and oppose the trade direction."""
+    if direction == Direction.UNDEFINED:
+        return False
+    fresh_opposing: list[Direction] = []
+    for sym in _PILLAR_SYMBOLS:
+        item = pillar_bias.get(sym)
+        if item is None:
+            return False      # missing pillar → fail open
+        bias, updated = item
+        if bias == Direction.UNDEFINED:
+            return False      # neutral pillar → fail open
+        if (now - updated).total_seconds() > max_age_s:
+            return False      # stale → fail open
+        fresh_opposing.append(bias)
+    if direction == Direction.BULLISH:
+        return all(b == Direction.BEARISH for b in fresh_opposing)
+    if direction == Direction.BEARISH:
+        return all(b == Direction.BULLISH for b in fresh_opposing)
+    return False
+
+
 def _derive_enrichment(state: MarketState) -> dict:
     """Pull derivatives + heatmap snapshot fields out of MarketState for
     journal persistence. All keys are None when a source is missing — the
@@ -226,6 +303,11 @@ class BotContext:
     contract_sizes: dict[str, float] = field(default_factory=dict)
     # Per-symbol OKX max leverage (BTC/ETH=100, SOL=50). Above this trips 59102.
     max_leverage_per_symbol: dict[str, int] = field(default_factory=dict)
+    # Phase 7.A6 — cross-asset pillar bias snapshot. Updated each cycle from
+    # BTC-USDT-SWAP and ETH-USDT-SWAP EMA stacks; consulted before altcoin
+    # entries so trades against both pillars can be rejected.
+    # Format: {pillar_symbol: (direction, updated_at_utc)}.
+    pillar_bias: dict[str, tuple[Direction, datetime]] = field(default_factory=dict)
     # Main event loop captured at `run()` start — threaded callbacks (from
     # `PositionMonitor.poll` running under `asyncio.to_thread`) schedule
     # coroutines on this loop via `run_coroutine_threadsafe`.
@@ -621,6 +703,38 @@ class BotRunner:
                 return side
         return None
 
+    def _pillar_opposition_for(self, symbol: str) -> Optional[Direction]:
+        """Cross-asset opposition signal for `symbol` (Phase 7.A6).
+
+        Returns:
+          * Direction.BULLISH when both pillars are BULLISH → blocks BEARISH alts
+          * Direction.BEARISH when both pillars are BEARISH → blocks BULLISH alts
+          * None when the veto is disabled, `symbol` is a pillar itself, either
+            pillar's bias is missing / neutral / stale.
+        """
+        cfg = self.ctx.config.analysis
+        if not cfg.cross_asset_veto_enabled:
+            return None
+        if symbol in _PILLAR_SYMBOLS:
+            return None
+        now = _utc_now()
+        biases: list[Direction] = []
+        for sym in _PILLAR_SYMBOLS:
+            item = self.ctx.pillar_bias.get(sym)
+            if item is None:
+                return None
+            bias, updated = item
+            if bias == Direction.UNDEFINED:
+                return None
+            if (now - updated).total_seconds() > cfg.cross_asset_veto_max_age_s:
+                return None
+            biases.append(bias)
+        if all(b == Direction.BULLISH for b in biases):
+            return Direction.BULLISH
+        if all(b == Direction.BEARISH for b in biases):
+            return Direction.BEARISH
+        return None
+
     def _is_ltf_reversal(self, ltf: LTFState, open_side: str, max_age: int) -> bool:
         """True when the fresh LTF signal contradicts the open side.
 
@@ -846,6 +960,25 @@ class BotRunner:
         buf = self.ctx.multi_tf.get_buffer(tf_key)
         candles = buf.last(50) if buf is not None else []
 
+        # 2c-alt. Cross-asset pillar bias (Phase 7.A6).
+        # Snapshot BTC/ETH EMA stacks as they pass through their own cycle;
+        # altcoin cycles below will consult the cache. Enough closes must
+        # be available to seed the slow-period EMA — otherwise the helper
+        # returns UNDEFINED and the snapshot entry is skipped.
+        if symbol in _PILLAR_SYMBOLS and cfg.analysis.cross_asset_veto_enabled:
+            bias = _pillar_bias_from(
+                state,
+                candles,
+                fast_period=cfg.analysis.ema_veto_fast_period,
+                slow_period=cfg.analysis.ema_veto_slow_period,
+            )
+            if bias != Direction.UNDEFINED:
+                self.ctx.pillar_bias[symbol] = (bias, _utc_now())
+            logger.info(
+                "pillar_bias_update symbol={} bias={}",
+                symbol, bias.value,
+            )
+
         # 2c-bis. Attach derivatives state + liquidity heatmap (Phase 1.5).
         # Failure here must never crash the symbol cycle.
         if self.ctx.derivatives_cache is not None:
@@ -954,6 +1087,7 @@ class BotRunner:
                 ema_veto_enabled=cfg.analysis.ema_veto_enabled,
                 ema_veto_fast_period=cfg.analysis.ema_veto_fast_period,
                 ema_veto_slow_period=cfg.analysis.ema_veto_slow_period,
+                pillar_opposition=self._pillar_opposition_for(symbol),
             )
         except Exception:
             logger.exception("plan_build_failed symbol={}", symbol)

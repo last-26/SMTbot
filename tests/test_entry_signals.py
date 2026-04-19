@@ -387,6 +387,61 @@ def test_ema_veto_fails_open_on_insufficient_data():
     assert reason == ""
 
 
+# ── Cross-asset pillar opposition (Phase 7.A6) ─────────────────────────────
+
+
+def test_cross_asset_veto_blocks_bearish_when_pillars_bullish():
+    ob = OrderBlock(direction=Direction.BEARISH, bottom=100.06, top=100.10)
+    state = _state(
+        order_blocks=[ob], price=100.0, atr=0.01,
+        trend_htf=Direction.BEARISH, last_mss="BEARISH@101",
+        active_ob="BEAR@100.06-100.10", vmc_ribbon="BEARISH",
+    )
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0,
+        min_sl_distance_pct=0.003,
+        pillar_opposition=Direction.BULLISH,
+    )
+    assert plan is None
+    assert reason == "cross_asset_opposition"
+
+
+def test_cross_asset_veto_blocks_bullish_when_pillars_bearish():
+    ob = OrderBlock(direction=Direction.BULLISH, bottom=99.9, top=99.94)
+    state = _state(order_blocks=[ob], price=100.0, atr=0.01)
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0,
+        min_sl_distance_pct=0.003,
+        pillar_opposition=Direction.BEARISH,
+    )
+    assert plan is None
+    assert reason == "cross_asset_opposition"
+
+
+def test_cross_asset_veto_passes_when_pillars_align():
+    ob = OrderBlock(direction=Direction.BULLISH, bottom=99.9, top=99.94)
+    state = _state(order_blocks=[ob], price=100.0, atr=0.01)
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0,
+        min_sl_distance_pct=0.003,
+        pillar_opposition=Direction.BULLISH,   # pillars BULL → allows BULL alt
+    )
+    assert plan is not None
+    assert reason == ""
+
+
+def test_cross_asset_veto_no_op_when_pillar_opposition_none():
+    ob = OrderBlock(direction=Direction.BULLISH, bottom=99.9, top=99.94)
+    state = _state(order_blocks=[ob], price=100.0, atr=0.01)
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0,
+        min_sl_distance_pct=0.003,
+        pillar_opposition=None,
+    )
+    assert plan is not None
+    assert reason == ""
+
+
 def test_ema_veto_disabled_by_default():
     ob = OrderBlock(direction=Direction.BULLISH, bottom=99.9, top=99.94)
     state = _state(order_blocks=[ob], price=100.0, atr=0.01)
