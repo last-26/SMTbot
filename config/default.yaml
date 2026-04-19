@@ -193,6 +193,17 @@ analysis:
   # Missing (zero) VWAPs are skipped; no-VWAP state is fail-open. Opt-in —
   # recommended for liquidity-driven futures runs after A+B validation.
   vwap_hard_veto_enabled: false
+  # Phase 7.A5 — EMA stack momentum veto on the entry TF. When `true`,
+  # reject entries that oppose the local stack regime:
+  #   * bull stack (price > EMA21 > EMA55) blocks bearish entries
+  #   * bear stack (price < EMA21 < EMA55) blocks bullish entries
+  # Neutral stacks and bars with < slow_period closes fail open.
+  # Enabled by default in the pivot plan — rule #1 of the new strategy is
+  # "don't fight the EMA stack on the entry TF". Flip off for a clean
+  # attribution window if you want to measure the veto's lift in isolation.
+  ema_veto_enabled: true
+  ema_veto_fast_period: 21
+  ema_veto_slow_period: 55
 
 okx:
   base_url: https://www.okx.com

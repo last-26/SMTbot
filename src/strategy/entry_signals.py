@@ -263,6 +263,52 @@ def _vwap_hard_veto(state: MarketState, direction: Direction, price: float) -> b
     return False
 
 
+# ── EMA 21/55 momentum veto (Phase 7.A5) ────────────────────────────────────
+#
+# Sprint 3 diagnostic: the bot repeatedly fired entries against the entry-TF
+# momentum stack — MSS-driven signals don't read the EMA trend. A clean
+# bull stack (price > EMA21 > EMA55) makes a bearish short statistically
+# worse; same for the mirror. Gate rejects trades that oppose the local
+# momentum regime; neutral / insufficient data fails open (no veto).
+
+
+def _ema(values: list[float], period: int) -> Optional[float]:
+    """EMA of the last `period` samples. Returns None when input is shorter
+    than the period (not enough data to seed a stable EMA)."""
+    if period <= 0 or len(values) < period:
+        return None
+    k = 2.0 / (period + 1.0)
+    ema = sum(values[:period]) / period        # SMA seed
+    for price in values[period:]:
+        ema = price * k + ema * (1.0 - k)
+    return ema
+
+
+def _ema_momentum_veto(
+    candles: Optional[list[Candle]],
+    direction: Direction,
+    price: float,
+    fast_period: int = 21,
+    slow_period: int = 55,
+) -> bool:
+    """True → reject. Short stack blocks BULLISH; long stack blocks BEARISH.
+    Neutral stack or missing data → False (fail-open)."""
+    if not candles or price <= 0:
+        return False
+    closes = [c.close for c in candles if getattr(c, "close", None) is not None]
+    ema_fast = _ema(closes, fast_period)
+    ema_slow = _ema(closes, slow_period)
+    if ema_fast is None or ema_slow is None:
+        return False
+    bull_stack = price > ema_fast > ema_slow
+    bear_stack = price < ema_fast < ema_slow
+    if direction == Direction.BULLISH and bear_stack:
+        return True
+    if direction == Direction.BEARISH and bull_stack:
+        return True
+    return False
+
+
 # ── Full pipeline ───────────────────────────────────────────────────────────
 
 
@@ -465,6 +511,9 @@ def build_trade_plan_with_reason(
     min_rsi_mfi_magnitude: float = 2.0,
     liquidity_pool_max_atr_dist: float = 3.0,
     vwap_hard_veto_enabled: bool = False,
+    ema_veto_enabled: bool = False,
+    ema_veto_fast_period: int = 21,
+    ema_veto_slow_period: int = 55,
 ) -> tuple[Optional[TradePlan], str]:
     """Same as `build_trade_plan_from_state` but returns `(plan, reason)`.
 
@@ -474,6 +523,8 @@ def build_trade_plan_with_reason(
       - "no_sl_source"     — intent produced no SL price
       - "vwap_misaligned"  — vwap_hard_veto_enabled and price on the wrong
         side of all available session VWAPs for the proposed direction
+      - "ema_momentum_contra" — ema_veto_enabled and EMA stack opposes
+        the proposed direction (bull stack + bearish entry, or vice versa)
       - "crowded_skip"     — derivatives crowded-skip gate blocked
       - "zero_contracts"   — contract rounding wiped position to zero
       - "htf_tp_ceiling"   — HTF S/R ceiling squeezed R:R below min_rr_ratio
@@ -527,6 +578,15 @@ def build_trade_plan_with_reason(
         state, intent.direction, intent.entry_price,
     ):
         return None, "vwap_misaligned"
+
+    if ema_veto_enabled and _ema_momentum_veto(
+        candles,
+        intent.direction,
+        intent.entry_price,
+        fast_period=ema_veto_fast_period,
+        slow_period=ema_veto_slow_period,
+    ):
+        return None, "ema_momentum_contra"
 
     if _should_skip_for_derivatives(
         getattr(state, "derivatives", None),

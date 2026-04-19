@@ -951,6 +951,9 @@ class BotRunner:
                 min_rsi_mfi_magnitude=cfg.analysis.min_rsi_mfi_magnitude,
                 liquidity_pool_max_atr_dist=cfg.analysis.liquidity_pool_max_atr_dist,
                 vwap_hard_veto_enabled=cfg.analysis.vwap_hard_veto_enabled,
+                ema_veto_enabled=cfg.analysis.ema_veto_enabled,
+                ema_veto_fast_period=cfg.analysis.ema_veto_fast_period,
+                ema_veto_slow_period=cfg.analysis.ema_veto_slow_period,
             )
         except Exception:
             logger.exception("plan_build_failed symbol={}", symbol)

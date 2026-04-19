@@ -309,6 +309,96 @@ def test_min_tp_distance_gate_short_side():
 # ── min_sl_distance_pct (noise floor gate) ─────────────────────────────────
 
 
+# ── EMA 21/55 momentum veto (Phase 7.A5) ───────────────────────────────────
+
+
+def _candles_bull_stack(n: int = 60, start: float = 90.0) -> list[Candle]:
+    """Monotonic rising closes → EMA21 > EMA55 and price > EMA21."""
+    out = []
+    for i in range(n):
+        c = start + i * 0.2
+        out.append(Candle(open=c, high=c + 0.05, low=c - 0.05, close=c))
+    return out
+
+
+def _candles_bear_stack(n: int = 60, start: float = 110.0) -> list[Candle]:
+    """Monotonic falling closes → EMA21 < EMA55 and price < EMA21."""
+    out = []
+    for i in range(n):
+        c = start - i * 0.2
+        out.append(Candle(open=c, high=c + 0.05, low=c - 0.05, close=c))
+    return out
+
+
+def test_ema_veto_blocks_bearish_under_bull_stack():
+    ob = OrderBlock(direction=Direction.BEARISH, bottom=100.06, top=100.10)
+    state = _state(
+        order_blocks=[ob], price=100.0, atr=0.01,
+        trend_htf=Direction.BEARISH, last_mss="BEARISH@101",
+        active_ob="BEAR@100.06-100.10", vmc_ribbon="BEARISH",
+    )
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0,
+        candles=_candles_bull_stack(),
+        min_sl_distance_pct=0.003,
+        ema_veto_enabled=True,
+    )
+    assert plan is None
+    assert reason == "ema_momentum_contra"
+
+
+def test_ema_veto_blocks_bullish_under_bear_stack():
+    ob = OrderBlock(direction=Direction.BULLISH, bottom=99.9, top=99.94)
+    state = _state(order_blocks=[ob], price=100.0, atr=0.01)
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0,
+        candles=_candles_bear_stack(),
+        min_sl_distance_pct=0.003,
+        ema_veto_enabled=True,
+    )
+    assert plan is None
+    assert reason == "ema_momentum_contra"
+
+
+def test_ema_veto_allows_aligned_trade():
+    ob = OrderBlock(direction=Direction.BULLISH, bottom=99.9, top=99.94)
+    state = _state(order_blocks=[ob], price=100.0, atr=0.01)
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0,
+        candles=_candles_bull_stack(),
+        min_sl_distance_pct=0.003,
+        ema_veto_enabled=True,
+    )
+    assert plan is not None
+    assert reason == ""
+
+
+def test_ema_veto_fails_open_on_insufficient_data():
+    """Fewer closes than slow_period → no veto."""
+    ob = OrderBlock(direction=Direction.BULLISH, bottom=99.9, top=99.94)
+    state = _state(order_blocks=[ob], price=100.0, atr=0.01)
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0,
+        candles=_candles_bear_stack(n=20),    # < 55
+        min_sl_distance_pct=0.003,
+        ema_veto_enabled=True,
+    )
+    assert plan is not None
+    assert reason == ""
+
+
+def test_ema_veto_disabled_by_default():
+    ob = OrderBlock(direction=Direction.BULLISH, bottom=99.9, top=99.94)
+    state = _state(order_blocks=[ob], price=100.0, atr=0.01)
+    plan, reason = build_trade_plan_with_reason(
+        state, account_balance=10_000.0,
+        candles=_candles_bear_stack(),
+        min_sl_distance_pct=0.003,
+    )
+    assert plan is not None
+    assert reason == ""
+
+
 def test_min_sl_distance_gate_disabled_by_default():
     """With default min_sl_distance_pct=0, the gate is off."""
     ob = OrderBlock(direction=Direction.BULLISH, bottom=99.9, top=99.94)

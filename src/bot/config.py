@@ -169,6 +169,14 @@ class AnalysisConfig(BaseModel):
     # the proposed direction. Opt-in; default off to avoid changing behaviour
     # for back-compat. Enable after A+B validation for liquidity-driven runs.
     vwap_hard_veto_enabled: bool = False
+    # Phase 7.A5 — EMA stack momentum veto. When true, reject entries that
+    # oppose the local EMA stack regime on the entry TF:
+    #   * bull stack (price > EMA21 > EMA55) blocks bearish entries;
+    #   * bear stack (price < EMA21 < EMA55) blocks bullish entries.
+    # Neutral stacks and insufficient-data bars fail open (no veto).
+    ema_veto_enabled: bool = False
+    ema_veto_fast_period: int = 21
+    ema_veto_slow_period: int = 55
 
     @field_validator("confluence_weights")
     @classmethod
