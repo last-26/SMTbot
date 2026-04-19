@@ -147,7 +147,15 @@ atrVal = ta.atr(14)
 showVWAPLines = input.bool(false, "Plot Multi-TF VWAP lines", group="VWAP")
 vwapSrc       = hlc3
 vwap1m  = request.security(syminfo.tickerid, "1",  ta.vwap(vwapSrc), lookahead=barmerge.lookahead_off)
-vwap3m  = request.security(syminfo.tickerid, "3",  ta.vwap(vwapSrc), lookahead=barmerge.lookahead_off)
+// 3m VWAP returns mean + ±1σ bands (anchored on daily session boundary).
+// Bot uses bands to place entry at (vwap + 0.5σ) on the directional side —
+// replaces the static ATR-buffer zone that was filling < 5% of setups on
+// tight-tape sessions (see CLAUDE.md changelog).
+vwap3m_bands() =>
+    anchor = timeframe.change("D")
+    [v, u, l] = ta.vwap(vwapSrc, anchor, 1.0)
+    [v, u, l]
+[vwap3m, vwap3m_u1, vwap3m_l1] = request.security(syminfo.tickerid, "3", vwap3m_bands(), lookahead=barmerge.lookahead_off)
 vwap15m = request.security(syminfo.tickerid, "15", ta.vwap(vwapSrc), lookahead=barmerge.lookahead_off)
 plot(showVWAPLines ? vwap1m  : na, "VWAP 1m",  color=color.new(color.aqua,   0), linewidth=1)
 plot(showVWAPLines ? vwap3m  : na, "VWAP 3m",  color=color.new(color.yellow, 0), linewidth=1)
@@ -1133,6 +1141,17 @@ if enableTable and barstate.islast
 
     table.cell(sigTable, 0, row, "vwap_3m", text_color=neutCol, text_size=size.small)
     table.cell(sigTable, 1, row, na(vwap3m)  ? "—" : str.tostring(vwap3m,  "#.########") + " (" + vwap3mSide  + ")", text_color=vwap3mCol,  text_size=size.small)
+    row += 1
+
+    // 3m VWAP ±1σ bands — bot reads these to place entries at vwap ± 0.5σ
+    // instead of the old static-ATR buffer. 0 / "—" when session too young
+    // for stdev (first few bars post-reset) → Python falls back to ATR zone.
+    table.cell(sigTable, 0, row, "vwap_3m_upper", text_color=neutCol, text_size=size.small)
+    table.cell(sigTable, 1, row, na(vwap3m_u1) ? "—" : str.tostring(vwap3m_u1, "#.########"), text_color=color.white, text_size=size.small)
+    row += 1
+
+    table.cell(sigTable, 0, row, "vwap_3m_lower", text_color=neutCol, text_size=size.small)
+    table.cell(sigTable, 1, row, na(vwap3m_l1) ? "—" : str.tostring(vwap3m_l1, "#.########"), text_color=color.white, text_size=size.small)
     row += 1
 
     table.cell(sigTable, 0, row, "vwap_15m", text_color=neutCol, text_size=size.small)

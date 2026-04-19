@@ -138,8 +138,10 @@ def parse_signal_table(tables_data: dict[str, Any]) -> Optional[SignalTableData]
     Row 16: price           | 69500.0
     Row 17: vwap_1m         | 69480.5 (above)
     Row 18: vwap_3m         | 69450.0 (above)
-    Row 19: vwap_15m        | 69400.0 (above)
-    Row 20: last_bar        | 12345
+    Row 19: vwap_3m_upper   | 69520.0
+    Row 20: vwap_3m_lower   | 69380.0
+    Row 21: vwap_15m        | 69400.0 (above)
+    Row 22: last_bar        | 12345
 
     Phase 7.D4 dropped `active_ob` and `confluence` rows. `_none_if_dash`
     defaults keep this parser backward-compatible with older Pine versions.
@@ -194,6 +196,8 @@ def _build_signal_data(kv: dict[str, str]) -> SignalTableData:
     vwap_1m_val  = _parse_leading_float(kv.get("vwap_1m"))
     vwap_3m_val  = _parse_leading_float(kv.get("vwap_3m"))
     vwap_15m_val = _parse_leading_float(kv.get("vwap_15m"))
+    vwap_3m_upper_val = _parse_leading_float(kv.get("vwap_3m_upper"))
+    vwap_3m_lower_val = _parse_leading_float(kv.get("vwap_3m_lower"))
 
     return SignalTableData(
         # Price Action
@@ -222,6 +226,8 @@ def _build_signal_data(kv: dict[str, str]) -> SignalTableData:
         vwap_1m=vwap_1m_val,
         vwap_3m=vwap_3m_val,
         vwap_15m=vwap_15m_val,
+        vwap_3m_upper=vwap_3m_upper_val,
+        vwap_3m_lower=vwap_3m_lower_val,
         last_bar=_parse_int(kv.get("last_bar")),
     )
 

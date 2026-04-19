@@ -11,15 +11,48 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 - **Strategy:** zone-based scalper. Confluence ≥ threshold → identify zone → post-only limit order at zone edge → wait N bars → fill | cancel.
 - **Pairs:** 5 OKX perps — `BTC / ETH / SOL / DOGE / BNB`. 5 concurrent slots on cross margin (all active, no queue).
 - **Entry TF:** 3m. HTF context 15m, LTF confirmation 1m.
-- **Scoring:** 5 pillars (Market Structure, Liquidity, Money Flow, VWAP, Divergence) + hard gates (displacement, EMA momentum, VWAP, cross-asset opposition) + ADX regime-conditional weights. *Premium/discount gate temporarily disabled 2026-04-19 — see changelog; to be re-enabled as a soft/weighted factor (~10-15%) post-Phase-9.*
+- **Scoring:** 5 pillars (Market Structure, Liquidity, Money Flow, VWAP, Divergence) + hard gates (displacement, EMA momentum, VWAP, cross-asset opposition) + ADX regime-conditional weights. *Premium/discount gate and HTF TP/SR ceiling temporarily disabled 2026-04-19 — see changelog; P/D to be re-enabled as a soft/weighted factor (~10-15%) post-Phase-9, HTF ceiling re-evaluated after Phase 9 GBT.*
 - **Execution:** post-only limit → regular limit → market-at-edge fallback. OCO SL/TP, partial TP at 1.5R with fee-buffered SL-to-BE on TP1 fill.
 - **Journal:** async SQLite, schema v2 (zone source, wait/fill latency, trend regime, funding Z-scores). `rejected_signals` table with counter-factual outcome pegging.
-- **Tests:** ~682, all green. Demo-runnable end-to-end.
-- **Data cutoff (`rl.clean_since`):** `2026-04-19T13:10:00Z` (bumped after `vwap_1m_alignment` weight flip). Reporter and future RL see only post-pivot trades.
+- **Tests:** 699, all green. Demo-runnable end-to-end.
+- **Data cutoff (`rl.clean_since`):** `2026-04-19T17:30:00Z` (bumped after VWAP band-based zone rewire). Reporter and future RL see only post-pivot trades.
 
 ---
 
 ## Changelog
+
+### 2026-04-19 (night) — VWAP band-based zone for `vwap_retest`
+
+- **Trigger:** post-1:3-RR-cap demo pass 16:26Z → 17:00Z (~34min). All 4 limit orders (BTC/ETH/SOL/DOGE) placed at `vwap_retest` zones **0.77%–1.54% below market** timed out after 10 bars with zero fills. Operator quote: *"giriş yerleri neye göre belirlendi belki biraz daha yakına getirilebilir… vwap cidden işleyen bir metrik, TradingView'deki gibi high-eq-low bantları bizde de olsun."*
+- **Root cause:** `_vwap_zone` returned `(target − 0.25·ATR, target + 0.25·ATR)` and `zone_limit_price` picked `zone.low` for long → entry sat *past* VWAP on the discount side. A static ATR buffer has no relationship to session-realised VWAP volatility, so tight tape sessions never retest down to the limit. Fill rate <5% observed.
+- **Fix — Pine (3m VWAP ±1σ bands):**
+  - `pine/smt_overlay.pine:149-154` — 3m VWAP switched to 3-arg `ta.vwap(src, anchor=timeframe.change("D"), stdev_mult=1.0)`. Returns `[vwap, upper_band, lower_band]` via tuple-returning function inside `request.security`.
+  - `pine/smt_overlay.pine:1136-1148` — two new SMT Signals rows: `vwap_3m_upper`, `vwap_3m_lower`. `sigTable` capacity 23 → still fits (22/23 used).
+  - 1m / 15m VWAPs kept as single-value (bands scoped to entry TF).
+- **Fix — Python:**
+  - `src/data/models.py:SignalTableData` — `vwap_3m_upper`, `vwap_3m_lower` fields (default 0.0 = missing).
+  - `src/data/structured_reader.py` — parses new rows with `_parse_leading_float`.
+  - `src/strategy/setup_planner.py:_vwap_zone` — rewritten: long zone = `(vwap, upper_band)`, short zone = `(lower_band, vwap)`. When 3m is the nearest VWAP *and* Pine emitted bands, band-based zone fires. Otherwise: single-sided ATR half-band on the directional side of VWAP (still above VWAP for long, below for short — never past VWAP on the far side like the old zone).
+  - `src/strategy/setup_planner.py:zone_limit_price` — `vwap_retest` added to mid-entry list alongside `liq_pool_near`. Entry sits at zone mid = `vwap ± 0.5σ` when bands available, or `vwap ± 0.5·0.25·ATR` on fallback. Pullback-edge sources (`ema21_pullback`, `sweep_retest`, `fvg_entry`) still use near-edge — unchanged.
+  - SL math unchanged: `sl_beyond_zone` = `zone.low − sl_buffer·ATR` for long. With new zone shape, this puts SL just below VWAP (structurally meaningful — long thesis broken if VWAP fully reclaimed from above).
+- **Tests:** 4 new — band-based long zone, band-based short zone, ATR fallback when 3m bands missing (session too young / older Pine), 3m bands ignored when 1m is nearer. 5 existing tests updated for new entry-mid math (vwap_retest apply_zone_to_plan cases). Full suite **699 passed**.
+- **Smoke (`--dry-run --once`):** entry distances from market price dropped from **0.77%–1.54%** (pre-fix) to **0.52%–0.63%** (post-fix) on ATR fallback alone. Live Pine bands will further adapt to realised session volatility — tight tape → band narrows → entry closer; volatile tape → band widens → entry farther (protects against false fills).
+- **Dataset:** `rl.clean_since` bumped `2026-04-19T16:15:00Z → 2026-04-19T17:30:00Z`. Cost: pre-rewire post-disable window (~1h15m) falls out of clean data. The 4 timed-out limits never opened positions so no trade data lost.
+- **Re-evaluation:** after ≥50 closed post-rewire trades, Phase 9 GBT checks whether `vwap_retest` WR diverges from other sources. If band-based entries show positive lift over ATR-fallback entries (same source, different zone shape), treat the stdev-band path as canonical and drop ATR fallback; if no meaningful difference, keep fallback for resilience.
+- **Restart note:** 2 open positions at time of deploy — OCOs on OKX side are live and independent of bot. Bot reconciles on startup via `OKXClient.get_positions` + `monitor.register_open`. `sl_moved_to_be` flag preserved via DB. Safe to restart.
+
+### 2026-04-19 (night) — HTF TP/SR ceiling temporarily disabled
+
+- **`analysis.htf_sr_ceiling_enabled: true → false`** (`config/default.yaml:121`).
+- **Trigger:** post-restart demo pass 14:16Z → 16:10Z (~2h) produced **17 NO_TRADE decisions across 5 pairs, 10 of which rejected on `htf_tp_ceiling`** with confluence 3.95–6.50 (well above threshold 3.0). Only 1 order placed (BNB BULLISH via `vwap_retest` at 14:58Z) — the one pair whose direction flipped mid-window. Other 4 pairs stuck in a 0.2% range with 15m resistance sitting inside 1.5R of entry — `_apply_htf_tp_ceiling` trimmed TP below `min_rr_ratio=1.5` → plan rejected.
+- **Root cause:** the new hard 1:3 RR cap (this morning) + tight-tape 15m-level clustering combine poorly. The gate was correct in principle (don't TP past a 15m resistance), but against a 1:3 contract with the 15m pool acting as the range ceiling it kills almost every long. Operator wants indicator-reversal signals to execute cleanly during data collection rather than wait for the range to break.
+- **Side effect:** flag also gates `_push_sl_past_htf_zone` (`entry_signals.py:745`) — so SL is no longer auto-widened past HTF zones on entry. `min_sl_distance_pct_per_symbol` floors (BTC 0.4%, ETH 0.6%, SOL 1.0%, DOGE 0.8%, BNB 0.5%) remain the primary wick-protection layer. Dynamic TP revision (`tp_dynamic_enabled`) and `ltf_reversal_close` still active for post-fill defense.
+- **Dataset:** `rl.clean_since` bumped `2026-04-19T13:10:00Z → 2026-04-19T16:15:00Z`. Cost: all pre-disable trades from this demo run (incl. the BNB 14:58Z open position) fall out of clean window. Post-disable trades train on the new gate regime only.
+- **Re-evaluation:** after ≥50 post-disable closed trades, Phase 9 GBT factor audit decides the path. Three outcomes:
+  1. HTF-ceiling distance has positive WR impact → restore as hard gate.
+  2. Only the SL-push side has lift → split the flag into `htf_sr_tp_ceiling_enabled` + `htf_sr_sl_push_enabled` (code change, 1 new flag + 2 branches in `plan_and_size_entry`).
+  3. Neither shows lift → leave off permanently, update CLAUDE.md hard-gate list to drop the reference.
+- **Tests:** no code changes — YAML flag flip only. `test_entry_signals.py` still passes its HTF-ceiling tests with `htf_sr_ceiling_enabled=True` passed explicitly. `test_default_yaml_runner_tp_is_hard_1_3` unaffected (guards `target_rr_ratio`/`default_rr_ratio` alignment only).
 
 ### 2026-04-19 (night) — Hard 1:3 RR cap + dynamic TP revision
 
@@ -191,7 +224,7 @@ End-to-end tick walkthrough: see `docs/trade_lifecycle.md`.
 
 ### Hard gates (reject, not scored)
 
-`displacement_candle` · `ema_momentum_contra` · `vwap_misaligned` · `cross_asset_opposition` (altcoin veto when BTC+ETH both oppose). *`premium_discount_zone` is wired but currently disabled (`analysis.premium_discount_veto_enabled=false`) — see changelog 2026-04-19.*
+`displacement_candle` · `ema_momentum_contra` · `vwap_misaligned` · `cross_asset_opposition` (altcoin veto when BTC+ETH both oppose). *`premium_discount_zone` and `htf_tp_ceiling` are wired but currently disabled (`analysis.premium_discount_veto_enabled=false` and `analysis.htf_sr_ceiling_enabled=false`) — see changelog 2026-04-19.*
 
 ### Zone-based entry
 

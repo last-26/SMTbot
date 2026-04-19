@@ -122,7 +122,64 @@ def test_vwap_retest_picks_nearest_below_for_long():
     assert setup is not None
     assert setup.zone_source == "vwap_retest"
     low, high = setup.entry_zone
-    assert low < 99.5 < high
+    # Post-2026-04-19 rewire: zone sits on the directional side of VWAP
+    # (long → above). No bands in this fixture → ATR half-band above VWAP.
+    assert low == pytest.approx(99.5)
+    assert high > 99.5
+
+
+def test_vwap_retest_uses_3m_bands_when_available():
+    """3m is the nearest VWAP and Pine has emitted ±1σ bands → zone spans
+    (vwap, upper_band) for long. Realised session volatility, not ATR."""
+    state = _state(
+        100.0, 1.0,
+        vwap_3m=99.5, vwap_3m_upper=99.9, vwap_3m_lower=99.1,
+    )
+    setup = build_zone_setup(direction=Direction.BULLISH, state=state)
+    assert setup is not None
+    assert setup.zone_source == "vwap_retest"
+    assert setup.entry_zone == (pytest.approx(99.5), pytest.approx(99.9))
+
+
+def test_vwap_retest_short_uses_lower_band():
+    """Short mirror: zone = (lower_band, vwap). Price must be above VWAP."""
+    state = _state(
+        100.0, 1.0,
+        vwap_3m=100.5, vwap_3m_upper=100.9, vwap_3m_lower=100.1,
+    )
+    setup = build_zone_setup(direction=Direction.BEARISH, state=state)
+    assert setup is not None
+    assert setup.zone_source == "vwap_retest"
+    assert setup.entry_zone == (pytest.approx(100.1), pytest.approx(100.5))
+
+
+def test_vwap_retest_falls_back_to_atr_when_bands_missing():
+    """3m is nearest but bands are 0 (session too young or old Pine) →
+    directional ATR half-band above VWAP for long."""
+    state = _state(100.0, 1.0, vwap_3m=99.5)
+    setup = build_zone_setup(
+        direction=Direction.BULLISH, state=state, zone_buffer_atr=0.25,
+    )
+    assert setup is not None
+    assert setup.zone_source == "vwap_retest"
+    assert setup.entry_zone == (pytest.approx(99.5), pytest.approx(99.75))
+
+
+def test_vwap_retest_ignores_3m_bands_when_1m_is_nearer():
+    """Bands live on 3m only. If 1m VWAP is the nearest, the 3m bands must
+    not leak into the zone — falls back to ATR around 1m VWAP."""
+    state = _state(
+        100.0, 1.0,
+        vwap_1m=99.8, vwap_3m=99.5,
+        vwap_3m_upper=99.9, vwap_3m_lower=99.1,
+    )
+    setup = build_zone_setup(direction=Direction.BULLISH, state=state)
+    assert setup is not None
+    assert setup.zone_source == "vwap_retest"
+    # Zone anchored on 99.8 (1m), NOT (99.5, 99.9) from 3m bands.
+    low, high = setup.entry_zone
+    assert low == pytest.approx(99.8)
+    assert high > 99.8
 
 
 def test_vwap_retest_ignores_zero_and_wrong_side():
@@ -269,16 +326,20 @@ def test_liq_pool_near_wrong_side_skipped():
 
 
 def test_liq_pool_near_entry_price_is_zone_mid():
-    """Unlike edge-entry sources, liq_pool_near entry sits at zone mid
-    (buy/sell AT the cluster, not on the far edge)."""
+    """Zone-mid sources (liq_pool_near, vwap_retest) both centre entry in
+    the middle of the zone; pullback-edge sources still hit the far edge."""
     from src.strategy.setup_planner import zone_limit_price
     zone = (99.0, 99.5)
     assert zone_limit_price(
         Direction.BULLISH, zone, zone_source="liq_pool_near",
     ) == pytest.approx(99.25)
-    # Sanity: default (near-edge) behaviour unchanged for other sources.
+    # vwap_retest is now a zone-mid source too (entry at vwap + 0.5σ).
     assert zone_limit_price(
         Direction.BULLISH, zone, zone_source="vwap_retest",
+    ) == pytest.approx(99.25)
+    # Sanity: pullback-edge sources still hit the far edge for long.
+    assert zone_limit_price(
+        Direction.BULLISH, zone, zone_source="ema21_pullback",
     ) == 99.0
 
 
@@ -485,10 +546,11 @@ def test_apply_zone_to_plan_target_rr_cap_clamps_long_tp():
     new_plan = apply_zone_to_plan(
         _plan(), zone, contract_size=0.01, target_rr_cap=3.0,
     )
-    # entry = zone low (99.0), sl = 98.5 (sl_dist 0.5). 1:3 → tp = 99.0 + 3*0.5 = 100.5.
-    assert new_plan.entry_price == pytest.approx(99.0)
+    # vwap_retest uses zone mid for entry → 99.25. sl=98.5 → sl_dist=0.75.
+    # 1:3 → tp = 99.25 + 3*0.75 = 101.5.
+    assert new_plan.entry_price == pytest.approx(99.25)
     assert new_plan.sl_price == pytest.approx(98.5)
-    assert new_plan.tp_price == pytest.approx(100.5)
+    assert new_plan.tp_price == pytest.approx(101.5)
     assert new_plan.rr_ratio == pytest.approx(3.0)
 
 
@@ -507,10 +569,11 @@ def test_apply_zone_to_plan_target_rr_cap_clamps_short_tp():
         _plan(direction=Direction.BEARISH), zone, contract_size=0.01,
         target_rr_cap=3.0,
     )
-    # entry = zone high (101.5), sl = 102.0 (sl_dist 0.5). tp = 101.5 - 1.5 = 100.0.
-    assert new_plan.entry_price == pytest.approx(101.5)
+    # vwap_retest uses zone mid for entry → 101.25. sl=102.0 → sl_dist=0.75.
+    # tp = 101.25 - 3*0.75 = 99.0.
+    assert new_plan.entry_price == pytest.approx(101.25)
     assert new_plan.sl_price == pytest.approx(102.0)
-    assert new_plan.tp_price == pytest.approx(100.0)
+    assert new_plan.tp_price == pytest.approx(99.0)
     assert new_plan.rr_ratio == pytest.approx(3.0)
 
 
@@ -530,12 +593,12 @@ def test_apply_zone_to_plan_target_rr_cap_clamps_ladder_rungs():
     new_plan = apply_zone_to_plan(
         _plan(), zone, contract_size=0.01, target_rr_cap=3.0,
     )
-    # 1:3 boundary = entry(99.0) + 3*0.5 = 100.5. The first rung (101.0) is
-    # already beyond the cap → clamps to 100.5; rungs 2 and 3 also clamp.
+    # entry=99.25 (vwap_retest mid), sl=98.5 → sl_dist=0.75. boundary=101.5.
+    # Rung 1 (101.0) is inside the cap → untouched. Rungs 2 and 3 clamp.
     assert new_plan.tp_ladder == [
-        (pytest.approx(100.5), 0.4),
-        (pytest.approx(100.5), 0.35),
-        (pytest.approx(100.5), 0.25),
+        (pytest.approx(101.0), 0.4),
+        (pytest.approx(101.5), 0.35),
+        (pytest.approx(101.5), 0.25),
     ]
 
 
@@ -571,12 +634,13 @@ def test_apply_zone_to_plan_target_rr_cap_after_sl_widening():
     )
     new_plan = apply_zone_to_plan(
         _plan(), zone, contract_size=0.01,
-        min_sl_distance_pct=0.01,         # forces SL ≥ 1 % below entry (99.0 → 98.01)
+        min_sl_distance_pct=0.01,         # forces SL ≥ 1 % below entry
         target_rr_cap=3.0,
     )
-    # entry=99.0 (zone low), sl widened to 99.0*(1-0.01)=98.01 (sl_dist=0.99).
-    # TP forced to 99.0 + 3*0.99 = 101.97.
-    assert new_plan.entry_price == pytest.approx(99.0)
-    assert new_plan.sl_price == pytest.approx(98.01)
-    assert new_plan.tp_price == pytest.approx(101.97)
+    # vwap_retest → entry = mid(99.0, 99.5) = 99.25.
+    # sl widened to 99.25*(1-0.01) = 98.2575 (sl_dist = 0.9925).
+    # TP forced to 99.25 + 3*0.9925 = 102.2275.
+    assert new_plan.entry_price == pytest.approx(99.25)
+    assert new_plan.sl_price == pytest.approx(98.2575)
+    assert new_plan.tp_price == pytest.approx(102.2275)
     assert new_plan.rr_ratio == pytest.approx(3.0)

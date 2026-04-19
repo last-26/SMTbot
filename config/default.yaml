@@ -118,7 +118,22 @@ analysis:
     DOGE-USDT-SWAP: [london]
     XRP-USDT-SWAP: [london]
     ADA-USDT-SWAP: [london]   # thin alt; BNB inherits global (london+new_york)
-  htf_sr_ceiling_enabled: true    # Madde D — push SL past HTF zones + cap TP
+  # Madde D — push SL past HTF zones + cap TP (reject if trimmed RR <
+  # min_rr_ratio). 2026-04-19 (night): TEMPORARILY flipped OFF. Range-bound
+  # tape + new hard 1:3 RR target → every BULLISH setup rejecting on
+  # `htf_tp_ceiling` because 15m resistance sat inside 1.5R of entry (2h
+  # demo pass: 17 NO_TRADE, 10 of them this gate, only 1 order placed on
+  # BNB via vwap_retest). Operator wants indicator-reversal signals to
+  # execute cleanly during data collection. Disabling this flag ALSO turns
+  # off `_push_sl_past_htf_zone` (SL widening past HTF zones) — per-symbol
+  # `min_sl_distance_pct` floors (0.4–1.0%) remain the primary wick-
+  # protection layer. Re-evaluate after Phase 9 GBT: if HTF-ceiling
+  # distance shows positive WR impact, restore as hard gate; if only the
+  # SL-push side has lift, split the flag into two separate knobs
+  # (htf_sr_tp_ceiling_enabled + htf_sr_sl_push_enabled); if neither
+  # shows lift, leave off. When flipping back on, bump `rl.clean_since`
+  # again so the disabled-window trades don't pollute the clean set.
+  htf_sr_ceiling_enabled: false
   htf_sr_buffer_atr: 0.2
   # Phase 6.9 B2 — per-symbol HTF S/R TP-ceiling buffer. SOL 0/3 post-cutoff
   # LOSSes all bumped the HTF TP ceiling; the global 0.2×ATR padding clips
@@ -489,4 +504,10 @@ rl:
   # in DB for historical audit; reporter + RL train on post-cutoff data
   # only. Bump this cutoff again only if another strategy-level pivot
   # lands.
-  clean_since: "2026-04-19T13:10:00Z"
+  # 2026-04-19T13:10Z — bumped after `vwap_1m_alignment: 0.0 → 0.2`
+  # weight probe. 1 closed post-pivot trade fell out of clean window.
+  # 2026-04-19T16:15Z — bumped after `htf_sr_ceiling_enabled: true → false`
+  # disable. Pre-disable trades (incl. the BNB 14:58Z open position from
+  # the same demo run) fall out of clean window so post-disable data
+  # trains on the new gate regime only.
+  clean_since: "2026-04-19T17:30:00Z"

@@ -71,19 +71,45 @@ def _vwap_zone(
     direction: Direction, price: float, atr: float,
     state: MarketState, zone_atr: float,
 ) -> Optional[tuple[float, float]]:
-    """Nearest parsed session VWAP on the correct side of price."""
+    """Directional zone anchored on the nearest session VWAP.
+
+    Long:  zone = (vwap, upper_band) — entry mid = vwap + 0.5σ
+    Short: zone = (lower_band, vwap) — entry mid = vwap − 0.5σ
+
+    When the picked VWAP is 3m and Pine emitted a live ±1σ band, the zone
+    uses the band (session-realised volatility). Otherwise the zone is a
+    single-sided ATR half-band on the directional side of VWAP — still
+    above VWAP for long / below for short, just using ATR as a stdev
+    proxy. Either way entry lands between VWAP and current price (never
+    past VWAP on the far side), which was the point of the 2026-04-19
+    rewire: static ATR buffer below VWAP was filling <5% of setups on
+    tight-tape sessions.
+    """
     sig = state.signal_table
-    raw = [sig.vwap_1m, sig.vwap_3m, sig.vwap_15m]
+    raw = [
+        ("1m", sig.vwap_1m),
+        ("3m", sig.vwap_3m),
+        ("15m", sig.vwap_15m),
+    ]
     candidates = [
-        v for v in raw if v and v > 0
+        (tf, v) for tf, v in raw if v > 0
         and ((_is_long(direction) and v < price)
              or (not _is_long(direction) and v > price))
     ]
     if not candidates:
         return None
-    target = min(candidates, key=lambda v: abs(price - v))
+    tf, target = min(candidates, key=lambda tv: abs(price - tv[1]))
+    if tf == "3m":
+        upper = sig.vwap_3m_upper
+        lower = sig.vwap_3m_lower
+        if _is_long(direction) and upper > target:
+            return (target, upper)
+        if not _is_long(direction) and 0.0 < lower < target:
+            return (lower, target)
     half = zone_atr * atr
-    return (target - half, target + half)
+    if _is_long(direction):
+        return (target, target + half)
+    return (target - half, target)
 
 
 def _ema(values: list[float], period: int) -> Optional[float]:
@@ -406,15 +432,20 @@ def zone_limit_price(
 ) -> float:
     """Limit-entry price for `direction` inside `zone`.
 
-    Near-edge for pullback-style sources (VWAP / EMA / FVG / sweep):
+    Near-edge for pullback-style sources (EMA / FVG / sweep):
       * Long: zone low (buy-limit below market).
       * Short: zone high (sell-limit above market).
 
-    Zone mid for ``liq_pool_near``: the cluster IS the support/resistance
-    target, not something to fade — entry sits at the cluster itself.
+    Zone mid for ``liq_pool_near`` and ``vwap_retest``:
+      * liq_pool_near — the cluster IS the support/resistance target.
+      * vwap_retest — zone now spans (vwap, upper_band) for long /
+        (lower_band, vwap) for short, so zone-mid = vwap ± 0.5σ, i.e.
+        inside the VWAP band on the directional side. Previously used
+        zone.low for long which sat past VWAP on the discount side and
+        rarely filled.
     """
     low, high = zone
-    if zone_source == "liq_pool_near":
+    if zone_source in ("liq_pool_near", "vwap_retest"):
         return (low + high) / 2.0
     return low if _is_long(direction) else high
 

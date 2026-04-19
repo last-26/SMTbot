@@ -120,6 +120,12 @@ class SignalTableData(BaseModel):
     vwap_1m: float = 0.0
     vwap_3m: float = 0.0
     vwap_15m: float = 0.0
+    # 3m VWAP ±1σ bands (session-anchored). 0.0 when Pine did not emit them
+    # (older script) or when session is too young for a valid stdev. The
+    # band-based zone logic in setup_planner falls back to ATR buffer in
+    # that case.
+    vwap_3m_upper: float = 0.0
+    vwap_3m_lower: float = 0.0
 
     last_bar: Optional[int] = None  # bar_index of last Pine update — used
                                     # by the runner's freshness-poll to
