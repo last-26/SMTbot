@@ -14,12 +14,60 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 - **Scoring:** 5 pillars (Market Structure, Liquidity, Money Flow, VWAP, Divergence) + hard gates (displacement, EMA momentum, VWAP, cross-asset opposition) + ADX regime-conditional weights. *Premium/discount gate and HTF TP/SR ceiling temporarily disabled 2026-04-19 — see changelog; P/D to be re-enabled as a soft/weighted factor (~10-15%) post-Phase-9, HTF ceiling re-evaluated after Phase 9 GBT.*
 - **Execution:** post-only limit → regular limit → market-at-edge fallback. OCO SL/TP, partial TP at 1.5R with fee-buffered SL-to-BE on TP1 fill.
 - **Journal:** async SQLite, schema v2 (zone source, wait/fill latency, trend regime, funding Z-scores). `rejected_signals` table with counter-factual outcome pegging.
-- **Tests:** 699, all green. Demo-runnable end-to-end.
+- **Tests:** 729, all green. Demo-runnable end-to-end.
 - **Data cutoff (`rl.clean_since`):** `2026-04-19T17:30:00Z` (bumped after VWAP band-based zone rewire). Reporter and future RL see only post-pivot trades.
 
 ---
 
 ## Changelog
+
+### 2026-04-19 (late night) — TP-revise hardening + demo-wick artefact cross-check
+
+Bundled follow-up to the 2026-04-19 fixes. Two incidents drove this:
+
+1. **BNB 17:50 UNPROTECTED after dynamic TP revise**: runner OCO cancelled, replacement rejected with OKX `51277` (trigger on wrong side of mark) because the revise path computed `new_tp = entry + target_rr × sl_distance` where `sl_distance` had collapsed to ~0. Root cause: after SL-to-BE, `_Tracked.sl_price` was mutated to the BE price — the same field dynamic TP used for ratio math. Post-BE the "SL distance" was entry − BE ≈ 0, producing a TP target essentially on top of mark.
+2. **Demo-wick poisoning**: OKX demo book produces wicks that never hit real exchanges. SL/TP triggered at `last` price fired on these fake ticks; the journal then recorded artefact fills that would poison RL training data.
+
+**Fix A — Immutable `plan_sl_price` for TP ratio math** (`src/execution/position_monitor.py`, `src/bot/runner.py`)
+- `_Tracked` gained immutable `plan_sl_price` — set once at `register_open`, never mutated by SL-to-BE. The existing `sl_price` remains the *active* SL leg (BE-aware) used by the real SL/TP order.
+- `register_open(... plan_sl_price: Optional[float] = None)` with sentinel semantics: `None` → fall back to `sl_price` (legacy callers), explicit `0.0` → "unknown, disable revise" (rehydrate path for BE-moved positions after restart).
+- `get_tracked_runner` exposes `plan_sl_price` verbatim (no fallback) so the runner sees 0.0 when unknown.
+- `runner._maybe_revise_tp_dynamic` reads `plan_sl_price`; `plan_sl <= 0` short-circuits revise (avoids posting degenerate-RR OCOs).
+- Three `register_open` call sites thread `plan_sl_price`: `_try_place_zone_entry` (`plan.sl_price`), `_handle_pending_filled` (`plan.sl_price`), `_rehydrate_open_positions` (`0.0` if `sl_moved_to_be` else `rec.sl_price`).
+
+**Fix B — Enriched CRITICAL place-failure logs** (`src/execution/position_monitor.py`)
+- SL-to-BE and revise place-failure paths now log `code=` and `payload=` from `OrderRejected`. Previously `err={!r}` dropped those fields, so every `51277`/`51008`/etc. looked identical in the log.
+
+**Fix C — Verify 51400 against live algos before placing replacement** (`src/execution/position_monitor.py`, `src/execution/okx_client.py`)
+- OKX demo has been observed returning `51400` ("algo does not exist") on a cancel call while the algo is still on the book. Placing a replacement OCO at that point leaves **two** stops on the position, both firing back-to-back at the next adverse wick.
+- New `OKXClient.list_pending_algos(inst_id, ord_type="oco")` + `PositionMonitor._verify_algo_gone(inst_id, algo_id)` helper. When cancel returns an idempotent code (`51400/51401/51402`), we now query the live pending algos; only if the specific `algoId` is truly absent do we proceed to place the replacement. Network/API failure on the verify query is treated as NOT-gone (conservative; retry next poll).
+
+**Katman 1 — Mark-price SL/TP triggers** (`src/execution/okx_client.py`, `src/execution/order_router.py`, `src/execution/position_monitor.py`, `src/bot/config.py`, `config/default.yaml`)
+- `place_oco_algo(..., trigger_px_type: str = "mark")` now emits `slTriggerPxType`/`tpTriggerPxType` when set. OKX defaults to `last` which means a single demo-book wick fires SL/TP. `mark` uses the exchange's index-weighted mark which is immune to demo-only wicks.
+- Threaded top-to-bottom: `RouterConfig.algo_trigger_px_type`, `PositionMonitor.__init__(algo_trigger_px_type=...)`. `ExecutionConfig.algo_trigger_px_type: "mark"` (YAML-overridable; flip to `"last"` to restore legacy behavior).
+- SL-to-BE replacement OCO and runner-TP revision OCO both now use the configured trigger type.
+
+**Katman 2 — Post-close Binance cross-check for artefact detection** (new: `src/data/public_market_feed.py`; updates: `src/journal/models.py`, `src/journal/database.py`, `src/bot/config.py`, `src/bot/runner.py`, `scripts/report.py`)
+- New `BinancePublicClient.get_kline_around(binance_symbol, ts_ms)` fetches the concurrent Binance USD-M futures 1m kline for a given timestamp. Failure-isolated: every method returns `None` on network error, non-200, parse failure, empty list.
+- `okx_swap_to_binance_futures("BTC-USDT-SWAP") → "BTCUSDT"`; rejects non-SWAP symbols (returns `None` → cross-check skips).
+- Journal schema v3 additions on `trades`: `real_market_entry_valid INTEGER`, `real_market_exit_valid INTEGER`, `demo_artifact INTEGER`, `artifact_reason TEXT`. Idempotent `ALTER TABLE` migrations; `_row_to_record` tri-state bool parser (`None`/`0`/`1`).
+- `BotRunner._cross_check_close_artefacts` runs after `journal.record_close`: maps symbol, fetches entry + exit candles via `asyncio.to_thread`, applies `price_inside_candle(price, candle, tolerance_pct)`. Both sides invalid → `demo_artifact=True` with reason like `"exit_above_binance_high"`. Any checked side invalid → flag set. Both feed-down → flag stays `None` (tri-state). Failure swallowed (never breaks journal close).
+- `execution.artefact_check_enabled=true`, `artefact_check_timeout_s=5.0`, `artefact_check_tolerance_pct=0.0005` (5 bps — catches blatant demo wicks without flagging routine OKX-vs-Binance microstructure skew).
+- `scripts/report.py --exclude-artifacts` filters `demo_artifact=1` rows out of the summary so operator can compare artefact-excluded vs raw PnL.
+
+**Tests:** 30 new + 7 existing updated.
+- `tests/test_public_market_feed.py` (19 cases): symbol mapping, `price_inside_candle` band + tolerance, `get_kline_around` happy path + 4 failure modes.
+- `tests/test_journal_artifact_flags.py` (4 cases): round-trip, all-None, unknown-id raises `KeyError`, mixed-validity tri-state.
+- `tests/test_runner_artefact_cross_check.py` (6 cases): client=None, unmappable symbol, both sides inside (valid), exit above real high (flagged), partial feed None, both sides missing.
+- FakeClients in `test_order_router.py`, `test_partial_tp.py`, `test_position_monitor.py`, `test_sl_to_be.py` gained `trigger_px_type` kwarg; `test_sl_to_be.py` and `test_position_monitor.py::FakeRevisableClient` gained `list_pending_algos` stub.
+- `tests/conftest.py:FakeMonitor.register_open` accepts `plan_sl_price`.
+- Full suite **729 passed**.
+
+**Dataset:** `rl.clean_since` unchanged (`2026-04-19T17:30:00Z`) — no trading-behavior regression from these changes; they're defensive. Mark-trigger switch is expected to *reduce* artefact SL/TP fills; the Binance cross-check labels any remaining artefacts for filtering at report/RL time.
+
+**Re-evaluation:** after ≥30 closed post-deploy trades, inspect `demo_artifact` distribution. If it's >5% the mark-trigger switch didn't help enough and we should tighten tolerance or investigate instrument-specific OKX demo behavior. If it's ~0%, mark-trigger did its job and the cross-check is belt-and-suspenders — keep it on, low-cost.
+
+**Restart note:** existing open positions rehydrate with `plan_sl_price=0.0` when `sl_moved_to_be=True` (dynamic TP revise disabled for them — safer than reviving with degenerate sl_distance). Fresh entries post-restart get the full protection chain.
 
 ### 2026-04-19 (night) — VWAP band-based zone for `vwap_retest`
 
