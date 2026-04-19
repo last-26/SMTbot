@@ -21,6 +21,24 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 
 ## Changelog
 
+### 2026-04-19 (night) — Hard 1:3 RR cap + dynamic TP revision
+
+- **Trigger:** post-restart demo log showed 5 zone_limit_placed orders all sized off heatmap clusters that landed 8-12R away from entry (e.g. BTC `sl=$300 → tp=$3600`, 12:1 effective) despite `symbol_decision` claiming RR=4.5. Operator quote: *"100 dolar stop loss başına 300 dolar kar yani 1:3 olacak şekilde setuplar kurulmasını istiyorum. Ayrıca illaki bu tp seviyeleri tek seferlik eklenmesi yerine anlık gelen verilerle yorumlanıp dinamik bir şekilde öne veya arkaya çekilebilmeli."*
+- **Root cause:** `apply_zone_to_plan` overrode `plan.tp_price` with `zone.tp_primary` (= nearest unswept liq cluster from heatmap) with no RR bound. The `default_rr_ratio=4.5` knob never reached the runner because the zone path bypassed it entirely.
+- **Fix — hard 1:N cap:**
+  - `src/strategy/setup_planner.py:apply_zone_to_plan` — new `target_rr_cap` param. When > 0, primary TP is forced to `entry ± cap × sl_distance` and every ladder rung is clamped to the same boundary.
+  - `src/bot/config.py:ExecutionConfig` — new `target_rr_ratio` (default 0.0 = off; YAML sets 3.0).
+  - `config/default.yaml` — `execution.target_rr_ratio: 3.0` + `trading.default_rr_ratio: 4.5 → 3.0` (entry_signals fallback aligned). Guard test `test_default_yaml_runner_tp_is_hard_1_3` enforces both knobs match.
+  - `src/bot/runner.py:_try_place_zone_entry` — threads `cfg.execution.target_rr_ratio` into the planner.
+- **Fix — dynamic TP revision:**
+  - `src/execution/position_monitor.py:revise_runner_tp(inst_id, pos_side, new_tp)` — cancels `algo_ids[-1]` (runner OCO), places fresh OCO using the **active** SL (BE-aware via `_Tracked.sl_price`) and `_Tracked.runner_size`. Idempotent cancel codes `{51400, 51401, 51402}` treated as success. Place failure after cancel → trim algo_ids, CRITICAL log "runner unprotected" — no auto market-close.
+  - `_Tracked` extended with `sl_price` + `runner_size` + `last_tp_revise_at`; `register_open` accepts both as kwargs; SL-to-BE updates `t.sl_price` in place.
+  - `src/bot/runner.py:_maybe_revise_tp_dynamic(symbol, pos_side, state)` — recomputes target from live state each cycle (`new_tp = entry + sign × target_rr × sl_dist`), gates on `tp_revise_min_delta_atr × ATR` (avoid OCO churn) + `tp_revise_cooldown_s` rate-limit + `tp_min_rr_floor` (don't revise into sub-floor RR if mark drifted past entry). Dispatched via `asyncio.to_thread(monitor.revise_runner_tp, ...)`. Wired into `_run_one_symbol` between LTF reversal close and dedup.
+  - `config/default.yaml` — `execution.tp_dynamic_enabled: true`, `tp_min_rr_floor: 1.5`, `tp_revise_min_delta_atr: 0.5`, `tp_revise_cooldown_s: 30.0`.
+- **Tests:** 13 new — 5 `apply_zone_to_plan(target_rr_cap=)` cases (long/short clamp, ladder collapse, off-mode, post-widening recompute), 7 `revise_runner_tp` cases (happy path, no-op, untracked, idempotent cancel, unknown cancel error, place-fail unprotect, BE-aware SL preservation), 1 YAML guard. `tests/conftest.py:FakeMonitor` extended with `sl_price`/`runner_size` kwargs + `revise_runner_tp` + `get_tracked_runner` stubs. `runner._DryRunRouter` gained `place_limit_entry` + `attach_algos` stubs so the smoke test exercises the zone path. Full suite **695 passed**.
+- **Smoke (`--dry-run --once`):** all 5 symbols place zone limits at exactly 1:3. Example BTC: `entry=75332.49 sl=75633.82 tp=74428.50 rr=3.00` vs. operator log's `tp=71698.52 ≈ 12R` pre-fix.
+- **Re-tuning:** to change RR contract (e.g. 1:2 or 1:4), flip `execution.target_rr_ratio` AND `trading.default_rr_ratio` together — the guard test will catch drift. Do NOT introduce weighted-reward calculations as a substitute for the hard cap.
+
 ### 2026-04-19 (eve) — `vwap_1m_alignment` re-opened at 0.2
 
 - **Change:** `config/default.yaml:196` — `vwap_1m_alignment: 0.0 → 0.2`. Other per-TF VWAP slots (3m/15m) remain at 0.0; composite (1.25) unchanged.
