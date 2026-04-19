@@ -343,6 +343,19 @@ class ExecutionConfig(BaseModel):
     tp_revise_min_delta_atr: float = 0.5
     tp_revise_cooldown_s: float = 30.0
 
+    # 2026-04-20 — MFE-triggered SL lock (Option A). When MFE (maximum favorable
+    # excursion, measured in R multiples of plan_sl_distance) crosses
+    # `sl_lock_mfe_r`, cancel + re-place the runner OCO with a new SL at
+    # ``entry + sign × sl_lock_at_r × plan_sl_distance``. At 0.0 the new SL
+    # sits at entry (± fee buffer via sl_be_offset_pct), turning the trade
+    # risk-free; at >0 it locks in that fraction of R as guaranteed profit.
+    # One-shot: once applied, the `sl_lock_applied` flag blocks further locks
+    # on the same position (subsequent tightening would need a proper trail,
+    # see Phase 12 Option B). `plan_sl_price <= 0` (post-BE rehydrate) skips.
+    sl_lock_enabled: bool = False
+    sl_lock_mfe_r: float = 2.0
+    sl_lock_at_r: float = 0.0
+
     # OKX OCO trigger-price source. "mark" = index-weighted price across
     # the major real exchanges (Binance / Bybit / Coinbase). "last" = last
     # trade on the OKX book (default in OKX SDK). Mark is strongly

@@ -254,3 +254,141 @@ def test_revise_runner_tp_uses_be_price_for_sl_after_be_move():
 def test_get_tracked_runner_returns_none_for_untracked():
     mon = PositionMonitor(FakeClient())
     assert mon.get_tracked_runner("ETH-USDT-SWAP", "long") is None
+
+
+# ── lock_sl_at (Option A — MFE-triggered SL lock) ──────────────────────────
+
+
+def test_lock_sl_at_cancels_and_replaces_runner_with_new_sl():
+    """Happy path: runner OCO gets cancelled, replacement OCO goes up with
+    the new SL + original TP. `sl_lock_applied` flips to True."""
+    client = FakeRevisableClient(next_algo_id="LOCKED_OCO")
+    mon = PositionMonitor(client, margin_mode="cross")
+    mon.register_open(
+        "BTC-USDT-SWAP", "long", size=3.0, entry_price=70000.0,
+        algo_ids=["RUNNER_ID"], tp2_price=73000.0,
+        sl_price=69000.0, runner_size=3, plan_sl_price=69000.0,
+    )
+    # MFE at 2R → new SL at entry (BE).
+    ok = mon.lock_sl_at("BTC-USDT-SWAP", "long", new_sl=70000.0)
+    assert ok is True
+    assert client.cancelled == [("BTC-USDT-SWAP", "RUNNER_ID")]
+    assert len(client.placed) == 1
+    p = client.placed[0]
+    assert p["sl_trigger_px"] == 70000.0
+    assert p["tp_trigger_px"] == 73000.0
+    assert p["size_contracts"] == 3
+    assert p["td_mode"] == "cross"
+    snap = mon.get_tracked_runner("BTC-USDT-SWAP", "long")
+    assert snap is not None
+    assert snap["sl_lock_applied"] is True
+    assert snap["sl_price"] == 70000.0
+    assert mon._tracked[("BTC-USDT-SWAP", "long")].algo_ids == ["LOCKED_OCO"]
+
+
+def test_lock_sl_at_is_one_shot():
+    """Second call on the same position is a no-op — no cancel, no place."""
+    client = FakeRevisableClient(next_algo_id="LOCKED_OCO")
+    mon = PositionMonitor(client)
+    mon.register_open(
+        "BTC-USDT-SWAP", "long", size=3.0, entry_price=70000.0,
+        algo_ids=["RUNNER_ID"], tp2_price=73000.0,
+        sl_price=69000.0, runner_size=3, plan_sl_price=69000.0,
+    )
+    assert mon.lock_sl_at("BTC-USDT-SWAP", "long", new_sl=70000.0) is True
+    # Reset the capture so the no-op is easy to see.
+    client.cancelled.clear()
+    client.placed.clear()
+    assert mon.lock_sl_at("BTC-USDT-SWAP", "long", new_sl=70500.0) is False
+    assert client.cancelled == []
+    assert client.placed == []
+
+
+def test_lock_sl_at_returns_false_for_untracked():
+    client = FakeRevisableClient()
+    mon = PositionMonitor(client)
+    assert mon.lock_sl_at("BTC-USDT-SWAP", "long", new_sl=70000.0) is False
+    assert client.placed == []
+
+
+def test_lock_sl_at_rejects_new_sl_on_wrong_side_of_tp():
+    """For a long, new_sl >= tp is nonsense — guard must abort without
+    touching the runner OCO."""
+    client = FakeRevisableClient()
+    mon = PositionMonitor(client)
+    mon.register_open(
+        "BTC-USDT-SWAP", "long", size=3.0, entry_price=70000.0,
+        algo_ids=["RUNNER_ID"], tp2_price=73000.0,
+        sl_price=69000.0, runner_size=3, plan_sl_price=69000.0,
+    )
+    ok = mon.lock_sl_at("BTC-USDT-SWAP", "long", new_sl=73500.0)
+    assert ok is False
+    assert client.cancelled == []
+    assert client.placed == []
+
+
+def test_lock_sl_at_short_direction():
+    """Short parity: new SL below original but above entry (BE for short)."""
+    client = FakeRevisableClient(next_algo_id="SHORT_LOCKED")
+    mon = PositionMonitor(client)
+    mon.register_open(
+        "ETH-USDT-SWAP", "short", size=2.0, entry_price=2300.0,
+        algo_ids=["RUNNER_ID"], tp2_price=2200.0,
+        sl_price=2330.0, runner_size=2, plan_sl_price=2330.0,
+    )
+    ok = mon.lock_sl_at("ETH-USDT-SWAP", "short", new_sl=2300.0)
+    assert ok is True
+    p = client.placed[0]
+    assert p["sl_trigger_px"] == 2300.0
+    assert p["tp_trigger_px"] == 2200.0
+    assert p["pos_side"] == "short"
+
+
+def test_lock_sl_at_unprotects_on_place_failure():
+    """Cancel succeeded, place failed → algo_ids trimmed, flag still set
+    (prevents retry spin)."""
+    client = FakeRevisableClient(place_raises=RuntimeError("OCO rejected"))
+    mon = PositionMonitor(client)
+    mon.register_open(
+        "BTC-USDT-SWAP", "long", size=3.0, entry_price=70000.0,
+        algo_ids=["RUNNER_ID"], tp2_price=73000.0,
+        sl_price=69000.0, runner_size=3, plan_sl_price=69000.0,
+    )
+    ok = mon.lock_sl_at("BTC-USDT-SWAP", "long", new_sl=70000.0)
+    assert ok is False
+    assert mon._tracked[("BTC-USDT-SWAP", "long")].algo_ids == []
+    # Flag still set so we don't loop forever.
+    assert mon._tracked[("BTC-USDT-SWAP", "long")].sl_lock_applied is True
+
+
+def test_lock_sl_at_aborts_on_unknown_cancel_error():
+    client = FakeRevisableClient(
+        cancel_raises=OrderRejected("oops", code="51999"),
+    )
+    mon = PositionMonitor(client)
+    mon.register_open(
+        "BTC-USDT-SWAP", "long", size=3.0, entry_price=70000.0,
+        algo_ids=["RUNNER_ID"], tp2_price=73000.0,
+        sl_price=69000.0, runner_size=3, plan_sl_price=69000.0,
+    )
+    assert mon.lock_sl_at("BTC-USDT-SWAP", "long", new_sl=70000.0) is False
+    assert client.placed == []
+    # Flag NOT set on a clean abort — runner OCO is untouched, next cycle
+    # may retry.
+    assert mon._tracked[("BTC-USDT-SWAP", "long")].sl_lock_applied is False
+
+
+def test_lock_sl_at_idempotent_cancel_proceeds_to_place():
+    client = FakeRevisableClient(
+        cancel_raises=OrderRejected("algo gone", code="51400"),
+        next_algo_id="LOCKED_AFTER_GONE",
+    )
+    mon = PositionMonitor(client)
+    mon.register_open(
+        "BTC-USDT-SWAP", "long", size=3.0, entry_price=70000.0,
+        algo_ids=["RUNNER_ID"], tp2_price=73000.0,
+        sl_price=69000.0, runner_size=3, plan_sl_price=69000.0,
+    )
+    ok = mon.lock_sl_at("BTC-USDT-SWAP", "long", new_sl=70000.0)
+    assert ok is True
+    assert len(client.placed) == 1

@@ -71,6 +71,12 @@ class _Tracked:
     # else post-BE sl_distance collapses to the BE offset (~0.1%) and the
     # 1:N target becomes unreachably close to mark (OKX rejects as 51277).
     plan_sl_price: float = 0.0
+    # 2026-04-20 — MFE-triggered SL lock (Option A). One-shot flag: once the
+    # position has crossed sl_lock_mfe_r in favor and the runner OCO has
+    # been re-placed with a BE / profit-locked SL, further MFE gains do NOT
+    # tighten further. A true trailing mechanic (Phase 12 Option B) would
+    # keep moving; this is the simpler "one-time risk removal" contract.
+    sl_lock_applied: bool = False
 
 
 @dataclass
@@ -456,7 +462,117 @@ class PositionMonitor:
             "runner_size": t.runner_size,
             "be_already_moved": t.be_already_moved,
             "last_tp_revise_at": t.last_tp_revise_at,
+            "sl_lock_applied": t.sl_lock_applied,
         }
+
+    def lock_sl_at(
+        self, inst_id: str, pos_side: str, new_sl: float,
+    ) -> bool:
+        """Cancel the runner OCO and place a replacement with `new_sl`
+        (keeping the current TP). Used by the MFE-lock gate in the runner:
+        once the trade is far enough in favor, the old SL below entry is
+        no longer protecting risk — it's protecting a loss that shouldn't
+        happen. This pulls the SL up to BE / profit-lock.
+
+        One-shot: `sl_lock_applied` is set to True on success so repeated
+        MFE ticks can't re-trigger (subsequent tightening needs a real
+        trail, out of scope here).
+
+        Failure modes mirror `revise_runner_tp`:
+          * cancel returns idempotent-gone code → proceed (verified).
+          * cancel returns hard error → abort, OCO untouched.
+          * place fails after cancel → CRITICAL log, UNPROTECTED, return False.
+        """
+        key = (inst_id, pos_side)
+        t = self._tracked.get(key)
+        if t is None or not t.algo_ids:
+            return False
+        if t.sl_lock_applied:
+            return False
+        if t.runner_size <= 0:
+            return False
+        if t.tp2_price is None or t.tp2_price <= 0:
+            return False
+        # Guard against degenerate placements: new SL must still be on the
+        # protective side of entry. A long's new SL must be ≤ entry for
+        # "risk-free / locked-profit" to make sense; a short's new SL must
+        # be ≥ entry. Otherwise we'd be tightening into a worse-than-old
+        # stop, which defeats the point.
+        if t.pos_side == "long" and new_sl >= t.tp2_price:
+            return False
+        if t.pos_side == "short" and new_sl <= t.tp2_price:
+            return False
+
+        runner_algo_id = t.algo_ids[-1]
+
+        try:
+            self.client.cancel_algo(t.inst_id, runner_algo_id)
+        except OrderRejected as exc:
+            if not self._cancel_error_is_already_gone(exc):
+                logger.warning(
+                    "sl_lock_cancel_failed inst={} side={} algo_id={} "
+                    "code={} — abort, runner OCO untouched",
+                    t.inst_id, t.pos_side, runner_algo_id, exc.code,
+                )
+                return False
+            if not self._verify_algo_gone(t.inst_id, runner_algo_id):
+                logger.warning(
+                    "sl_lock_cancel_51400_but_still_live inst={} side={} "
+                    "algo_id={} — abort to avoid double-OCO, try next cycle",
+                    t.inst_id, t.pos_side, runner_algo_id,
+                )
+                return False
+            logger.warning(
+                "sl_lock_runner_already_gone inst={} side={} algo_id={} "
+                "code={} verified=true — proceeding with replacement",
+                t.inst_id, t.pos_side, runner_algo_id, exc.code,
+            )
+        except Exception:
+            logger.exception(
+                "sl_lock_cancel_exception inst={} side={} algo_id={}",
+                t.inst_id, t.pos_side, runner_algo_id,
+            )
+            return False
+
+        try:
+            new_algo = self.client.place_oco_algo(
+                inst_id=t.inst_id, pos_side=t.pos_side,
+                size_contracts=int(t.runner_size),
+                sl_trigger_px=new_sl,
+                tp_trigger_px=t.tp2_price,
+                td_mode=self.margin_mode,
+                trigger_px_type=self.algo_trigger_px_type,
+            )
+        except Exception as exc:
+            code = getattr(exc, "code", None)
+            payload = getattr(exc, "payload", None)
+            logger.critical(
+                "sl_lock_place_failed_position_unprotected inst={} side={} "
+                "size={} new_sl={} tp={} err={!r} code={} payload={} — "
+                "runner unprotected, manual intervention",
+                t.inst_id, t.pos_side, t.runner_size, new_sl, t.tp2_price,
+                exc, code, payload,
+            )
+            t.algo_ids = t.algo_ids[:-1]
+            # Mark as applied so we don't loop on another failed cancel+place.
+            t.sl_lock_applied = True
+            return False
+
+        t.algo_ids = t.algo_ids[:-1] + [new_algo.algo_id]
+        t.sl_price = new_sl
+        t.sl_lock_applied = True
+        logger.info(
+            "sl_locked_via_replace inst={} side={} size={} new_sl={} "
+            "tp={} new_algo={}",
+            t.inst_id, t.pos_side, t.runner_size, new_sl, t.tp2_price,
+            new_algo.algo_id,
+        )
+        if self._on_sl_moved is not None:
+            try:
+                self._on_sl_moved(t.inst_id, t.pos_side, list(t.algo_ids))
+            except Exception:
+                logger.exception("on_sl_moved_callback_failed")
+        return True
 
     @staticmethod
     def _cancel_error_is_already_gone(exc: OrderRejected) -> bool:

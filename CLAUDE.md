@@ -12,15 +12,46 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 - **Pairs:** 5 OKX perps — `BTC / ETH / SOL / DOGE / BNB`. 5 concurrent slots on cross margin (all active, no queue).
 - **Entry TF:** 3m. HTF context 15m, LTF confirmation 1m.
 - **Scoring:** 5 pillars (Market Structure, Liquidity, Money Flow, VWAP, Divergence) + hard gates (displacement, EMA momentum, VWAP, cross-asset opposition) + ADX regime-conditional weights. *Premium/discount gate and HTF TP/SR ceiling temporarily disabled 2026-04-19 — see changelog; P/D to be re-enabled as a soft/weighted factor (~10-15%) post-Phase-9, HTF ceiling re-evaluated after Phase 9 GBT.*
-- **Execution:** post-only limit → regular limit → market-at-edge fallback. Single-leg OCO SL/TP at hard 1:3 RR (partial TP disabled 2026-04-19 late-night — see changelog; `move_sl_to_be_after_tp1` flag kept but inert while partial off). Dynamic TP revision re-anchors the runner OCO to `entry ± 3 × sl_distance` every cycle.
+- **Execution:** post-only limit → regular limit → market-at-edge fallback. Single-leg OCO SL/TP at hard 1:3 RR (partial TP disabled 2026-04-19 late-night — see changelog; `move_sl_to_be_after_tp1` flag kept but inert while partial off). Dynamic TP revision re-anchors the runner OCO to `entry ± 3 × sl_distance` every cycle. **MFE-triggered SL lock (Option A, 2026-04-20)**: once MFE ≥ 2R, the runner OCO's SL is pulled to entry (+fee buffer) so the remaining 1R of target is risk-free. One-shot per position.
 - **Sizing:** fee-aware ceil on per-contract total cost so total realized SL loss (price + fee reserve) ≥ target_risk across every symbol (2026-04-19 late-night-2 — see changelog). Previously floor-rounding produced $40-$54 variance on nominal $55; overshoot now bounded by one per-contract step (< $3 per position on current symbols).
 - **Journal:** async SQLite, schema v2 (zone source, wait/fill latency, trend regime, funding Z-scores). `rejected_signals` table with counter-factual outcome pegging.
-- **Tests:** 730, all green. Demo-runnable end-to-end.
+- **Tests:** 738, all green. Demo-runnable end-to-end.
 - **Data cutoff (`rl.clean_since`):** `2026-04-19T19:55:00Z` (bumped after ceil sizing flipped — realized-R distribution shifts from clustered-below-target to clustered-at-or-above-target). Reporter and future RL see only post-pivot trades.
 
 ---
 
 ## Changelog
+
+### 2026-04-20 — MFE-triggered SL lock (Option A)
+
+- **Trigger:** operator observed two open shorts almost touching TP (~2.5R MFE) then reversing. With single-leg 3R OCO + dynamic TP revise + partial TP disabled, nothing protects a deep winner from round-tripping back to -1R — the static SL sits at plan distance forever. Operator quote: *"shortlar neredeyse tp seviyesin yakın bir yerden döndü … burada girişte stop olmak yerine nasıl bir geliştirme yapabiliriz"*. Four options discussed (MFE-lock, ATR-trail, momentum-fade near TP, partial-TP reinstatement at 2R); picked Option A for its simplicity + high-EV "risk removal" contract.
+- **Fix — cancel+replace runner OCO when MFE crosses threshold** (`src/execution/position_monitor.py`, `src/bot/runner.py`):
+  - `_Tracked.sl_lock_applied: bool = False` — one-shot flag, True blocks further locks on the same position.
+  - `PositionMonitor.lock_sl_at(inst_id, pos_side, new_sl)` — cancels runner OCO (`algo_ids[-1]`), re-places with `new_sl` + original TP + original runner_size. Mirrors `revise_runner_tp`'s failure handling verbatim: idempotent cancel codes `{51400,51401,51402}` verified against live-pending list; unknown cancel error → abort, OCO untouched; place failure after cancel → CRITICAL log, UNPROTECTED, `sl_lock_applied` still set (prevents retry spin on the same broken cycle). Sets `t.sl_price = new_sl` so a subsequent dynamic-TP revise uses the locked SL on the replacement.
+  - Direction guard: long's `new_sl < tp2_price`, short's `new_sl > tp2_price` — else abort (would tighten into a worse stop).
+  - `get_tracked_runner` now exposes `sl_lock_applied` so the runner gate can short-circuit without touching monitor internals.
+  - `BotRunner._maybe_lock_sl_on_mfe(symbol, pos_side, state)` in the per-symbol cycle, right after `_maybe_revise_tp_dynamic`. Computes `mfe_r = sign × (current_price - entry) / plan_sl_distance` using `state.current_price` (Pine-settled 3m close). Fires when `mfe_r ≥ sl_lock_mfe_r` AND not already applied AND not post-BE (TP1 BE replacement is already at BE — re-locking is churn at best). Dispatches via `asyncio.to_thread(monitor.lock_sl_at, …)`.
+  - New SL computation: `lock_r == 0.0` → `entry + sign × entry × sl_be_offset_pct` (BE with fee buffer, matches TP1 BE replacement convention); `lock_r > 0` → `entry + sign × lock_r × plan_sl_distance` (locked profit).
+- **Config (`config/default.yaml` + `ExecutionConfig`):**
+  - `execution.sl_lock_enabled: true` (default on)
+  - `execution.sl_lock_mfe_r: 2.0` — trigger at 2R MFE
+  - `execution.sl_lock_at_r: 0.0` — lock at BE + fee buffer (set >0 for profit-lock, e.g. 0.5 = guaranteed +0.5R)
+- **Expected behavior change:**
+  - Before: short goes +2.5R → reverses → stops out at -1R → round-trip loss = full -1R on what was a deep winner.
+  - After: short goes +2.0R → monitor pulls SL to entry+fee_buffer (BE). If the reversal continues past entry, SL fires at BE (realized ≈ 0R before fees, ~-0.05R after). If price resumes down to TP, win = 3R (unchanged). Net effect: "almost-winners" no longer cost -1R; upper bound on reward is still 3R.
+  - **Break-even WR shift:** at pure 3R (current) break-even is 25% (1/(1+3)). With the MFE lock, winners that *almost* won now contribute ≈ 0R instead of -1R; break-even falls proportional to the frequency of "hit 2R then reversed" trades. Data-driven — factor-audit will quantify after ≥30 closed post-deploy trades.
+- **Skip conditions (explicit):**
+  - `plan_sl_price <= 0` (post-BE rehydrate, plan SL lost across restart) — skip, the ratio math is unreliable.
+  - `be_already_moved=True` (legacy partial-TP cascade hit BE) — skip, runner OCO already at BE.
+  - `sl_lock_applied=True` — skip, already locked.
+  - `current_price <= 0` or `plan_sl_distance <= 0` — skip, bad state.
+- **Tests:** 8 new in `tests/test_position_monitor.py` — happy path, one-shot idempotency, untracked position, wrong-side-of-TP guard, short-direction parity, place-failure unprotect, unknown-cancel abort, idempotent-cancel-proceeds. Full suite **738 passed**.
+- **Dataset:** `rl.clean_since` unchanged (`2026-04-19T19:55:00Z`). This change affects *exit* geometry on post-deploy trades; it's additive to the SL/TP contract, not a scoring or sizing regime shift. Avg-R distribution will shift post-deploy but in a well-defined direction (reduced left tail from "almost-wins"), which factor-audit will pick up cleanly without mixing regimes.
+- **Re-evaluation:** after ≥30 post-deploy closed trades, factor-audit checks:
+  1. Frequency of `sl_lock_applied` fires. Low (<30% of trades) → threshold too high (`sl_lock_mfe_r=2.0` rarely reached) or reversal pattern was exaggerated. Bump threshold down to 1.5R or reconsider.
+  2. Distribution of realized R on locked trades. Should bimodal — cluster near 0R (locked and fell back) + cluster at 3R (went all the way). No middle-cluster = working as designed.
+  3. Locked-and-fell-back %. If >60%, the "almost-win" bucket was real and the lock is load-bearing; if <30%, most 2R+ trades went to 3R anyway and the lock is neutral insurance.
+- **Restart note:** existing positions opened pre-deploy rehydrate with `sl_lock_applied=False` default. Any of them that hit 2R MFE post-restart will now lock — a post-hoc benefit on the in-flight DOGE/BNB shorts at deploy time. `plan_sl_price` preserved across restart via rehydrate path; only the BE-moved rehydrate path (which passes `plan_sl_price=0.0`) skips the lock.
 
 ### 2026-04-19 (late night, cont. #2) — Fee-aware ceil sizing (equal USDT SL/TP across symbols)
 
@@ -495,6 +526,7 @@ These are candidates, **not commitments.** Re-evaluate after Phase 11 stability.
 - **Additional pairs** — 6th+ OKX perp. Coinalyze budget allows ~6 symbols at free tier. Add parametrized instrument spec test + per-symbol YAML overrides before bringing online.
 - **1m as a zone source in `setup_planner`** — add `ltf_fvg_entry` and/or `ltf_sweep_retest` as new zone sources (1m unfilled FVG or 1m sweep-reversal). Same architectural pattern as existing sources (zone + post-only limit + `max_wait_bars` cancel), just tighter stops → larger notional at flat R. Expected tradeoff: better micro-entry quality at the cost of higher cancel rate (1m FVGs fill fast). `max_wait_bars` for 1m sources likely needs to be 3-4 (not 10). Data-driven decision: revisit after Phase 9 GBT confirms 1m factors carry weight; if they don't, a 1m zone source likely won't either.
 - **1m-triggered dynamic trail / runner management** — dynamic exit after TP1 using the 1m oscillator. Currently SL-to-BE is static at TP1 fill; a 1m momentum fade could progressively tighten SL on the runner leg. Complements (does not replace) the existing `ltf_reversal_close` defensive-close gate, which is a binary veto, not a trail. Data-driven decision after 100+ post-pivot closed trades — are we leaving too much on TP2, or is BE-after-TP1 the right discipline?
+- **ATR-trailing SL after MFE threshold (Option B to the 2026-04-20 MFE-lock)** — the MFE-lock (Option A) is one-shot: crosses 2R → SL pulled to BE → done. A true trail would keep going: after the lock fires, every cycle update SL to `current_mark ± trail_atr × ATR` so the stop walks with price. Chandelier-style. Tradeoff: `trail_atr` tuning is load-bearing — too tight (0.5 ATR) gets shaken out by normal noise, too wide (2 ATR) reduces to Option A. Only worth the code if Option A's locked-and-fell-back frequency data (see 2026-04-20 re-evaluation) shows a meaningful third bucket: "locked at BE but then price resumed to +2.5R and reversed again" — that's where a trail would have captured an extra 1-2R. Re-evaluate after ≥50 post-Option-A closed trades. Implementation sketch: new `execution.sl_trail_enabled` + `sl_trail_atr_mult` knobs, new `_Tracked.sl_trail_active` flag, new `monitor.trail_sl_to(new_sl)` method (mostly `lock_sl_at` minus the one-shot guard), runner gate `_maybe_trail_sl_after_lock` that only fires when `sl_lock_applied=True` AND `mfe_r > sl_lock_mfe_r + trail_atr_step_margin`. Keep cooldown + min-delta semantics from dynamic-TP revise to avoid OCO churn.
 - **Multi-strategy ensemble** — after scalper matures, add a separate swing module (higher TFs, different pillar weights) and route to shared execution layer. Big scope; only meaningful once scalper is provably stable.
 - **Auto-retrain loop** — monthly RL refresh on rolling window. Cron + CI pipeline. Meaningless until Phase 11 is steady.
 - **Alt-exchange support** — Bybit / Binance futures. Current execution layer is OKX-specific; abstracting `ExchangeClient` is 2-3 weeks of careful refactor.

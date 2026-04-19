@@ -896,6 +896,75 @@ class BotRunner:
                 "tp_revise_dispatch_failed symbol={} side={}", symbol, pos_side,
             )
 
+    async def _maybe_lock_sl_on_mfe(
+        self, symbol: str, pos_side: str, state: MarketState,
+    ) -> None:
+        """MFE-triggered SL lock (Option A, 2026-04-20).
+
+        Once a position's maximum favorable excursion (current price vs.
+        entry, measured in plan-R multiples) crosses
+        ``execution.sl_lock_mfe_r``, cancel + re-place the runner OCO
+        with a new SL at ``entry + sign × sl_lock_at_r × plan_sl_dist``.
+        With ``sl_lock_at_r: 0.0`` the new SL lands at entry + a tiny
+        fee buffer (``sl_be_offset_pct``), turning the last
+        ``target_rr - sl_lock_mfe_r`` of reward into risk-free upside.
+
+        One-shot per position (monitor's ``sl_lock_applied`` gate). Skips
+        when ``plan_sl_price <= 0`` (post-BE rehydrate) or when the runner
+        OCO is already the BE replacement from the TP1 path (legacy
+        partial-TP flow — those are already at BE, locking again is a no-op
+        at best, a "tighten further" at worst).
+        """
+        cfg = self.ctx.config
+        if not cfg.execution.sl_lock_enabled:
+            return
+        mfe_threshold = float(cfg.execution.sl_lock_mfe_r)
+        if mfe_threshold <= 0:
+            return
+        snap = self.ctx.monitor.get_tracked_runner(symbol, pos_side)
+        if snap is None:
+            return
+        if snap.get("sl_lock_applied"):
+            return
+        # Leave post-TP1 BE positions alone — their runner OCO is already
+        # at BE from the partial-TP cascade. Reapplying would either cancel
+        # a protective SL and replace it with the same thing (churn) or, if
+        # sl_lock_at_r > 0, would tighten further, which is out of scope
+        # for a "first-time risk removal" gate.
+        if snap.get("be_already_moved"):
+            return
+        plan_sl = float(snap.get("plan_sl_price") or 0.0)
+        entry = float(snap.get("entry_price") or 0.0)
+        if plan_sl <= 0 or entry <= 0:
+            return
+        sl_distance = abs(entry - plan_sl)
+        if sl_distance <= 0:
+            return
+        current_px = float(getattr(state, "current_price", 0.0) or 0.0)
+        if current_px <= 0:
+            return
+        sign = 1 if pos_side == "long" else -1
+        mfe_r = sign * (current_px - entry) / sl_distance
+        if mfe_r < mfe_threshold:
+            return
+        # Compute new SL: entry + sign × sl_lock_at_r × plan_sl_distance.
+        # At sl_lock_at_r=0, layer the BE fee-buffer (sl_be_offset_pct) so
+        # the stop sits a hair past entry on the profit side — covers the
+        # remaining leg's exit taker fee + slippage (same pattern as the
+        # TP1 BE replacement).
+        lock_r = float(cfg.execution.sl_lock_at_r)
+        new_sl = entry + sign * lock_r * sl_distance
+        if lock_r == 0.0:
+            new_sl = entry + sign * (entry * cfg.execution.sl_be_offset_pct)
+        try:
+            await asyncio.to_thread(
+                self.ctx.monitor.lock_sl_at, symbol, pos_side, new_sl,
+            )
+        except Exception:
+            logger.exception(
+                "sl_lock_dispatch_failed symbol={} side={}", symbol, pos_side,
+            )
+
     def _pillar_opposition_for(self, symbol: str) -> Optional[Direction]:
         """Cross-asset opposition signal for `symbol` (Phase 7.A6).
 
@@ -1304,6 +1373,13 @@ class BotRunner:
         # `execution.tp_dynamic_enabled` is false. Cheap no-op otherwise.
         if open_side:
             await self._maybe_revise_tp_dynamic(symbol, open_side, state)
+
+        # 2f. MFE-triggered SL lock — when MFE crosses `sl_lock_mfe_r`, pull
+        # the runner SL up to entry (± fee buffer) so the remaining target
+        # is risk-free. Off when `execution.sl_lock_enabled` is false.
+        # One-shot per position.
+        if open_side:
+            await self._maybe_lock_sl_on_mfe(symbol, open_side, state)
 
         # 3. Symbol-level dedup — skip open if we still hold anything OR
         # already have a pending limit entry waiting for fill (Phase 7.C4).
