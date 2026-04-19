@@ -24,8 +24,23 @@ from typing import Callable, Optional
 
 from loguru import logger
 
+from src.execution.errors import OrderRejected
 from src.execution.models import CloseFill, PositionSnapshot, PositionState
 from src.execution.okx_client import OKXClient
+
+# OKX V5 error codes where cancel_algo_order can be treated as already-done:
+# 51400 = order does not exist, 51401 = already canceled, 51402 = already
+# filled. If the TP2 algo vanished (OCO cascade after TP1 fill, prior-poll
+# cancel whose place leg failed, operator manual cancel), the monitor's
+# cancel is a no-op — proceed to place the BE replacement instead of
+# spinning on the cancel every poll.
+_ALGO_GONE_CODES = frozenset({"51400", "51401", "51402"})
+
+# Backstop: if cancel keeps failing with an unknown code (e.g. malformed
+# OKX response with no sCode), stop after this many polls and surface the
+# position as unprotected. Prevents the retry-spin pathology even when
+# `_ALGO_GONE_CODES` doesn't match the actual error code.
+_CANCEL_MAX_RETRIES = 3
 
 
 @dataclass
@@ -38,6 +53,7 @@ class _Tracked:
     algo_ids: list[str] = field(default_factory=list)
     tp2_price: Optional[float] = None
     be_already_moved: bool = False
+    cancel_retry_count: int = 0
 
 
 class PositionMonitor:
@@ -120,8 +136,22 @@ class PositionMonitor:
     ) -> None:
         """If the live size shrank (TP1 fill) and we haven't moved SL yet,
         cancel TP2 and replace it with SL=entry on the remaining size.
-        Failures are logged and the `be_already_moved` flag stays False so
-        the next poll retries."""
+
+        Failure handling (every branch exits without spin):
+
+        1. Cancel fails with `_ALGO_GONE_CODES` → treat as idempotent
+           success and proceed to place (handles OCO cascade, prior-poll
+           cancel whose place leg failed, operator manual cancel).
+        2. Cancel fails with an unknown code → increment
+           `cancel_retry_count`; next poll retries. After
+           `_CANCEL_MAX_RETRIES` attempts, give up and mark
+           `be_already_moved=True` so poll stops spinning — live TP2
+           algo state is then unknown, operator intervenes.
+        3. Place fails after cancel already landed → the surviving leg is
+           now *unprotected*. Mark `be_already_moved=True`, drop TP2
+           from `algo_ids`, log CRITICAL. Emergency market-close is
+           intentionally NOT automated — a winning TP1 runner without a
+           stop is better handled by a human than a blind exit."""
         if not self.move_sl_to_be_enabled:
             return
         if t.be_already_moved:
@@ -137,8 +167,58 @@ class PositionMonitor:
         tp2_algo_id = t.algo_ids[1]
         sign = 1 if t.pos_side == "long" else -1
         be_price = t.entry_price + (t.entry_price * self.sl_be_offset_pct * sign)
+
+        # Step 1: cancel TP2 (tolerant of already-gone).
+        cancel_succeeded_or_idempotent = False
         try:
             self.client.cancel_algo(t.inst_id, tp2_algo_id)
+            cancel_succeeded_or_idempotent = True
+        except OrderRejected as exc:
+            if self._cancel_error_is_already_gone(exc):
+                logger.warning(
+                    "sl_to_be_tp2_already_gone inst={} side={} algo_id={} "
+                    "code={} — proceeding with BE placement",
+                    t.inst_id, t.pos_side, tp2_algo_id, exc.code,
+                )
+                cancel_succeeded_or_idempotent = True
+            else:
+                t.cancel_retry_count += 1
+                logger.exception(
+                    "sl_to_be_cancel_retry_next_poll inst={} side={} code={} "
+                    "attempt={}/{}",
+                    t.inst_id, t.pos_side, exc.code,
+                    t.cancel_retry_count, _CANCEL_MAX_RETRIES,
+                )
+        except Exception:
+            t.cancel_retry_count += 1
+            logger.exception(
+                "sl_to_be_cancel_retry_next_poll inst={} side={} attempt={}/{}",
+                t.inst_id, t.pos_side,
+                t.cancel_retry_count, _CANCEL_MAX_RETRIES,
+            )
+
+        if not cancel_succeeded_or_idempotent:
+            if t.cancel_retry_count >= _CANCEL_MAX_RETRIES:
+                # Backstop: we can't tell if the algo is truly gone or if
+                # OKX is returning malformed errors. Either way, stop
+                # spinning and surface the state. The TP2 algo *might*
+                # still be live on OKX — but after N failed cancels we
+                # can't confirm, and the original SL leg from the TP1
+                # OCO is already effected (state=effective, sz=partial),
+                # so the runner's real risk is that the live TP2 algo
+                # may still trigger on its own. Operator decides.
+                logger.critical(
+                    "sl_to_be_cancel_gave_up inst={} side={} algo_id={} "
+                    "after {} attempts — not moving SL to BE; live TP2 "
+                    "algo state unknown, manual intervention required",
+                    t.inst_id, t.pos_side, tp2_algo_id, t.cancel_retry_count,
+                )
+                t.be_already_moved = True
+            return
+
+        # Step 2: place the BE replacement. Cancel has already landed, so
+        # the surviving leg is unprotected until this returns.
+        try:
             new_algo = self.client.place_oco_algo(
                 inst_id=t.inst_id, pos_side=t.pos_side,
                 size_contracts=int(snap.size),
@@ -147,10 +227,22 @@ class PositionMonitor:
                 td_mode=self.margin_mode,
             )
         except Exception:
-            logger.exception(
-                "sl_to_be_retry_next_poll inst={} side={}",
-                t.inst_id, t.pos_side,
+            logger.critical(
+                "sl_to_be_place_failed_position_unprotected inst={} side={} "
+                "remaining_size={} be_price={} — TP2 cancelled, replacement "
+                "OCO rejected, manual intervention required",
+                t.inst_id, t.pos_side, snap.size, be_price,
             )
+            # Prevent retry-spin: cancel already succeeded, so a retry
+            # would just "cancel a vanished algo" forever. Drop TP2 from
+            # algo_ids so the journal reflects that only TP1 remains.
+            t.algo_ids = [t.algo_ids[0]]
+            t.be_already_moved = True
+            if self._on_sl_moved is not None:
+                try:
+                    self._on_sl_moved(t.inst_id, t.pos_side, list(t.algo_ids))
+                except Exception:
+                    logger.exception("on_sl_moved_callback_failed")
             return
 
         t.algo_ids = [t.algo_ids[0], new_algo.algo_id]
@@ -166,6 +258,15 @@ class PositionMonitor:
                 self._on_sl_moved(t.inst_id, t.pos_side, list(t.algo_ids))
             except Exception:
                 logger.exception("on_sl_moved_callback_failed")
+
+    @staticmethod
+    def _cancel_error_is_already_gone(exc: OrderRejected) -> bool:
+        # Known OKX "algo doesn't exist / already cancelled / already
+        # filled" codes. Anything else (including empty/None code —
+        # generally a wrapping issue, not a semantic 'gone' signal) falls
+        # through to the retry path, where the generic retry counter will
+        # eventually give up if it truly cannot recover.
+        return exc.code in _ALGO_GONE_CODES
 
     def _close_fill_from(self, t: _Tracked) -> CloseFill:
         # At close time, OKX has already removed the position row. Best we

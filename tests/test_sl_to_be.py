@@ -11,6 +11,7 @@ from typing import Optional
 
 import pytest
 
+from src.execution.errors import OrderRejected
 from src.execution.models import AlgoResult, CloseFill, PositionSnapshot
 from src.execution.position_monitor import PositionMonitor
 
@@ -19,11 +20,15 @@ class _FakeClient:
     """Just the surface PositionMonitor touches."""
 
     def __init__(self, positions: Optional[list[PositionSnapshot]] = None,
-                 cancel_raises: bool = False):
+                 cancel_raises: bool = False,
+                 cancel_error: Optional[Exception] = None,
+                 place_raises: bool = False):
         self.positions = positions or []
         self.cancelled: list[tuple[str, str]] = []
         self.placed: list[dict] = []
         self.cancel_raises = cancel_raises
+        self.cancel_error = cancel_error
+        self.place_raises = place_raises
         self._algo_counter = 0
 
     def get_positions(self, inst_id: Optional[str] = None) -> list[PositionSnapshot]:
@@ -31,12 +36,16 @@ class _FakeClient:
 
     def cancel_algo(self, inst_id: str, algo_id: str) -> dict:
         self.cancelled.append((inst_id, algo_id))
+        if self.cancel_error is not None:
+            raise self.cancel_error
         if self.cancel_raises:
             raise RuntimeError("cancel failed")
         return {}
 
     def place_oco_algo(self, *, inst_id, pos_side, size_contracts,
                        sl_trigger_px, tp_trigger_px, td_mode="isolated") -> AlgoResult:
+        if self.place_raises:
+            raise OrderRejected("place failed", code="51000")
         self._algo_counter += 1
         self.placed.append({
             "inst_id": inst_id, "pos_side": pos_side,
@@ -211,3 +220,126 @@ def test_be_offset_zero_preserves_exact_entry_behavior():
     )
     monitor.poll()
     assert client.placed[0]["sl"] == pytest.approx(100.0)
+
+
+# ── Recovery from stale / failed cancel or place ───────────────────────────
+
+
+def test_cancel_with_algo_gone_code_proceeds_to_place():
+    # If TP2 was already cancelled externally (e.g. by a prior poll whose
+    # place leg failed), OKX returns code 51400. Cancel should be treated
+    # as idempotent and the BE OCO placed anyway, so the position is no
+    # longer unprotected.
+    client = _FakeClient(
+        positions=[_snap(size=5.0)],
+        cancel_error=OrderRejected("algo does not exist", code="51400"),
+    )
+    monitor = PositionMonitor(client, move_sl_to_be_enabled=True)
+    monitor.register_open(
+        "BTC-USDT-SWAP", "long", 10.0, 100.0,
+        algo_ids=["ALG1", "ALG2"], tp2_price=105.0,
+    )
+    monitor.poll()
+    assert len(client.placed) == 1
+    assert client.placed[0]["size"] == 5
+    assert monitor._tracked[("BTC-USDT-SWAP", "long")].be_already_moved is True
+
+
+def test_cancel_with_unknown_code_retries_up_to_backstop():
+    # Generic non-"gone" OrderRejected increments retry counter. After
+    # _CANCEL_MAX_RETRIES attempts, monitor gives up and marks
+    # be_already_moved=True so poll stops spinning.
+    from src.execution.position_monitor import _CANCEL_MAX_RETRIES
+
+    client = _FakeClient(
+        positions=[_snap(size=5.0)],
+        cancel_error=OrderRejected("weird", code="99999"),
+    )
+    monitor = PositionMonitor(client, move_sl_to_be_enabled=True)
+    monitor.register_open(
+        "BTC-USDT-SWAP", "long", 10.0, 100.0,
+        algo_ids=["ALG1", "ALG2"], tp2_price=105.0,
+    )
+
+    for _ in range(_CANCEL_MAX_RETRIES):
+        monitor.poll()
+    # After max retries, monitor gives up — no more cancels on the next poll.
+    tracked = monitor._tracked[("BTC-USDT-SWAP", "long")]
+    assert tracked.be_already_moved is True
+    assert tracked.cancel_retry_count == _CANCEL_MAX_RETRIES
+    assert client.placed == []
+
+    prior_cancel_count = len(client.cancelled)
+    monitor.poll()
+    assert len(client.cancelled) == prior_cancel_count  # no retry-spin
+
+
+def test_cancel_runtime_error_still_counts_toward_retry_cap():
+    # Generic (non-OrderRejected) exceptions go through the fallback
+    # `except Exception` branch but still increment the retry counter.
+    from src.execution.position_monitor import _CANCEL_MAX_RETRIES
+
+    client = _FakeClient(positions=[_snap(size=5.0)], cancel_raises=True)
+    monitor = PositionMonitor(client, move_sl_to_be_enabled=True)
+    monitor.register_open(
+        "BTC-USDT-SWAP", "long", 10.0, 100.0,
+        algo_ids=["ALG1", "ALG2"], tp2_price=105.0,
+    )
+    for _ in range(_CANCEL_MAX_RETRIES):
+        monitor.poll()
+    tracked = monitor._tracked[("BTC-USDT-SWAP", "long")]
+    assert tracked.be_already_moved is True
+    assert tracked.cancel_retry_count == _CANCEL_MAX_RETRIES
+
+
+def test_place_failure_after_cancel_marks_unprotected_no_spin():
+    # The real-world bug: cancel succeeded, place OCO failed → remaining
+    # leg unprotected. Monitor must mark be_already_moved=True so it
+    # doesn't try to re-cancel a vanished TP2 every poll. Journal
+    # callback fires with only TP1 in algo_ids.
+    client = _FakeClient(positions=[_snap(size=5.0)], place_raises=True)
+    callback_calls: list[tuple[str, str, list[str]]] = []
+
+    def on_sl_moved(inst_id, pos_side, algo_ids):
+        callback_calls.append((inst_id, pos_side, list(algo_ids)))
+
+    monitor = PositionMonitor(
+        client, move_sl_to_be_enabled=True, on_sl_moved=on_sl_moved,
+    )
+    monitor.register_open(
+        "BTC-USDT-SWAP", "long", 10.0, 100.0,
+        algo_ids=["ALG1", "ALG2"], tp2_price=105.0,
+    )
+
+    monitor.poll()
+    tracked = monitor._tracked[("BTC-USDT-SWAP", "long")]
+    assert tracked.be_already_moved is True
+    assert tracked.algo_ids == ["ALG1"]  # TP2 dropped, journal callback reflects it
+    assert callback_calls == [("BTC-USDT-SWAP", "long", ["ALG1"])]
+
+    # Subsequent polls must NOT re-attempt cancel or place — that was the
+    # original retry-spin bug.
+    prior_cancel_count = len(client.cancelled)
+    monitor.poll()
+    monitor.poll()
+    assert len(client.cancelled) == prior_cancel_count
+
+
+def test_successful_path_resets_retry_counter_via_be_flag():
+    # After a successful SL-to-BE move, be_already_moved=True means
+    # subsequent polls short-circuit before touching the retry counter,
+    # so the counter value is irrelevant post-success. This exercises the
+    # happy path to make sure retry-counter code didn't regress it.
+    client = _FakeClient(positions=[_snap(size=5.0)])
+    monitor = PositionMonitor(client, move_sl_to_be_enabled=True)
+    monitor.register_open(
+        "BTC-USDT-SWAP", "long", 10.0, 100.0,
+        algo_ids=["ALG1", "ALG2"], tp2_price=105.0,
+    )
+    monitor.poll()
+    tracked = monitor._tracked[("BTC-USDT-SWAP", "long")]
+    assert tracked.be_already_moved is True
+    assert tracked.cancel_retry_count == 0
+    monitor.poll()
+    assert len(client.cancelled) == 1
+    assert len(client.placed) == 1
