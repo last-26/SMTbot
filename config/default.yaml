@@ -240,9 +240,15 @@ analysis:
   # Phase 7.D1 — premium/discount zone veto. When `true`, longs that sit
   # above the last N-bar swing midpoint and shorts below it are rejected
   # as `wrong_side_of_premium_discount`. Sprint 3 forensics: market-order
-  # bot chronically bought premium / sold discount. Flipped ON 2026-04-19
-  # together with zone-entry for full pivot discipline (CLAUDE.md hard-gate list).
-  premium_discount_veto_enabled: true
+  # bot chronically bought premium / sold discount.
+  # 2026-04-19 pivot: flipped ON for full pivot discipline.
+  # 2026-04-19 (same day, later): TEMPORARILY flipped OFF — all 7 symbols
+  # were stuck rejecting on this gate in a range-bound tape; operator opted
+  # to let zone-based entries take over for data collection. Re-enable as a
+  # *soft / weighted* factor (~10-15% weight-equivalent) once GBT reveals
+  # the right form in Phase 9. When re-enabled, update CLAUDE.md hard-gate
+  # list + re-pin `rl.clean_since` if the disabled-window polluted data.
+  premium_discount_veto_enabled: false
   premium_discount_lookback: 40
   # Phase 7.D1 — displacement candle factor. Confirms a "real imbalance"
   # move in the trade direction within the last N closed bars. Weight is

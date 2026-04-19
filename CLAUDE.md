@@ -11,7 +11,7 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 - **Strategy:** zone-based scalper. Confluence ≥ threshold → identify zone → post-only limit order at zone edge → wait N bars → fill | cancel.
 - **Pairs:** 7 OKX perps — `BTC / ETH / SOL / DOGE / XRP / ADA / BNB`. 7 concurrent slots on cross margin (all active, no queue).
 - **Entry TF:** 3m. HTF context 15m, LTF confirmation 1m.
-- **Scoring:** 5 pillars (Market Structure, Liquidity, Money Flow, VWAP, Divergence) + hard gates (premium/discount, displacement, EMA momentum, VWAP, cross-asset opposition) + ADX regime-conditional weights.
+- **Scoring:** 5 pillars (Market Structure, Liquidity, Money Flow, VWAP, Divergence) + hard gates (displacement, EMA momentum, VWAP, cross-asset opposition) + ADX regime-conditional weights. *Premium/discount gate temporarily disabled 2026-04-19 — see changelog; to be re-enabled as a soft/weighted factor (~10-15%) post-Phase-9.*
 - **Execution:** post-only limit → regular limit → market-at-edge fallback. OCO SL/TP, partial TP at 1.5R with fee-buffered SL-to-BE on TP1 fill.
 - **Journal:** async SQLite, schema v2 (zone source, wait/fill latency, trend regime, funding Z-scores). `rejected_signals` table with counter-factual outcome pegging.
 - **Tests:** ~682, all green. Demo-runnable end-to-end.
@@ -20,6 +20,14 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 ---
 
 ## Changelog
+
+### 2026-04-19 — Premium/discount gate temporarily disabled
+
+- **`analysis.premium_discount_veto_enabled: true → false`** (`config/default.yaml:245`).
+- **Reason:** range-bound tape after scalp-native rewire → all 7 symbols chronically rejecting on `wrong_side_of_premium_discount`; zone-based entries (VWAP retest, EMA21 pullback, FVG, sweep) never got to fire. Operator opted to let the zone layer take over for data collection.
+- **Re-enable plan:** bring back as a *soft / weighted* factor, **not** a hard gate. Target weight equivalent ~**10-15%** of final confluence contribution (exact form — inverse distance from midpoint, scaled penalty, or pillar-style factor — to be chosen from Phase 9 GBT output).
+- **Dataset implication:** trades opened during this window are NOT P/D-disciplined. If factor-audit shows "premium long / discount short" bleeding WR, bump `rl.clean_since` forward before RL training so Phase 10 doesn't learn chase-the-move behavior.
+- **Other gates unchanged:** displacement, EMA momentum, VWAP, cross-asset opposition still active. No code changes, no test changes.
 
 ### 2026-04-19 — Scalp-native rewire
 
@@ -125,7 +133,7 @@ End-to-end tick walkthrough: see `docs/trade_lifecycle.md`.
 
 ### Hard gates (reject, not scored)
 
-`premium_discount_zone` · `displacement_candle` · `ema_momentum_contra` · `vwap_misaligned` · `cross_asset_opposition` (altcoin veto when BTC+ETH both oppose).
+`displacement_candle` · `ema_momentum_contra` · `vwap_misaligned` · `cross_asset_opposition` (altcoin veto when BTC+ETH both oppose). *`premium_discount_zone` is wired but currently disabled (`analysis.premium_discount_veto_enabled=false`) — see changelog 2026-04-19.*
 
 ### Zone-based entry
 
