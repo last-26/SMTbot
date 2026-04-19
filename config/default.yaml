@@ -214,9 +214,9 @@ analysis:
   # Phase 7.D1 — premium/discount zone veto. When `true`, longs that sit
   # above the last N-bar swing midpoint and shorts below it are rejected
   # as `wrong_side_of_premium_discount`. Sprint 3 forensics: market-order
-  # bot chronically bought premium / sold discount. Flip on together with
-  # zone-entry for full pivot discipline. Default off for back-compat.
-  premium_discount_veto_enabled: false
+  # bot chronically bought premium / sold discount. Flipped ON 2026-04-19
+  # together with zone-entry for full pivot discipline (CLAUDE.md hard-gate list).
+  premium_discount_veto_enabled: true
   premium_discount_lookback: 40
   # Phase 7.D1 — displacement candle factor. Confirms a "real imbalance"
   # move in the trade direction within the last N closed bars. Weight is
@@ -236,9 +236,10 @@ analysis:
   # Classifier runs every cycle on entry-TF closed bars; the label (and the
   # decoded +DI/-DI) is always computed and persisted on a fill. When the
   # conditional scoring flag is on, STRONG_TREND boosts `htf_trend_alignment`
-  # ×1.5 and penalises `recent_sweep` ×0.5; RANGING mirrors the ratio. Leave
-  # off until Sprint 4 demo validation shows regime-gated stack outperforms.
-  trend_regime_conditional_scoring_enabled: false
+  # ×1.5 and penalises `recent_sweep` ×0.5; RANGING mirrors the ratio.
+  # Flipped ON 2026-04-19 — CLAUDE.md "Regime awareness" section mandates
+  # regime-gated weights as part of the post-pivot strategy.
+  trend_regime_conditional_scoring_enabled: true
   adx_period: 14                       # Wilder's canonical 14-period ADX.
   trend_regime_ranging_threshold: 20.0 # ADX < this → RANGING.
   trend_regime_strong_threshold: 30.0  # ADX ≥ this → STRONG_TREND.
@@ -277,6 +278,24 @@ execution:
   ltf_reversal_min_confluence: 3
   ltf_reversal_min_bars_in_position: 2
   ltf_reversal_signal_max_age: 3
+
+  # Phase 7.C4 — zone-based limit entry. When `true`, the setup_planner
+  # builds a ZoneSetup (HTF FVG / liq pool / VWAP / sweep) from the picked
+  # confluence direction, rewrites plan entry/SL/TP to structural levels,
+  # and places a post-only limit order. Fills are observed via PENDING →
+  # FILLED lifecycle; timeout after zone_max_wait_bars entry-TF bars.
+  # Flipped ON 2026-04-19 — CLAUDE.md "Zone-based entry" section is the
+  # post-pivot default execution path.
+  zone_entry_enabled: true
+  # When `true` AND zone_entry_enabled, signals without a valid zone are
+  # rejected with reason `no_setup_zone` (present in CLAUDE.md unified
+  # reject list). When `false`, missing-zone signals fall back to the
+  # legacy market-order path (hybrid mode — not what CLAUDE.md describes).
+  zone_require_setup: true
+  zone_max_wait_bars: 10
+  zone_buffer_atr: 0.25
+  zone_sl_buffer_atr: 0.5
+  zone_default_rr: 2.0
 
 derivatives:
   # Phase 1.5 — derivatives data layer. Disabling this short-circuits the
