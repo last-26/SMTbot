@@ -262,6 +262,153 @@ async def test_persists_to_disk_and_reopens(tmp_path):
     assert fetched.confluence_factors == ["OB_test", "FVG_active", "VMC_bullish"]
 
 
+async def test_schema_v2_columns_present_on_fresh_db():
+    """Phase 7.B5 — fresh DB should have the new zone/regime/funding columns."""
+    async with TradeJournal(":memory:") as j:
+        conn = j._require_conn()
+        async with conn.execute("PRAGMA table_info(trades)") as cur:
+            rows = await cur.fetchall()
+    cols = {r["name"] for r in rows}
+    assert "setup_zone_source" in cols
+    assert "zone_wait_bars" in cols
+    assert "zone_fill_latency_bars" in cols
+    assert "trend_regime_at_entry" in cols
+    assert "funding_z_6h" in cols
+    assert "funding_z_24h" in cols
+
+
+async def test_schema_v2_round_trip_preserves_new_fields():
+    async with TradeJournal(":memory:") as j:
+        rec = await j.record_open(_plan(), _report(), symbol="BTC-USDT-SWAP",
+                                  signal_timestamp=datetime(2026, 4, 16, tzinfo=UTC))
+        # Schema-v2 columns start NULL; confirm round-trip keeps them None.
+        fetched = await j.get_trade(rec.trade_id)
+        assert fetched.setup_zone_source is None
+        assert fetched.zone_wait_bars is None
+        assert fetched.trend_regime_at_entry is None
+        assert fetched.funding_z_6h is None
+
+
+# ── record_rejected_signal ──────────────────────────────────────────────────
+
+
+async def test_record_rejected_signal_minimal():
+    """Only required fields — direction + reason + ts — round-trip cleanly."""
+    async with TradeJournal(":memory:") as j:
+        rec = await j.record_rejected_signal(
+            symbol="BTC-USDT-SWAP",
+            direction=Direction.BULLISH,
+            reject_reason="below_confluence",
+            signal_timestamp=datetime(2026, 4, 19, 12, tzinfo=UTC),
+        )
+    assert rec.rejection_id  # uuid generated
+    assert rec.reject_reason == "below_confluence"
+    assert rec.direction == Direction.BULLISH
+    assert rec.confluence_score == 0.0
+    assert rec.confluence_factors == []
+
+
+async def test_record_rejected_signal_persists_full_snapshot():
+    async with TradeJournal(":memory:") as j:
+        await j.record_rejected_signal(
+            symbol="ETH-USDT-SWAP",
+            direction=Direction.BEARISH,
+            reject_reason="cross_asset_opposition",
+            signal_timestamp=datetime(2026, 4, 19, 12, tzinfo=UTC),
+            price=2400.0,
+            atr=15.0,
+            confluence_score=3.2,
+            confluence_factors=["mss_alignment", "recent_sweep"],
+            entry_timeframe="3m",
+            htf_timeframe="15m",
+            htf_bias="BULLISH",
+            session="LONDON",
+            market_structure="BULLISH",
+            regime_at_entry="BALANCED",
+            funding_z_at_entry=1.5,
+            pillar_btc_bias="BULLISH",
+            pillar_eth_bias="BULLISH",
+        )
+        rows = await j.list_rejected_signals()
+    assert len(rows) == 1
+    r = rows[0]
+    assert r.symbol == "ETH-USDT-SWAP"
+    assert r.reject_reason == "cross_asset_opposition"
+    assert r.price == 2400.0
+    assert r.confluence_factors == ["mss_alignment", "recent_sweep"]
+    assert r.pillar_btc_bias == "BULLISH"
+    assert r.pillar_eth_bias == "BULLISH"
+    assert r.hypothetical_outcome is None  # not stamped yet
+
+
+async def test_list_rejected_signals_filters_stack():
+    async with TradeJournal(":memory:") as j:
+        t0 = datetime(2026, 4, 19, 12, tzinfo=UTC)
+        await j.record_rejected_signal(
+            symbol="BTC-USDT-SWAP", direction=Direction.BULLISH,
+            reject_reason="below_confluence", signal_timestamp=t0,
+        )
+        await j.record_rejected_signal(
+            symbol="BTC-USDT-SWAP", direction=Direction.BEARISH,
+            reject_reason="session_filter", signal_timestamp=t0 + timedelta(minutes=5),
+        )
+        await j.record_rejected_signal(
+            symbol="ETH-USDT-SWAP", direction=Direction.BULLISH,
+            reject_reason="below_confluence", signal_timestamp=t0 + timedelta(minutes=10),
+        )
+
+        # symbol filter
+        btc = await j.list_rejected_signals(symbol="BTC-USDT-SWAP")
+        assert len(btc) == 2
+
+        # reason filter
+        confluence_rejects = await j.list_rejected_signals(
+            reject_reason="below_confluence",
+        )
+        assert len(confluence_rejects) == 2
+
+        # since filter
+        recent = await j.list_rejected_signals(
+            since=t0 + timedelta(minutes=7),
+        )
+        assert len(recent) == 1
+        assert recent[0].symbol == "ETH-USDT-SWAP"
+
+        # stacked filters (AND)
+        narrowed = await j.list_rejected_signals(
+            symbol="BTC-USDT-SWAP", reject_reason="session_filter",
+        )
+        assert len(narrowed) == 1
+        assert narrowed[0].reject_reason == "session_filter"
+
+
+async def test_update_rejected_outcome_stamps_counterfactual():
+    async with TradeJournal(":memory:") as j:
+        r = await j.record_rejected_signal(
+            symbol="BTC-USDT-SWAP", direction=Direction.BULLISH,
+            reject_reason="below_confluence",
+            signal_timestamp=datetime(2026, 4, 19, tzinfo=UTC),
+        )
+        await j.update_rejected_outcome(
+            r.rejection_id,
+            hypothetical_outcome="WIN",
+            bars_to_tp=6,
+            bars_to_sl=None,
+        )
+        rows = await j.list_rejected_signals()
+    assert rows[0].hypothetical_outcome == "WIN"
+    assert rows[0].hypothetical_bars_to_tp == 6
+    assert rows[0].hypothetical_bars_to_sl is None
+
+
+async def test_update_rejected_outcome_unknown_id_raises():
+    async with TradeJournal(":memory:") as j:
+        with pytest.raises(KeyError):
+            await j.update_rejected_outcome(
+                "does-not-exist", hypothetical_outcome="WIN",
+            )
+
+
 async def test_replay_for_risk_manager_rebuilds_streaks_and_peak():
     """3 wins then 2 losses → peak after the wins, consecutive_losses=2 at end."""
     async with TradeJournal(":memory:") as j:

@@ -29,7 +29,7 @@ import aiosqlite
 
 from src.data.models import Direction
 from src.execution.models import CloseFill, ExecutionReport
-from src.journal.models import TradeOutcome, TradeRecord
+from src.journal.models import RejectedSignal, TradeOutcome, TradeRecord
 from src.strategy.risk_manager import RiskManager, TradeResult
 from src.strategy.trade_plan import TradePlan
 
@@ -90,6 +90,13 @@ CREATE TABLE IF NOT EXISTS trades (
     nearest_liq_cluster_above_distance_atr REAL,
     nearest_liq_cluster_below_distance_atr REAL,
 
+    setup_zone_source       TEXT,
+    zone_wait_bars          INTEGER,
+    zone_fill_latency_bars  INTEGER,
+    trend_regime_at_entry   TEXT,
+    funding_z_6h            REAL,
+    funding_z_24h           REAL,
+
     notes               TEXT,
     screenshot_entry    TEXT,
     screenshot_exit     TEXT
@@ -98,6 +105,52 @@ CREATE TABLE IF NOT EXISTS trades (
 CREATE INDEX IF NOT EXISTS idx_trades_outcome      ON trades(outcome);
 CREATE INDEX IF NOT EXISTS idx_trades_entry_ts     ON trades(entry_timestamp);
 CREATE INDEX IF NOT EXISTS idx_trades_exit_ts      ON trades(exit_timestamp);
+
+CREATE TABLE IF NOT EXISTS rejected_signals (
+    rejection_id        TEXT PRIMARY KEY,
+    symbol              TEXT NOT NULL,
+    direction           TEXT NOT NULL,
+    reject_reason       TEXT NOT NULL,
+    signal_timestamp    TEXT NOT NULL,
+
+    price               REAL,
+    atr                 REAL,
+    confluence_score    REAL NOT NULL DEFAULT 0,
+    confluence_factors  TEXT NOT NULL DEFAULT '[]',
+
+    entry_timeframe     TEXT,
+    htf_timeframe       TEXT,
+    htf_bias            TEXT,
+    session             TEXT,
+    market_structure    TEXT,
+
+    proposed_sl_price   REAL,
+    proposed_tp_price   REAL,
+    proposed_rr_ratio   REAL,
+
+    regime_at_entry                     TEXT,
+    funding_z_at_entry                  REAL,
+    ls_ratio_at_entry                   REAL,
+    oi_change_24h_at_entry              REAL,
+    liq_imbalance_1h_at_entry           REAL,
+    nearest_liq_cluster_above_price     REAL,
+    nearest_liq_cluster_below_price     REAL,
+    nearest_liq_cluster_above_notional  REAL,
+    nearest_liq_cluster_below_notional  REAL,
+    nearest_liq_cluster_above_distance_atr REAL,
+    nearest_liq_cluster_below_distance_atr REAL,
+
+    pillar_btc_bias     TEXT,
+    pillar_eth_bias     TEXT,
+
+    hypothetical_outcome    TEXT,
+    hypothetical_bars_to_tp INTEGER,
+    hypothetical_bars_to_sl INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_rejected_symbol_ts  ON rejected_signals(symbol, signal_timestamp);
+CREATE INDEX IF NOT EXISTS idx_rejected_reason     ON rejected_signals(reject_reason);
+CREATE INDEX IF NOT EXISTS idx_rejected_outcome    ON rejected_signals(hypothetical_outcome);
 """
 
 
@@ -118,7 +171,24 @@ _COLUMNS = [
     "nearest_liq_cluster_above_price", "nearest_liq_cluster_below_price",
     "nearest_liq_cluster_above_notional", "nearest_liq_cluster_below_notional",
     "nearest_liq_cluster_above_distance_atr", "nearest_liq_cluster_below_distance_atr",
+    "setup_zone_source", "zone_wait_bars", "zone_fill_latency_bars",
+    "trend_regime_at_entry", "funding_z_6h", "funding_z_24h",
     "notes", "screenshot_entry", "screenshot_exit",
+]
+
+
+_REJECTED_COLUMNS = [
+    "rejection_id", "symbol", "direction", "reject_reason", "signal_timestamp",
+    "price", "atr", "confluence_score", "confluence_factors",
+    "entry_timeframe", "htf_timeframe", "htf_bias", "session", "market_structure",
+    "proposed_sl_price", "proposed_tp_price", "proposed_rr_ratio",
+    "regime_at_entry", "funding_z_at_entry", "ls_ratio_at_entry",
+    "oi_change_24h_at_entry", "liq_imbalance_1h_at_entry",
+    "nearest_liq_cluster_above_price", "nearest_liq_cluster_below_price",
+    "nearest_liq_cluster_above_notional", "nearest_liq_cluster_below_notional",
+    "nearest_liq_cluster_above_distance_atr", "nearest_liq_cluster_below_distance_atr",
+    "pillar_btc_bias", "pillar_eth_bias",
+    "hypothetical_outcome", "hypothetical_bars_to_tp", "hypothetical_bars_to_sl",
 ]
 
 
@@ -141,6 +211,13 @@ _MIGRATIONS = [
     # BLOK D-7 — cluster distance in ATR units, pre-computed at entry.
     "ALTER TABLE trades ADD COLUMN nearest_liq_cluster_above_distance_atr REAL",
     "ALTER TABLE trades ADD COLUMN nearest_liq_cluster_below_distance_atr REAL",
+    # Phase 7.B5 schema v2 — zone-entry context + ADX regime + windowed funding.
+    "ALTER TABLE trades ADD COLUMN setup_zone_source TEXT",
+    "ALTER TABLE trades ADD COLUMN zone_wait_bars INTEGER",
+    "ALTER TABLE trades ADD COLUMN zone_fill_latency_bars INTEGER",
+    "ALTER TABLE trades ADD COLUMN trend_regime_at_entry TEXT",
+    "ALTER TABLE trades ADD COLUMN funding_z_6h REAL",
+    "ALTER TABLE trades ADD COLUMN funding_z_24h REAL",
 ]
 
 
@@ -169,7 +246,66 @@ def _record_to_row(rec: TradeRecord) -> tuple:
         rec.nearest_liq_cluster_above_price, rec.nearest_liq_cluster_below_price,
         rec.nearest_liq_cluster_above_notional, rec.nearest_liq_cluster_below_notional,
         rec.nearest_liq_cluster_above_distance_atr, rec.nearest_liq_cluster_below_distance_atr,
+        rec.setup_zone_source, rec.zone_wait_bars, rec.zone_fill_latency_bars,
+        rec.trend_regime_at_entry, rec.funding_z_6h, rec.funding_z_24h,
         rec.notes, rec.screenshot_entry, rec.screenshot_exit,
+    )
+
+
+def _rejected_to_row(rec: RejectedSignal) -> tuple:
+    return (
+        rec.rejection_id, rec.symbol, rec.direction.value, rec.reject_reason,
+        _iso(rec.signal_timestamp),
+        rec.price, rec.atr, rec.confluence_score,
+        json.dumps(rec.confluence_factors),
+        rec.entry_timeframe, rec.htf_timeframe, rec.htf_bias,
+        rec.session, rec.market_structure,
+        rec.proposed_sl_price, rec.proposed_tp_price, rec.proposed_rr_ratio,
+        rec.regime_at_entry, rec.funding_z_at_entry, rec.ls_ratio_at_entry,
+        rec.oi_change_24h_at_entry, rec.liq_imbalance_1h_at_entry,
+        rec.nearest_liq_cluster_above_price, rec.nearest_liq_cluster_below_price,
+        rec.nearest_liq_cluster_above_notional, rec.nearest_liq_cluster_below_notional,
+        rec.nearest_liq_cluster_above_distance_atr, rec.nearest_liq_cluster_below_distance_atr,
+        rec.pillar_btc_bias, rec.pillar_eth_bias,
+        rec.hypothetical_outcome, rec.hypothetical_bars_to_tp, rec.hypothetical_bars_to_sl,
+    )
+
+
+def _row_to_rejected(row: aiosqlite.Row) -> RejectedSignal:
+    return RejectedSignal(
+        rejection_id=row["rejection_id"],
+        symbol=row["symbol"],
+        direction=Direction(row["direction"]),
+        reject_reason=row["reject_reason"],
+        signal_timestamp=_parse_iso(row["signal_timestamp"]),
+        price=row["price"],
+        atr=row["atr"],
+        confluence_score=row["confluence_score"],
+        confluence_factors=json.loads(row["confluence_factors"] or "[]"),
+        entry_timeframe=row["entry_timeframe"],
+        htf_timeframe=row["htf_timeframe"],
+        htf_bias=row["htf_bias"],
+        session=row["session"],
+        market_structure=row["market_structure"],
+        proposed_sl_price=row["proposed_sl_price"],
+        proposed_tp_price=row["proposed_tp_price"],
+        proposed_rr_ratio=row["proposed_rr_ratio"],
+        regime_at_entry=row["regime_at_entry"],
+        funding_z_at_entry=row["funding_z_at_entry"],
+        ls_ratio_at_entry=row["ls_ratio_at_entry"],
+        oi_change_24h_at_entry=row["oi_change_24h_at_entry"],
+        liq_imbalance_1h_at_entry=row["liq_imbalance_1h_at_entry"],
+        nearest_liq_cluster_above_price=row["nearest_liq_cluster_above_price"],
+        nearest_liq_cluster_below_price=row["nearest_liq_cluster_below_price"],
+        nearest_liq_cluster_above_notional=row["nearest_liq_cluster_above_notional"],
+        nearest_liq_cluster_below_notional=row["nearest_liq_cluster_below_notional"],
+        nearest_liq_cluster_above_distance_atr=row["nearest_liq_cluster_above_distance_atr"],
+        nearest_liq_cluster_below_distance_atr=row["nearest_liq_cluster_below_distance_atr"],
+        pillar_btc_bias=row["pillar_btc_bias"],
+        pillar_eth_bias=row["pillar_eth_bias"],
+        hypothetical_outcome=row["hypothetical_outcome"],
+        hypothetical_bars_to_tp=row["hypothetical_bars_to_tp"],
+        hypothetical_bars_to_sl=row["hypothetical_bars_to_sl"],
     )
 
 
@@ -221,6 +357,12 @@ def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
         nearest_liq_cluster_below_notional=_safe_col(row, "nearest_liq_cluster_below_notional"),
         nearest_liq_cluster_above_distance_atr=_safe_col(row, "nearest_liq_cluster_above_distance_atr"),
         nearest_liq_cluster_below_distance_atr=_safe_col(row, "nearest_liq_cluster_below_distance_atr"),
+        setup_zone_source=_safe_col(row, "setup_zone_source"),
+        zone_wait_bars=_safe_col(row, "zone_wait_bars"),
+        zone_fill_latency_bars=_safe_col(row, "zone_fill_latency_bars"),
+        trend_regime_at_entry=_safe_col(row, "trend_regime_at_entry"),
+        funding_z_6h=_safe_col(row, "funding_z_6h"),
+        funding_z_24h=_safe_col(row, "funding_z_24h"),
         notes=row["notes"],
         screenshot_entry=row["screenshot_entry"],
         screenshot_exit=row["screenshot_exit"],
@@ -439,6 +581,146 @@ class TradeJournal:
         await conn.commit()
         if cur.rowcount == 0:
             raise KeyError(f"No trade with id={trade_id!r}")
+
+    async def record_rejected_signal(
+        self,
+        *,
+        symbol: str,
+        direction: Direction,
+        reject_reason: str,
+        signal_timestamp: datetime,
+        price: Optional[float] = None,
+        atr: Optional[float] = None,
+        confluence_score: float = 0.0,
+        confluence_factors: Optional[list[str]] = None,
+        entry_timeframe: Optional[str] = None,
+        htf_timeframe: Optional[str] = None,
+        htf_bias: Optional[str] = None,
+        session: Optional[str] = None,
+        market_structure: Optional[str] = None,
+        proposed_sl_price: Optional[float] = None,
+        proposed_tp_price: Optional[float] = None,
+        proposed_rr_ratio: Optional[float] = None,
+        regime_at_entry: Optional[str] = None,
+        funding_z_at_entry: Optional[float] = None,
+        ls_ratio_at_entry: Optional[float] = None,
+        oi_change_24h_at_entry: Optional[float] = None,
+        liq_imbalance_1h_at_entry: Optional[float] = None,
+        nearest_liq_cluster_above_price: Optional[float] = None,
+        nearest_liq_cluster_below_price: Optional[float] = None,
+        nearest_liq_cluster_above_notional: Optional[float] = None,
+        nearest_liq_cluster_below_notional: Optional[float] = None,
+        nearest_liq_cluster_above_distance_atr: Optional[float] = None,
+        nearest_liq_cluster_below_distance_atr: Optional[float] = None,
+        pillar_btc_bias: Optional[str] = None,
+        pillar_eth_bias: Optional[str] = None,
+    ) -> RejectedSignal:
+        """Insert a single row into `rejected_signals`.
+
+        Only called by the runner on `plan is None` return. Never raises on
+        duplicate — we generate a fresh uuid per call, the table is
+        append-only. Counter-factual outcome fields stay NULL until
+        `peg_rejected_outcomes.py` walks candles forward and stamps them.
+        """
+        conn = self._require_conn()
+        rec = RejectedSignal(
+            rejection_id=uuid.uuid4().hex,
+            symbol=symbol,
+            direction=direction,
+            reject_reason=reject_reason,
+            signal_timestamp=signal_timestamp,
+            price=price,
+            atr=atr,
+            confluence_score=confluence_score,
+            confluence_factors=list(confluence_factors or []),
+            entry_timeframe=entry_timeframe,
+            htf_timeframe=htf_timeframe,
+            htf_bias=htf_bias,
+            session=session,
+            market_structure=market_structure,
+            proposed_sl_price=proposed_sl_price,
+            proposed_tp_price=proposed_tp_price,
+            proposed_rr_ratio=proposed_rr_ratio,
+            regime_at_entry=regime_at_entry,
+            funding_z_at_entry=funding_z_at_entry,
+            ls_ratio_at_entry=ls_ratio_at_entry,
+            oi_change_24h_at_entry=oi_change_24h_at_entry,
+            liq_imbalance_1h_at_entry=liq_imbalance_1h_at_entry,
+            nearest_liq_cluster_above_price=nearest_liq_cluster_above_price,
+            nearest_liq_cluster_below_price=nearest_liq_cluster_below_price,
+            nearest_liq_cluster_above_notional=nearest_liq_cluster_above_notional,
+            nearest_liq_cluster_below_notional=nearest_liq_cluster_below_notional,
+            nearest_liq_cluster_above_distance_atr=nearest_liq_cluster_above_distance_atr,
+            nearest_liq_cluster_below_distance_atr=nearest_liq_cluster_below_distance_atr,
+            pillar_btc_bias=pillar_btc_bias,
+            pillar_eth_bias=pillar_eth_bias,
+        )
+        placeholders = ", ".join("?" * len(_REJECTED_COLUMNS))
+        cols = ", ".join(_REJECTED_COLUMNS)
+        await conn.execute(
+            f"INSERT INTO rejected_signals ({cols}) VALUES ({placeholders})",
+            _rejected_to_row(rec),
+        )
+        await conn.commit()
+        return rec
+
+    async def update_rejected_outcome(
+        self,
+        rejection_id: str,
+        *,
+        hypothetical_outcome: str,
+        bars_to_tp: Optional[int] = None,
+        bars_to_sl: Optional[int] = None,
+    ) -> None:
+        """Stamp the N-bar counter-factual on an existing rejected_signals row.
+
+        Called by `scripts/peg_rejected_outcomes.py`. `hypothetical_outcome`
+        is one of 'WIN' (TP hit first), 'LOSS' (SL hit first), 'NEITHER'.
+        Raises `KeyError` on unknown id so the script's dry-run catches stale data.
+        """
+        conn = self._require_conn()
+        cur = await conn.execute(
+            """UPDATE rejected_signals SET
+                   hypothetical_outcome = ?,
+                   hypothetical_bars_to_tp = ?,
+                   hypothetical_bars_to_sl = ?
+               WHERE rejection_id = ?""",
+            (hypothetical_outcome, bars_to_tp, bars_to_sl, rejection_id),
+        )
+        await conn.commit()
+        if cur.rowcount == 0:
+            raise KeyError(f"No rejected_signal with id={rejection_id!r}")
+
+    async def list_rejected_signals(
+        self,
+        *,
+        since: Optional[datetime] = None,
+        symbol: Optional[str] = None,
+        reject_reason: Optional[str] = None,
+    ) -> list[RejectedSignal]:
+        """Read rejects in signal-timestamp order.
+
+        Filters stack (AND): `since` excludes older rows, `symbol` narrows
+        to one pair, `reject_reason` narrows to a single reason bucket.
+        Returns [] if nothing matches. No pagination — call it with a tight
+        `since` for large journals.
+        """
+        conn = self._require_conn()
+        sql = "SELECT * FROM rejected_signals WHERE 1=1"
+        params: list = []
+        if since is not None:
+            sql += " AND signal_timestamp >= ?"
+            params.append(_iso(since))
+        if symbol is not None:
+            sql += " AND symbol = ?"
+            params.append(symbol)
+        if reject_reason is not None:
+            sql += " AND reject_reason = ?"
+            params.append(reject_reason)
+        sql += " ORDER BY signal_timestamp ASC"
+        async with conn.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_rejected(r) for r in rows]
 
     async def mark_canceled(self, trade_id: str, reason: str = "") -> None:
         """Flip an OPEN row to CANCELED — used when the entry never filled or the

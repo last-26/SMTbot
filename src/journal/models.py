@@ -121,6 +121,20 @@ class TradeRecord(BaseModel):
     nearest_liq_cluster_above_distance_atr: Optional[float] = None
     nearest_liq_cluster_below_distance_atr: Optional[float] = None
 
+    # Phase 7.B5 schema v2 — nullable on pre-pivot rows, filled by 7.C/7.D.
+    # setup_zone_source: which zone source produced the limit entry
+    #   (fvg_htf | liq_pool | vwap_retest | sweep_retest | market).
+    # zone_wait_bars: how many bars the limit sat pending before fill/cancel.
+    # zone_fill_latency_bars: bars between placement and fill (<= zone_wait_bars).
+    # trend_regime_at_entry: ADX-classifier label (RANGING/WEAK/STRONG_TREND).
+    # funding_z_{6h,24h}: windowed funding-rate z-scores (future derivatives work).
+    setup_zone_source: Optional[str] = None
+    zone_wait_bars: Optional[int] = None
+    zone_fill_latency_bars: Optional[int] = None
+    trend_regime_at_entry: Optional[str] = None
+    funding_z_6h: Optional[float] = None
+    funding_z_24h: Optional[float] = None
+
     # Notes / screenshots (manual or future automation)
     notes: Optional[str] = None
     screenshot_entry: Optional[str] = None
@@ -143,3 +157,69 @@ class TradeRecord(BaseModel):
     @property
     def is_loss(self) -> bool:
         return self.outcome == TradeOutcome.LOSS
+
+
+class RejectedSignal(BaseModel):
+    """One row in the `rejected_signals` table (Phase 7.B1).
+
+    Persists the context around every `plan is None` return from
+    `build_trade_plan_with_reason`. Feeds two downstream uses:
+      1. `scripts/peg_rejected_outcomes.py` walks candles forward N bars
+         and stamps a hypothetical outcome on each reject — the
+         counter-factual dataset that validates/invalidates our veto logic.
+      2. `scripts/factor_audit.py` joins rejects vs. trades for a fair
+         apples-to-apples WR comparison across reject_reason buckets.
+
+    All snapshot fields are nullable — some reject paths short-circuit
+    before SL/TP math is reached (e.g. `below_confluence`) so proposed_*
+    columns stay None on those rows.
+    """
+
+    rejection_id: str
+    symbol: str
+    direction: Direction
+    reject_reason: str
+    signal_timestamp: datetime
+
+    # Snapshot at reject time
+    price: Optional[float] = None
+    atr: Optional[float] = None
+    confluence_score: float = 0.0
+    confluence_factors: list[str] = Field(default_factory=list)
+
+    entry_timeframe: Optional[str] = None
+    htf_timeframe: Optional[str] = None
+    htf_bias: Optional[str] = None
+    session: Optional[str] = None
+    market_structure: Optional[str] = None
+
+    # Proposed plan — populated when reject happens after SL/TP math
+    # (htf_tp_ceiling, tp_too_tight, insufficient_contracts_for_split);
+    # stays None on pre-math rejects (below_confluence, session_filter, etc.)
+    proposed_sl_price: Optional[float] = None
+    proposed_tp_price: Optional[float] = None
+    proposed_rr_ratio: Optional[float] = None
+
+    # Derivatives snapshot — same fields as TradeRecord
+    regime_at_entry: Optional[str] = None
+    funding_z_at_entry: Optional[float] = None
+    ls_ratio_at_entry: Optional[float] = None
+    oi_change_24h_at_entry: Optional[float] = None
+    liq_imbalance_1h_at_entry: Optional[float] = None
+    nearest_liq_cluster_above_price: Optional[float] = None
+    nearest_liq_cluster_below_price: Optional[float] = None
+    nearest_liq_cluster_above_notional: Optional[float] = None
+    nearest_liq_cluster_below_notional: Optional[float] = None
+    nearest_liq_cluster_above_distance_atr: Optional[float] = None
+    nearest_liq_cluster_below_distance_atr: Optional[float] = None
+
+    # Cross-asset pillar state (Phase 7.A6) — essential for auditing
+    # `cross_asset_opposition` rejects: were BTC + ETH really opposing?
+    pillar_btc_bias: Optional[str] = None
+    pillar_eth_bias: Optional[str] = None
+
+    # Counter-factual outcome — filled by peg_rejected_outcomes.py after N bars
+    # "WIN" = TP hit first, "LOSS" = SL hit first, "NEITHER" = neither inside window.
+    hypothetical_outcome: Optional[str] = None
+    hypothetical_bars_to_tp: Optional[int] = None
+    hypothetical_bars_to_sl: Optional[int] = None

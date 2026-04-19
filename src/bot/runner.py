@@ -735,6 +735,71 @@ class BotRunner:
             return Direction.BEARISH
         return None
 
+    def _pillar_bias_label(self, pillar_symbol: str) -> Optional[str]:
+        """Current pillar bias as a string, or None if missing/stale.
+
+        Used when stamping `cross_asset_opposition` rejects — the auditor
+        needs to know which pillar pair tripped the veto on the exact signal.
+        """
+        cfg = self.ctx.config.analysis
+        item = self.ctx.pillar_bias.get(pillar_symbol)
+        if item is None:
+            return None
+        bias, updated = item
+        if (_utc_now() - updated).total_seconds() > cfg.cross_asset_veto_max_age_s:
+            return None
+        return bias.value
+
+    async def _record_reject(
+        self,
+        *,
+        symbol: str,
+        reject_reason: str,
+        state: MarketState,
+        conf,
+    ) -> None:
+        """Persist a reject to `rejected_signals` (Phase 7.B1).
+
+        Caller is responsible for try/except around this — any DB issue
+        must never block the main cycle (reject logging is observational).
+        All snapshot fields default to None so partial data is fine.
+        """
+        cfg = self.ctx.config
+        enrichment = _derive_enrichment(state)
+        htf_trend = state.trend_htf
+        session = state.active_session
+        price = state.current_price
+        atr = state.atr
+        signal_ts = state.timestamp or _utc_now()
+        await self.ctx.journal.record_rejected_signal(
+            symbol=symbol,
+            direction=getattr(conf, "direction", Direction.UNDEFINED),
+            reject_reason=reject_reason,
+            signal_timestamp=signal_ts,
+            price=float(price) if price else None,
+            atr=float(atr) if atr else None,
+            confluence_score=float(getattr(conf, "score", 0.0) or 0.0),
+            confluence_factors=list(getattr(conf, "factor_names", []) or []),
+            entry_timeframe=cfg.trading.entry_timeframe,
+            htf_timeframe=cfg.trading.htf_timeframe,
+            htf_bias=htf_trend.value if htf_trend != Direction.UNDEFINED else None,
+            session=session.value if session != Session.OFF else None,
+            market_structure=_structure_str(state),
+            regime_at_entry=enrichment["regime_at_entry"],
+            funding_z_at_entry=enrichment["funding_z_at_entry"],
+            ls_ratio_at_entry=enrichment["ls_ratio_at_entry"],
+            oi_change_24h_at_entry=enrichment["oi_change_24h_at_entry"],
+            liq_imbalance_1h_at_entry=enrichment["liq_imbalance_1h_at_entry"],
+            nearest_liq_cluster_above_price=enrichment["nearest_liq_cluster_above_price"],
+            nearest_liq_cluster_below_price=enrichment["nearest_liq_cluster_below_price"],
+            nearest_liq_cluster_above_notional=enrichment["nearest_liq_cluster_above_notional"],
+            nearest_liq_cluster_below_notional=enrichment["nearest_liq_cluster_below_notional"],
+            nearest_liq_cluster_above_distance_atr=enrichment["nearest_liq_cluster_above_distance_atr"],
+            nearest_liq_cluster_below_distance_atr=enrichment["nearest_liq_cluster_below_distance_atr"],
+            pillar_btc_bias=self._pillar_bias_label("BTC-USDT-SWAP"),
+            pillar_eth_bias=self._pillar_bias_label("ETH-USDT-SWAP"),
+        )
+
     def _is_ltf_reversal(self, ltf: LTFState, open_side: str, max_age: int) -> bool:
         """True when the fresh LTF signal contradicts the open side.
 
@@ -1094,9 +1159,12 @@ class BotRunner:
             return
 
         if plan is None:
-            # reject_reason is one of: below_confluence / session_filter /
-            # no_sl_source / crowded_skip / zero_contracts / htf_tp_ceiling /
-            # tp_too_tight. Sub-floor SL distances are widened, not rejected.
+            # reject_reason taxonomy: below_confluence / session_filter /
+            # no_sl_source / vwap_misaligned / ema_momentum_contra /
+            # cross_asset_opposition / crowded_skip / zero_contracts /
+            # htf_tp_ceiling / tp_too_tight / insufficient_contracts_for_split
+            # / macro_event_blackout. Sub-floor SL distances are widened,
+            # not rejected.
             try:
                 conf = calculate_confluence(
                     state,
@@ -1117,6 +1185,17 @@ class BotRunner:
                     conf.score, cfg.analysis.min_confluence_score,
                     ",".join(conf.factor_names) or "-",
                 )
+                # Phase 7.B1 — persist reject context for counter-factual audit.
+                # Failure here must not block the cycle; downgrade to debug.
+                try:
+                    await self._record_reject(
+                        symbol=symbol,
+                        reject_reason=reject_reason or "unknown",
+                        state=state,
+                        conf=conf,
+                    )
+                except Exception:
+                    logger.debug("record_rejected_signal_failed symbol={}", symbol)
             except Exception:
                 logger.debug("no_trade_log_failed symbol={}", symbol)
             return
