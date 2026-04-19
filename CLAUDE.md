@@ -9,12 +9,12 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 ## Current state (snapshot)
 
 - **Strategy:** zone-based scalper. Confluence ≥ threshold → identify zone → post-only limit order at zone edge → wait N bars → fill | cancel.
-- **Pairs:** 5 OKX perps — `BTC / ETH / SOL / DOGE / XRP`. 4 concurrent slots on cross margin.
+- **Pairs:** 7 OKX perps — `BTC / ETH / SOL / DOGE / XRP / ADA / BNB`. 7 concurrent slots on cross margin (all active, no queue).
 - **Entry TF:** 3m. HTF context 15m, LTF confirmation 1m.
 - **Scoring:** 5 pillars (Market Structure, Liquidity, Money Flow, VWAP, Divergence) + hard gates (premium/discount, displacement, EMA momentum, VWAP, cross-asset opposition) + ADX regime-conditional weights.
 - **Execution:** post-only limit → regular limit → market-at-edge fallback. OCO SL/TP, partial TP at 1.5R with fee-buffered SL-to-BE on TP1 fill.
 - **Journal:** async SQLite, schema v2 (zone source, wait/fill latency, trend regime, funding Z-scores). `rejected_signals` table with counter-factual outcome pegging.
-- **Tests:** ~667, all green. Demo-runnable end-to-end.
+- **Tests:** ~669, all green. Demo-runnable end-to-end.
 - **Data cutoff (`rl.clean_since`):** `2026-04-19T06:30:00Z`. Reporter and future RL see only post-pivot trades.
 
 ---
@@ -181,19 +181,19 @@ Things that aren't self-evident from the code. Inline comments cover the *what*;
 
 ## Currency pair notes
 
-5 OKX perps — BTC / ETH / SOL / DOGE / XRP. BTC + ETH are market pillars; SOL/DOGE/XRP are altcoins gated by the cross-asset veto.
+7 OKX perps — BTC / ETH / SOL / DOGE / XRP / ADA / BNB. BTC + ETH + BNB are market pillars (major-class book depth); SOL/DOGE/XRP/ADA are altcoins gated by the cross-asset veto.
 
-`max_concurrent_positions=4` (5 pairs compete for 4 slots — one waits each cycle, confluence gate picks the best). Cross margin, `per_slot ≈ total_eq / 4 ≈ $1250` on a $5k demo. R stays 1% of total equity; only the notional ceiling shrinks 25%.
+`max_concurrent_positions=7` (every pair can hold a position simultaneously — no slot competition; confluence gate still picks setups, but cycle isn't queue-limited). Cross margin, `per_slot ≈ total_eq / 7 ≈ $714` on a $5k demo. R stays 1% of total equity ($50); only the notional ceiling shrinks proportionally.
 
-Cycle timing at 3m entry TF = 180s budget: typical 125–155s (freshness poll returns early), worst ~247s. Worst-case skips a cycle. DOGE/XRP leverage-capped at 30x.
+Cycle timing at 3m entry TF = 180s budget: typical 210–240s with 7 pairs (post-2026-04-19 expansion; TF bütçesi aşılıyor, bar zaman zaman atlanır), worst ~330s. Worst-case skips a cycle; next bar catches up. DOGE/XRP/ADA leverage-capped at 30x; SOL/BNB inherit OKX 50x cap.
 
 Per-symbol overrides (YAML):
-- `swing_lookback_per_symbol`: DOGE/XRP=30 (thin 3m books).
-- `htf_sr_buffer_atr_per_symbol`: SOL=0.10 (wide-ATR, narrower buffer).
-- `session_filter_per_symbol`: SOL/DOGE/XRP=[london] only.
-- `min_sl_distance_pct_per_symbol`: BTC 0.005, ETH 0.010, SOL 0.008, DOGE/XRP 0.007.
+- `swing_lookback_per_symbol`: DOGE/XRP/ADA=30 (thin 3m books).
+- `htf_sr_buffer_atr_per_symbol`: SOL=0.10 (wide-ATR, narrower buffer); DOGE/XRP/ADA=0.15; BNB inherits global 0.2.
+- `session_filter_per_symbol`: SOL/DOGE/XRP/ADA=[london] only. BNB inherits global (london+new_york) as major.
+- `min_sl_distance_pct_per_symbol`: BTC 0.004, ETH 0.006, SOL 0.010, DOGE/XRP/ADA 0.008, BNB 0.005.
 
-Adding a 6th pair: drop into `trading.symbols`, add `okx_to_tv_symbol()` parametrized test, add `derivatives.regime_per_symbol_overrides`, add `min_sl_distance_pct_per_symbol`, watch 20-30 cycles for `htf_settle_timeout` / `set_symbol_failed`.
+Adding an 8th+ pair: drop into `trading.symbols`, add `okx_to_tv_symbol()` parametrized test, add `derivatives.regime_per_symbol_overrides`, add `min_sl_distance_pct_per_symbol`, watch 20-30 cycles for `htf_settle_timeout` / `set_symbol_failed`. Coinalyze free tier supports ~8 pairs at refresh_interval_s=75s; beyond that needs paid tier or longer interval.
 
 ---
 
