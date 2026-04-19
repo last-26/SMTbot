@@ -34,7 +34,7 @@ data/models/
 # Trade data (local only)
 data/journal.db
 data/trades.db
-data/trades.db.backup*
+data/trades.db.*
 data/screenshots/
 
 # SQLite helper files (crash-time artifacts)

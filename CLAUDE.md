@@ -84,6 +84,8 @@ Legacy single-purpose scripts under `pine/legacy/` (not loaded).
 ## Deferred / performance TODO
 
 - **Overlay Pine split (~1200 lines → 2 parts)** — symbol-switch settle (~3-5s) is dominant multi-pair cycle cost. Split into `_structure.pine` + `_levels.pine` could parallelize TV recompute. Low priority — tackle if freshness-poll latency becomes problematic.
+- **HTF Order Block re-add (post-pivot)** — Pivot 2026-04-19 removed `at_order_block` because Pine 3m OBs showed 0% WR in Sprint 3 (vs 35.7% pre-sprint — regime-fragile). Re-introduce as 15m-sourced `at_order_block_htf` once zone-planner is stable; gate on factor-audit evidence that HTF OBs outperform current zone sources.
+- **Pine overlay refactor (post-pivot, after Phase D)** — once 5-pillar factor stack is final, strip overlay to Pillar visuals only (drop OB rendering, unused tooltip fields, redundant session labels). Oscillator stays largely intact.
 
 ## Architecture (code layout)
 
@@ -114,7 +116,12 @@ Phases 1–6 + 6.5 + 1.5 + live-demo hardening + macro-blackout + fee-aware sizi
 | Macro Event Blackout (Finnhub + FairEconomy, ±30/15-min USD HIGH) | ✅ |
 | Fee-aware sizing + TP1/TP2 guarantee + fee-buffered BE | ✅ |
 | 6.9 Pre-RL baseline (orphan factors + per-symbol overrides + VWAP veto) | ✅ |
-| 7. RL parameter tuner | 🔜 Next |
+| **7.0 Strategy Pivot 2026-04-19** — zone-based entry + 5-pillar stack + cross-asset veto | 🔄 **Active** |
+| 7.A Quick wins (per-symbol SL floor, factor demote, EMA veto, cross-asset snapshot) | 🔜 |
+| 7.B Data layer (counter-factual rejects, factor audit, HTF cache, journal schema v2) | 🔜 |
+| 7.C Zone-based entry refactor (`setup_planner.py`, limit orders, PENDING state) | 🔜 |
+| 7.D Structural refinements (displacement, premium/discount, ADX trend-regime, Pine trim) | 🔜 |
+| 8. Analytics (GBT) → optional RL | 🔜 |
 
 ---
 
@@ -184,101 +191,205 @@ Gotchas and rationales not self-evident from the code. Inline comments cover the
 
 ---
 
-## Sprint 3 baseline run — active
+## Sprint 3 — archived (diagnostic) 2026-04-17 → 2026-04-19
 
-**Started 2026-04-17T23:50Z** with $5k demo balance, $50 R (1%), 4 concurrent-slot cap, cross margin. All Phase 6.9 changes (BLOK A factors, BLOK B per-symbol overrides, min_confluence=3.0, A4 VWAP veto off by default) are live. Pre-sprint snapshot preserved:
+**Started 2026-04-17T23:50Z, paused 2026-04-19 after pivot decision.** $5k demo, $50 R (1%), 4 slots, cross margin. Phase 6.9 stack (BLOK A + BLOK B overrides + `min_confluence=3.0`, VWAP veto off). Closed 14 trades, WR 28.6%, avg R -0.60, PnL -$456 (DB balance 10000→9544 includes pre-sprint carry).
 
-### Mid-sprint adjustments (2026-04-18T13Z, restart #2 with --clear-halt)
+**Why it was archived:** Sprint 3 + pre-sprint data together (46 closed trades) showed the strategy is **regime-fragile**, not mis-tuned. Core forensics:
+1. **Every sprint 3 trade has `sl_pct == 0.500%`** — `entry_signals.py:558-564` `min_sl_distance_pct` floor hits every structural SL. Journal's `sl_source` label is nominal; real SL is uniform flat percent. ETH-volatility pairs get swept in 1-2 candles.
+2. **Every entry `ordType="market"`** (`okx_client.py:214`). Zero zone-wait, zero limit orders. Bot is a momentum-chaser, not a scalper.
+3. **14/14 sprint 3 trades in BALANCED regime** — existing `derivatives_regime` classifier not discriminating. RL has no regime signal to learn from.
+4. **Factor WR regression: `at_order_block` 35.7%→0%, `htf_trend_alignment` 35.7%→0% between pre-sprint and sprint 3.** Same code, different market → factors are regime-fragile trend-continuation signals, not intrinsically broken. Deleting them is wrong fix; conditioning them on regime is the right fix.
+5. **Zero cross-asset awareness** — each symbol in isolation. SOL/DOGE shorts closed in profit 2026-04-19 because BTC/ETH turned up while shorts stayed active. Correlation blind spot.
 
-Sprint 3 first-restart burned 5 LOSS / 1 WIN / 2 open in 4h → `max_consecutive_losses=5` halt tripped at 06:56Z, bot froze for ~20h. During the halt 135 PLANNED signals were blocked. Root-cause: with only 6 closed trades the breaker is too tight to collect RL training volume.
+**Mid-sprint adjustments (now moot, context only):** `max_consecutive_losses 5→9999`, `max_daily_loss_pct 15→40`, `max_drawdown_pct 25→40`, `min_rr_ratio 2.0→1.5`. POST-PIVOT RESTORE to 5 / 15 / 25 / 2.0 after Phase 7.C demonstrates zone-entry doesn't over-trigger breakers.
 
-**YAML levers loosened for data-gathering pass** (RE-TIGHTEN POST-RL):
+**Archived artifacts:**
+- `data/trades.db.sprint3_diagnostic_2026-04-19` — 46 closed trades (pre-sprint 32 + sprint 3 14), 5 OPEN rows converted to CANCELED with `close_reason=manual_close_pivot_2026-04-19`.
+- `logs/bot.log.sprint3_final_2026-04-19` — pre-pivot log dump.
+- `data/trades.db.backup_2026-04-18_pre-sprint3` — pre-existing checkpoint.
+- `rl.clean_since` updated to `2026-04-19T<pivot-start>Z` after Phase 7.A ships.
 
-1. **All three circuit breakers eased** so no halt can starve the RL dataset:
-   - `max_consecutive_losses: 5 → 9999` (effectively disabled)
-   - `max_daily_loss_pct: 15.0 → 40.0`
-   - `max_drawdown_pct: 25.0 → 40.0`
-   On $5k demo with $50 R, 40% ≈ $2k equity loss before halt — covers a rough stretch without freezing the bot. POST-RL restore to 5 / 15 / 25 respectively.
-2. **`trading.min_rr_ratio: 2.0 → 1.5`** — `htf_tp_ceiling` was the dominant NO_TRADE reason (370 rejects, 47% on DOGE alone). Mechanism: post-plan TP pulled back to `htf_zone - 0.2×ATR`, if resulting RR < 2.0 → reject. DOGE/SOL/XRP clipped-TP RRs often land 1.6-1.9 on 15m HTF, which is already not a "major" TF — VWAP (1m/3m/15m) and session filters provide direction discipline. Lowering floor lets legitimate clipped setups through.
+**What pre-sprint + sprint 3 data taught us (inputs to pivot design):**
+- 5-pillar factors — Market Structure, Liquidity, Money Flow, VWAP, Divergence — carry the real WR signal. `recent_sweep` 45% WR, pre-split `vwap_alignment` 75% WR (n=8, strong), `mss_alignment` 35% WR.
+- LONDON session WR 45%, NEW_YORK 33%, OFF 17% — session discipline is validated. Per-symbol session filter (BLOK B4) was a correct instinct.
+- Same-direction loss streaks (ETH 6× consecutive BULLISH LOSS on 2026-04-17) point directly at missing cross-asset / regime flip detection.
+- Trend-continuation factors alone without regime gating = trap at move-end. Zone-based entry plus patience fixes the "enter at end of move" pattern.
 
-**Attribution caveat:** These changes alter Sprint 3's post-cutoff stats. If a clean 50-trade baseline is desired for RL, treat 2026-04-18T13Z as the *real* cutoff rather than 23:50Z. Candidate `rl.clean_since` bump is noted but not applied — if reporter output stays noisy, bump it.
+## Strategy Pivot 2026-04-19 — zone-entry + 5-pillar + cross-asset veto
 
-- `data/trades.db.backup_2026-04-18_pre-sprint3` — full DB copy (32 closed trades + 4 OPEN pre-close).
-- `logs/bot.log.pre-sprint3_2026-04-17` — pre-restart log, 1.4MB.
-- 4 pre-restart OPEN rows flipped to `outcome=CANCELED` + `close_reason=manual_reset_pre_sprint3` in-place, so reporter never counts them.
-- `rl.clean_since=2026-04-17T23:50:00Z` → reporter/RL only see post-restart rows. `scripts/report.py --ignore-clean-since` reads the full history.
+**Framing:** not "tear down and rewrite". The factor machinery, Pine pipeline, OKX execution layer, journal, and derivatives ingestion all stay. Pivot adds **three missing layers** and **demotes** (not deletes) the regime-fragile parts of the current stack.
 
-**Gate for RL:** ≥50 closed trades post-cutoff AND net `pnl_r ≥ 0` before invoking `train_rl.py`. Until then, iterate YAML manually using reporter output. If baseline stays negative after 50, the next lever is the opt-in A4 VWAP hard veto (flip `analysis.vwap_hard_veto_enabled: true`) — BLOK B5 volatility-adaptive widening and BLOK C shadow timeframes come after that only if the veto alone doesn't fix WR.
+### Layer 1 — 5-Pillar factor stack
 
-## Post-Sprint 3 roadmap — BLOK D: liquidity-aware execution (Coinalyze deepening)
+| Pillar | Concrete factors | Role |
+|---|---|---|
+| **Market Structure** | `mss_alignment`, `recent_sweep` | Core score |
+| **Liquidity** | Pine standing pools + Coinalyze heatmap clusters + sweeps | Core score + zone source |
+| **Money Flow** | `money_flow_alignment` (MFI bias), oscillator MFI trend | Core score |
+| **VWAP** | `vwap_composite` = all-3 TFs align → 0.6, 2-of-3 → 0.3, 1-of-3 → 0 | Core score (re-consolidated from split) |
+| **Divergence** | Oscillator regular + hidden divergences, gold signals | Core score (absorbs `oscillator_signal` + `oscillator_high_conviction_signal`) |
 
-**Premise:** we pull 6 Coinalyze endpoints but funnel them into a single confluence slot (`derivatives_heatmap_target` @ 0.5 weight) + regime classification. Heatmap is not consulted for TP/SL placement and lookback windows are mismatched to our 3m scalp horizon (historical liq 48h, LS z-score 14d, funding z-score 30d). Short TFs need short liquidity context.
+**Demoted from scoring (become direction-picker / zone-source / deferred):**
+- `htf_trend_alignment` → moved from scoring factor to **setup-planner direction input** (tells planner "this is a long setup" but does not add score points). Plus feeds regime classifier.
+- `at_order_block` → **removed entirely for now** (Pine 3m OB = noise). Queued in Deferred as HTF-variant re-add.
+- `liquidity_pool_target` → absorbed into zone source (no longer a stand-alone score contributor).
+- `oscillator_signal` → absorbed into Divergence pillar as an ingredient, not a separate entry.
 
-**Scope (evaluate after Sprint 3 baseline + A4 VWAP veto have each been given their 50-trade window):**
+**New factors (Phase 7.D additions):**
+- `displacement_candle` — large-body fast-move candle within last 3-5 bars, used as "real imbalance" gate on FVGs.
+- `premium_discount_zone` — long setups need discount side (below last-swing midpoint), shorts need premium. Reject-on-mismatch, not scoring.
 
-1. **Shorten liquidity-heatmap lookback** — `historical_lookback_ms` default 48h → expose per-TF knob, probably 12h for 3m entries. Old liq events far from current price are noise; clusters from 2 days ago rarely magnet intraday.
-2. **Add short-window funding/LS z-scores alongside long ones** — keep 30d/14d for regime stability, add 6h/24h rolling z for "is *right now* crowded?" signal. Current `crowded_skip` using only 30d z misses short squeezes that build in hours.
-3. **Liq-sweep reversal entry (user's primary ask)** — detect cascade in rolling window (Binance WS aggregated + Coinalyze `/liquidation-history` 1h as cross-check): if total liq notional in last 60-120s > threshold × symbol baseline AND price wicked ≥ 0.5× ATR through a heatmap cluster then reverted, emit a `liq_sweep_reversal` confluence factor (or standalone high-priority entry trigger) for the counter side. Caveat: Binance WS is "largest-per-1s-per-symbol" rate-limited — single events undercount cascades, so Coinalyze aggregated is mandatory for magnitude.
-4. **Heatmap → TP ceiling (HTF-zone analog)** — `rr_system` should treat `nearest_big_liq_cluster ± buffer_atr` as a candidate ceiling alongside HTF S/R. Effective ceiling = min(HTF_zone, heatmap_cluster). Also the upside mirror: if proposed TP is *before* a big cluster and RR allows, extend to cluster (magnet target). Add `heatmap_tp_ceiling_enabled` YAML flag; start with large clusters only (notional ≥ X% of largest symbol-wide) to limit noise.
-5. **Liq-cluster-proximity veto** — currently `derivatives_heatmap_target` rewards a cluster *in path*, which is ambiguous: cluster can be magnet OR wall. When distance < 0.5×ATR AND notional is massive, flip the sign — veto the entry instead of boosting confluence (`reject_reason=liq_cluster_too_close`). Borderline cases stay in confluence.
-6. **Heatmap factor weight scaling** — today binary (0.5 fires/not). Scale by cluster notional (log-proportional to largest) so 500M cluster ≠ 50M cluster. Better RL feature signal.
-7. **Journal feature columns (zero-risk, can do during Sprint 3 without polluting baseline if additive only)** — add `nearest_liq_cluster_above_notional`, `nearest_liq_cluster_below_notional`, `nearest_liq_cluster_distance_atr`, `liq_1h_imbalance_at_entry`, `funding_z_6h`, `funding_z_24h` to trade records. Doesn't change decisions, just enables post-hoc analysis: "do trades with close big clusters win more?" RL can then learn from these features.
+### Layer 2 — Zone-based entry (execution model overhaul)
 
-**Ordering rule:** item 7 can go in mid-sprint if needed (it's purely additive metadata). Items 1-6 must wait until Sprint 3 and the A4 VWAP-veto window have each produced a read on baseline WR — adding them simultaneously destroys attribution.
+**Current flow:** `confluence ≥ threshold → market order at current price`
+**Pivot flow:** `confluence ≥ threshold → identify zone → limit order at zone edge → wait N bars → fill or cancel`
 
-## Post-Sprint 3 roadmap — BLOK E: scalp-native exit architecture
+**New module** `src/strategy/setup_planner.py`:
+```python
+@dataclass
+class ZoneSetup:
+    direction: Direction
+    entry_zone: tuple[float, float]     # e.g. FVG range, liq pool ± buffer
+    trigger_type: Literal["zone_touch", "sweep_reversal", "displacement_return"]
+    sl_beyond_zone: float                # structural, not % floor
+    tp_primary: float                    # first liq target or HTF zone
+    max_wait_bars: int
+    zone_source: Literal["fvg_htf", "liq_pool", "vwap_retest", "sweep_retest"]
+```
 
-**Premise:** on 3m entry TF, TP1 hits reasonably and gives a clean profit-lock moment (followed by SL→BE on the remainder). TP2 is aspirational — sustained moves that satisfy a fixed 2-3R TP2 are rare, so the runner mostly exits at BE. Result: bi-modal `pnl_r` distribution (`~+0.75R` TP1+BE winners, `~-1R` losers, rare `~+2.25R` TP2 winners). Runner is effectively dead weight 80%+ of the time, and RL sees a reward surface with an unreachable tail.
+**Zone source priority (highest first):**
+1. Unswept Coinalyze liq pool + premium/discount match (long at discount pool, short at premium pool)
+2. HTF 15m unfilled FVG, price approaching from outside
+3. Session VWAP re-test on pullback in the chosen direction
+4. Recent-swing liquidity sweep-and-reversal setup (swept then closed back inside)
 
-**Diagnosis:** the runner's job on a scalp should not be "hit a fixed TP2". It should be "ride the occasional real move if it shows up, otherwise exit cleanly near TP1". Fix is to keep TP1 unchanged (the psychological/math lock works) and replace the static TP2 order with a dynamic runner exit.
+**Execution rules:**
+- Entry: `limit` (post-only preferred for maker fee). Fallback to regular limit when post-only is rejected because price is on the wrong side.
+- SL: beyond zone structure, not % floor. `min_sl_distance_pct` becomes emergency floor only (widen when structural zone is pathologically thin).
+- TP: primary = liquidity target or HTF zone (not fixed-R). Runner dynamic (post-TP1 optional trail, see Phase 7.D revisit).
+- Timeout: after `max_wait_bars` (default 10 bars = 30 min on 3m), cancel if unfilled — `reject_reason=zone_timeout_cancel`.
+- Invalidation: zone violated without fill → immediate cancel.
+- `max_concurrent_setups_per_symbol = 1`. Pending limit + live position cannot coexist on same symbol.
 
-**Scope (evaluate only after Sprint 3 + A4 VWAP veto windows have each produced a 50-trade read; do NOT bundle with BLOK D items — this is its own attribution window):**
+**Position monitor new state:** `PENDING` (limit placed, not filled). Transitions: `PENDING → FILLED → OPEN → CLOSED | PENDING → CANCELED`.
 
-1. **Remove fixed TP2 order; runner exits dynamically.** Optional soft safety cap (e.g. 5R) as catastrophic-move ceiling only. TP1 order unchanged.
-2. **R-step trail on post-TP1 runner only** — pre-TP1 SL stays at original price (risk is already priced there). After TP1 fill:
-   - trigger at `+1R` past TP1 → SL moves to `+0.5R` past TP1 (on top of `sl_be_offset_pct` fee buffer)
-   - `+2R` → `+1R`, `+3R` → `+2R`
-   - Each step = algo cancel + re-place (same pattern as current SL→BE). Journal each step.
-3. **Time-based runner exit** — if no new HH (long) / LL (short) within N bars (~15-20 bars = 45-60 min on 3m) after TP1 fill, market-close runner at current trail level. Matches scalp horizon — runner that isn't progressing is decaying.
-4. **Structure-based runner exit (extend existing `ltf_reversal_defensive_close`)** — after TP1 hit, loosen `ltf_reversal_min_bars_in_position` for runners (TP1 already locked profit, can be bolder on exits). Runner closes on LTF trend flip against position.
-5. **HTF zone soft-trail alignment** — when runner approaches HTF S/R minus buffer, tighten trail aggressively or market-close. Currently `_apply_htf_tp_ceiling` bakes HTF zone into TP2 price at plan-time; with no TP2 order, HTF zone becomes a runner trail magnet instead. Design shares pattern with BLOK D-4 (heatmap TP ceiling) — consider co-designing.
-6. **`min_rr_ratio` re-basing** — current plan RR uses TP2 distance. With TP2 gone, plan RR should use TP1 (lower floor, e.g. `min_rr_ratio=1.0-1.2` measured against TP1). TP1 is the concrete order; soft runner target is not a filter input.
+### Layer 3 — Cross-asset correlation layer
 
-**Expected RL impact:** `pnl_r` distribution becomes smoother (continuous runner exits between `+0.75R` and `+3R+`), easier reward surface for RL. New tunable knobs for Phase 7: trail step triggers/offsets, time-exit bar count, post-TP1 LTF-reversal gate loosening.
+**New struct:** `CryptoSnapshot`
+```python
+@dataclass
+class CryptoSnapshot:
+    btc_15m_trend: Direction                # BULLISH / BEARISH / NEUTRAL
+    eth_15m_trend: Direction
+    btc_3m_momentum: float                   # last-5-bars % change
+    eth_3m_momentum: float
+    updated_at: datetime
+```
 
-**Fee math check:** trail modifies are algo cancel+replace (maker-side on the new algo), typically cheaper net than letting TP2 go unhit and closing at BE on taker via SL→BE trigger. Worth validating on demo before live.
+**Lifecycle:** outer loop builds snapshot from BTC + ETH cycles (they run first in the symbol sequence), stores on `ctx.crypto_snapshot`. Altcoin cycles (`SOL`/`DOGE`/`XRP`) read it before entry.
 
-**Risk — choppy-tape whipsaw.** Trail converts "big winner" into "small winner" on range days. Variance goes up. Mandatory demo window before any live flip. Deployment gate: 50 trades post-cutoff, net `pnl_r` not materially worse than pre-BLOK-E baseline (preferably better).
+**Veto rule (conservative v1):**
+```
+altcoin_symbol in {SOL, DOGE, XRP}:
+  LONG  + btc_15m==BEARISH + eth_15m==BEARISH → reject("cross_asset_opposition")
+  SHORT + btc_15m==BULLISH + eth_15m==BULLISH → reject("cross_asset_opposition")
+```
+Both pillars must oppose (sector rotation passes when only one opposes). Later tightening uses momentum delta thresholds.
 
-**Ordering within post-sprint queue:** Sprint 3 baseline → A4 VWAP veto window → BLOK D-7 (additive, can overlap) → BLOK E (this) → BLOK D-1..D-6 (liquidity-aware execution) → Phase 7 RL. BLOK E before BLOK D-4 because D-4 (heatmap TP ceiling) assumes the runner-trail pattern exists.
+**BTC/ETH themselves:** no cross-asset veto on the pillars (BTC ↔ ETH divergence info used as neutral context for either).
 
-## Phase 7 — Reinforcement learning (Next)
+### Layer 4 — Regime-awareness (trend-strength axis)
 
-**Architecture:** parameter tuner, NOT raw decision maker. Rule-based strategy generates signals; RL tunes:
-- `confluence_threshold` (2-5), `pattern_weights`, `min_rr_ratio` (1.5-5.0)
-- `risk_pct` (0.005-0.02), `htf_required` (bool), `session_filter` (list)
-- `volatility_scale` (0.5-2.0), `ob_vs_fvg_preference` (0.0-1.0)
+Current `derivatives_regime` returns BALANCED 14/14 in sprint 3. Add **trend-strength axis** (Phase 7.D):
+- ADX-like directional movement index over last N bars
+- Classification: `RANGING` / `WEAK_TREND` / `STRONG_TREND`
+- Persist as new journal column `trend_regime_at_entry`
 
-**Reward** = `pnl_r + setup_penalty + dd_penalty + consistency_bonus`
-- `setup_penalty = -3.0` if confluence < 2
-- `dd_penalty = -2.0` if dd > 5%, `-1.0` if > 3%
-- `consistency_bonus = min(sharpe_last10 * 0.5, 1.5)`
+**Conditional factor scoring** (Phase 7.D activation):
+- Trend-continuation factors (HTF trend direction input, VWAP alignment in trend direction) gain weight only in `WEAK_TREND`/`STRONG_TREND`.
+- Reversal factors (sweep-reversal, counter-trend zones) gain weight only in `RANGING` or regime-transition states.
 
-**Walk-forward:** train 1-N, validate N+1 to N+50, advance window. Never deploy params that didn't improve OOS. Retrain every 50 new trades OR weekly; min 50 trades before first training.
+### Per-symbol SL floor (Phase 7.A)
 
-**Cycle:** `python scripts/train_rl.py --min-trades 50 --walk-forward`. Improved params → `config/strategies/active.yaml`.
+YAML `analysis.min_sl_distance_pct_per_symbol`:
+```yaml
+min_sl_distance_pct_per_symbol:
+  BTC-USDT-SWAP: 0.005
+  ETH-USDT-SWAP: 0.010       # 2× — higher beta
+  SOL-USDT-SWAP: 0.008
+  DOGE-USDT-SWAP: 0.007
+  XRP-USDT-SWAP: 0.007
+```
+`BotConfig.resolve_min_sl_distance_pct(symbol)` — pattern matches existing `swing_lookback_per_symbol` resolver. Floor remains emergency-only once Phase 7.C structural SL binds.
 
-**Pre-RL workflow (mandatory):**
-1. **Filter dirty data.** `clean_since` cutoff (entry_timestamp after last meaningful policy change) so early API-test / pre-fix trades don't poison training. Old rows stay in DB for comparison; never delete.
-2. **Read the reporter first.** `scripts/report.py --last 7d` shows `win_rate_by_session/factor`, `regime_breakdown`. Fix obvious losers manually in YAML — RL isn't for catching things you can already see.
-3. **Hand-tune the baseline.** Baseline should be at least break-even on the clean window before RL touches it. RL is fine-tuning, not rescue surgery.
-4. **Then RL.** Walk-forward only after baseline is positive on ≥50 clean trades.
+### EMA 21/55 momentum veto (Phase 7.A)
 
-**Mental model:** RL reads each trade's feature columns (`confluence_score`, `confluence_factors`, `session`, `regime_at_entry`, `funding_z_at_entry`, …) and pairs them with `pnl_r`. Gradient updates params so *trades that pass the filters* maximize average `pnl_r`. **It does NOT do root-cause analysis** — 16 losses from 5 different causes all look like "this feature combination = LOSS" to the optimizer. Steps 2-3 above cannot be skipped.
+Short-TF trap filter: long signals blocked when 21-EMA < 55-EMA and spread widening; shorts blocked in the mirror case. Reject reason `ema_momentum_contra`. Not a scoring factor (lagging indicator); pre-entry gate only.
+
+### Phased plan
+
+**Phase 7.A — Quick wins (1-2 days, zero refactor risk)**
+- A1: Per-symbol `min_sl_distance_pct` resolver + YAML block.
+- A2: Demote `at_order_block`, `oscillator_signal`, `liquidity_pool_target` to `weight=0` (keep functions for audit).
+- A3: `htf_trend_alignment` → direction-picker only (no score contribution).
+- A4: VWAP composite (`vwap_composite` replaces 3 independent `vwap_{1m,3m,15m}_alignment` contributions).
+- A5: EMA 21/55 momentum veto.
+- A6: `CryptoSnapshot` + altcoin cross-asset veto.
+- A7: Reporter extensions (per-symbol WR, factor-combo top-10, confluence-score bucket, cluster-distance bucket).
+
+**Phase 7.B — Data layer (3-5 days, additive, no decision change)**
+- B1: `rejected_signals` table + INSERT on every reject path in `entry_signals.py`. Snapshot features at reject time.
+- B2: `scripts/peg_rejected_outcomes.py` — N-bar-ahead hypothetical TP/SL outcome for each reject. Yields counter-factual validation set.
+- B3: `scripts/factor_audit.py` — factor-combo cross-tab, per-symbol WR, score-bucket WR, regime split.
+- B4: HTF 15m MarketState caching for altcoin cycles (OB/FVG source param plumbing for later).
+- B5: Journal schema v2 — `funding_z_6h`, `funding_z_24h`, `trend_regime_at_entry`, `setup_zone_source`, `zone_wait_bars`, `zone_fill_latency_bars`.
+
+**Phase 7.C — Zone-based entry (1-2 weeks)**
+- C1: `src/strategy/setup_planner.py` (new module).
+- C2: `OrderRouter.place_limit_entry` + `cancel_pending_entry`.
+- C3: `PositionMonitor` `PENDING` state with timeout/invalidation logic.
+- C4: `BotRunner` pending-setup lifecycle — creation, swap (better setup preempts worse), cancel, transition to OPEN on fill.
+- C5: Integration tests — mock OKX, limit fill simulation, timeout cancel, invalidation, post-only rejection fallback.
+- C6: Demo observation, 2+ days, fill-rate monitoring.
+
+**Phase 7.D — Structural refinements (1 week)**
+- D1: `displacement_candle` + `premium_discount_zone` factors.
+- D2: Divergence factor formalization (hidden + regular, bar-ago decay).
+- D3: ADX-based `trend_regime` classifier + conditional factor scoring.
+- D4: Pine overlay trim (drop OB rendering + unused tooltip rows once Pillar stack is final).
+- D5: Runner trail / post-TP1 exit re-evaluation (former BLOK E). Zone-based entries may hit TP2 more often; revisit necessity with data.
+
+**Phase 8 — Analytics & optional RL (after 50+ clean post-pivot trades)**
+- E1: `scripts/analyze.py` — GBT (xgboost) feature importance + partial dependence plots on clean trades.
+- E2: Manual tune based on GBT output (per-symbol thresholds, factor weights, veto thresholds).
+- E3: RL (stable-baselines3) **only if** GBT + manual hit a clear ceiling. Scope unchanged from legacy Phase 7 spec — parameter tuner, not decision maker.
+
+### Gates
+
+- **7.A → 7.B:** `pytest` green, smoke run clean, factor-reduced confluence logs consistent, cross-asset veto fires at least once in 4h demo without false positives on BTC/ETH themselves.
+- **7.B → 7.C:** `rejected_signals` ≥ 200 rows, `factor_audit.py` produces stable per-symbol output, HTF cache hit rate ≥ 80%.
+- **7.C → 7.D:** 20 closed trades via zone-entry, WR ≥ 40%, fill rate ≥ 50% (half of setups fill before timeout), no `PENDING` state bugs.
+- **7.D → 8:** 50 closed post-pivot trades, WR ≥ 45%, avg R ≥ 0, ≥2 trend-regimes represented in data, net PnL non-negative.
+- **8 (GBT) → maybe RL:** 100+ post-pivot trades, GBT + manual tuning plateau evident.
+
+### Risks and mitigations
+
+- **Zone fill rate too low** → bot idles, no data. Mitigation: start with generous `max_wait_bars=15`, tighten after observation; fallback-to-market option as emergency hatch during Phase 7.C bring-up.
+- **Cross-asset veto too restrictive** → altcoins rarely trade. Mitigation: v1 requires BOTH BTC+ETH opposition; relax if altcoin trade volume drops >60%.
+- **OKX post-only rejection** → price on wrong side at placement. Mitigation: integration test covers fallback to regular limit, then market-at-zone-edge as final fallback.
+- **Phase 7.B schema change interacts with 7.C code** → counter-factual features may not match zone-entry context. Mitigation: keep schema flexible (nullable columns), regenerate hypothetical outcomes after 7.C ships.
+- **Factor demote surprises** → pre-sprint data says demoted factors had 35% WR. If removal causes a flood of `below_confluence` rejects, consider keeping at weight=0.2 transitionally.
+
+### Reject reasons post-pivot (extends legacy list)
+
+Added: `cross_asset_opposition`, `ema_momentum_contra`, `zone_timeout_cancel`, `no_setup_zone`, `pending_invalidated`, `wrong_side_of_premium_discount`. Legacy list (`below_confluence`, `session_filter`, `no_sl_source`, `vwap_misaligned`, `crowded_skip`, `zero_contracts`, `htf_tp_ceiling`, `tp_too_tight`, `insufficient_contracts_for_split`, `macro_event_blackout`) remains active.
 
 ## Currency pair strategy
 
 **5 OKX perps — BTC / ETH / SOL / DOGE / XRP.** Phase 1.5'te 5 → 3'e inilmişti (Coinalyze free-tier budget + dengeli RL dataset için). 2026-04-17'de DOGE + XRP eklendi — BTC/ETH/SOL genelde correlated, momentum-driven iki parite uncorrelated alpha ekler. Coinalyze free-tier budget hâlâ güvenli: 5 × 5 call / 60s = 25/40 min. `trading.symbols` tek kaynak; legacy single-`symbol` form `DeprecationWarning` ile yüklenir.
+
+**Pivot 2026-04-19 — BTC/ETH pillar role.** BTC ve ETH "piyasa direği" olarak ele alınıyor; SOL/DOGE/XRP altcoin olarak bunların rejim değişimlerine tabi. Sprint 3'te SOL/DOGE short'larının BTC/ETH yukarı dönüşünde squeeze yemesi bu kör noktanın kanıtıydı. `CryptoSnapshot` (Layer 3) altcoin cycle'larında zorunlu veto input'u. BTC/ETH arası ayrı bir korelasyon kontrolü yok; biri rip ederken diğeri flat ise altcoin için nötr context olarak okunur.
 
 **`max_concurrent_positions=4`** (5 parite 4 slot için yarışır — her cycle 1 parite beklemede kalır, confluence gate daha iyi sinyal seçer; 4. pozisyon queue karakteri). `per_slot = total_eq / 4 ≈ $800` margin budget (cross margin mode ile shared pool). R hâlâ total_eq'nun %1'i sabit, sadece notional tavan %25 küçülür.
 
@@ -294,7 +405,9 @@ Top-level sections: `bot`, `trading` (symbols, TFs, risk, `symbol_leverage_caps`
 
 `.env` keys: `OKX_API_KEY`, `OKX_API_SECRET`, `OKX_PASSPHRASE`, `OKX_DEMO_FLAG`, `COINALYZE_API_KEY`, `FINNHUB_API_KEY`, `TV_MCP_PORT`, `LOG_LEVEL`.
 
-**Reject reasons** (joined log family): `below_confluence`, `session_filter`, `no_sl_source`, `vwap_misaligned`, `crowded_skip`, `zero_contracts`, `htf_tp_ceiling`, `tp_too_tight`, `insufficient_contracts_for_split`, `macro_event_blackout`. Sub-floor SL distances are **widened**, not rejected.
+**Reject reasons** (joined log family, legacy): `below_confluence`, `session_filter`, `no_sl_source`, `vwap_misaligned`, `crowded_skip`, `zero_contracts`, `htf_tp_ceiling`, `tp_too_tight`, `insufficient_contracts_for_split`, `macro_event_blackout`. Sub-floor SL distances are **widened**, not rejected.
+
+**Pivot-era additions** (Phase 7.A+): `cross_asset_opposition`, `ema_momentum_contra`, `zone_timeout_cancel`, `no_setup_zone`, `pending_invalidated`, `wrong_side_of_premium_discount`.
 
 ## Tech stack
 
