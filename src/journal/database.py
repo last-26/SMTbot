@@ -99,7 +99,12 @@ CREATE TABLE IF NOT EXISTS trades (
 
     notes               TEXT,
     screenshot_entry    TEXT,
-    screenshot_exit     TEXT
+    screenshot_exit     TEXT,
+
+    real_market_entry_valid INTEGER,
+    real_market_exit_valid  INTEGER,
+    demo_artifact           INTEGER,
+    artifact_reason         TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_trades_outcome      ON trades(outcome);
@@ -174,6 +179,8 @@ _COLUMNS = [
     "setup_zone_source", "zone_wait_bars", "zone_fill_latency_bars",
     "trend_regime_at_entry", "funding_z_6h", "funding_z_24h",
     "notes", "screenshot_entry", "screenshot_exit",
+    "real_market_entry_valid", "real_market_exit_valid",
+    "demo_artifact", "artifact_reason",
 ]
 
 
@@ -218,6 +225,12 @@ _MIGRATIONS = [
     "ALTER TABLE trades ADD COLUMN trend_regime_at_entry TEXT",
     "ALTER TABLE trades ADD COLUMN funding_z_6h REAL",
     "ALTER TABLE trades ADD COLUMN funding_z_24h REAL",
+    # 2026-04-19 — demo-wick artefact cross-check. SQLite has no BOOLEAN
+    # type; we use INTEGER (0/1) with NULL for "couldn't run the check".
+    "ALTER TABLE trades ADD COLUMN real_market_entry_valid INTEGER",
+    "ALTER TABLE trades ADD COLUMN real_market_exit_valid INTEGER",
+    "ALTER TABLE trades ADD COLUMN demo_artifact INTEGER",
+    "ALTER TABLE trades ADD COLUMN artifact_reason TEXT",
 ]
 
 
@@ -249,6 +262,12 @@ def _record_to_row(rec: TradeRecord) -> tuple:
         rec.setup_zone_source, rec.zone_wait_bars, rec.zone_fill_latency_bars,
         rec.trend_regime_at_entry, rec.funding_z_6h, rec.funding_z_24h,
         rec.notes, rec.screenshot_entry, rec.screenshot_exit,
+        (None if rec.real_market_entry_valid is None
+         else int(rec.real_market_entry_valid)),
+        (None if rec.real_market_exit_valid is None
+         else int(rec.real_market_exit_valid)),
+        (None if rec.demo_artifact is None else int(rec.demo_artifact)),
+        rec.artifact_reason,
     )
 
 
@@ -366,6 +385,10 @@ def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
         notes=row["notes"],
         screenshot_entry=row["screenshot_entry"],
         screenshot_exit=row["screenshot_exit"],
+        real_market_entry_valid=_safe_bool(row, "real_market_entry_valid"),
+        real_market_exit_valid=_safe_bool(row, "real_market_exit_valid"),
+        demo_artifact=_safe_bool(row, "demo_artifact"),
+        artifact_reason=_safe_col(row, "artifact_reason"),
     )
 
 
@@ -375,6 +398,14 @@ def _safe_col(row: aiosqlite.Row, name: str):
         return row[name]
     except (IndexError, KeyError):
         return None
+
+
+def _safe_bool(row: aiosqlite.Row, name: str) -> Optional[bool]:
+    """Tri-state bool: None when column missing or NULL, else cast 0/1."""
+    v = _safe_col(row, name)
+    if v is None:
+        return None
+    return bool(v)
 
 
 def _classify(pnl_usdt: float) -> TradeOutcome:
@@ -566,6 +597,41 @@ class TradeJournal:
         updated = await self.get_trade(trade_id)
         assert updated is not None
         return updated
+
+    async def update_artifact_flags(
+        self,
+        trade_id: str,
+        *,
+        real_market_entry_valid: Optional[bool],
+        real_market_exit_valid: Optional[bool],
+        demo_artifact: Optional[bool],
+        artifact_reason: Optional[str],
+    ) -> None:
+        """Stamp demo-wick artefact flags on a closed trade. Non-destructive —
+        the trade stays in the journal; downstream reporting / RL filter on
+        `demo_artifact=1` to exclude artefact fills. Raises KeyError on
+        unknown trade_id so the caller notices stale state."""
+        conn = self._require_conn()
+        cur = await conn.execute(
+            """UPDATE trades SET
+                   real_market_entry_valid = ?,
+                   real_market_exit_valid  = ?,
+                   demo_artifact           = ?,
+                   artifact_reason         = ?
+               WHERE trade_id = ?""",
+            (
+                None if real_market_entry_valid is None
+                else int(real_market_entry_valid),
+                None if real_market_exit_valid is None
+                else int(real_market_exit_valid),
+                None if demo_artifact is None else int(demo_artifact),
+                artifact_reason,
+                trade_id,
+            ),
+        )
+        await conn.commit()
+        if cur.rowcount == 0:
+            raise KeyError(f"No trade with id={trade_id!r}")
 
     async def update_algo_ids(self, trade_id: str, algo_ids: list[str]) -> None:
         """Rewrite the `algo_ids` column AND stamp `sl_moved_to_be = 1`.

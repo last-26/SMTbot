@@ -282,16 +282,24 @@ class OKXClient:
         tp_trigger_px: float,
         td_mode: str = "isolated",
         client_algo_id: Optional[str] = None,
+        trigger_px_type: str = "mark",
     ) -> AlgoResult:
         """Place an OCO SL/TP algo on the position just opened.
 
         `side` of the algo is the OPPOSITE of the entry side — closing long
         means selling, closing short means buying. OKX uses ordPx=-1 to
         signal "market" when the trigger fires.
+
+        `trigger_px_type` controls what price OKX watches to fire the
+        trigger: `"last"` (default in OKX) fires on last trade price,
+        `"mark"` fires on mark price (index-weighted across major real
+        exchanges). On demo, `"mark"` is strongly preferred — demo book
+        wicks have no real-market counterpart and trigger artefact stops
+        if we watch the last-trade feed.
         """
         closing_side = "sell" if pos_side == "long" else "buy"
         cl_algo_id = client_algo_id or f"smtalgo{uuid.uuid4().hex[:20]}"
-        resp = self.trade.place_algo_order(
+        kwargs: dict[str, Any] = dict(
             instId=inst_id, tdMode=td_mode,
             side=closing_side, posSide=pos_side, ordType="oco",
             sz=str(size_contracts),
@@ -299,6 +307,10 @@ class OKXClient:
             tpTriggerPx=str(tp_trigger_px), tpOrdPx="-1",
             algoClOrdId=cl_algo_id,
         )
+        if trigger_px_type:
+            kwargs["slTriggerPxType"] = trigger_px_type
+            kwargs["tpTriggerPxType"] = trigger_px_type
+        resp = self.trade.place_algo_order(**kwargs)
         data = _check(resp, "place_algo_order")
         return AlgoResult(
             algo_id=str(data.get("algoId", "")),
@@ -313,6 +325,24 @@ class OKXClient:
             {"instId": inst_id, "algoId": algo_id},
         ])
         return _check(resp, "cancel_algo_order")
+
+    def list_pending_algos(
+        self, inst_id: Optional[str] = None, ord_type: str = "oco",
+    ) -> list[dict]:
+        """Return the raw rows of live/paused algo orders. Used to verify
+        whether an algo OKX claimed is gone (sCode 51400) actually is — the
+        demo-env occasionally returns 51400 on a still-live algo, and
+        placing a replacement OCO on top would double-protect the position
+        (two SL triggers hit back-to-back)."""
+        kwargs: dict[str, Any] = {"ordType": ord_type}
+        if inst_id:
+            kwargs["instId"] = inst_id
+        resp = self.trade.order_algos_list(**kwargs)
+        if str(resp.get("code", "")) != "0":
+            raise OKXError(
+                f"order_algos_list: {resp.get('msg')}", payload=resp,
+            )
+        return list(resp.get("data") or [])
 
     def close_position(self, inst_id: str, pos_side: str, td_mode: str = "isolated") -> dict:
         resp = self.trade.close_positions(

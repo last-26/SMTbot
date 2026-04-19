@@ -182,12 +182,14 @@ class FakeMonitor:
                       tp2_price: Optional[float] = None,
                       be_already_moved: bool = False,
                       sl_price: float = 0.0,
-                      runner_size: int = 0) -> None:
+                      runner_size: int = 0,
+                      plan_sl_price: Optional[float] = None) -> None:
         self.registered.append((inst_id, pos_side, size, entry_price))
         self.register_extras.append(
             {"algo_ids": list(algo_ids or []), "tp2_price": tp2_price,
              "be_already_moved": be_already_moved,
-             "sl_price": sl_price, "runner_size": runner_size}
+             "sl_price": sl_price, "runner_size": runner_size,
+             "plan_sl_price": plan_sl_price}
         )
 
     def poll(self, inst_id: Optional[str] = None) -> list[CloseFill]:

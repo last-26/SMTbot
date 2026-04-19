@@ -42,14 +42,20 @@ class _FakeClient:
             raise RuntimeError("cancel failed")
         return {}
 
+    def list_pending_algos(self, inst_id: str, ord_type: str = "oco") -> list:
+        # Default: algo already gone (matches the common post-fill case).
+        return []
+
     def place_oco_algo(self, *, inst_id, pos_side, size_contracts,
-                       sl_trigger_px, tp_trigger_px, td_mode="isolated") -> AlgoResult:
+                       sl_trigger_px, tp_trigger_px, td_mode="isolated",
+                       trigger_px_type="") -> AlgoResult:
         if self.place_raises:
             raise OrderRejected("place failed", code="51000")
         self._algo_counter += 1
         self.placed.append({
             "inst_id": inst_id, "pos_side": pos_side,
             "size": size_contracts, "sl": sl_trigger_px, "tp": tp_trigger_px,
+            "trigger_px_type": trigger_px_type,
         })
         return AlgoResult(
             algo_id=f"NEW{self._algo_counter}", client_algo_id=f"cliNEW{self._algo_counter}",

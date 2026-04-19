@@ -110,13 +110,19 @@ class FakeRevisableClient(FakeClient):
         if self.cancel_raises is not None:
             raise self.cancel_raises
 
+    def list_pending_algos(self, inst_id: str, ord_type: str = "oco") -> list:
+        # Default: algo already gone — the 51400 is legitimate.
+        return []
+
     def place_oco_algo(self, *, inst_id, pos_side, size_contracts,
-                       sl_trigger_px, tp_trigger_px, td_mode):
+                       sl_trigger_px, tp_trigger_px, td_mode,
+                       trigger_px_type=""):
         self.placed.append({
             "inst_id": inst_id, "pos_side": pos_side,
             "size_contracts": size_contracts,
             "sl_trigger_px": sl_trigger_px, "tp_trigger_px": tp_trigger_px,
             "td_mode": td_mode,
+            "trigger_px_type": trigger_px_type,
         })
         if self.place_raises is not None:
             raise self.place_raises

@@ -343,6 +343,26 @@ class ExecutionConfig(BaseModel):
     tp_revise_min_delta_atr: float = 0.5
     tp_revise_cooldown_s: float = 30.0
 
+    # OKX OCO trigger-price source. "mark" = index-weighted price across
+    # the major real exchanges (Binance / Bybit / Coinbase). "last" = last
+    # trade on the OKX book (default in OKX SDK). Mark is strongly
+    # preferred on demo: demo-only wicks have no counterpart on the index
+    # and so can't fire mark-based triggers, preventing stop-hunt artefacts
+    # from poisoning the RL dataset. Kept configurable so a live deploy
+    # can pick "last" if it wants book-native triggering.
+    algo_trigger_px_type: str = "mark"
+
+    # Katman 2 — post-close demo-wick artefact cross-check. When True, on
+    # every trade close we fetch the concurrent 1m candle from Binance
+    # USD-M futures and stamp `demo_artifact=True` when entry or exit
+    # sits outside the real-market [low, high] band. Non-destructive: the
+    # trade still persists, but downstream reporting/RL can filter.
+    # `artefact_check_tolerance_pct` widens the band to tolerate routine
+    # OKX-vs-Binance microstructure skew without flagging it as artefact.
+    artefact_check_enabled: bool = True
+    artefact_check_timeout_s: float = 5.0
+    artefact_check_tolerance_pct: float = 0.0005   # 5 bps
+
 
 class DerivativesConfig(BaseModel):
     """Phase 1.5 — derivatives data layer configuration.

@@ -65,6 +65,12 @@ class _Tracked:
     sl_price: float = 0.0
     runner_size: int = 0
     last_tp_revise_at: Optional[datetime] = None
+    # Immutable plan SL, snapshotted at entry. `sl_price` mutates after BE
+    # move, which destroys the original risk distance — dynamic TP revision
+    # needs the plan SL to compute `entry + target_rr × plan_sl_distance`,
+    # else post-BE sl_distance collapses to the BE offset (~0.1%) and the
+    # 1:N target becomes unreachably close to mark (OKX rejects as 51277).
+    plan_sl_price: float = 0.0
 
 
 @dataclass
@@ -113,12 +119,17 @@ class PositionMonitor:
         move_sl_to_be_enabled: bool = False,
         sl_be_offset_pct: float = 0.0,
         on_sl_moved: Optional[Callable[[str, str, list[str]], None]] = None,
+        algo_trigger_px_type: str = "mark",
     ):
         self.client = client
         self.margin_mode = margin_mode
         self.move_sl_to_be_enabled = move_sl_to_be_enabled
         self.sl_be_offset_pct = sl_be_offset_pct
         self._on_sl_moved = on_sl_moved
+        # Replacement OCOs (BE move, dynamic-TP revise) inherit the same
+        # trigger-price source as the initial OCO so behavior stays
+        # consistent across the position's lifetime.
+        self.algo_trigger_px_type = algo_trigger_px_type
         self._tracked: dict[tuple[str, str], _Tracked] = {}
         # Phase 7.C3 — limit entries placed but not yet filled.
         self._pending: dict[tuple[str, str], _PendingEntry] = {}
@@ -140,12 +151,18 @@ class PositionMonitor:
         be_already_moved: bool = False,
         sl_price: float = 0.0,
         runner_size: int = 0,
+        plan_sl_price: Optional[float] = None,
     ) -> None:
+        # plan_sl_price semantics: None → caller didn't provide one, default to
+        # sl_price (correct at fill time). An explicit 0.0 → "unknown, disable
+        # dynamic-TP revise" (rehydrate path for post-BE positions).
+        resolved_plan_sl = sl_price if plan_sl_price is None else plan_sl_price
         self._tracked[(inst_id, pos_side)] = _Tracked(
             inst_id=inst_id, pos_side=pos_side, size=size, entry_price=entry_price,
             initial_size=size, algo_ids=list(algo_ids or []), tp2_price=tp2_price,
             be_already_moved=be_already_moved,
             sl_price=sl_price, runner_size=runner_size or int(size),
+            plan_sl_price=resolved_plan_sl,
         )
 
     def poll(self, inst_id: Optional[str] = None) -> list[CloseFill]:
@@ -219,19 +236,31 @@ class PositionMonitor:
         sign = 1 if t.pos_side == "long" else -1
         be_price = t.entry_price + (t.entry_price * self.sl_be_offset_pct * sign)
 
-        # Step 1: cancel TP2 (tolerant of already-gone).
+        # Step 1: cancel TP2 (tolerant of already-gone, but verify 51400 —
+        # OKX demo has been seen returning 51400 on a still-live algo,
+        # and placing a replacement then leaves TWO stops on the book).
         cancel_succeeded_or_idempotent = False
         try:
             self.client.cancel_algo(t.inst_id, tp2_algo_id)
             cancel_succeeded_or_idempotent = True
         except OrderRejected as exc:
             if self._cancel_error_is_already_gone(exc):
-                logger.warning(
-                    "sl_to_be_tp2_already_gone inst={} side={} algo_id={} "
-                    "code={} — proceeding with BE placement",
-                    t.inst_id, t.pos_side, tp2_algo_id, exc.code,
-                )
-                cancel_succeeded_or_idempotent = True
+                if self._verify_algo_gone(t.inst_id, tp2_algo_id):
+                    logger.warning(
+                        "sl_to_be_tp2_already_gone inst={} side={} algo_id={} "
+                        "code={} verified=true — proceeding with BE placement",
+                        t.inst_id, t.pos_side, tp2_algo_id, exc.code,
+                    )
+                    cancel_succeeded_or_idempotent = True
+                else:
+                    t.cancel_retry_count += 1
+                    logger.warning(
+                        "sl_to_be_cancel_51400_but_still_live inst={} side={} "
+                        "algo_id={} — not placing replacement (avoid double-SL), "
+                        "retry next poll attempt={}/{}",
+                        t.inst_id, t.pos_side, tp2_algo_id,
+                        t.cancel_retry_count, _CANCEL_MAX_RETRIES,
+                    )
             else:
                 t.cancel_retry_count += 1
                 logger.exception(
@@ -276,13 +305,16 @@ class PositionMonitor:
                 sl_trigger_px=be_price,
                 tp_trigger_px=t.tp2_price,
                 td_mode=self.margin_mode,
+                trigger_px_type=self.algo_trigger_px_type,
             )
-        except Exception:
+        except Exception as exc:
+            code = getattr(exc, "code", None)
+            payload = getattr(exc, "payload", None)
             logger.critical(
                 "sl_to_be_place_failed_position_unprotected inst={} side={} "
-                "remaining_size={} be_price={} — TP2 cancelled, replacement "
-                "OCO rejected, manual intervention required",
-                t.inst_id, t.pos_side, snap.size, be_price,
+                "remaining_size={} be_price={} err={!r} code={} payload={} — "
+                "TP2 cancelled, replacement OCO rejected, manual intervention required",
+                t.inst_id, t.pos_side, snap.size, be_price, exc, code, payload,
             )
             # Prevent retry-spin: cancel already succeeded, so a retry
             # would just "cancel a vanished algo" forever. Drop TP2 from
@@ -354,9 +386,17 @@ class PositionMonitor:
                     t.inst_id, t.pos_side, runner_algo_id, exc.code,
                 )
                 return False
+            # Verify 51400 before placing — demo can lie about algo state.
+            if not self._verify_algo_gone(t.inst_id, runner_algo_id):
+                logger.warning(
+                    "tp_revise_cancel_51400_but_still_live inst={} side={} "
+                    "algo_id={} — abort to avoid double-OCO, try next cycle",
+                    t.inst_id, t.pos_side, runner_algo_id,
+                )
+                return False
             logger.warning(
                 "tp_revise_runner_already_gone inst={} side={} algo_id={} "
-                "code={} — proceeding with replacement",
+                "code={} verified=true — proceeding with replacement",
                 t.inst_id, t.pos_side, runner_algo_id, exc.code,
             )
         except Exception:
@@ -373,12 +413,17 @@ class PositionMonitor:
                 sl_trigger_px=t.sl_price,
                 tp_trigger_px=new_tp,
                 td_mode=self.margin_mode,
+                trigger_px_type=self.algo_trigger_px_type,
             )
-        except Exception:
+        except Exception as exc:
+            code = getattr(exc, "code", None)
+            payload = getattr(exc, "payload", None)
             logger.critical(
                 "tp_revise_place_failed_position_unprotected inst={} side={} "
-                "size={} sl={} new_tp={} — runner unprotected, manual intervention",
+                "size={} sl={} new_tp={} err={!r} code={} payload={} — "
+                "runner unprotected, manual intervention",
                 t.inst_id, t.pos_side, t.runner_size, t.sl_price, new_tp,
+                exc, code, payload,
             )
             t.algo_ids = t.algo_ids[:-1]
             return False
@@ -404,6 +449,9 @@ class PositionMonitor:
         return {
             "entry_price": t.entry_price,
             "sl_price": t.sl_price,
+            # 0.0 signals "plan_sl unknown" (post-BE rehydrate) — runner
+            # disables dynamic-TP revise when this is not positive.
+            "plan_sl_price": t.plan_sl_price,
             "tp2_price": t.tp2_price,
             "runner_size": t.runner_size,
             "be_already_moved": t.be_already_moved,
@@ -418,6 +466,31 @@ class PositionMonitor:
         # through to the retry path, where the generic retry counter will
         # eventually give up if it truly cannot recover.
         return exc.code in _ALGO_GONE_CODES
+
+    def _verify_algo_gone(self, inst_id: str, algo_id: str) -> bool:
+        """Double-check 51400 against the live pending-algos list.
+
+        OKX demo has been seen returning 51400 ("algo does not exist") on
+        a cancel while the algo is still on the book — placing a
+        replacement OCO then leaves TWO stops on the position, both of
+        which fire back-to-back at the next adverse wick. This helper
+        queries the live algos and only returns True when the specific
+        algoId is truly absent. Network / API failure returns False (be
+        conservative — do not proceed to place).
+        """
+        try:
+            pending = self.client.list_pending_algos(inst_id=inst_id)
+        except Exception:
+            logger.exception(
+                "algo_verify_list_failed inst={} algo_id={} — "
+                "treating as NOT-gone (conservative)",
+                inst_id, algo_id,
+            )
+            return False
+        for row in pending:
+            if str(row.get("algoId", "")) == str(algo_id):
+                return False
+        return True
 
     def _close_fill_from(self, t: _Tracked) -> CloseFill:
         # At close time, OKX has already removed the position row. Best we

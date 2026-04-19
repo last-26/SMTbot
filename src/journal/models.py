@@ -140,6 +140,24 @@ class TradeRecord(BaseModel):
     screenshot_entry: Optional[str] = None
     screenshot_exit: Optional[str] = None
 
+    # 2026-04-19 — demo-wick artefact flags. Populated at record_close time
+    # by cross-checking entry / exit candles against a real-market public
+    # feed (Binance). `demo_artifact=True` when either side appears to be a
+    # demo-only wick that did not happen on a real exchange. Non-destructive
+    # (we still keep the trade), but the reporter + RL can filter on the
+    # flag so artefact fills don't poison WR or parameter tuning.
+    # real_market_entry_valid: True when entry price sits inside the
+    #   concurrent real-market candle's [low, high]. False when not.
+    #   None when the cross-check couldn't run (feed down, missing candle).
+    # real_market_exit_valid:  Same, for the exit candle.
+    # demo_artifact: True when at least one side is invalid. None when
+    #   neither side could be checked.
+    # artifact_reason: short human-readable reason (e.g. "entry_above_binance_high").
+    real_market_entry_valid: Optional[bool] = None
+    real_market_exit_valid: Optional[bool] = None
+    demo_artifact: Optional[bool] = None
+    artifact_reason: Optional[str] = None
+
     @property
     def is_open(self) -> bool:
         return self.outcome == TradeOutcome.OPEN

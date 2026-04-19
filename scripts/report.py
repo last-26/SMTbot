@@ -67,13 +67,27 @@ def _resolve_clean_since() -> Optional[datetime]:
     return dt
 
 
-async def _run(db_path: str, since: Optional[datetime], starting_balance: float) -> int:
+async def _run(
+    db_path: str,
+    since: Optional[datetime],
+    starting_balance: float,
+    exclude_artifacts: bool,
+) -> int:
     async with TradeJournal(db_path) as j:
         closed = await j.list_closed_trades(since=since)
     if not closed:
         window = "all time" if since is None else f"since {since.isoformat()}"
         print(f"No closed trades in window ({window}).")
         return 0
+    if exclude_artifacts:
+        before = len(closed)
+        closed = [t for t in closed if t.demo_artifact is not True]
+        dropped = before - len(closed)
+        if dropped:
+            print(f"[INFO] --exclude-artifacts dropped {dropped}/{before} artefact-flagged trade(s).")
+        if not closed:
+            print("No non-artefact trades in window.")
+            return 0
     print(format_summary(summary(closed, starting_balance)))
     return 0
 
@@ -89,6 +103,10 @@ def main() -> int:
     parser.add_argument(
         "--ignore-clean-since", action="store_true",
         help="Include trades before `rl.clean_since` (default: honour cutoff)",
+    )
+    parser.add_argument(
+        "--exclude-artifacts", action="store_true",
+        help="Drop trades flagged `demo_artifact=1` by the Binance cross-check.",
     )
     args = parser.parse_args()
 
@@ -108,7 +126,9 @@ def main() -> int:
         print(f"[WARN] DB not found at {db_path} - nothing to report.")
         return 0
 
-    return asyncio.run(_run(db_path, since, args.starting_balance))
+    return asyncio.run(
+        _run(db_path, since, args.starting_balance, args.exclude_artifacts)
+    )
 
 
 if __name__ == "__main__":

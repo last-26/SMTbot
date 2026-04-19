@@ -47,6 +47,12 @@ from src.data.economic_calendar import (
 from src.data.liquidation_stream import LiquidationStream
 from src.data.ltf_reader import LTFReader, LTFState
 from src.data.models import Direction, MarketState, Session
+from src.data.public_market_feed import (
+    BinancePublicClient,
+    RealCandle,
+    okx_swap_to_binance_futures,
+    price_inside_candle,
+)
 from src.data.structured_reader import StructuredReader
 from src.data.tv_bridge import TVBridge, okx_to_tv_symbol
 from src.execution.errors import (
@@ -373,6 +379,9 @@ class BotContext:
     # `PositionMonitor.poll` running under `asyncio.to_thread`) schedule
     # coroutines on this loop via `run_coroutine_threadsafe`.
     main_loop: Any = None
+    # Katman 2 — Binance public futures client for the demo-wick artefact
+    # cross-check (set by from_config). Optional in tests.
+    binance_public: Any = None
 
 
 # ── Runner ──────────────────────────────────────────────────────────────────
@@ -462,6 +471,7 @@ class BotRunner:
             partial_tp_ratio=cfg.execution.partial_tp_ratio,
             partial_tp_rr=cfg.execution.partial_tp_rr,
             move_sl_to_be_after_tp1=cfg.execution.move_sl_to_be_after_tp1,
+            algo_trigger_px_type=cfg.execution.algo_trigger_px_type,
         )
         router = _DryRunRouter(router_cfg) if dry_run else OrderRouter(client, router_cfg)
         journal = TradeJournal(cfg.journal.db_path)
@@ -500,13 +510,24 @@ class BotRunner:
             move_sl_to_be_enabled=cfg.execution.move_sl_to_be_after_tp1,
             sl_be_offset_pct=cfg.execution.sl_be_offset_pct,
             on_sl_moved=_on_sl_moved,
+            algo_trigger_px_type=cfg.execution.algo_trigger_px_type,
         )
         risk_mgr = RiskManager(cfg.bot.starting_balance, cfg.breakers())
+        # Katman 2 — Binance public client for demo-wick artefact cross-check.
+        # Opt-in via execution.artefact_check_enabled; disabled keeps ctx
+        # field None so the cross-check code path short-circuits.
+        binance_public = (
+            BinancePublicClient(
+                timeout_s=cfg.execution.artefact_check_timeout_s,
+            )
+            if cfg.execution.artefact_check_enabled else None
+        )
         ctx = BotContext(
             reader=reader, multi_tf=multi_tf, journal=journal,
             router=router, monitor=monitor, risk_mgr=risk_mgr,
             okx_client=client, config=cfg, bridge=bridge,
             ltf_reader=ltf_reader,
+            binance_public=binance_public,
         )
         ctx_holder["ctx"] = ctx
 
@@ -676,6 +697,12 @@ class BotRunner:
                         await result
             except Exception:
                 logger.exception("coinalyze_client_close_failed")
+        binance_public = self.ctx.binance_public
+        if binance_public is not None:
+            try:
+                binance_public.close()
+            except Exception:
+                logger.exception("binance_public_close_failed")
 
     async def _start_economic_calendar(self) -> None:
         """Warm the cache + spawn the periodic refresh task. No-op when
@@ -826,11 +853,15 @@ class BotRunner:
         snap = self.ctx.monitor.get_tracked_runner(symbol, pos_side)
         if snap is None:
             return
-        sl = float(snap.get("sl_price") or 0.0)
+        # Use plan_sl_price (immutable, the SL at fill time) for ratio math —
+        # after SL-to-BE the mutable sl_price collapses to ~0.1% of entry,
+        # which produces a near-entry new_tp that OKX rejects as 51277.
+        # plan_sl_price == 0.0 means "unknown" (post-BE rehydrate): skip.
+        plan_sl = float(snap.get("plan_sl_price") or 0.0)
         entry = float(snap.get("entry_price") or 0.0)
-        if sl <= 0 or entry <= 0:
+        if plan_sl <= 0 or entry <= 0:
             return
-        sl_distance = abs(entry - sl)
+        sl_distance = abs(entry - plan_sl)
         if sl_distance <= 0:
             return
         sign = 1 if pos_side == "long" else -1
@@ -1528,6 +1559,7 @@ class BotRunner:
             symbol, pos_side, float(plan.num_contracts), plan.entry_price,
             algo_ids=algo_ids, tp2_price=plan.tp_price,
             sl_price=plan.sl_price, runner_size=runner_size,
+            plan_sl_price=plan.sl_price,
         )
         self.ctx.risk_mgr.register_trade_opened()
 
@@ -1878,6 +1910,7 @@ class BotRunner:
             ev.inst_id, ev.pos_side, float(plan.num_contracts), fill_px,
             algo_ids=algo_ids, tp2_price=plan.tp_price,
             sl_price=plan.sl_price, runner_size=runner_size,
+            plan_sl_price=plan.sl_price,
         )
         self.ctx.risk_mgr.register_trade_opened()
 
@@ -2037,6 +2070,124 @@ class BotRunner:
         logger.info("closed trade_id={} outcome={} pnl_r={:.2f}",
                     trade_id, updated.outcome.value, updated.pnl_r or 0.0)
 
+        # Katman 2 — cross-check entry/exit against real-market public feed.
+        # Best-effort: swallow failures so journal close success doesn't
+        # hinge on Binance availability.
+        try:
+            await self._cross_check_close_artefacts(
+                trade_id=trade_id,
+                symbol=updated.symbol,
+                entry_ts=updated.entry_timestamp,
+                entry_price=float(updated.entry_price),
+                exit_ts=enriched.closed_at or _utc_now(),
+                exit_price=float(enriched.exit_price or 0.0),
+            )
+        except Exception:
+            logger.exception(
+                "artefact_cross_check_failed trade_id={}", trade_id,
+            )
+
+    async def _cross_check_close_artefacts(
+        self,
+        *,
+        trade_id: str,
+        symbol: str,
+        entry_ts: datetime,
+        entry_price: float,
+        exit_ts: datetime,
+        exit_price: float,
+    ) -> None:
+        """Compare journaled entry/exit prices against Binance USD-M futures
+        1m candles. Stamps `demo_artifact=True` when either price sits outside
+        the concurrent real-market [low, high] band. Non-destructive — the
+        trade stays in the journal; downstream filters use the flag.
+
+        Disabled in two ways:
+          - `execution.artefact_check_enabled=false` → `ctx.binance_public`
+            is None and we return before any network call.
+          - Any leg (entry or exit) whose candle couldn't be fetched leaves
+            that side's `real_market_*_valid=None` (tri-state), and
+            `demo_artifact` stays None only when BOTH sides fail. If at
+            least one side could be checked and that side is invalid, we
+            still flag the trade.
+        """
+        client = self.ctx.binance_public
+        if client is None:
+            return
+        binance_symbol = okx_swap_to_binance_futures(symbol)
+        if not binance_symbol:
+            logger.debug(
+                "artefact_unmapped_symbol symbol={} trade_id={}",
+                symbol, trade_id,
+            )
+            return
+        tolerance = self.ctx.config.execution.artefact_check_tolerance_pct
+
+        def _fetch(ts: datetime) -> Optional[RealCandle]:
+            return client.get_kline_around(
+                binance_symbol, int(ts.timestamp() * 1000),
+            )
+
+        try:
+            entry_candle = await asyncio.to_thread(_fetch, entry_ts)
+            exit_candle = await asyncio.to_thread(_fetch, exit_ts)
+        except Exception:
+            logger.exception(
+                "artefact_kline_fetch_failed trade_id={} symbol={}",
+                trade_id, binance_symbol,
+            )
+            return
+
+        entry_valid: Optional[bool] = (
+            price_inside_candle(entry_price, entry_candle, tolerance)
+            if entry_candle is not None else None
+        )
+        exit_valid: Optional[bool] = (
+            price_inside_candle(exit_price, exit_candle, tolerance)
+            if exit_candle is not None else None
+        )
+
+        def _describe(prefix: str, price: float, candle: RealCandle) -> str:
+            if price > candle.high:
+                return f"{prefix}_above_binance_high"
+            return f"{prefix}_below_binance_low"
+
+        reasons: list[str] = []
+        if entry_candle is not None and entry_valid is False:
+            reasons.append(_describe("entry", entry_price, entry_candle))
+        if exit_candle is not None and exit_valid is False:
+            reasons.append(_describe("exit", exit_price, exit_candle))
+
+        if entry_valid is None and exit_valid is None:
+            artifact: Optional[bool] = None
+        else:
+            artifact = bool(reasons)  # flag iff at least one checked side invalid
+
+        try:
+            await self.ctx.journal.update_artifact_flags(
+                trade_id,
+                real_market_entry_valid=entry_valid,
+                real_market_exit_valid=exit_valid,
+                demo_artifact=artifact,
+                artifact_reason=";".join(reasons) if reasons else None,
+            )
+        except KeyError:
+            logger.warning(
+                "artefact_update_unknown_trade trade_id={}", trade_id,
+            )
+            return
+
+        if artifact:
+            logger.warning(
+                "demo_artifact_detected trade_id={} symbol={} reasons={}",
+                trade_id, binance_symbol, reasons,
+            )
+        else:
+            logger.debug(
+                "artefact_check_ok trade_id={} symbol={} entry_valid={} exit_valid={}",
+                trade_id, binance_symbol, entry_valid, exit_valid,
+            )
+
     async def _rehydrate_open_positions(self) -> None:
         """Populate monitor + open_trade_ids from journal OPEN rows.
 
@@ -2046,6 +2197,11 @@ class BotRunner:
         for rec in await self.ctx.journal.list_open_trades():
             pos_side = _direction_to_pos_side(rec.direction)
             runner_size = _runner_size(int(rec.num_contracts), self.ctx.config)
+            # plan_sl_price is lost post-BE on restart (journal only stores the
+            # current SL). Pre-BE: current SL == plan SL. Post-BE: pass 0 →
+            # dynamic TP revision no-ops for this position (safer than reviving
+            # with a near-zero sl_distance that OKX rejects).
+            plan_sl = 0.0 if rec.sl_moved_to_be else rec.sl_price
             self.ctx.monitor.register_open(
                 rec.symbol, pos_side,
                 float(rec.num_contracts), rec.entry_price,
@@ -2053,6 +2209,7 @@ class BotRunner:
                 tp2_price=rec.tp_price,
                 be_already_moved=rec.sl_moved_to_be,
                 sl_price=rec.sl_price, runner_size=runner_size,
+                plan_sl_price=plan_sl,
             )
             self.ctx.open_trade_ids[(rec.symbol, pos_side)] = rec.trade_id
             self.ctx.open_trade_opened_at[(rec.symbol, pos_side)] = rec.entry_timestamp

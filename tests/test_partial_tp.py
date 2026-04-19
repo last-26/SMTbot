@@ -43,9 +43,11 @@ class _FakeClient:
         )
 
     def place_oco_algo(self, *, inst_id, pos_side, size_contracts,
-                       sl_trigger_px, tp_trigger_px, td_mode="isolated"):
+                       sl_trigger_px, tp_trigger_px, td_mode="isolated",
+                       trigger_px_type=""):
         self.algo_calls.append({
             "size": size_contracts, "sl": sl_trigger_px, "tp": tp_trigger_px,
+            "trigger_px_type": trigger_px_type,
         })
         return AlgoResult(
             algo_id=f"A{len(self.algo_calls)}",

@@ -41,6 +41,10 @@ class RouterConfig:
     partial_tp_ratio: float = 0.5         # fraction of contracts exited at TP1
     partial_tp_rr: float = 1.5            # TP1 RR relative to SL distance
     move_sl_to_be_after_tp1: bool = True
+    # OCO trigger price source: "mark" (index-weighted, demo-immune) or
+    # "last" (demo-book sensitive, default in OKX). Mark recommended on
+    # demo; kept config-driven so a live deploy can choose otherwise.
+    algo_trigger_px_type: str = "mark"
 
 
 def _pos_side(direction: Direction) -> str:
@@ -228,11 +232,13 @@ class OrderRouter:
                 inst_id=inst, pos_side=pos_side, size_contracts=size1,
                 sl_trigger_px=plan.sl_price, tp_trigger_px=tp1,
                 td_mode=cfg.margin_mode,
+                trigger_px_type=cfg.algo_trigger_px_type,
             )
             algo2 = self.client.place_oco_algo(
                 inst_id=inst, pos_side=pos_side, size_contracts=size2,
                 sl_trigger_px=plan.sl_price, tp_trigger_px=plan.tp_price,
                 td_mode=cfg.margin_mode,
+                trigger_px_type=cfg.algo_trigger_px_type,
             )
             return [algo1, algo2]
 
@@ -240,6 +246,7 @@ class OrderRouter:
             inst_id=inst, pos_side=pos_side, size_contracts=plan.num_contracts,
             sl_trigger_px=plan.sl_price, tp_trigger_px=plan.tp_price,
             td_mode=cfg.margin_mode,
+            trigger_px_type=cfg.algo_trigger_px_type,
         )
         return [algo]
 

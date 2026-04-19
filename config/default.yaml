@@ -405,6 +405,26 @@ execution:
   tp_revise_min_delta_atr: 0.5
   tp_revise_cooldown_s: 30.0
 
+  # 2026-04-19 — OCO trigger price source. "mark" uses OKX's index-weighted
+  # mark price (Binance + Bybit + Coinbase VWAP), "last" uses the OKX book's
+  # last trade. On demo the book has no real-market counterpart, so
+  # demo-only wicks trigger `last`-based stops and poison the RL dataset
+  # with artefact outcomes. Mark is index-computed from real exchanges →
+  # immune to demo wicks. Keep "mark" for demo + live unless a specific
+  # strategy benefits from book-native triggering.
+  algo_trigger_px_type: "mark"
+
+  # 2026-04-19 — post-close artefact cross-check. On every close, fetch the
+  # concurrent 1m candle from Binance USD-M futures; flag the trade as
+  # `demo_artifact=true` when entry or exit falls outside the real candle's
+  # [low, high] band. Non-destructive — the trade still writes to the
+  # journal; reporter + RL can filter on the flag. Tolerance widens the
+  # band on both sides (5 bps default) to tolerate routine cross-exchange
+  # microstructure skew without flagging benign differences.
+  artefact_check_enabled: true
+  artefact_check_timeout_s: 5.0
+  artefact_check_tolerance_pct: 0.0005
+
 derivatives:
   # Phase 1.5 — derivatives data layer. Disabling this short-circuits the
   # Binance WS + Coinalyze poll loop but leaves entry/exit logic untouched,

@@ -51,10 +51,11 @@ class FakeClient:
         )
 
     def place_oco_algo(self, inst_id, pos_side, size_contracts, sl_trigger_px, tp_trigger_px,
-                       td_mode="isolated"):
+                       td_mode="isolated", trigger_px_type=""):
         self.calls.append(("place_oco_algo", {
             "inst_id": inst_id, "pos_side": pos_side, "size": size_contracts,
             "sl": sl_trigger_px, "tp": tp_trigger_px,
+            "trigger_px_type": trigger_px_type,
         }))
         if self.algo_fails:
             raise RuntimeError("algo rejected")
