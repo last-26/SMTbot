@@ -97,9 +97,18 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     # Sum (1.0) is slightly higher than the old single-factor max (0.6) since
     # VWAP is a primary anchor for intraday price. 15m gets the largest slice
     # as the HTF anchor; 1m is the fastest signal for short-term flips.
+    # NOTE (Phase 7.A4): these per-TF slots are superseded by the single
+    # `vwap_composite_alignment` factor below. Per-TF factors still fire for
+    # RL feature visibility / back-compat tests, but YAML zeroes their weight
+    # so the composite carries the score. Flip YAML to re-enable split mode.
     "vwap_1m_alignment": 0.3,
     "vwap_3m_alignment": 0.3,
     "vwap_15m_alignment": 0.4,
+    # Phase 7.A4 — VWAP composite: single factor whose weight scales with
+    # how many available TFs align. w × (aligned / present) where `present`
+    # is the count of non-zero VWAPs. 3-of-3 aligned = full weight; 2-of-3
+    # = 0.667×w; 1-of-3 = 0.333×w. Missing VWAPs don't count against.
+    "vwap_composite_alignment": 1.0,
     # Money-flow (Phase 6.9 A1). Fires when oscillator RSI+MFI bias agrees
     # with the trade direction AND the |rsi_mfi| magnitude clears a threshold
     # (weak bias filtered out). Futures markets are liquidity-driven; MFI is
@@ -456,23 +465,35 @@ def score_direction(
                     detail=f"ltf_signal={sig_raw} bars_ago={bars_ago}",
                 ))
 
-    # 12.5 Multi-TF VWAP alignment — each TF fires as its own independent
-    # factor so 1m can flip before 15m. Zero-valued (missing) VWAPs skipped.
+    # 12.5 Multi-TF VWAP alignment.
+    #
+    # Two factor families fire here:
+    #   * vwap_{1m,3m,15m}_alignment — legacy per-TF factors. YAML zeroes
+    #     their weight by default (Phase 7.A4); they remain for RL feature
+    #     visibility and existing test coverage.
+    #   * vwap_composite_alignment — single factor scaling with the fraction
+    #     of PRESENT TFs that align. Missing VWAPs (0.0) are excluded from
+    #     both numerator and denominator so a run with only 1m+3m VWAPs
+    #     still scores 3/3 if both agree.
     sig = state.signal_table
     vwap_entries = (
         ("vwap_1m_alignment",  sig.vwap_1m),
         ("vwap_3m_alignment",  sig.vwap_3m),
         ("vwap_15m_alignment", sig.vwap_15m),
     )
+    present = 0
+    aligned = 0
     if price > 0:
         for fname, vwap_val in vwap_entries:
             if vwap_val <= 0:
                 continue
+            present += 1
             side_ok = (
                 (direction == Direction.BULLISH and price > vwap_val) or
                 (direction == Direction.BEARISH and price < vwap_val)
             )
             if side_ok:
+                aligned += 1
                 factors.append(ConfluenceFactor(
                     name=fname,
                     weight=w[fname],
@@ -480,6 +501,14 @@ def score_direction(
                     detail=f"price {'>' if direction == Direction.BULLISH else '<'} "
                            f"{vwap_val:.4f}",
                 ))
+    if present > 0 and aligned > 0:
+        composite_weight = w["vwap_composite_alignment"] * (aligned / present)
+        factors.append(ConfluenceFactor(
+            name="vwap_composite_alignment",
+            weight=composite_weight,
+            direction=direction,
+            detail=f"{aligned}/{present} VWAPs aligned",
+        ))
 
     # 13. Derivatives (Phase 1.5 Madde 6) — one slot max per cycle.
     deriv_state = getattr(state, "derivatives", None)

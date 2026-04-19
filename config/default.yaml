@@ -141,24 +141,33 @@ analysis:
   # src/analysis/multi_timeframe.py (Moderate rebalance baseline below is
   # already baked into code). Only keys set here override; others stay at
   # their defaults. Unknown keys trigger a warning at load time.
-  # Phase 7.A2 — ghost factors demoted to 0.0 until re-architected:
-  #   at_order_block: OB on 3m entry TF is noise (mitigation flips too fast);
-  #     plan is to re-add as HTF-only (15m/1h) in Phase 7.C. See CLAUDE.md
-  #     "Strategy Pivot 2026-04-19 — Layer 1 (5-pillar)".
+  # Phase 7.A — factor weight overrides post-Sprint-3 pivot:
+  #   at_order_block: OB on 3m entry TF is noise (mitigation flips too
+  #     fast); to be re-added as HTF-only (15m/1h) in Phase 7.C. See
+  #     CLAUDE.md "Strategy Pivot 2026-04-19 — Layer 1 (5-pillar)".
   #   oscillator_signal: regular BUY/SELL from Cipher-B overlapped with
-  #     momentum factors and triggered at MA crosses; keeping only the
-  #     GOLD_BUY / *_DIV high-conviction variant (still weighted).
-  #   liquidity_pool_target: Pine pool detection emits too many "hairline"
+  #     momentum factors and triggered at MA crosses; only GOLD_BUY /
+  #     *_DIV high-conviction variant kept (via oscillator_high_conviction).
+  #   liquidity_pool_target: Pine pool detection emits too many hairline
   #     pools; to be replaced by ATR-scaled S/R cluster target in 7.A.
-  #
-  # htf_trend_alignment kept around but its confluence credit will be
-  # zeroed in Phase 7.A3 (direction-picker only); leaving the weight here
-  # acts as a fallback until A3 ships in the same sprint.
+  #   htf_trend_alignment → 0 (A3): direction-picker only now. Tie-break
+  #     in calculate_confluence already consults `state.trend_htf`
+  #     directly, so zeroing the score weight removes the bias from
+  #     close-score decisions while preserving the tie-break role and
+  #     the factor tag on trade records (weight=0 still appends).
   confluence_weights:
-    htf_trend_alignment: 0.70
+    htf_trend_alignment: 0.0
     at_order_block: 0.0
     oscillator_signal: 0.0
     liquidity_pool_target: 0.0
+    # Phase 7.A4 — per-TF VWAP slots demoted in favour of
+    # vwap_composite_alignment. Legacy tags still appear in trade-record
+    # factor lists (weight=0 emits for RL post-hoc) but the composite
+    # carries the scoring credit.
+    vwap_1m_alignment: 0.0
+    vwap_3m_alignment: 0.0
+    vwap_15m_alignment: 0.0
+    vwap_composite_alignment: 1.0
   # Example override block (uncomment + edit to hand-tune before Phase 7 RL):
   # confluence_weights:
   #   htf_trend_alignment: 0.75

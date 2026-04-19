@@ -162,6 +162,43 @@ def test_confluence_weights_override_from_kwarg():
     assert got["vwap_15m_alignment"] == DEFAULT_WEIGHTS["vwap_15m_alignment"]
 
 
+def _composite_weight(factors) -> float | None:
+    for f in factors:
+        if f.name == "vwap_composite_alignment":
+            return f.weight
+    return None
+
+
+def test_vwap_composite_full_alignment_weights_full_value():
+    """All 3 VWAPs present + aligned → composite = full weight."""
+    state = _state(price=70_000, v1=69_900, v3=69_800, v15=69_500)
+    score = score_direction(state, Direction.BULLISH)
+    assert _composite_weight(score.factors) == DEFAULT_WEIGHTS["vwap_composite_alignment"]
+
+
+def test_vwap_composite_scales_with_aligned_fraction():
+    """2-of-3 aligned → composite = 2/3 × full weight."""
+    state = _state(price=70_000, v1=69_900, v3=70_500, v15=69_500)
+    score = score_direction(state, Direction.BULLISH)
+    got = _composite_weight(score.factors)
+    assert got is not None
+    assert abs(got - DEFAULT_WEIGHTS["vwap_composite_alignment"] * (2 / 3)) < 1e-9
+
+
+def test_vwap_composite_ignores_missing_vwaps_in_denominator():
+    """When 15m VWAP is missing, 2-of-2 present = full composite weight."""
+    state = _state(price=70_000, v1=69_900, v3=69_800, v15=0.0)
+    score = score_direction(state, Direction.BULLISH)
+    assert _composite_weight(score.factors) == DEFAULT_WEIGHTS["vwap_composite_alignment"]
+
+
+def test_vwap_composite_zero_when_no_alignment():
+    """Price on wrong side of all VWAPs for this direction → no composite."""
+    state = _state(price=70_000, v1=70_100, v3=70_200, v15=70_500)
+    score = score_direction(state, Direction.BULLISH)
+    assert _composite_weight(score.factors) is None
+
+
 def test_unknown_confluence_weight_key_warns_at_config_load():
     """AnalysisConfig emits UserWarning for keys that don't exist in
     DEFAULT_WEIGHTS — typo guard, not a hard fail."""
