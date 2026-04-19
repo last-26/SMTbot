@@ -33,6 +33,7 @@ from src.analysis.order_blocks import (
 )
 from src.analysis.price_action import detect_all_patterns, CandlePattern
 from src.analysis.support_resistance import SRZone, at_key_level
+from src.analysis.trend_regime import TrendRegime
 from src.data.candle_buffer import Candle
 from src.data.models import Direction, MarketState, Session
 
@@ -233,6 +234,35 @@ def _heatmap_supports_direction(state: MarketState, direction: Direction) -> boo
 # ── Scoring ─────────────────────────────────────────────────────────────────
 
 
+def _apply_trend_regime_conditional(
+    weights: dict[str, float],
+    regime: Optional[TrendRegime],
+    enabled: bool,
+) -> dict[str, float]:
+    """Return a copy of `weights` adjusted for the trend-regime gate.
+
+    Policy (opt-in, off by default for back-compat):
+      * STRONG_TREND → `htf_trend_alignment` × 1.5, `recent_sweep` × 0.5.
+        Rewards trend-continuation, penalises reversal setups that
+        consistently lose in trending tape.
+      * RANGING      → `htf_trend_alignment` × 0.5, `recent_sweep` × 1.5.
+        Mean-reversion / sweep-reversal setups earn their keep here.
+      * WEAK_TREND / UNKNOWN / None → unchanged (fail-open).
+    """
+    if not enabled or regime is None or regime == TrendRegime.UNKNOWN:
+        return weights
+    if regime == TrendRegime.WEAK_TREND:
+        return weights
+    adjusted = dict(weights)
+    if regime == TrendRegime.STRONG_TREND:
+        adjusted["htf_trend_alignment"] = adjusted.get("htf_trend_alignment", 0.0) * 1.5
+        adjusted["recent_sweep"] = adjusted.get("recent_sweep", 0.0) * 0.5
+    elif regime == TrendRegime.RANGING:
+        adjusted["htf_trend_alignment"] = adjusted.get("htf_trend_alignment", 0.0) * 0.5
+        adjusted["recent_sweep"] = adjusted.get("recent_sweep", 0.0) * 1.5
+    return adjusted
+
+
 def _divergence_direction(div_raw: Optional[str]) -> Direction:
     """Map the Pine `last_wt_div` token to the direction it signals.
 
@@ -323,6 +353,8 @@ def score_direction(
     divergence_fresh_bars: int = DEFAULT_DIVERGENCE_FRESH_BARS,
     divergence_decay_bars: int = DEFAULT_DIVERGENCE_DECAY_BARS,
     divergence_max_bars: int = DEFAULT_DIVERGENCE_MAX_BARS,
+    trend_regime: Optional[TrendRegime] = None,
+    trend_regime_conditional_scoring_enabled: bool = False,
 ) -> ConfluenceScore:
     """Compute a confluence score for `direction` from the current market state.
 
@@ -332,6 +364,9 @@ def score_direction(
     if direction == Direction.UNDEFINED:
         return ConfluenceScore(direction=Direction.UNDEFINED, score=0.0)
     w = {**DEFAULT_WEIGHTS, **(weights or {})}
+    w = _apply_trend_regime_conditional(
+        w, trend_regime, trend_regime_conditional_scoring_enabled,
+    )
     factors: list[ConfluenceFactor] = []
 
     # 1. HTF trend alignment
@@ -724,6 +759,8 @@ def calculate_confluence(
     divergence_fresh_bars: int = DEFAULT_DIVERGENCE_FRESH_BARS,
     divergence_decay_bars: int = DEFAULT_DIVERGENCE_DECAY_BARS,
     divergence_max_bars: int = DEFAULT_DIVERGENCE_MAX_BARS,
+    trend_regime: Optional[TrendRegime] = None,
+    trend_regime_conditional_scoring_enabled: bool = False,
 ) -> ConfluenceScore:
     """Compute confluence for BOTH directions and return the winning side.
 
@@ -746,6 +783,8 @@ def calculate_confluence(
         divergence_fresh_bars=divergence_fresh_bars,
         divergence_decay_bars=divergence_decay_bars,
         divergence_max_bars=divergence_max_bars,
+        trend_regime=trend_regime,
+        trend_regime_conditional_scoring_enabled=trend_regime_conditional_scoring_enabled,
     )
     bear = score_direction(
         state, Direction.BEARISH,
@@ -760,6 +799,8 @@ def calculate_confluence(
         divergence_fresh_bars=divergence_fresh_bars,
         divergence_decay_bars=divergence_decay_bars,
         divergence_max_bars=divergence_max_bars,
+        trend_regime=trend_regime,
+        trend_regime_conditional_scoring_enabled=trend_regime_conditional_scoring_enabled,
     )
 
     if bull.score == 0 and bear.score == 0:

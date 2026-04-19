@@ -232,6 +232,16 @@ analysis:
   divergence_fresh_bars: 3
   divergence_decay_bars: 6
   divergence_max_bars: 9
+  # Phase 7.D3 — ADX trend-regime classifier + conditional factor scoring.
+  # Classifier runs every cycle on entry-TF closed bars; the label (and the
+  # decoded +DI/-DI) is always computed and persisted on a fill. When the
+  # conditional scoring flag is on, STRONG_TREND boosts `htf_trend_alignment`
+  # ×1.5 and penalises `recent_sweep` ×0.5; RANGING mirrors the ratio. Leave
+  # off until Sprint 4 demo validation shows regime-gated stack outperforms.
+  trend_regime_conditional_scoring_enabled: false
+  adx_period: 14                       # Wilder's canonical 14-period ADX.
+  trend_regime_ranging_threshold: 20.0 # ADX < this → RANGING.
+  trend_regime_strong_threshold: 30.0  # ADX ≥ this → STRONG_TREND.
 
 okx:
   base_url: https://www.okx.com

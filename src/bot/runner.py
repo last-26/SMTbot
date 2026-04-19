@@ -33,6 +33,7 @@ from loguru import logger
 from src.analysis.liquidity_heatmap import build_heatmap
 from src.analysis.multi_timeframe import calculate_confluence
 from src.analysis.support_resistance import detect_sr_zones
+from src.analysis.trend_regime import TrendRegime, classify_trend_regime
 from src.bot.config import BotConfig
 from src.bot.lifecycle import install_shutdown_handlers
 from src.data.candle_buffer import MultiTFBuffer
@@ -285,12 +286,18 @@ class PendingSetupMeta:
     the plan (for OCO placement + journal record_open) and the MarketState
     snapshot (for journal enrichment) here so the FILLED event path can
     reconstruct everything without re-reading.
+
+    `trend_regime_at_entry` (Phase 7.D3) is the ADX regime classification
+    captured at placement time. Persisted to the journal on fill so regime
+    at *decision* is recorded, not at fill — the tape can shift between
+    limit placement and a fill minutes later.
     """
     plan: TradePlan
     zone: ZoneSetup
     order_id: str
     signal_state: MarketState
     placed_at: datetime
+    trend_regime_at_entry: Optional[str] = None
 
 
 @dataclass
@@ -1179,6 +1186,19 @@ class BotRunner:
         risk_balance = min(total_eq, self.ctx.risk_mgr.current_balance)
         margin_balance = min(per_slot, okx_avail)
         sizing_balance = margin_balance  # retained for logging/back-compat
+
+        # Phase 7.D3 — classify trend regime on the entry-TF closed buffer.
+        # Used both as a scoring input (conditional factor weights) and as a
+        # journal tag (`trend_regime_at_entry`). UNKNOWN is fail-open: the
+        # scorer sees no regime signal and falls back to base weights.
+        trend_regime_result = classify_trend_regime(
+            candles,
+            period=cfg.analysis.adx_period,
+            ranging_threshold=cfg.analysis.trend_regime_ranging_threshold,
+            strong_threshold=cfg.analysis.trend_regime_strong_threshold,
+        )
+        trend_regime = trend_regime_result.regime
+
         try:
             plan, reject_reason = build_trade_plan_with_reason(
                 state, risk_balance,
@@ -1225,6 +1245,9 @@ class BotRunner:
                 divergence_fresh_bars=cfg.analysis.divergence_fresh_bars,
                 divergence_decay_bars=cfg.analysis.divergence_decay_bars,
                 divergence_max_bars=cfg.analysis.divergence_max_bars,
+                trend_regime=trend_regime,
+                trend_regime_conditional_scoring_enabled=
+                    cfg.analysis.trend_regime_conditional_scoring_enabled,
             )
         except Exception:
             logger.exception("plan_build_failed symbol={}", symbol)
@@ -1251,6 +1274,9 @@ class BotRunner:
                     divergence_fresh_bars=cfg.analysis.divergence_fresh_bars,
                     divergence_decay_bars=cfg.analysis.divergence_decay_bars,
                     divergence_max_bars=cfg.analysis.divergence_max_bars,
+                    trend_regime=trend_regime,
+                    trend_regime_conditional_scoring_enabled=
+                        cfg.analysis.trend_regime_conditional_scoring_enabled,
                 )
                 logger.info(
                     "symbol_decision symbol={} NO_TRADE reason={} price={:.4f} "
@@ -1322,6 +1348,7 @@ class BotRunner:
                 pos_side=pos_side,
                 plan=plan,
                 state=state,
+                trend_regime=trend_regime,
             )
             if placed:
                 return  # wait for fill event
@@ -1344,6 +1371,9 @@ class BotRunner:
                         divergence_fresh_bars=cfg.analysis.divergence_fresh_bars,
                         divergence_decay_bars=cfg.analysis.divergence_decay_bars,
                         divergence_max_bars=cfg.analysis.divergence_max_bars,
+                        trend_regime=trend_regime,
+                        trend_regime_conditional_scoring_enabled=
+                            cfg.analysis.trend_regime_conditional_scoring_enabled,
                     )
                     await self._record_reject(
                         symbol=symbol, reject_reason="no_setup_zone",
@@ -1390,6 +1420,11 @@ class BotRunner:
                 htf_bias=_bias_str(state),
                 session=_session_str(state),
                 market_structure=_structure_str(state),
+                trend_regime_at_entry=(
+                    trend_regime.value
+                    if trend_regime and trend_regime != TrendRegime.UNKNOWN
+                    else None
+                ),
                 **_derive_enrichment(state),
             )
             self.ctx.open_trade_ids[(symbol, pos_side)] = rec.trade_id
@@ -1493,6 +1528,7 @@ class BotRunner:
         pos_side: str,
         plan: TradePlan,
         state: MarketState,
+        trend_regime: Optional[TrendRegime] = None,
     ) -> bool:
         """Try to place a zone-based limit entry. Return True if a pending
         was registered, False otherwise (caller falls back to market path).
@@ -1574,6 +1610,11 @@ class BotRunner:
             order_id=result.order_id,
             signal_state=state,
             placed_at=placed_at,
+            trend_regime_at_entry=(
+                trend_regime.value
+                if trend_regime and trend_regime != TrendRegime.UNKNOWN
+                else None
+            ),
         )
         logger.info(
             "zone_limit_placed symbol={} side={} order_id={} entry={:.4f} "
@@ -1688,6 +1729,7 @@ class BotRunner:
                 htf_bias=_bias_str(state),
                 session=_session_str(state),
                 market_structure=_structure_str(state),
+                trend_regime_at_entry=meta.trend_regime_at_entry,
                 **_derive_enrichment(state),
             )
             self.ctx.open_trade_ids[key] = rec.trade_id

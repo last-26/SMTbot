@@ -208,6 +208,17 @@ class AnalysisConfig(BaseModel):
     divergence_fresh_bars: int = 3
     divergence_decay_bars: int = 6
     divergence_max_bars: int = 9
+    # Phase 7.D3 — ADX trend-regime classifier + conditional scoring.
+    # Classifier runs on the entry-TF closed-bar buffer and labels each
+    # cycle RANGING / WEAK_TREND / STRONG_TREND / UNKNOWN based on Wilder-
+    # smoothed ADX. The conditional scoring flag (opt-in, off by default)
+    # scales `htf_trend_alignment` ×1.5 and `recent_sweep` ×0.5 in STRONG_
+    # TREND tape, and mirrors the ratio in RANGING tape. WEAK_TREND and
+    # UNKNOWN leave weights unchanged.
+    trend_regime_conditional_scoring_enabled: bool = False
+    adx_period: int = 14
+    trend_regime_ranging_threshold: float = 20.0
+    trend_regime_strong_threshold: float = 30.0
 
     @field_validator("confluence_weights")
     @classmethod

@@ -465,6 +465,7 @@ class TradeJournal:
         nearest_liq_cluster_below_notional: Optional[float] = None,
         nearest_liq_cluster_above_distance_atr: Optional[float] = None,
         nearest_liq_cluster_below_distance_atr: Optional[float] = None,
+        trend_regime_at_entry: Optional[str] = None,
     ) -> TradeRecord:
         """Insert an OPEN row describing a freshly-placed trade.
 
@@ -514,6 +515,7 @@ class TradeJournal:
             nearest_liq_cluster_below_notional=nearest_liq_cluster_below_notional,
             nearest_liq_cluster_above_distance_atr=nearest_liq_cluster_above_distance_atr,
             nearest_liq_cluster_below_distance_atr=nearest_liq_cluster_below_distance_atr,
+            trend_regime_at_entry=trend_regime_at_entry,
         )
         placeholders = ", ".join("?" * len(_COLUMNS))
         cols = ", ".join(_COLUMNS)

@@ -25,6 +25,7 @@ from src.analysis.multi_timeframe import (
 )
 from src.analysis.order_blocks import OrderBlock as PyOrderBlock
 from src.analysis.support_resistance import SRZone
+from src.analysis.trend_regime import TrendRegime
 from src.data.candle_buffer import Candle
 from src.data.models import (
     Direction,
@@ -392,6 +393,8 @@ def generate_entry_intent(
     divergence_fresh_bars: int = 3,
     divergence_decay_bars: int = 6,
     divergence_max_bars: int = 9,
+    trend_regime: Optional[TrendRegime] = None,
+    trend_regime_conditional_scoring_enabled: bool = False,
 ) -> Optional[EntryIntent]:
     """Compute confluence + pick an SL. Returns None when not tradable."""
     if state.current_price <= 0:
@@ -413,6 +416,8 @@ def generate_entry_intent(
         divergence_fresh_bars=divergence_fresh_bars,
         divergence_decay_bars=divergence_decay_bars,
         divergence_max_bars=divergence_max_bars,
+        trend_regime=trend_regime,
+        trend_regime_conditional_scoring_enabled=trend_regime_conditional_scoring_enabled,
     )
     if not confluence.is_tradable(min_confluence_score):
         return None
@@ -512,6 +517,8 @@ def build_trade_plan_from_state(
     divergence_fresh_bars: int = 3,
     divergence_decay_bars: int = 6,
     divergence_max_bars: int = 9,
+    trend_regime: Optional[TrendRegime] = None,
+    trend_regime_conditional_scoring_enabled: bool = False,
 ) -> Optional[TradePlan]:
     """End-to-end: MarketState → TradePlan. Returns None when no trade.
 
@@ -567,6 +574,8 @@ def build_trade_plan_from_state(
         divergence_fresh_bars=divergence_fresh_bars,
         divergence_decay_bars=divergence_decay_bars,
         divergence_max_bars=divergence_max_bars,
+        trend_regime=trend_regime,
+        trend_regime_conditional_scoring_enabled=trend_regime_conditional_scoring_enabled,
     )
     return plan
 
@@ -616,6 +625,8 @@ def build_trade_plan_with_reason(
     divergence_fresh_bars: int = 3,
     divergence_decay_bars: int = 6,
     divergence_max_bars: int = 9,
+    trend_regime: Optional[TrendRegime] = None,
+    trend_regime_conditional_scoring_enabled: bool = False,
 ) -> tuple[Optional[TradePlan], str]:
     """Same as `build_trade_plan_from_state` but returns `(plan, reason)`.
 
@@ -667,6 +678,8 @@ def build_trade_plan_with_reason(
         divergence_fresh_bars=divergence_fresh_bars,
         divergence_decay_bars=divergence_decay_bars,
         divergence_max_bars=divergence_max_bars,
+        trend_regime=trend_regime,
+        trend_regime_conditional_scoring_enabled=trend_regime_conditional_scoring_enabled,
     )
     if intent is None:
         # Distinguish the three upstream `generate_entry_intent` None paths.
@@ -682,6 +695,8 @@ def build_trade_plan_with_reason(
             divergence_fresh_bars=divergence_fresh_bars,
             divergence_decay_bars=divergence_decay_bars,
             divergence_max_bars=divergence_max_bars,
+            trend_regime=trend_regime,
+            trend_regime_conditional_scoring_enabled=trend_regime_conditional_scoring_enabled,
         )
         if not conf.is_tradable(min_confluence_score):
             return None, "below_confluence"
