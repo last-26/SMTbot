@@ -379,3 +379,182 @@ async def test_process_pending_external_cancel_marks_invalidated(
 
     reasons = [r.reject_reason for r in rows]
     assert "pending_invalidated" in reasons
+
+
+# ── Multi-cycle integration (7.C5) ─────────────────────────────────────────
+
+
+async def test_integration_full_lifecycle_place_fill_close(monkeypatch, make_ctx):
+    """Three cycles: place limit → fill → close.
+
+    Cycle 1: zone builder returns a ZoneSetup → runner places a limit,
+    stashes meta, registers pending.
+    Cycle 2: zone builder now returns None (irrelevant — dedup blocks
+    any new placement); monitor emits a FILLED event → runner attaches
+    OCO, registers the open position, records the trade.
+    Cycle 3: monitor emits a close fill → runner enriches, records the
+    close, the trade is CLOSED in the journal.
+    """
+    plan = make_plan()
+    cfg = make_config(contract_size=0.01)
+    _enable_zone(cfg)
+    monitor = ZoneFakeMonitor()
+    router = ZoneFakeRouter()
+    ctx, fakes = make_ctx(config=cfg, monitor=monitor, router=router)
+    ctx.contract_sizes = {"BTC-USDT-SWAP": 0.01}
+
+    # Per-cycle zone-builder return value (controlled by monkeypatch).
+    zone_returns = [_ZONE, None, None]
+
+    def _zone_stub(*a, **kw):
+        return zone_returns.pop(0) if zone_returns else None
+    monkeypatch.setattr("src.bot.runner.build_zone_setup", _zone_stub)
+    _patch_plan_builder(monkeypatch, plan)
+
+    runner = BotRunner(ctx)
+
+    async with ctx.journal:
+        # Cycle 1: places a limit.
+        await runner.run_once()
+        assert len(router.limit_calls) == 1
+        assert ("BTC-USDT-SWAP", "long") in ctx.pending_setups
+        assert router.calls == []  # no market path
+        opens_after_c1 = await ctx.journal.list_open_trades()
+        assert opens_after_c1 == []  # pending, not yet open
+
+        # Cycle 2: FILLED → promote to OPEN.
+        monitor.pending_events = [PendingEvent(
+            inst_id="BTC-USDT-SWAP", pos_side="long", order_id=router.limit_order_id,
+            event_type="FILLED", reason="fill",
+            filled_size=plan.num_contracts, avg_price=plan.entry_price,
+        )]
+        await runner.run_once()
+        assert len(router.attach_calls) == 1
+        assert ("BTC-USDT-SWAP", "long") in ctx.open_trade_ids
+        assert ("BTC-USDT-SWAP", "long") not in ctx.pending_setups
+        opens_after_c2 = await ctx.journal.list_open_trades()
+        assert len(opens_after_c2) == 1
+
+        # Cycle 3: close fill → CLOSED.
+        from tests.conftest import make_close_fill
+        monitor.queued_fills = [make_close_fill()]
+        await runner.run_once()
+        opens_after_c3 = await ctx.journal.list_open_trades()
+        assert opens_after_c3 == []  # trade now closed
+
+
+async def test_integration_pending_persists_across_cycles(monkeypatch, make_ctx):
+    """Cycle 1 places; cycle 2 sees no events → nothing new placed;
+    cycle 3 receives a timeout event → rejected_signal written.
+
+    Zone builder returns a zone on cycle 1 only — cycles 2 & 3 return
+    None so that after the cycle-3 cancellation clears `pending_setups`,
+    the symbol loop does NOT immediately stash a fresh pending.
+    """
+    plan = make_plan()
+    cfg = make_config(contract_size=0.01)
+    _enable_zone(cfg)
+    monitor = ZoneFakeMonitor()
+    router = ZoneFakeRouter()
+    ctx, fakes = make_ctx(config=cfg, monitor=monitor, router=router)
+    ctx.contract_sizes = {"BTC-USDT-SWAP": 0.01}
+
+    _patch_plan_builder(monkeypatch, plan)
+    zone_returns = [_ZONE, None, None]
+
+    def _zone_stub(*a, **kw):
+        return zone_returns.pop(0) if zone_returns else None
+    monkeypatch.setattr("src.bot.runner.build_zone_setup", _zone_stub)
+
+    runner = BotRunner(ctx)
+    async with ctx.journal:
+        await runner.run_once()                    # cycle 1: place
+        assert len(router.limit_calls) == 1
+
+        await runner.run_once()                    # cycle 2: dedup blocks
+        assert len(router.limit_calls) == 1, "dedup should prevent a 2nd limit"
+
+        monitor.pending_events = [PendingEvent(   # cycle 3: timeout
+            inst_id="BTC-USDT-SWAP", pos_side="long",
+            order_id=router.limit_order_id,
+            event_type="CANCELED", reason="timeout",
+        )]
+        await runner.run_once()
+        rows = await ctx.journal.list_rejected_signals()
+
+    reasons = [r.reject_reason for r in rows]
+    assert "zone_timeout_cancel" in reasons
+    assert ("BTC-USDT-SWAP", "long") not in ctx.pending_setups
+
+
+async def test_integration_post_only_rejection_at_router_is_logged(
+    monkeypatch, make_ctx,
+):
+    """Router raises OrderRejected (after its own post-only fallback also
+    failed); the runner must swallow the error, NOT register a pending,
+    and not fall through to a market order when `zone_require_setup=True`."""
+    from src.execution.errors import OrderRejected
+
+    _patch_plan_builder(monkeypatch, make_plan())
+    _patch_zone_builder(monkeypatch, _ZONE)
+    cfg = make_config(contract_size=0.01)
+    _enable_zone(cfg, require_setup=True)
+    monitor = ZoneFakeMonitor()
+    router = ZoneFakeRouter()
+    router.limit_raises = OrderRejected(
+        "sCode=51124 post-only would cross", code="51124",
+    )
+    ctx, fakes = make_ctx(config=cfg, monitor=monitor, router=router)
+    ctx.contract_sizes = {"BTC-USDT-SWAP": 0.01}
+
+    runner = BotRunner(ctx)
+    async with ctx.journal:
+        await runner.run_once()
+
+    # Limit was attempted, but no pending stashed, no open trade opened,
+    # no fallback market order.
+    assert len(router.limit_calls) == 1
+    assert router.calls == []
+    assert ctx.pending_setups == {}
+    assert ctx.open_trade_ids == {}
+    assert monitor.pending_registered == []
+
+
+async def test_integration_risk_gate_blocks_zoned_plan(monkeypatch, make_ctx):
+    """The zone re-sizes the plan to match the structural SL, which
+    widens R slightly. Risk manager is re-consulted on that zoned plan;
+    if it blocks, no limit is placed and no pending is stashed.
+
+    Set `zone_require_setup=True` so the runner doesn't silently fall
+    through to a market order after the zone path refuses the plan.
+    """
+    _patch_plan_builder(monkeypatch, make_plan())
+    _patch_zone_builder(monkeypatch, _ZONE)
+    cfg = make_config(contract_size=0.01)
+    _enable_zone(cfg, require_setup=True)
+    monitor = ZoneFakeMonitor()
+    router = ZoneFakeRouter()
+    ctx, fakes = make_ctx(config=cfg, monitor=monitor, router=router)
+    ctx.contract_sizes = {"BTC-USDT-SWAP": 0.01}
+
+    # Force the can_trade call inside _try_place_zone_entry (on the
+    # zoned plan) to return False while the pre-zone gate still passes.
+    call_count = {"n": 0}
+    original = ctx.risk_mgr.can_trade
+
+    def _blocker(plan_arg):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return original(plan_arg)   # pre-zone gate passes
+        return (False, "test_blocks_zoned_plan")  # zone's re-check blocks
+    ctx.risk_mgr.can_trade = _blocker  # type: ignore[assignment]
+
+    runner = BotRunner(ctx)
+    async with ctx.journal:
+        await runner.run_once()
+
+    assert router.limit_calls == []
+    assert monitor.pending_registered == []
+    assert ctx.pending_setups == {}
+    # With `zone_require_setup=True`, the market fallback is suppressed.
+    assert router.calls == []
