@@ -26,6 +26,7 @@ class OrderStatus(str, Enum):
 
 
 class PositionState(str, Enum):
+    PENDING = "PENDING"      # limit entry placed, not yet filled (Phase 7.C3)
     OPEN = "OPEN"            # entry filled, algo live
     CLOSED = "CLOSED"        # SL or TP hit, position flat
     UNPROTECTED = "UNPROTECTED"  # entry filled but algo failed — dangerous

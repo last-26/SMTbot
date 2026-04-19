@@ -20,6 +20,7 @@ pos_side) key so it can detect the edge.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Callable, Optional
 
 from loguru import logger
@@ -27,6 +28,10 @@ from loguru import logger
 from src.execution.errors import OrderRejected
 from src.execution.models import CloseFill, PositionSnapshot, PositionState
 from src.execution.okx_client import OKXClient
+
+
+def _utc_now() -> datetime:
+    return datetime.now(tz=timezone.utc)
 
 # OKX V5 error codes where cancel_algo_order can be treated as already-done:
 # 51400 = order does not exist, 51401 = already canceled, 51402 = already
@@ -56,6 +61,41 @@ class _Tracked:
     cancel_retry_count: int = 0
 
 
+@dataclass
+class _PendingEntry:
+    """A limit entry placed but not yet filled (Phase 7.C3)."""
+    inst_id: str
+    pos_side: str
+    order_id: str
+    num_contracts: int
+    entry_px: float
+    placed_at: datetime
+    max_wait_s: float
+
+
+@dataclass
+class PendingEvent:
+    """Emitted by `poll_pending` / `cancel_pending` when a limit entry
+    transitions out of PENDING.
+
+    - `event_type="FILLED"`: runner should place OCO and call
+      `register_open` to move the row into the live-position tracker.
+    - `event_type="CANCELED"`: setup died before filling; runner logs,
+      may record a `zone_timeout_cancel` reject, and cleans up.
+    """
+    inst_id: str
+    pos_side: str
+    order_id: str
+    event_type: str            # "FILLED" | "CANCELED"
+    reason: str                # "fill" | "timeout" | "external" | "manual" | "invalidated"
+    filled_size: float = 0.0
+    avg_price: float = 0.0
+
+
+_TERMINAL_FILLED = frozenset({"filled"})
+_TERMINAL_CANCELED = frozenset({"canceled", "mmp_canceled"})
+
+
 class PositionMonitor:
     """Tracks open positions and emits CloseFill events on closure."""
 
@@ -74,6 +114,8 @@ class PositionMonitor:
         self.sl_be_offset_pct = sl_be_offset_pct
         self._on_sl_moved = on_sl_moved
         self._tracked: dict[tuple[str, str], _Tracked] = {}
+        # Phase 7.C3 — limit entries placed but not yet filled.
+        self._pending: dict[tuple[str, str], _PendingEntry] = {}
 
     # Called by the router after it places an order, so the monitor
     # "knows" to expect this position on the next poll. On restart,
@@ -286,6 +328,166 @@ class PositionMonitor:
     def tracked_count(self) -> int:
         return len(self._tracked)
 
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending)
+
     def state(self, inst_id: str, pos_side: str) -> PositionState:
         key = (inst_id, pos_side)
-        return PositionState.OPEN if key in self._tracked else PositionState.CLOSED
+        if key in self._tracked:
+            return PositionState.OPEN
+        if key in self._pending:
+            return PositionState.PENDING
+        return PositionState.CLOSED
+
+    # ── Pending-entry lifecycle (Phase 7.C3) ────────────────────────────────
+
+    def register_pending(
+        self,
+        inst_id: str,
+        pos_side: str,
+        order_id: str,
+        *,
+        num_contracts: int,
+        entry_px: float,
+        max_wait_s: float,
+        placed_at: Optional[datetime] = None,
+    ) -> None:
+        """Track a limit entry that the router just placed.
+
+        The runner holds the zone invalidation logic; this monitor only
+        knows about (order_id, placed_at, max_wait_s). Timeouts are
+        enforced in `poll_pending`; invalidation cancels come through
+        `cancel_pending(reason="invalidated")`.
+        """
+        self._pending[(inst_id, pos_side)] = _PendingEntry(
+            inst_id=inst_id, pos_side=pos_side, order_id=order_id,
+            num_contracts=num_contracts, entry_px=entry_px,
+            placed_at=placed_at or _utc_now(), max_wait_s=max_wait_s,
+        )
+
+    def poll_pending(
+        self, now: Optional[datetime] = None,
+    ) -> list[PendingEvent]:
+        """Poll OKX for each tracked pending order and emit transitions.
+
+        For each pending entry:
+          * OKX state `filled`            → FILLED event
+          * OKX state `canceled`/`mmp_canceled` → CANCELED (reason="external")
+          * Still `live`/`partially_filled` beyond `max_wait_s`
+              → cancel on OKX, CANCELED (reason="timeout")
+          * Transient error fetching state → skip this poll, retry next
+
+        Partial fills that age past max_wait_s are canceled but we still
+        emit a FILLED event with the partial size so the runner can
+        route whatever did fill into the live-position tracker.
+        """
+        now = now or _utc_now()
+        events: list[PendingEvent] = []
+        to_remove: list[tuple[str, str]] = []
+
+        for key, p in self._pending.items():
+            try:
+                raw = self.client.get_order(p.inst_id, p.order_id)
+            except Exception:
+                logger.exception(
+                    "pending_poll_get_order_failed inst={} ord={}",
+                    p.inst_id, p.order_id,
+                )
+                continue
+
+            state = str(raw.get("state", "")).lower()
+            filled_sz = float(raw.get("accFillSz") or 0.0)
+            avg_px = float(raw.get("avgPx") or 0.0)
+
+            if state in _TERMINAL_FILLED:
+                events.append(PendingEvent(
+                    p.inst_id, p.pos_side, p.order_id,
+                    event_type="FILLED", reason="fill",
+                    filled_size=filled_sz, avg_price=avg_px,
+                ))
+                to_remove.append(key)
+                continue
+
+            if state in _TERMINAL_CANCELED:
+                events.append(PendingEvent(
+                    p.inst_id, p.pos_side, p.order_id,
+                    event_type="CANCELED", reason="external",
+                    filled_size=filled_sz, avg_price=avg_px,
+                ))
+                to_remove.append(key)
+                continue
+
+            # Still live or partially filled — check timeout.
+            age_s = (now - p.placed_at).total_seconds()
+            if age_s < p.max_wait_s:
+                continue
+
+            try:
+                self.client.cancel_order(p.inst_id, p.order_id)
+            except OrderRejected as exc:
+                # 51400/1/2: order already gone. Treat as success.
+                if not self._cancel_error_is_already_gone(exc):
+                    logger.warning(
+                        "pending_timeout_cancel_failed inst={} ord={} "
+                        "code={} msg={} — emitting CANCELED anyway",
+                        p.inst_id, p.order_id, exc.code, str(exc),
+                    )
+            except Exception:
+                logger.exception(
+                    "pending_timeout_cancel_exception inst={} ord={}",
+                    p.inst_id, p.order_id,
+                )
+
+            # If something filled before the cancel landed, surface it as
+            # FILLED so the runner places an OCO on the real remainder.
+            if filled_sz > 0:
+                events.append(PendingEvent(
+                    p.inst_id, p.pos_side, p.order_id,
+                    event_type="FILLED", reason="timeout_partial_fill",
+                    filled_size=filled_sz, avg_price=avg_px,
+                ))
+            else:
+                events.append(PendingEvent(
+                    p.inst_id, p.pos_side, p.order_id,
+                    event_type="CANCELED", reason="timeout",
+                    filled_size=0.0, avg_price=0.0,
+                ))
+            to_remove.append(key)
+
+        for key in to_remove:
+            self._pending.pop(key, None)
+        return events
+
+    def cancel_pending(
+        self, inst_id: str, pos_side: str, *, reason: str = "manual",
+    ) -> Optional[PendingEvent]:
+        """Caller-driven cancel (e.g. runner detects zone invalidation).
+
+        Returns the CANCELED event on success, or None if no pending row
+        existed for that (inst_id, pos_side). Idempotent OKX errors are
+        swallowed the same way `poll_pending` swallows them.
+        """
+        key = (inst_id, pos_side)
+        p = self._pending.get(key)
+        if p is None:
+            return None
+        try:
+            self.client.cancel_order(p.inst_id, p.order_id)
+        except OrderRejected as exc:
+            if not self._cancel_error_is_already_gone(exc):
+                logger.warning(
+                    "pending_manual_cancel_failed inst={} ord={} code={} "
+                    "msg={} reason={} — emitting CANCELED anyway",
+                    p.inst_id, p.order_id, exc.code, str(exc), reason,
+                )
+        except Exception:
+            logger.exception(
+                "pending_manual_cancel_exception inst={} ord={} reason={}",
+                p.inst_id, p.order_id, reason,
+            )
+        self._pending.pop(key, None)
+        return PendingEvent(
+            p.inst_id, p.pos_side, p.order_id,
+            event_type="CANCELED", reason=reason,
+        )

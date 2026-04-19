@@ -263,6 +263,16 @@ class OKXClient:
         resp = self.trade.cancel_order(instId=inst_id, ordId=order_id)
         return _check(resp, "cancel_order")
 
+    def get_order(self, inst_id: str, order_id: str) -> dict:
+        """Fetch the current state of one order (Phase 7.C3 — pending poll).
+
+        Returns the raw OKX `data[0]` dict with at least `state` (live |
+        partially_filled | filled | canceled | mmp_canceled), `accFillSz`,
+        and `avgPx`. Callers should read `state` case-insensitively.
+        """
+        resp = self.trade.get_order(instId=inst_id, ordId=order_id)
+        return _check(resp, "get_order")
+
     def place_oco_algo(
         self,
         inst_id: str,
