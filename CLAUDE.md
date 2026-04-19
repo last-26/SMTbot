@@ -13,13 +13,39 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 - **Entry TF:** 3m. HTF context 15m, LTF confirmation 1m.
 - **Scoring:** 5 pillars (Market Structure, Liquidity, Money Flow, VWAP, Divergence) + hard gates (displacement, EMA momentum, VWAP, cross-asset opposition) + ADX regime-conditional weights. *Premium/discount gate and HTF TP/SR ceiling temporarily disabled 2026-04-19 — see changelog; P/D to be re-enabled as a soft/weighted factor (~10-15%) post-Phase-9, HTF ceiling re-evaluated after Phase 9 GBT.*
 - **Execution:** post-only limit → regular limit → market-at-edge fallback. Single-leg OCO SL/TP at hard 1:3 RR (partial TP disabled 2026-04-19 late-night — see changelog; `move_sl_to_be_after_tp1` flag kept but inert while partial off). Dynamic TP revision re-anchors the runner OCO to `entry ± 3 × sl_distance` every cycle.
+- **Sizing:** fee-aware ceil on per-contract total cost so total realized SL loss (price + fee reserve) ≥ target_risk across every symbol (2026-04-19 late-night-2 — see changelog). Previously floor-rounding produced $40-$54 variance on nominal $55; overshoot now bounded by one per-contract step (< $3 per position on current symbols).
 - **Journal:** async SQLite, schema v2 (zone source, wait/fill latency, trend regime, funding Z-scores). `rejected_signals` table with counter-factual outcome pegging.
-- **Tests:** 729, all green. Demo-runnable end-to-end.
-- **Data cutoff (`rl.clean_since`):** `2026-04-19T17:35:00Z` (bumped after partial TP disabled — single-leg 3R OCO regime). Reporter and future RL see only post-pivot trades.
+- **Tests:** 730, all green. Demo-runnable end-to-end.
+- **Data cutoff (`rl.clean_since`):** `2026-04-19T19:55:00Z` (bumped after ceil sizing flipped — realized-R distribution shifts from clustered-below-target to clustered-at-or-above-target). Reporter and future RL see only post-pivot trades.
 
 ---
 
 ## Changelog
+
+### 2026-04-19 (late night, cont. #2) — Fee-aware ceil sizing (equal USDT SL/TP across symbols)
+
+- **Trigger:** post-partial-disable restart review of per-position realized risk. Operator quote: *"hala pozisyonlardaki sl ve kar miktarları farklı bunları eşitlemen gerektiğini söylemiştim sana"* — SL/TP USDT amounts were still varying $40-$54 per position (on nominal $55 target) even after partial TP came off. Root cause: `int(notional // contracts_unit_usdt)` floor-rounding truncates harder on symbols with large per-contract USDT steps (BTC ctu=$680 at 0.01 ctVal × $68k) than on symbols with fine steps (DOGE ctu=$0.35). Low-price coins landed closer to $55; BTC landed ~$43.
+- **Fix — ceil on per-contract TOTAL cost** (`src/strategy/rr_system.py:188-203`):
+  - Un-capped path: `num_contracts = math.ceil(max_risk_usdt / per_contract_cost)` where `per_contract_cost = effective_sl_pct × contracts_unit_usdt` and `effective_sl_pct = sl_pct + fee_reserve_pct`.
+  - This sizes contracts so **total realized loss** (price move + fee reserve budget) clears `max_risk_usdt` on every symbol. Overshoot bounded by one per_contract_cost step — < $3 per position on the current universe (BTC $3.40, SOL $1.54, ETH $1.68, DOGE $0.003, BNB $0.42).
+  - Capped path (leverage/margin ceiling binds) still floors — respecting the hard leverage cap wins over the equal-risk target. When the ceiling can't afford a single contract, `max_contracts_by_notional = 0` propagates honestly (no forced `max(1, …)`) so entry_signals rejects with `zero_contracts`.
+  - `actual_risk_usdt` journal field stays **price-only** (`sl_pct`, not `effective`) so it represents the bare price-move slice. The fee reserve portion of per_contract_cost is not realized loss if fees/slippage come in under budget — it's a sizing headroom.
+- **Operator-visible contract:** each position's realized SL loss on OKX (price + fees) is now ≥ target_risk, with max overshoot ≈ the widest symbol's per_contract_cost. At 1% R on $5,500 demo: each position lands in $55-$58 band instead of the former $40-$54 band. TP reward clears $165 on winners (ceil * 3 × rr) and is bounded above by ~`$165 + 3 × per_contract_cost`.
+- **Mechanical side-effects:**
+  - `required_leverage` still reports off `ideal_notional = max_risk / effective_sl_pct` (unchanged) for telemetry.
+  - `min_lev_for_margin` computed off pre-ceil `notional`, not `actual_notional`. In practice margin headroom is large enough that ceil's contract bump never exceeds the margin floor — smoke test confirms.
+  - Module docstring updated (`rr_system.py:10-18`): "actual risk below requested" rule reworded — now only true in capped path; un-capped path targets realized ≥ requested with bounded overshoot.
+- **Dataset:** `rl.clean_since` bumped `2026-04-19T17:35:00Z → 2026-04-19T19:55:00Z`. Rationale: realized-R distribution under floor-rounding was left-skewed below nominal; under ceil it's near-target with right-tail bounded. Mixing the two in avg-R / expectancy calcs would blur the regime shift. Cost: 2h20m of post-partial-off clean window falls out; 0 closed trades in that window (the 5 positions the operator manually closed opened earlier).
+- **Re-evaluation:** after ≥30 post-flip closed trades, factor-audit inspects:
+  1. Distribution of `risk_amount_usdt` (journal) + matching `realizedPnl` (OKX). Should cluster ≥ max_risk_usdt with tail bounded at `max_risk + per_contract_cost`. Flat-below target → ceil not engaging (likely capped-path dominance).
+  2. sCode 51008 incidence. Ceil raises notional slightly vs floor; if margin buffer is too tight, 51008 re-emerges. None observed in smoke — expect zero on live.
+- **Tests:** 1 new + 2 existing updated.
+  - `tests/test_rr_system.py::test_contract_rounding_keeps_risk_at_or_above_target` (renamed from `_below_target`) — flips the invariant for the un-capped path.
+  - `tests/test_rr_system.py::test_equal_realized_loss_across_heterogeneous_symbols` — 5-symbol matrix (BTC/ETH/SOL/DOGE/BNB), asserts total realized (price+fee reserve) ≥ target and spread < $3.50.
+  - `tests/test_entry_signals.py::test_reject_when_partial_tp_split_would_be_degenerate` + `test_partial_tp_disabled_skips_split_gate` — tightened OB (470→440 at same price) so sl_pct≥10% produces per_contract_cost≥max_risk → ceil lands on exactly 1 contract (not splittable). Same logical scenario, params tuned to new ceil math.
+  - Full suite **730 passed**.
+- **Smoke (`--dry-run --once`):** 2 PLANNED decisions (ETH short + BNB short) at ~$50 total realized target on $5000 dry-run balance. Per-symbol math: BNB `contracts=202 notional=$4663 risk_price_only=$45.41` → total incl fee reserve ≈ $50.08 (ceil overshoot $0.08). ETH `contracts=755139 risk_price_only=$42.86` → total ≈ $50 (tighter overshoot due to fine ctu).
+- **Restart note:** operator has 0 open positions + 0 pending algos at time of this change (verified earlier this session). Next fresh bot cycle will produce positions sized under ceil regime.
 
 ### 2026-04-19 (late night, cont.) — Partial TP disabled
 

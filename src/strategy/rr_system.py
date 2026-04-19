@@ -10,8 +10,12 @@ Given an entry, stop-loss, account balance, and risk budget, compute:
 Design rules (CLAUDE.md):
   - USDT risk per trade stays constant; leverage is dynamic, never fixed.
   - Tight SL (0.3%) ⇒ ~15-20x; wide SL (2%) ⇒ ~3-5x.
-  - When the leverage cap binds, we SHRINK the position. Actual risk then
-    ends up below the requested risk — never above.
+  - When the leverage/margin ceiling binds (`capped=True`), contracts are
+    floor-rounded → actual risk ends up strictly below requested risk.
+    Otherwise contracts are ceil-rounded (post-2026-04-19 operator contract)
+    so realized loss ≥ max_risk_usdt; overshoot bounded by one per-contract
+    cost step (< $3 for current symbol universe). This keeps SL/TP USDT
+    amounts equalized across symbols instead of varying $40-$54 by symbol.
   - OKX BTC-USDT-SWAP: 1 contract = 0.01 BTC notional. Integer contracts only.
 
 This module is pure: no I/O, no async, safe to import from anywhere.
@@ -173,10 +177,33 @@ def calculate_trade_plan(
     leverage = min(max_leverage, liq_safe_leverage)
     leverage = max(leverage, min_lev_for_margin, 1)
 
-    # Integer OKX contracts — always round DOWN so we never exceed notional.
+    # Integer OKX contracts. Operator contract (2026-04-19, post-partial-TP-off):
+    # each position must realize AT LEAST max_risk_usdt at SL (and rr_ratio ×
+    # that at TP), regardless of per-symbol ctVal/entry quantization. Ceil on
+    # per-contract TOTAL cost (price + fee reserve) so realized loss ≈
+    # max_risk across symbols; previously floor produced $40-$54 variance on
+    # nominal $55. Overshoot bounded by one per_contract_cost step (< $3 for
+    # current symbol set). Capped path (leverage/margin ceiling binds) keeps
+    # floor — respecting the hard ceiling wins over the equal-risk target.
     contracts_unit_usdt = contract_size * entry_price
-    num_contracts = int(notional // contracts_unit_usdt)
-    # Re-derive actual notional from rounded contracts so downstream risk is exact.
+    if capped:
+        num_contracts = int(notional // contracts_unit_usdt)
+    else:
+        per_contract_cost = effective_sl_pct * contracts_unit_usdt
+        target_contracts = math.ceil(max_risk_usdt / per_contract_cost)
+        # Safety: ceil must not breach the leverage/margin ceiling. When the
+        # cap can't afford even one contract, propagate 0 — the caller
+        # rejects with `zero_contracts`. We never force a minimum of 1 here
+        # because that would silently violate the margin buffer.
+        max_contracts_by_notional = int(max_notional // contracts_unit_usdt)
+        if target_contracts > max_contracts_by_notional:
+            num_contracts = max_contracts_by_notional
+            capped = True
+        else:
+            num_contracts = target_contracts
+    # actual_risk_usdt stays price-only (sl_pct, not effective) so the journal
+    # field represents the price-move loss; fees are covered by the reserved
+    # portion of per_contract_cost.
     actual_notional = num_contracts * contracts_unit_usdt
     actual_risk_usdt = actual_notional * sl_pct
 

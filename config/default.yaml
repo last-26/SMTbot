@@ -543,4 +543,9 @@ rl:
   # Single-leg 3R OCO regime — expectancy geometry shifts vs partial mode
   # (2.25R full-win cap → 3R full-win), so post-flip trades must not mix
   # with split-OCO trades in reporter/RL windows.
-  clean_since: "2026-04-19T17:35:00Z"
+  # 2026-04-19T19:55Z — bumped after fee-aware ceil sizing flipped (floor →
+  # ceil on per-contract total cost). Under floor the realized-R distribution
+  # clustered BELOW target ($40-$54 on $55 nominal); under ceil it clusters
+  # at or slightly above target (bounded by one per_contract_cost step).
+  # Mixing the two in avg-R / expectancy calcs blurs the regime shift.
+  clean_since: "2026-04-19T19:55:00Z"

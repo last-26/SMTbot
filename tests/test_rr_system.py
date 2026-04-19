@@ -223,16 +223,69 @@ def test_capped_plan_never_exceeds_requested_risk():
     assert plan.risk_amount_usdt <= plan.max_risk_usdt + 1e-6
 
 
-def test_contract_rounding_keeps_risk_below_target():
-    """Integer contract rounding should never push risk ABOVE the target."""
+def test_contract_rounding_keeps_risk_at_or_above_target():
+    """Integer contract ceil should produce risk ≥ target (un-capped path).
+
+    Post-2026-04-19 operator contract: each position's realized SL loss must
+    clear max_risk_usdt regardless of per-symbol ctVal/entry quantization,
+    so SL/TP USDT amounts are equalized across symbols (previously floor
+    produced $40-$54 variance on nominal $55). Overshoot bounded by one
+    per_contract_cost step (sl_pct × contracts_unit_usdt).
+    """
     plan = calculate_trade_plan(
         Direction.BULLISH,
         entry_price=123.45, sl_price=120.0,
         account_balance=500.0, risk_pct=0.01, rr_ratio=3.0,
         max_leverage=20,
     )
-    assert plan.num_contracts >= 0
-    assert plan.risk_amount_usdt <= plan.max_risk_usdt + 1e-6
+    assert plan.num_contracts >= 1
+    assert not plan.capped
+    # New invariant: un-capped ceil keeps risk ≥ target (modulo float noise).
+    assert plan.risk_amount_usdt >= plan.max_risk_usdt - 1e-6
+    # Overshoot bounded by one per-contract price-cost step.
+    ctu = 0.01 * 123.45
+    per_contract_price_cost = plan.sl_pct * ctu
+    assert plan.risk_amount_usdt <= plan.max_risk_usdt + per_contract_price_cost + 1e-6
+
+
+def test_equal_realized_loss_across_heterogeneous_symbols():
+    """Operator-visible contract: at $55 R target with fee reserve, each
+    symbol's TOTAL realized SL loss (price + fee reserve) clusters tightly
+    around $55, not the $40-$54 variance that floor-rounding produced.
+    `risk_amount_usdt` tracks the price-only slice, so we compute the total
+    as `num_contracts × effective_sl_pct × ctu` for the invariant check.
+    """
+    # (entry, sl_pct, ctval) per symbol — representative mid-market prices.
+    symbols = [
+        ("BTC", 68_000.0, 0.004, 0.01),  # ctu = 680
+        ("ETH",  2_400.0, 0.006, 0.10),  # ctu = 240
+        ("SOL",    140.0, 0.010, 1.00),  # ctu = 140
+        ("DOGE",     0.35, 0.008, 1.00),  # ctu = 0.35
+        ("BNB",    700.0, 0.005, 0.10),  # ctu = 70
+    ]
+    account_balance = 5_500.0
+    risk_pct = 0.01  # $55 target
+    fee_reserve_pct = 0.001
+    target = account_balance * risk_pct
+    realized_totals = []
+    for _sym, entry, sl_pct, ctval in symbols:
+        sl_price = entry * (1.0 - sl_pct)
+        plan = calculate_trade_plan(
+            direction=Direction.BULLISH,
+            entry_price=entry, sl_price=sl_price,
+            account_balance=account_balance, risk_pct=risk_pct,
+            rr_ratio=3.0, max_leverage=75, contract_size=ctval,
+            margin_balance=1_000.0, fee_reserve_pct=fee_reserve_pct,
+        )
+        assert not plan.capped  # Un-capped path is what we're testing.
+        effective_sl_pct = plan.sl_pct + plan.fee_reserve_pct
+        total_realized = plan.position_size_usdt * effective_sl_pct
+        # ceil on effective_sl_pct ensures total realized ≥ target.
+        assert total_realized >= target - 1e-6
+        realized_totals.append(total_realized)
+    # Spread bounded by the widest symbol's per-contract *total* step
+    # (BTC: 0.005 × 680 = $3.40). Previously floor produced ≥ $10 spread.
+    assert max(realized_totals) - min(realized_totals) < 3.5
 
 
 def test_tp_distance_equals_rr_times_sl_distance():
