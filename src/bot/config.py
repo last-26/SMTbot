@@ -200,6 +200,14 @@ class AnalysisConfig(BaseModel):
     # Defaults match `DEFAULT_DISPLACEMENT_*` constants in multi_timeframe.py.
     displacement_atr_mult: float = 1.5
     displacement_max_bars_ago: int = 5
+    # Phase 7.D2 — divergence_signal bar-ago decay bands. Matches Pine
+    # `last_wt_div_bars_ago` values (int). Weight is full up to fresh_bars,
+    # 0.5× up to decay_bars, 0.25× up to max_bars, then skipped. Defaults
+    # (3 / 6 / 9) give divergences ~30 minutes of edge on a 3m TF before
+    # the scorer drops them.
+    divergence_fresh_bars: int = 3
+    divergence_decay_bars: int = 6
+    divergence_max_bars: int = 9
 
     @field_validator("confluence_weights")
     @classmethod

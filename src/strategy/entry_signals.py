@@ -389,6 +389,9 @@ def generate_entry_intent(
     liquidity_pool_max_atr_dist: float = 3.0,
     displacement_atr_mult: float = 1.5,
     displacement_max_bars_ago: int = 5,
+    divergence_fresh_bars: int = 3,
+    divergence_decay_bars: int = 6,
+    divergence_max_bars: int = 9,
 ) -> Optional[EntryIntent]:
     """Compute confluence + pick an SL. Returns None when not tradable."""
     if state.current_price <= 0:
@@ -407,6 +410,9 @@ def generate_entry_intent(
         liquidity_pool_max_atr_dist=liquidity_pool_max_atr_dist,
         displacement_atr_mult=displacement_atr_mult,
         displacement_max_bars_ago=displacement_max_bars_ago,
+        divergence_fresh_bars=divergence_fresh_bars,
+        divergence_decay_bars=divergence_decay_bars,
+        divergence_max_bars=divergence_max_bars,
     )
     if not confluence.is_tradable(min_confluence_score):
         return None
@@ -503,6 +509,9 @@ def build_trade_plan_from_state(
     premium_discount_lookback: int = 40,
     displacement_atr_mult: float = 1.5,
     displacement_max_bars_ago: int = 5,
+    divergence_fresh_bars: int = 3,
+    divergence_decay_bars: int = 6,
+    divergence_max_bars: int = 9,
 ) -> Optional[TradePlan]:
     """End-to-end: MarketState → TradePlan. Returns None when no trade.
 
@@ -555,6 +564,9 @@ def build_trade_plan_from_state(
         premium_discount_lookback=premium_discount_lookback,
         displacement_atr_mult=displacement_atr_mult,
         displacement_max_bars_ago=displacement_max_bars_ago,
+        divergence_fresh_bars=divergence_fresh_bars,
+        divergence_decay_bars=divergence_decay_bars,
+        divergence_max_bars=divergence_max_bars,
     )
     return plan
 
@@ -601,6 +613,9 @@ def build_trade_plan_with_reason(
     premium_discount_lookback: int = 40,
     displacement_atr_mult: float = 1.5,
     displacement_max_bars_ago: int = 5,
+    divergence_fresh_bars: int = 3,
+    divergence_decay_bars: int = 6,
+    divergence_max_bars: int = 9,
 ) -> tuple[Optional[TradePlan], str]:
     """Same as `build_trade_plan_from_state` but returns `(plan, reason)`.
 
@@ -649,6 +664,9 @@ def build_trade_plan_with_reason(
         liquidity_pool_max_atr_dist=liquidity_pool_max_atr_dist,
         displacement_atr_mult=displacement_atr_mult,
         displacement_max_bars_ago=displacement_max_bars_ago,
+        divergence_fresh_bars=divergence_fresh_bars,
+        divergence_decay_bars=divergence_decay_bars,
+        divergence_max_bars=divergence_max_bars,
     )
     if intent is None:
         # Distinguish the three upstream `generate_entry_intent` None paths.
@@ -661,6 +679,9 @@ def build_trade_plan_with_reason(
             liquidity_pool_max_atr_dist=liquidity_pool_max_atr_dist,
             displacement_atr_mult=displacement_atr_mult,
             displacement_max_bars_ago=displacement_max_bars_ago,
+            divergence_fresh_bars=divergence_fresh_bars,
+            divergence_decay_bars=divergence_decay_bars,
+            divergence_max_bars=divergence_max_bars,
         )
         if not conf.is_tradable(min_confluence_score):
             return None, "below_confluence"

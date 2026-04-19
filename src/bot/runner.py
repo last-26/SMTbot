@@ -1222,6 +1222,9 @@ class BotRunner:
                 premium_discount_lookback=cfg.analysis.premium_discount_lookback,
                 displacement_atr_mult=cfg.analysis.displacement_atr_mult,
                 displacement_max_bars_ago=cfg.analysis.displacement_max_bars_ago,
+                divergence_fresh_bars=cfg.analysis.divergence_fresh_bars,
+                divergence_decay_bars=cfg.analysis.divergence_decay_bars,
+                divergence_max_bars=cfg.analysis.divergence_max_bars,
             )
         except Exception:
             logger.exception("plan_build_failed symbol={}", symbol)
@@ -1245,6 +1248,9 @@ class BotRunner:
                     liquidity_pool_max_atr_dist=cfg.analysis.liquidity_pool_max_atr_dist,
                     displacement_atr_mult=cfg.analysis.displacement_atr_mult,
                     displacement_max_bars_ago=cfg.analysis.displacement_max_bars_ago,
+                    divergence_fresh_bars=cfg.analysis.divergence_fresh_bars,
+                    divergence_decay_bars=cfg.analysis.divergence_decay_bars,
+                    divergence_max_bars=cfg.analysis.divergence_max_bars,
                 )
                 logger.info(
                     "symbol_decision symbol={} NO_TRADE reason={} price={:.4f} "
@@ -1335,6 +1341,9 @@ class BotRunner:
                         liquidity_pool_max_atr_dist=cfg.analysis.liquidity_pool_max_atr_dist,
                         displacement_atr_mult=cfg.analysis.displacement_atr_mult,
                         displacement_max_bars_ago=cfg.analysis.displacement_max_bars_ago,
+                        divergence_fresh_bars=cfg.analysis.divergence_fresh_bars,
+                        divergence_decay_bars=cfg.analysis.divergence_decay_bars,
+                        divergence_max_bars=cfg.analysis.divergence_max_bars,
                     )
                     await self._record_reject(
                         symbol=symbol, reject_reason="no_setup_zone",

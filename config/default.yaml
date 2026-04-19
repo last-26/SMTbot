@@ -224,6 +224,14 @@ analysis:
   # the geometric gate (body ≥ atr_mult × ATR, within max_bars_ago bars).
   displacement_atr_mult: 1.5
   displacement_max_bars_ago: 5
+  # Phase 7.D2 — divergence_signal bar-ago decay bands. Reads Pine's native
+  # `last_wt_div` stream (BULL_REG / BEAR_REG / BULL_HIDDEN / BEAR_HIDDEN).
+  # fresh_bars: full weight ceiling (≤ → 1.0×).
+  # decay_bars: half weight ceiling (>fresh & ≤decay → 0.5×).
+  # max_bars:   quarter weight ceiling (>decay & ≤max → 0.25×), else skip.
+  divergence_fresh_bars: 3
+  divergence_decay_bars: 6
+  divergence_max_bars: 9
 
 okx:
   base_url: https://www.okx.com

@@ -128,6 +128,14 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     # / inefficiencies created without displacement are low quality. Weight
     # below core pillars because it's momentum confirmation, not structure.
     "displacement_candle": 0.6,
+    # Divergence signal (Phase 7.D2) — Pine oscillator's native divergence
+    # stream (`last_wt_div`: BULL_REG / BEAR_REG / BULL_HIDDEN / BEAR_HIDDEN).
+    # Weight 1.0 at peak (bars_ago ≤ 3) with monotonic bar-ago decay so a
+    # stale divergence doesn't carry the same edge as a fresh one. Distinct
+    # from `oscillator_high_conviction_signal` which reads the `last_signal`
+    # summary string (BUY_DIV / SELL_DIV firings on the Pine side). The D2
+    # factor captures every divergence regardless of the summary signal.
+    "divergence_signal": 1.0,
 }
 
 
@@ -147,6 +155,15 @@ DEFAULT_LIQUIDITY_POOL_MAX_ATR_DIST: float = 3.0
 # ATR, and must sit within the last `DISPLACEMENT_MAX_BARS_AGO` closed bars.
 DEFAULT_DISPLACEMENT_ATR_MULT: float = 1.5
 DEFAULT_DISPLACEMENT_MAX_BARS_AGO: int = 5
+
+# D2 — divergence_signal bar-ago decay. Divergences lose edge fast as price
+# moves past the divergence pivot; we scale the factor weight monotonically.
+# bars_ago ≤ DIVERGENCE_FRESH_BARS: full weight
+# bars_ago ≤ DIVERGENCE_DECAY_BARS: 50% weight
+# bars_ago > DIVERGENCE_MAX_BARS:   skip entirely
+DEFAULT_DIVERGENCE_FRESH_BARS: int = 3
+DEFAULT_DIVERGENCE_DECAY_BARS: int = 6
+DEFAULT_DIVERGENCE_MAX_BARS: int = 9
 
 
 # ── Helpers to read MarketState ─────────────────────────────────────────────
@@ -216,6 +233,49 @@ def _heatmap_supports_direction(state: MarketState, direction: Direction) -> boo
 # ── Scoring ─────────────────────────────────────────────────────────────────
 
 
+def _divergence_direction(div_raw: Optional[str]) -> Direction:
+    """Map the Pine `last_wt_div` token to the direction it signals.
+
+    BULL_REG / BULL_HIDDEN → bullish entry edge.
+    BEAR_REG / BEAR_HIDDEN → bearish entry edge.
+    Unknown / empty tokens → UNDEFINED (no contribution).
+    """
+    if not div_raw:
+        return Direction.UNDEFINED
+    token = div_raw.strip().upper()
+    if token.startswith("BULL"):
+        return Direction.BULLISH
+    if token.startswith("BEAR"):
+        return Direction.BEARISH
+    return Direction.UNDEFINED
+
+
+def _divergence_decay_weight(
+    bars_ago: int,
+    fresh_bars: int,
+    decay_bars: int,
+    max_bars: int,
+) -> float:
+    """Monotonic bar-ago decay multiplier for divergence_signal.
+
+    bars_ago ≤ fresh_bars  → 1.0  (full weight)
+    bars_ago ≤ decay_bars  → 0.5  (half weight)
+    bars_ago ≤ max_bars    → 0.25 (faded tail)
+    bars_ago >  max_bars   → 0.0  (skip)
+
+    Returns the multiplier (0.0 = skip). Negative bars_ago normalized to 0.
+    """
+    if bars_ago < 0:
+        bars_ago = 0
+    if bars_ago > max_bars:
+        return 0.0
+    if bars_ago <= fresh_bars:
+        return 1.0
+    if bars_ago <= decay_bars:
+        return 0.5
+    return 0.25
+
+
 def _displacement_in_direction(
     candles: Optional[list[Candle]],
     direction: Direction,
@@ -260,6 +320,9 @@ def score_direction(
     liquidity_pool_max_atr_dist: float = DEFAULT_LIQUIDITY_POOL_MAX_ATR_DIST,
     displacement_atr_mult: float = DEFAULT_DISPLACEMENT_ATR_MULT,
     displacement_max_bars_ago: int = DEFAULT_DISPLACEMENT_MAX_BARS_AGO,
+    divergence_fresh_bars: int = DEFAULT_DIVERGENCE_FRESH_BARS,
+    divergence_decay_bars: int = DEFAULT_DIVERGENCE_DECAY_BARS,
+    divergence_max_bars: int = DEFAULT_DIVERGENCE_MAX_BARS,
 ) -> ConfluenceScore:
     """Compute a confluence score for `direction` from the current market state.
 
@@ -479,6 +542,31 @@ def score_direction(
             detail=f"body={body_atr:.2f}×ATR bars_ago={bars_ago}",
         ))
 
+    # 9d. Divergence signal (Phase 7.D2). Pine's native `last_wt_div` stream
+    # (BULL_REG / BEAR_REG / BULL_HIDDEN / BEAR_HIDDEN). Monotonic bar-ago
+    # decay: fresh divergence 1.0× weight, aging into 0.5× / 0.25×, dropped
+    # past `divergence_max_bars`. Orthogonal to `oscillator_high_conviction_
+    # signal` (which fires on the summary `last_signal` string). Either can
+    # contribute independently when both streams agree with the direction.
+    div_dir = _divergence_direction(osc.last_wt_div)
+    if div_dir == direction:
+        div_bars_ago = int(getattr(osc, "last_wt_div_bars_ago", 99))
+        decay = _divergence_decay_weight(
+            div_bars_ago,
+            fresh_bars=divergence_fresh_bars,
+            decay_bars=divergence_decay_bars,
+            max_bars=divergence_max_bars,
+        )
+        if decay > 0.0:
+            factors.append(ConfluenceFactor(
+                name="divergence_signal",
+                weight=w["divergence_signal"] * decay,
+                direction=direction,
+                detail=(
+                    f"{osc.last_wt_div} bars_ago={div_bars_ago} decay={decay:.2f}"
+                ),
+            ))
+
     # 10. VMC ribbon alignment (EMA trend bias)
     ribbon_dir = _parse_direction_prefix(state.signal_table.vmc_ribbon)
     if ribbon_dir == direction:
@@ -633,6 +721,9 @@ def calculate_confluence(
     liquidity_pool_max_atr_dist: float = DEFAULT_LIQUIDITY_POOL_MAX_ATR_DIST,
     displacement_atr_mult: float = DEFAULT_DISPLACEMENT_ATR_MULT,
     displacement_max_bars_ago: int = DEFAULT_DISPLACEMENT_MAX_BARS_AGO,
+    divergence_fresh_bars: int = DEFAULT_DIVERGENCE_FRESH_BARS,
+    divergence_decay_bars: int = DEFAULT_DIVERGENCE_DECAY_BARS,
+    divergence_max_bars: int = DEFAULT_DIVERGENCE_MAX_BARS,
 ) -> ConfluenceScore:
     """Compute confluence for BOTH directions and return the winning side.
 
@@ -652,6 +743,9 @@ def calculate_confluence(
         liquidity_pool_max_atr_dist=liquidity_pool_max_atr_dist,
         displacement_atr_mult=displacement_atr_mult,
         displacement_max_bars_ago=displacement_max_bars_ago,
+        divergence_fresh_bars=divergence_fresh_bars,
+        divergence_decay_bars=divergence_decay_bars,
+        divergence_max_bars=divergence_max_bars,
     )
     bear = score_direction(
         state, Direction.BEARISH,
@@ -663,6 +757,9 @@ def calculate_confluence(
         liquidity_pool_max_atr_dist=liquidity_pool_max_atr_dist,
         displacement_atr_mult=displacement_atr_mult,
         displacement_max_bars_ago=displacement_max_bars_ago,
+        divergence_fresh_bars=divergence_fresh_bars,
+        divergence_decay_bars=divergence_decay_bars,
+        divergence_max_bars=divergence_max_bars,
     )
 
     if bull.score == 0 and bear.score == 0:
