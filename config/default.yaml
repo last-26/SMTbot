@@ -211,6 +211,19 @@ analysis:
   # pivot strategy: don't fight a united BTC+ETH tape on altcoins.
   cross_asset_veto_enabled: true
   cross_asset_veto_max_age_s: 300.0
+  # Phase 7.D1 — premium/discount zone veto. When `true`, longs that sit
+  # above the last N-bar swing midpoint and shorts below it are rejected
+  # as `wrong_side_of_premium_discount`. Sprint 3 forensics: market-order
+  # bot chronically bought premium / sold discount. Flip on together with
+  # zone-entry for full pivot discipline. Default off for back-compat.
+  premium_discount_veto_enabled: false
+  premium_discount_lookback: 40
+  # Phase 7.D1 — displacement candle factor. Confirms a "real imbalance"
+  # move in the trade direction within the last N closed bars. Weight is
+  # configured in `confluence_weights.displacement_candle`; these control
+  # the geometric gate (body ≥ atr_mult × ATR, within max_bars_ago bars).
+  displacement_atr_mult: 1.5
+  displacement_max_bars_ago: 5
 
 okx:
   base_url: https://www.okx.com

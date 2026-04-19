@@ -123,6 +123,11 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     # Gold Buy / Buy Div / Sell Div carry strong statistical edge vs. plain
     # BUY/SELL. Mutually exclusive with `oscillator_signal` (elif chain).
     "oscillator_high_conviction_signal": 1.25,
+    # Displacement candle (Phase 7.D1). A large-body, fast-move candle in
+    # the trade direction within the last N bars ≈ "real imbalance". FVGs
+    # / inefficiencies created without displacement are low quality. Weight
+    # below core pillars because it's momentum confirmation, not structure.
+    "displacement_candle": 0.6,
 }
 
 
@@ -137,6 +142,11 @@ DEFAULT_MIN_RSI_MFI_MAGNITUDE: float = 2.0
 # for liquidity_pool_target to fire. 3.0 ≈ reachable-within-a-few-bars on
 # 3m TF without being so far away the pool is irrelevant.
 DEFAULT_LIQUIDITY_POOL_MAX_ATR_DIST: float = 3.0
+
+# D1 — displacement_candle tunables. Body must be at least this multiple of
+# ATR, and must sit within the last `DISPLACEMENT_MAX_BARS_AGO` closed bars.
+DEFAULT_DISPLACEMENT_ATR_MULT: float = 1.5
+DEFAULT_DISPLACEMENT_MAX_BARS_AGO: int = 5
 
 
 # ── Helpers to read MarketState ─────────────────────────────────────────────
@@ -206,6 +216,36 @@ def _heatmap_supports_direction(state: MarketState, direction: Direction) -> boo
 # ── Scoring ─────────────────────────────────────────────────────────────────
 
 
+def _displacement_in_direction(
+    candles: Optional[list[Candle]],
+    direction: Direction,
+    atr: float,
+    atr_mult: float,
+    max_bars_ago: int,
+) -> Optional[tuple[int, float]]:
+    """Find the freshest directional displacement candle in the last N bars.
+
+    Returns (bars_ago, body_atr_mult) when a qualifying candle exists, else
+    None. A displacement candle has (a) body in the trade direction and
+    (b) body size ≥ atr_mult × ATR. Skips bars where ATR or body is
+    degenerate. `bars_ago=0` is the most recent closed bar in `candles[-1]`.
+    """
+    if not candles or atr <= 0 or max_bars_ago <= 0:
+        return None
+    threshold = atr * atr_mult
+    tail = candles[-max_bars_ago:] if len(candles) >= max_bars_ago else list(candles)
+    # Iterate most-recent first so the freshest qualifying bar wins.
+    for offset, candle in enumerate(reversed(tail)):
+        if candle.body_size < threshold:
+            continue
+        if direction == Direction.BULLISH and not candle.is_bullish:
+            continue
+        if direction == Direction.BEARISH and not candle.is_bearish:
+            continue
+        return offset, candle.body_size / atr
+    return None
+
+
 def score_direction(
     state: MarketState,
     direction: Direction,
@@ -218,6 +258,8 @@ def score_direction(
     ltf_state: Optional[object] = None,
     min_rsi_mfi_magnitude: float = DEFAULT_MIN_RSI_MFI_MAGNITUDE,
     liquidity_pool_max_atr_dist: float = DEFAULT_LIQUIDITY_POOL_MAX_ATR_DIST,
+    displacement_atr_mult: float = DEFAULT_DISPLACEMENT_ATR_MULT,
+    displacement_max_bars_ago: int = DEFAULT_DISPLACEMENT_MAX_BARS_AGO,
 ) -> ConfluenceScore:
     """Compute a confluence score for `direction` from the current market state.
 
@@ -418,6 +460,25 @@ def score_direction(
             detail=f"bias={osc.rsi_mfi_bias} val={osc.rsi_mfi:+.2f}",
         ))
 
+    # 9c. Displacement candle (Phase 7.D1). Large-body, fast-move candle in
+    # direction within the last N bars = "real imbalance" confirmation. A
+    # pivot insight from sprint 3: FVGs / OBs formed *without* displacement
+    # are low quality (price just drifted through). Weight 0.6 — below core
+    # structural pillars but above pure oscillator slots.
+    disp = _displacement_in_direction(
+        ltf_candles, direction, state.atr,
+        atr_mult=displacement_atr_mult,
+        max_bars_ago=displacement_max_bars_ago,
+    )
+    if disp is not None:
+        bars_ago, body_atr = disp
+        factors.append(ConfluenceFactor(
+            name="displacement_candle",
+            weight=w["displacement_candle"],
+            direction=direction,
+            detail=f"body={body_atr:.2f}×ATR bars_ago={bars_ago}",
+        ))
+
     # 10. VMC ribbon alignment (EMA trend bias)
     ribbon_dir = _parse_direction_prefix(state.signal_table.vmc_ribbon)
     if ribbon_dir == direction:
@@ -570,6 +631,8 @@ def calculate_confluence(
     ltf_state: Optional[object] = None,
     min_rsi_mfi_magnitude: float = DEFAULT_MIN_RSI_MFI_MAGNITUDE,
     liquidity_pool_max_atr_dist: float = DEFAULT_LIQUIDITY_POOL_MAX_ATR_DIST,
+    displacement_atr_mult: float = DEFAULT_DISPLACEMENT_ATR_MULT,
+    displacement_max_bars_ago: int = DEFAULT_DISPLACEMENT_MAX_BARS_AGO,
 ) -> ConfluenceScore:
     """Compute confluence for BOTH directions and return the winning side.
 
@@ -587,6 +650,8 @@ def calculate_confluence(
         ltf_state=ltf_state,
         min_rsi_mfi_magnitude=min_rsi_mfi_magnitude,
         liquidity_pool_max_atr_dist=liquidity_pool_max_atr_dist,
+        displacement_atr_mult=displacement_atr_mult,
+        displacement_max_bars_ago=displacement_max_bars_ago,
     )
     bear = score_direction(
         state, Direction.BEARISH,
@@ -596,6 +661,8 @@ def calculate_confluence(
         ltf_state=ltf_state,
         min_rsi_mfi_magnitude=min_rsi_mfi_magnitude,
         liquidity_pool_max_atr_dist=liquidity_pool_max_atr_dist,
+        displacement_atr_mult=displacement_atr_mult,
+        displacement_max_bars_ago=displacement_max_bars_ago,
     )
 
     if bull.score == 0 and bear.score == 0:

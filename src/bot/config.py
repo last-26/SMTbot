@@ -186,6 +186,20 @@ class AnalysisConfig(BaseModel):
     # they set the snapshot but the gate skips them by symbol.
     cross_asset_veto_enabled: bool = False
     cross_asset_veto_max_age_s: float = 300.0
+    # Phase 7.D1 — premium/discount zone veto. When true, reject longs that
+    # enter above the last N-bar swing midpoint and shorts below it (the
+    # "chase the move" pattern sprint 3 flagged). Midpoint = (N-bar high +
+    # N-bar low) / 2 on the entry TF. Missing candles / degenerate range
+    # fails open. Opt-in; default off for back-compat. `_lookback` controls
+    # how many entry-TF bars feed the swing range.
+    premium_discount_veto_enabled: bool = False
+    premium_discount_lookback: int = 40
+    # Phase 7.D1 — displacement candle factor tunables (see DEFAULT_WEIGHTS
+    # `displacement_candle`). A directional candle with body ≥ atr_mult × ATR
+    # within the last max_bars_ago closed bars scores a confluence point.
+    # Defaults match `DEFAULT_DISPLACEMENT_*` constants in multi_timeframe.py.
+    displacement_atr_mult: float = 1.5
+    displacement_max_bars_ago: int = 5
 
     @field_validator("confluence_weights")
     @classmethod

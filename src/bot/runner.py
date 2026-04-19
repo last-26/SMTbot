@@ -1218,6 +1218,10 @@ class BotRunner:
                 ema_veto_fast_period=cfg.analysis.ema_veto_fast_period,
                 ema_veto_slow_period=cfg.analysis.ema_veto_slow_period,
                 pillar_opposition=self._pillar_opposition_for(symbol),
+                premium_discount_veto_enabled=cfg.analysis.premium_discount_veto_enabled,
+                premium_discount_lookback=cfg.analysis.premium_discount_lookback,
+                displacement_atr_mult=cfg.analysis.displacement_atr_mult,
+                displacement_max_bars_ago=cfg.analysis.displacement_max_bars_ago,
             )
         except Exception:
             logger.exception("plan_build_failed symbol={}", symbol)
@@ -1226,10 +1230,10 @@ class BotRunner:
         if plan is None:
             # reject_reason taxonomy: below_confluence / session_filter /
             # no_sl_source / vwap_misaligned / ema_momentum_contra /
-            # cross_asset_opposition / crowded_skip / zero_contracts /
-            # htf_tp_ceiling / tp_too_tight / insufficient_contracts_for_split
-            # / macro_event_blackout. Sub-floor SL distances are widened,
-            # not rejected.
+            # cross_asset_opposition / wrong_side_of_premium_discount /
+            # crowded_skip / zero_contracts / htf_tp_ceiling / tp_too_tight /
+            # insufficient_contracts_for_split / macro_event_blackout.
+            # Sub-floor SL distances are widened, not rejected.
             try:
                 conf = calculate_confluence(
                     state,
@@ -1239,6 +1243,8 @@ class BotRunner:
                     weights=cfg.analysis.confluence_weights or None,
                     min_rsi_mfi_magnitude=cfg.analysis.min_rsi_mfi_magnitude,
                     liquidity_pool_max_atr_dist=cfg.analysis.liquidity_pool_max_atr_dist,
+                    displacement_atr_mult=cfg.analysis.displacement_atr_mult,
+                    displacement_max_bars_ago=cfg.analysis.displacement_max_bars_ago,
                 )
                 logger.info(
                     "symbol_decision symbol={} NO_TRADE reason={} price={:.4f} "
@@ -1327,6 +1333,8 @@ class BotRunner:
                         weights=cfg.analysis.confluence_weights or None,
                         min_rsi_mfi_magnitude=cfg.analysis.min_rsi_mfi_magnitude,
                         liquidity_pool_max_atr_dist=cfg.analysis.liquidity_pool_max_atr_dist,
+                        displacement_atr_mult=cfg.analysis.displacement_atr_mult,
+                        displacement_max_bars_ago=cfg.analysis.displacement_max_bars_ago,
                     )
                     await self._record_reject(
                         symbol=symbol, reject_reason="no_setup_zone",

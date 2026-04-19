@@ -317,6 +317,38 @@ def _ema_momentum_veto(
 # open. Caller supplies the pillar bias dict; planner stays pure.
 
 
+def _premium_discount_veto(
+    candles: Optional[list[Candle]],
+    direction: Direction,
+    price: float,
+    lookback: int = 40,
+) -> bool:
+    """True → reject: entry is on the wrong side of premium/discount.
+
+    Swing midpoint = (last N-bar high + last N-bar low) / 2. Longs should
+    enter at a *discount* (price ≤ midpoint). Shorts should enter at a
+    *premium* (price ≥ midpoint). Buying premium / selling discount is the
+    "chase the move" pattern the pivot wants to block.
+
+    Missing candles / zero price / degenerate range → fail-open (False).
+    """
+    if not candles or price <= 0 or lookback < 2:
+        return False
+    tail = candles[-lookback:] if len(candles) >= lookback else list(candles)
+    if len(tail) < 2:
+        return False
+    hi = max(c.high for c in tail if c.high > 0)
+    lo = min(c.low for c in tail if c.low > 0)
+    if hi <= lo:
+        return False
+    midpoint = (hi + lo) / 2.0
+    if direction == Direction.BULLISH and price > midpoint:
+        return True
+    if direction == Direction.BEARISH and price < midpoint:
+        return True
+    return False
+
+
 def _cross_asset_opposes(
     pillar_opposition: Optional[Direction],
     direction: Direction,
@@ -355,6 +387,8 @@ def generate_entry_intent(
     ltf_state: Optional[object] = None,
     min_rsi_mfi_magnitude: float = 2.0,
     liquidity_pool_max_atr_dist: float = 3.0,
+    displacement_atr_mult: float = 1.5,
+    displacement_max_bars_ago: int = 5,
 ) -> Optional[EntryIntent]:
     """Compute confluence + pick an SL. Returns None when not tradable."""
     if state.current_price <= 0:
@@ -371,6 +405,8 @@ def generate_entry_intent(
         ltf_state=ltf_state,
         min_rsi_mfi_magnitude=min_rsi_mfi_magnitude,
         liquidity_pool_max_atr_dist=liquidity_pool_max_atr_dist,
+        displacement_atr_mult=displacement_atr_mult,
+        displacement_max_bars_ago=displacement_max_bars_ago,
     )
     if not confluence.is_tradable(min_confluence_score):
         return None
@@ -458,6 +494,15 @@ def build_trade_plan_from_state(
     partial_tp_ratio: float = 0.5,
     min_rsi_mfi_magnitude: float = 2.0,
     liquidity_pool_max_atr_dist: float = 3.0,
+    vwap_hard_veto_enabled: bool = False,
+    ema_veto_enabled: bool = False,
+    ema_veto_fast_period: int = 21,
+    ema_veto_slow_period: int = 55,
+    pillar_opposition: Optional[Direction] = None,
+    premium_discount_veto_enabled: bool = False,
+    premium_discount_lookback: int = 40,
+    displacement_atr_mult: float = 1.5,
+    displacement_max_bars_ago: int = 5,
 ) -> Optional[TradePlan]:
     """End-to-end: MarketState → TradePlan. Returns None when no trade.
 
@@ -501,6 +546,15 @@ def build_trade_plan_from_state(
         partial_tp_ratio=partial_tp_ratio,
         min_rsi_mfi_magnitude=min_rsi_mfi_magnitude,
         liquidity_pool_max_atr_dist=liquidity_pool_max_atr_dist,
+        vwap_hard_veto_enabled=vwap_hard_veto_enabled,
+        ema_veto_enabled=ema_veto_enabled,
+        ema_veto_fast_period=ema_veto_fast_period,
+        ema_veto_slow_period=ema_veto_slow_period,
+        pillar_opposition=pillar_opposition,
+        premium_discount_veto_enabled=premium_discount_veto_enabled,
+        premium_discount_lookback=premium_discount_lookback,
+        displacement_atr_mult=displacement_atr_mult,
+        displacement_max_bars_ago=displacement_max_bars_ago,
     )
     return plan
 
@@ -543,6 +597,10 @@ def build_trade_plan_with_reason(
     ema_veto_fast_period: int = 21,
     ema_veto_slow_period: int = 55,
     pillar_opposition: Optional[Direction] = None,
+    premium_discount_veto_enabled: bool = False,
+    premium_discount_lookback: int = 40,
+    displacement_atr_mult: float = 1.5,
+    displacement_max_bars_ago: int = 5,
 ) -> tuple[Optional[TradePlan], str]:
     """Same as `build_trade_plan_from_state` but returns `(plan, reason)`.
 
@@ -556,6 +614,9 @@ def build_trade_plan_with_reason(
         the proposed direction (bull stack + bearish entry, or vice versa)
       - "cross_asset_opposition" — BTC and ETH pillars both oppose the
         proposed altcoin direction (pillar_opposition set by caller)
+      - "wrong_side_of_premium_discount" — premium_discount_veto_enabled
+        and price sits on the wrong half of the N-bar swing range
+        (long above midpoint, or short below midpoint)
       - "crowded_skip"     — derivatives crowded-skip gate blocked
       - "zero_contracts"   — contract rounding wiped position to zero
       - "htf_tp_ceiling"   — HTF S/R ceiling squeezed R:R below min_rr_ratio
@@ -586,6 +647,8 @@ def build_trade_plan_with_reason(
         ltf_state=ltf_state,
         min_rsi_mfi_magnitude=min_rsi_mfi_magnitude,
         liquidity_pool_max_atr_dist=liquidity_pool_max_atr_dist,
+        displacement_atr_mult=displacement_atr_mult,
+        displacement_max_bars_ago=displacement_max_bars_ago,
     )
     if intent is None:
         # Distinguish the three upstream `generate_entry_intent` None paths.
@@ -596,6 +659,8 @@ def build_trade_plan_with_reason(
             allowed_sessions=allowed_sessions, ltf_state=ltf_state,
             min_rsi_mfi_magnitude=min_rsi_mfi_magnitude,
             liquidity_pool_max_atr_dist=liquidity_pool_max_atr_dist,
+            displacement_atr_mult=displacement_atr_mult,
+            displacement_max_bars_ago=displacement_max_bars_ago,
         )
         if not conf.is_tradable(min_confluence_score):
             return None, "below_confluence"
@@ -618,6 +683,14 @@ def build_trade_plan_with_reason(
         slow_period=ema_veto_slow_period,
     ):
         return None, "ema_momentum_contra"
+
+    if premium_discount_veto_enabled and _premium_discount_veto(
+        candles,
+        intent.direction,
+        intent.entry_price,
+        lookback=premium_discount_lookback,
+    ):
+        return None, "wrong_side_of_premium_discount"
 
     if _cross_asset_opposes(pillar_opposition, intent.direction):
         return None, "cross_asset_opposition"
