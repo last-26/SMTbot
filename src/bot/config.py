@@ -319,6 +319,30 @@ class ExecutionConfig(BaseModel):
     tp_ladder_shares: list[float] = Field(default_factory=lambda: [0.40, 0.35, 0.25])
     tp_ladder_min_notional_frac: float = 0.30
 
+    # 2026-04-19 (post-pivot diagnostic) — hard 1:N RR cap on the final TP.
+    # Operator log on 2026-04-19 showed 5 zone_limit_placed orders all sized
+    # off heatmap clusters that landed 8-12R away (e.g. BTC sl=$300 → tp=$3600,
+    # 12:1) despite the symbol_decision log claiming RR=4.5. Root cause:
+    # `apply_zone_to_plan` overrode `plan.tp_price` with `zone.tp_primary` =
+    # nearest heatmap cluster, with no RR bound. When > 0, the final primary
+    # TP is forced to ``entry ± target_rr_ratio × sl_distance`` and every
+    # ladder rung is clamped to the same boundary. 0 = off (legacy heatmap
+    # behavior, kept for back-compat).
+    target_rr_ratio: float = 0.0
+
+    # Dynamic TP revision. Off by default. When True, the runner periodically
+    # recomputes a fresh target TP from current state (`target_rr_ratio` × the
+    # SL distance fixed at fill, applied to the live entry-fill price) and
+    # revises the runner OCO (cancel + place) when the new target differs by
+    # at least `tp_revise_min_delta_atr × ATR` and at least
+    # `tp_revise_cooldown_s` seconds have elapsed since the last revision.
+    # `tp_min_rr_floor` prevents revising into a sub-floor RR if the live
+    # mark drifts past the entry. 0 = off (don't revise).
+    tp_dynamic_enabled: bool = False
+    tp_min_rr_floor: float = 1.5
+    tp_revise_min_delta_atr: float = 0.5
+    tp_revise_cooldown_s: float = 30.0
+
 
 class DerivativesConfig(BaseModel):
     """Phase 1.5 — derivatives data layer configuration.

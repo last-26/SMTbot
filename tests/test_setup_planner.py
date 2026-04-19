@@ -468,3 +468,115 @@ def test_apply_zone_to_plan_uses_zone_mid_for_liq_pool_near():
     )
     new_plan = apply_zone_to_plan(_plan(), zone, contract_size=0.01)
     assert new_plan.entry_price == pytest.approx(99.25)
+
+
+def test_apply_zone_to_plan_target_rr_cap_clamps_long_tp():
+    """When target_rr_cap > 0 the primary TP is forced to entry + cap × sl_dist
+    on a long, regardless of how far the heatmap-driven zone.tp_primary sits."""
+    zone = ZoneSetup(
+        direction=Direction.BULLISH,
+        entry_zone=(99.0, 99.5),
+        trigger_type="zone_touch",
+        sl_beyond_zone=98.5,
+        tp_primary=120.0,                 # 41R away from zone-low entry
+        max_wait_bars=10,
+        zone_source="vwap_retest",
+    )
+    new_plan = apply_zone_to_plan(
+        _plan(), zone, contract_size=0.01, target_rr_cap=3.0,
+    )
+    # entry = zone low (99.0), sl = 98.5 (sl_dist 0.5). 1:3 → tp = 99.0 + 3*0.5 = 100.5.
+    assert new_plan.entry_price == pytest.approx(99.0)
+    assert new_plan.sl_price == pytest.approx(98.5)
+    assert new_plan.tp_price == pytest.approx(100.5)
+    assert new_plan.rr_ratio == pytest.approx(3.0)
+
+
+def test_apply_zone_to_plan_target_rr_cap_clamps_short_tp():
+    """Same enforcement on shorts — TP = entry - cap × sl_dist."""
+    zone = ZoneSetup(
+        direction=Direction.BEARISH,
+        entry_zone=(101.0, 101.5),
+        trigger_type="zone_touch",
+        sl_beyond_zone=102.0,
+        tp_primary=80.0,
+        max_wait_bars=10,
+        zone_source="vwap_retest",
+    )
+    new_plan = apply_zone_to_plan(
+        _plan(direction=Direction.BEARISH), zone, contract_size=0.01,
+        target_rr_cap=3.0,
+    )
+    # entry = zone high (101.5), sl = 102.0 (sl_dist 0.5). tp = 101.5 - 1.5 = 100.0.
+    assert new_plan.entry_price == pytest.approx(101.5)
+    assert new_plan.sl_price == pytest.approx(102.0)
+    assert new_plan.tp_price == pytest.approx(100.0)
+    assert new_plan.rr_ratio == pytest.approx(3.0)
+
+
+def test_apply_zone_to_plan_target_rr_cap_clamps_ladder_rungs():
+    """Every ladder rung beyond the cap collapses to the boundary so the
+    downstream ladder consumer never sees a 12R rung."""
+    zone = ZoneSetup(
+        direction=Direction.BULLISH,
+        entry_zone=(99.0, 99.5),
+        trigger_type="zone_touch",
+        sl_beyond_zone=98.5,
+        tp_primary=120.0,
+        max_wait_bars=10,
+        zone_source="vwap_retest",
+        tp_ladder=((101.0, 0.4), (108.0, 0.35), (120.0, 0.25)),
+    )
+    new_plan = apply_zone_to_plan(
+        _plan(), zone, contract_size=0.01, target_rr_cap=3.0,
+    )
+    # 1:3 boundary = entry(99.0) + 3*0.5 = 100.5. The first rung (101.0) is
+    # already beyond the cap → clamps to 100.5; rungs 2 and 3 also clamp.
+    assert new_plan.tp_ladder == [
+        (pytest.approx(100.5), 0.4),
+        (pytest.approx(100.5), 0.35),
+        (pytest.approx(100.5), 0.25),
+    ]
+
+
+def test_apply_zone_to_plan_target_rr_cap_off_when_zero():
+    """Cap=0 keeps the legacy heatmap-cluster TP behavior intact."""
+    zone = ZoneSetup(
+        direction=Direction.BULLISH,
+        entry_zone=(99.0, 99.5),
+        trigger_type="zone_touch",
+        sl_beyond_zone=98.5,
+        tp_primary=120.0,
+        max_wait_bars=10,
+        zone_source="vwap_retest",
+    )
+    new_plan = apply_zone_to_plan(
+        _plan(), zone, contract_size=0.01, target_rr_cap=0.0,
+    )
+    assert new_plan.tp_price == pytest.approx(120.0)
+
+
+def test_apply_zone_to_plan_target_rr_cap_after_sl_widening():
+    """TP cap is re-derived from the *widened* sl_distance, not the
+    structural one — preserves the 1:N contract when min_sl_distance_pct
+    moves the SL outward."""
+    zone = ZoneSetup(
+        direction=Direction.BULLISH,
+        entry_zone=(99.0, 99.5),
+        trigger_type="zone_touch",
+        sl_beyond_zone=98.95,             # tiny structural stop, well inside floor
+        tp_primary=200.0,
+        max_wait_bars=10,
+        zone_source="vwap_retest",
+    )
+    new_plan = apply_zone_to_plan(
+        _plan(), zone, contract_size=0.01,
+        min_sl_distance_pct=0.01,         # forces SL ≥ 1 % below entry (99.0 → 98.01)
+        target_rr_cap=3.0,
+    )
+    # entry=99.0 (zone low), sl widened to 99.0*(1-0.01)=98.01 (sl_dist=0.99).
+    # TP forced to 99.0 + 3*0.99 = 101.97.
+    assert new_plan.entry_price == pytest.approx(99.0)
+    assert new_plan.sl_price == pytest.approx(98.01)
+    assert new_plan.tp_price == pytest.approx(101.97)
+    assert new_plan.rr_ratio == pytest.approx(3.0)

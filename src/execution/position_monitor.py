@@ -59,6 +59,12 @@ class _Tracked:
     tp2_price: Optional[float] = None
     be_already_moved: bool = False
     cancel_retry_count: int = 0
+    # 2026-04-19 — dynamic TP revision needs the active SL on the runner OCO
+    # (so a cancel+place keeps stop discipline) and the runner OCO size (so
+    # the replacement OCO covers the right slice in partial-TP mode).
+    sl_price: float = 0.0
+    runner_size: int = 0
+    last_tp_revise_at: Optional[datetime] = None
 
 
 @dataclass
@@ -132,11 +138,14 @@ class PositionMonitor:
         algo_ids: Optional[list[str]] = None,
         tp2_price: Optional[float] = None,
         be_already_moved: bool = False,
+        sl_price: float = 0.0,
+        runner_size: int = 0,
     ) -> None:
         self._tracked[(inst_id, pos_side)] = _Tracked(
             inst_id=inst_id, pos_side=pos_side, size=size, entry_price=entry_price,
             initial_size=size, algo_ids=list(algo_ids or []), tp2_price=tp2_price,
             be_already_moved=be_already_moved,
+            sl_price=sl_price, runner_size=runner_size or int(size),
         )
 
     def poll(self, inst_id: Optional[str] = None) -> list[CloseFill]:
@@ -289,6 +298,10 @@ class PositionMonitor:
 
         t.algo_ids = [t.algo_ids[0], new_algo.algo_id]
         t.be_already_moved = True
+        # Keep dynamic-TP bookkeeping in sync: the runner OCO is now this
+        # replacement; revise_runner_tp will read sl_price + runner_size.
+        t.sl_price = be_price
+        t.runner_size = int(snap.size)
         logger.info(
             "sl_moved_to_be_via_replace inst={} side={} remaining_size={} "
             "be_price={} offset_pct={} new_algo={}",
@@ -300,6 +313,102 @@ class PositionMonitor:
                 self._on_sl_moved(t.inst_id, t.pos_side, list(t.algo_ids))
             except Exception:
                 logger.exception("on_sl_moved_callback_failed")
+
+    def revise_runner_tp(
+        self, inst_id: str, pos_side: str, new_tp: float,
+        *, now: Optional[datetime] = None,
+    ) -> bool:
+        """Cancel the runner OCO and place a replacement with `new_tp`.
+
+        Keeps the active SL untouched (`t.sl_price`, which is plan SL pre-BE
+        and the BE-adjusted price post-BE). Used by the dynamic-TP loop in
+        the runner: when live conditions move the 1:N target away from the
+        original placement, we re-OCO instead of leaving stale TP geometry
+        on the book. Returns True on success.
+
+        Failure modes mirror `_detect_tp1_and_move_sl`:
+          * cancel returns idempotent-gone code → proceed to place.
+          * cancel returns hard error → abort, runner OCO untouched.
+          * place fails after cancel → CRITICAL log, runner UNPROTECTED,
+            algo_ids trimmed, returns False. No emergency market-close —
+            same operator-decides discipline as the BE replacement.
+        """
+        key = (inst_id, pos_side)
+        t = self._tracked.get(key)
+        if t is None or not t.algo_ids:
+            return False
+        if t.tp2_price is not None and abs(t.tp2_price - new_tp) < 1e-9:
+            return False
+        if t.runner_size <= 0:
+            return False
+
+        runner_algo_id = t.algo_ids[-1]
+
+        try:
+            self.client.cancel_algo(t.inst_id, runner_algo_id)
+        except OrderRejected as exc:
+            if not self._cancel_error_is_already_gone(exc):
+                logger.warning(
+                    "tp_revise_cancel_failed inst={} side={} algo_id={} "
+                    "code={} — abort, runner OCO untouched",
+                    t.inst_id, t.pos_side, runner_algo_id, exc.code,
+                )
+                return False
+            logger.warning(
+                "tp_revise_runner_already_gone inst={} side={} algo_id={} "
+                "code={} — proceeding with replacement",
+                t.inst_id, t.pos_side, runner_algo_id, exc.code,
+            )
+        except Exception:
+            logger.exception(
+                "tp_revise_cancel_exception inst={} side={} algo_id={}",
+                t.inst_id, t.pos_side, runner_algo_id,
+            )
+            return False
+
+        try:
+            new_algo = self.client.place_oco_algo(
+                inst_id=t.inst_id, pos_side=t.pos_side,
+                size_contracts=int(t.runner_size),
+                sl_trigger_px=t.sl_price,
+                tp_trigger_px=new_tp,
+                td_mode=self.margin_mode,
+            )
+        except Exception:
+            logger.critical(
+                "tp_revise_place_failed_position_unprotected inst={} side={} "
+                "size={} sl={} new_tp={} — runner unprotected, manual intervention",
+                t.inst_id, t.pos_side, t.runner_size, t.sl_price, new_tp,
+            )
+            t.algo_ids = t.algo_ids[:-1]
+            return False
+
+        t.algo_ids = t.algo_ids[:-1] + [new_algo.algo_id]
+        t.tp2_price = new_tp
+        t.last_tp_revise_at = now or _utc_now()
+        logger.info(
+            "tp_revised inst={} side={} new_tp={} sl={} new_algo={}",
+            t.inst_id, t.pos_side, new_tp, t.sl_price, new_algo.algo_id,
+        )
+        return True
+
+    def get_tracked_runner(
+        self, inst_id: str, pos_side: str,
+    ) -> Optional[dict]:
+        """Snapshot of runner-OCO state for the dynamic-TP gate. Returns
+        None when the (inst_id, pos_side) has no live tracked position.
+        Read-only — no mutation."""
+        t = self._tracked.get((inst_id, pos_side))
+        if t is None:
+            return None
+        return {
+            "entry_price": t.entry_price,
+            "sl_price": t.sl_price,
+            "tp2_price": t.tp2_price,
+            "runner_size": t.runner_size,
+            "be_already_moved": t.be_already_moved,
+            "last_tp_revise_at": t.last_tp_revise_at,
+        }
 
     @staticmethod
     def _cancel_error_is_already_gone(exc: OrderRejected) -> bool:

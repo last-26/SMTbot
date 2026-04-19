@@ -422,6 +422,7 @@ def zone_limit_price(
 def apply_zone_to_plan(
     plan: TradePlan, zone: "ZoneSetup", contract_size: float,
     min_sl_distance_pct: float = 0.0,
+    target_rr_cap: float = 0.0,
 ) -> TradePlan:
     """Return a new TradePlan with entry/SL/TP taken from *zone*, re-sized
     so total USDT risk on the structural SL equals `plan.risk_amount_usdt`.
@@ -442,6 +443,13 @@ def apply_zone_to_plan(
     had crossed the trigger between fill and OCO attach. Widen the SL
     here, keep the zone's direction/structural intent, resize contracts
     off the new distance so R stays flat.
+
+    `target_rr_cap` enforces a hard 1:N reward/risk on the final primary
+    TP (and clamps every ladder rung to the same bound). Without it, the
+    heatmap-cluster TP source drifted to 8-12R on 2026-04-19 (operator
+    log showed "$300 SL → $3600 TP"). When `target_rr_cap > 0` the
+    primary TP becomes exactly ``entry ± cap × sl_distance`` — clusters
+    no longer override the RR contract.
     """
     if plan.direction != zone.direction:
         raise ValueError(
@@ -464,6 +472,9 @@ def apply_zone_to_plan(
             else:
                 new_sl = new_entry + min_dist
             new_sl_distance = abs(new_entry - new_sl)
+    sign = 1 if zone.direction == Direction.BULLISH else -1
+    if target_rr_cap > 0.0:
+        new_tp = new_entry + sign * target_rr_cap * new_sl_distance
     new_sl_pct = new_sl_distance / new_entry
     risk = plan.risk_amount_usdt
     denom = new_sl_pct + plan.fee_reserve_pct
@@ -474,7 +485,18 @@ def apply_zone_to_plan(
     tp_distance = abs(new_tp - new_entry)
     new_rr = tp_distance / new_sl_distance if new_sl_distance > 0 else 0.0
     ladder_src = zone.tp_ladder if zone.tp_ladder else ((new_tp, 1.0),)
-    ladder = [(float(p), float(s)) for p, s in ladder_src]
+    if target_rr_cap > 0.0:
+        cap_boundary = new_entry + sign * target_rr_cap * new_sl_distance
+        ladder = []
+        for p, s in ladder_src:
+            pf = float(p)
+            if sign > 0 and pf > cap_boundary:
+                pf = cap_boundary
+            elif sign < 0 and pf < cap_boundary:
+                pf = cap_boundary
+            ladder.append((pf, float(s)))
+    else:
+        ladder = [(float(p), float(s)) for p, s in ladder_src]
 
     return TradePlan(
         direction=plan.direction,

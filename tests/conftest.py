@@ -174,16 +174,20 @@ class FakeMonitor:
         self.register_extras: list[dict] = []
         self.queued_fills: list[CloseFill] = []
         self.poll_count = 0
+        self.revise_calls: list[tuple[str, str, float]] = []
 
     def register_open(self, inst_id: str, pos_side: str,
                       size: float, entry_price: float,
                       *, algo_ids: Optional[list[str]] = None,
                       tp2_price: Optional[float] = None,
-                      be_already_moved: bool = False) -> None:
+                      be_already_moved: bool = False,
+                      sl_price: float = 0.0,
+                      runner_size: int = 0) -> None:
         self.registered.append((inst_id, pos_side, size, entry_price))
         self.register_extras.append(
             {"algo_ids": list(algo_ids or []), "tp2_price": tp2_price,
-             "be_already_moved": be_already_moved}
+             "be_already_moved": be_already_moved,
+             "sl_price": sl_price, "runner_size": runner_size}
         )
 
     def poll(self, inst_id: Optional[str] = None) -> list[CloseFill]:
@@ -191,6 +195,13 @@ class FakeMonitor:
         fills = self.queued_fills
         self.queued_fills = []
         return fills
+
+    def get_tracked_runner(self, inst_id: str, pos_side: str):
+        return None  # no-op: dynamic-TP gate exits early in tests
+
+    def revise_runner_tp(self, inst_id: str, pos_side: str, new_tp: float) -> bool:
+        self.revise_calls.append((inst_id, pos_side, new_tp))
+        return True
 
 
 class FakeOKXClient:

@@ -12,9 +12,14 @@ trading:
   # 57s blokluyor, (b) pending-poll run_once başında tek sefer → fill→attach
   # gecikmesi ~240s, (c) zone SL floor bypass. 7→5 per-slot margin'i +40%
   # açar ($714→$1000), cycle bütçesini 180s-üstü worst-case'den kurtarır,
-  # attach race'i daraltır. DOGE + XRP çıkarıldı (ince defter + momentum
-  # wick; toplam kalan: BTC/ETH/SOL/ADA/BNB).
-  symbols: [BTC-USDT-SWAP, ETH-USDT-SWAP, SOL-USDT-SWAP, ADA-USDT-SWAP, BNB-USDT-SWAP]
+  # attach race'i daraltır.
+  # 2026-04-19 (eve): ADA ↔ DOGE swap. ADA demo OI'da platform tavanına
+  # dayandı (sCode 54031 — "open interest reached platform's limit"),
+  # post-only + limit fallback her cycle reddedildi. DOGE/XRP override
+  # map'leri zaten YAML'da duruyordu, ADA yerine DOGE geri alındı. ADA
+  # override'ları (harmless) YAML'da bırakıldı, OI tavanı düşünce geri
+  # almak tek satır. Toplam kalan: BTC/ETH/SOL/DOGE/BNB.
+  symbols: [BTC-USDT-SWAP, ETH-USDT-SWAP, SOL-USDT-SWAP, DOGE-USDT-SWAP, BNB-USDT-SWAP]
   entry_timeframe: 3m
   htf_timeframe: 15m
   ltf_timeframe: 1m
@@ -27,9 +32,13 @@ trading:
   max_leverage: 75
   # TP2 (runner) RR. With partial_tp_enabled=true (default), half the position
   # exits at partial_tp_rr (1.5R) and the remaining half runs to this value.
-  # Weighted max reward when both TPs hit = 0.5×partial_tp_rr + 0.5×default_rr_ratio.
-  # 4.5 ⇒ weighted 3.0R (true 1:3). Drop to 3.0 for weighted 2.25R (legacy).
-  default_rr_ratio: 4.5
+  # 2026-04-19 (post-pivot): hard 1:3 RR enforced via execution.target_rr_ratio.
+  # `apply_zone_to_plan` now forces the final primary TP to entry ± 3 × sl_dist
+  # regardless of heatmap geometry, after operator log showed actual TP landing
+  # at 8-12R despite the symbol_decision claiming 4.5. Keeping default_rr_ratio
+  # at 3.0 here as the pre-zone fallback (entry_signals path) so any code path
+  # that bypasses the zone planner also stays at the hard 1:3 contract.
+  default_rr_ratio: 3.0
   # 2026-04-18: lowered 2.0 → 1.5 to ease `htf_tp_ceiling` rejections on 15m
   # HTF. With buffer=0.2×ATR the clipped-TP RR often lands 1.6-1.9 on
   # DOGE/SOL/XRP — legitimate setups that still clear 2× round-trip fees +
@@ -188,7 +197,13 @@ analysis:
     displacement_candle: 0.6
     liquidity_pool_target: 0.5
     # Per-TF VWAP slots demoted — composite carries the score.
-    vwap_1m_alignment: 0.0
+    # 2026-04-19 (eve): vwap_1m_alignment 0.0 → 0.2 re-opened as a low-weight
+    # probe factor. Rationale: scalp-native pivot emphasized oscillator/overlay
+    # factors; 1m VWAP (tight micro-bias) was the only per-TF VWAP slot worth
+    # keeping alive for Phase 9 GBT to evaluate. Composite remains the primary
+    # VWAP signal (1.25). If GBT confirms signal, raise toward 0.3; if flat,
+    # zero again.
+    vwap_1m_alignment: 0.2
     vwap_3m_alignment: 0.0
     vwap_15m_alignment: 0.0
     vwap_composite_alignment: 1.25
@@ -354,6 +369,27 @@ execution:
   tp_ladder_shares: [0.40, 0.35, 0.25]
   tp_ladder_min_notional_frac: 0.30
 
+  # 2026-04-19 (post-pivot diagnostic) — hard 1:N RR enforcement on the
+  # final primary TP. Operator log on 2026-04-19 showed 5 zone_limit_placed
+  # orders all sized off heatmap clusters that landed 8-12R away despite
+  # symbol_decision claiming 4.5R. `apply_zone_to_plan` now forces
+  # tp_price = entry ± target_rr_ratio × sl_distance and clamps every
+  # ladder rung to that boundary. 0.0 = off (legacy heatmap-cluster TP).
+  target_rr_ratio: 3.0
+
+  # Dynamic TP revision (live-data-driven). When true, the runner
+  # periodically recomputes a fresh target from the live mark + the
+  # SL distance fixed at fill (`target_rr_ratio × sl_dist applied to
+  # the realised entry`) and re-OCOs the runner leg via cancel+place.
+  # `tp_revise_min_delta_atr` × ATR is the minimum drift before a
+  # revision triggers (avoids OCO churn on noise); `tp_revise_cooldown_s`
+  # rate-limits revisions per position; `tp_min_rr_floor` prevents
+  # revising into a sub-floor RR if mark drifts past entry.
+  tp_dynamic_enabled: true
+  tp_min_rr_floor: 1.5
+  tp_revise_min_delta_atr: 0.5
+  tp_revise_cooldown_s: 30.0
+
 derivatives:
   # Phase 1.5 — derivatives data layer. Disabling this short-circuits the
   # Binance WS + Coinalyze poll loop but leaves entry/exit logic untouched,
@@ -453,4 +489,4 @@ rl:
   # in DB for historical audit; reporter + RL train on post-cutoff data
   # only. Bump this cutoff again only if another strategy-level pivot
   # lands.
-  clean_since: "2026-04-19T06:30:00Z"
+  clean_since: "2026-04-19T13:10:00Z"

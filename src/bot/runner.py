@@ -124,6 +124,21 @@ def _direction_to_pos_side(direction: Direction) -> str:
     return "long" if direction == Direction.BULLISH else "short"
 
 
+def _runner_size(num_contracts: int, cfg) -> int:
+    """Size of the runner (TP2) OCO leg, mirroring router._place_algos().
+
+    Partial mode splits ``num_contracts`` into ``size1 = floor(N × ratio)``
+    and ``size2 = N - size1``. The runner OCO is the ``size2`` leg. In
+    non-partial mode the single OCO covers the full ``num_contracts``.
+    Used by the dynamic-TP gate so cancel+place revisions cover the right
+    slice of the position.
+    """
+    if not getattr(cfg.execution, "partial_tp_enabled", False):
+        return int(num_contracts)
+    size1 = int(num_contracts * cfg.execution.partial_tp_ratio)
+    return max(1, num_contracts - size1)
+
+
 def _bias_str(state: MarketState) -> Optional[str]:
     try:
         return state.signal_table.trend_htf.value if state.signal_table else None
@@ -364,7 +379,9 @@ class BotContext:
 
 
 class _DryRunRouter:
-    """Stand-in router for --dry-run: mirrors OrderRouter.place(plan) signature."""
+    """Stand-in router for --dry-run: mirrors OrderRouter surface (`place`,
+    `place_limit_entry`, `attach_algos`) without touching OKX. Keeps the
+    zone-entry path runnable in --dry-run --once smoke tests."""
 
     def __init__(self, config: RouterConfig):
         self.config = config
@@ -378,6 +395,26 @@ class _DryRunRouter:
                 close_on_algo_failure=self.config.close_on_algo_failure,
             )
         return dry_run_report(plan, cfg)
+
+    def place_limit_entry(
+        self, plan, entry_px: float, inst_id: Optional[str] = None,
+        ord_type: str = "post_only", fallback_to_limit: bool = True,
+    ):
+        return OrderResult(
+            order_id="DRYRUN-LIMIT",
+            client_order_id="DRYRUN-LIMIT",
+            status=OrderStatus.PENDING,
+            filled_sz=0.0,
+            avg_price=entry_px,
+        )
+
+    def attach_algos(self, plan, inst_id: Optional[str] = None):
+        return [AlgoResult(
+            algo_id="DRYRUN-ALGO",
+            client_algo_id="DRYRUN-ALGO",
+            sl_trigger_px=plan.sl_price,
+            tp_trigger_px=plan.tp_price,
+        )]
 
 
 class BotRunner:
@@ -761,6 +798,72 @@ class BotRunner:
             if sym == symbol:
                 return side
         return None
+
+    async def _maybe_revise_tp_dynamic(
+        self, symbol: str, pos_side: str, state: MarketState,
+    ) -> None:
+        """Dynamic TP revision: re-anchor the runner OCO TP to the current
+        ``target_rr_ratio × sl_distance`` whenever live data suggests the
+        old placement has drifted past tolerance.
+
+        Why it exists: at fill time we set TP = entry ± target_rr × sl_dist.
+        That snapshot is correct *at fill*, but cancellation pressure (e.g.
+        the entry slipped vs. the limit price, or a partial fill happened)
+        and TP1/BE moves can leave the runner OCO at a stale ratio. The
+        revise re-derives the "ideal 1:N TP" from the live entry/SL state
+        held by the monitor and only fires when the delta passes
+        ``tp_revise_min_delta_atr × ATR`` and at least
+        ``tp_revise_cooldown_s`` have elapsed since the last revise.
+        Disabled when ``execution.target_rr_ratio == 0`` (no contract to
+        enforce) or ``execution.tp_dynamic_enabled == false``.
+        """
+        cfg = self.ctx.config
+        if not cfg.execution.tp_dynamic_enabled:
+            return
+        target_rr = cfg.execution.target_rr_ratio
+        if target_rr <= 0:
+            return
+        snap = self.ctx.monitor.get_tracked_runner(symbol, pos_side)
+        if snap is None:
+            return
+        sl = float(snap.get("sl_price") or 0.0)
+        entry = float(snap.get("entry_price") or 0.0)
+        if sl <= 0 or entry <= 0:
+            return
+        sl_distance = abs(entry - sl)
+        if sl_distance <= 0:
+            return
+        sign = 1 if pos_side == "long" else -1
+        new_tp = entry + sign * target_rr * sl_distance
+        # Guard against revising into a sub-floor RR if mark drifted past
+        # entry (post-BE move or unusual book) — tp_min_rr_floor is a
+        # hard backstop on the proposed RR.
+        floor = cfg.execution.tp_min_rr_floor
+        if floor > 0:
+            min_tp = entry + sign * floor * sl_distance
+            if sign > 0 and new_tp < min_tp:
+                new_tp = min_tp
+            elif sign < 0 and new_tp > min_tp:
+                new_tp = min_tp
+        cur_tp = snap.get("tp2_price")
+        if cur_tp is None:
+            return
+        atr = float(getattr(state, "atr", 0.0) or 0.0)
+        if atr > 0 and abs(float(cur_tp) - new_tp) < cfg.execution.tp_revise_min_delta_atr * atr:
+            return
+        last = snap.get("last_tp_revise_at")
+        if last is not None:
+            elapsed = (_utc_now() - last).total_seconds()
+            if elapsed < cfg.execution.tp_revise_cooldown_s:
+                return
+        try:
+            await asyncio.to_thread(
+                self.ctx.monitor.revise_runner_tp, symbol, pos_side, new_tp,
+            )
+        except Exception:
+            logger.exception(
+                "tp_revise_dispatch_failed symbol={} side={}", symbol, pos_side,
+            )
 
     def _pillar_opposition_for(self, symbol: str) -> Optional[Direction]:
         """Cross-asset opposition signal for `symbol` (Phase 7.A6).
@@ -1164,6 +1267,13 @@ class BotRunner:
                     await self._defensive_close(symbol, open_side, "ltf_reversal")
                     return
 
+        # 2e. Dynamic TP revision — when we still hold a position and the
+        # runner OCO has drifted from the contracted 1:N RR target, cancel +
+        # re-place at the current entry-anchored target. Off when
+        # `execution.tp_dynamic_enabled` is false. Cheap no-op otherwise.
+        if open_side:
+            await self._maybe_revise_tp_dynamic(symbol, open_side, state)
+
         # 3. Symbol-level dedup — skip open if we still hold anything OR
         # already have a pending limit entry waiting for fill (Phase 7.C4).
         if any(k[0] == symbol for k in self.ctx.open_trade_ids):
@@ -1413,9 +1523,11 @@ class BotRunner:
         # 6. In-memory FIRST — can't meaningfully fail; keeps us honest even
         # if the journal write below errors out.
         algo_ids = [a.algo_id for a in report.algos if a.algo_id]
+        runner_size = _runner_size(plan.num_contracts, cfg)
         self.ctx.monitor.register_open(
             symbol, pos_side, float(plan.num_contracts), plan.entry_price,
             algo_ids=algo_ids, tp2_price=plan.tp_price,
+            sl_price=plan.sl_price, runner_size=runner_size,
         )
         self.ctx.risk_mgr.register_trade_opened()
 
@@ -1584,6 +1696,7 @@ class BotRunner:
             zoned_plan = apply_zone_to_plan(
                 plan, zone, contract_size,
                 min_sl_distance_pct=cfg.min_sl_distance_pct_for(symbol),
+                target_rr_cap=cfg.execution.target_rr_ratio,
             )
         except Exception:
             logger.exception(
@@ -1760,9 +1873,11 @@ class BotRunner:
             return
 
         algo_ids = [a.algo_id for a in algos if a.algo_id]
+        runner_size = _runner_size(plan.num_contracts, self.ctx.config)
         self.ctx.monitor.register_open(
             ev.inst_id, ev.pos_side, float(plan.num_contracts), fill_px,
             algo_ids=algo_ids, tp2_price=plan.tp_price,
+            sl_price=plan.sl_price, runner_size=runner_size,
         )
         self.ctx.risk_mgr.register_trade_opened()
 
@@ -1930,12 +2045,14 @@ class BotRunner:
         """
         for rec in await self.ctx.journal.list_open_trades():
             pos_side = _direction_to_pos_side(rec.direction)
+            runner_size = _runner_size(int(rec.num_contracts), self.ctx.config)
             self.ctx.monitor.register_open(
                 rec.symbol, pos_side,
                 float(rec.num_contracts), rec.entry_price,
                 algo_ids=list(rec.algo_ids),
                 tp2_price=rec.tp_price,
                 be_already_moved=rec.sl_moved_to_be,
+                sl_price=rec.sl_price, runner_size=runner_size,
             )
             self.ctx.open_trade_ids[(rec.symbol, pos_side)] = rec.trade_id
             self.ctx.open_trade_opened_at[(rec.symbol, pos_side)] = rec.entry_timestamp

@@ -9,17 +9,34 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 ## Current state (snapshot)
 
 - **Strategy:** zone-based scalper. Confluence ≥ threshold → identify zone → post-only limit order at zone edge → wait N bars → fill | cancel.
-- **Pairs:** 5 OKX perps — `BTC / ETH / SOL / ADA / BNB`. 5 concurrent slots on cross margin (all active, no queue).
+- **Pairs:** 5 OKX perps — `BTC / ETH / SOL / DOGE / BNB`. 5 concurrent slots on cross margin (all active, no queue).
 - **Entry TF:** 3m. HTF context 15m, LTF confirmation 1m.
 - **Scoring:** 5 pillars (Market Structure, Liquidity, Money Flow, VWAP, Divergence) + hard gates (displacement, EMA momentum, VWAP, cross-asset opposition) + ADX regime-conditional weights. *Premium/discount gate temporarily disabled 2026-04-19 — see changelog; to be re-enabled as a soft/weighted factor (~10-15%) post-Phase-9.*
 - **Execution:** post-only limit → regular limit → market-at-edge fallback. OCO SL/TP, partial TP at 1.5R with fee-buffered SL-to-BE on TP1 fill.
 - **Journal:** async SQLite, schema v2 (zone source, wait/fill latency, trend regime, funding Z-scores). `rejected_signals` table with counter-factual outcome pegging.
 - **Tests:** ~682, all green. Demo-runnable end-to-end.
-- **Data cutoff (`rl.clean_since`):** `2026-04-19T06:30:00Z`. Reporter and future RL see only post-pivot trades.
+- **Data cutoff (`rl.clean_since`):** `2026-04-19T13:10:00Z` (bumped after `vwap_1m_alignment` weight flip). Reporter and future RL see only post-pivot trades.
 
 ---
 
 ## Changelog
+
+### 2026-04-19 (eve) — `vwap_1m_alignment` re-opened at 0.2
+
+- **Change:** `config/default.yaml:196` — `vwap_1m_alignment: 0.0 → 0.2`. Other per-TF VWAP slots (3m/15m) remain at 0.0; composite (1.25) unchanged.
+- **Rationale:** 1m LTF currently contributes to confluence via only two factors (`ltf_pattern` 0.75 + `ltf_momentum_alignment` 0.75). `vwap_1m_alignment` was zeroed in the scalp-native rewire because the composite was intended to carry the multi-TF VWAP signal. Re-opening it at a **low-weight probe value** (0.2) gives Phase 9 GBT a per-TF VWAP signal to evaluate independently of the composite — answers "is 1m VWAP directionality distinct alpha, or fully absorbed by composite?" on clean data.
+- **Scoring impact:** ~0.2 point bump on bullish-aligned-to-1m-VWAP trades; trades near the `min_confluence_score=3` threshold may marginally increase. Not a pivot; no architectural change.
+- **Dataset:** `rl.clean_since` bumped `2026-04-19T06:30:00Z → 2026-04-19T13:10:00Z` so post-change trades aren't mixed with pre-change scoring. Cost: 1 closed post-pivot trade (BTC WIN 12:56Z) falls out of clean window.
+- **Re-evaluation:** after Phase 8 gate (50 clean trades + factor-audit), if `vwap_1m_alignment` shows positive SHAP / partial-dependence, raise toward 0.3; if flat or noisy, zero again. This is a probe, not a commitment.
+
+### 2026-04-19 (eve) — ADA ↔ DOGE swap (demo OI cap)
+
+- **Trigger:** post-restart demo run, ADA-USDT-SWAP every cycle rejected with OKX `sCode 54031` — "Order failed. The open interest of ADA-USDT-SWAP has reached the platform's limit." Post-only + limit fallback both hit the same cap. Other 4 pairs unaffected.
+- **Root cause:** OKX demo instrument-level OI ceiling for ADA perp exhausted (demo pool much smaller than live). Not a sizing/margin/leverage issue — platform-side supply block.
+- **Fix:** `config/default.yaml:17` — `ADA-USDT-SWAP` → `DOGE-USDT-SWAP` in `trading.symbols`. `max_concurrent_positions` stays at 5. DOGE per-symbol overrides (leverage cap 30x, swing_lookback 30, session=london, htf_sr_buffer_atr 0.15, min_sl_distance_pct 0.008, regime capitulation_liq_notional $8M) were already present in YAML from the 7→5 rollback — no new overrides needed.
+- **ADA override retention:** ADA rows kept intact in YAML (per the "harmless when not watched" pattern). Reinstating ADA later = single-line flip in `trading.symbols` once OI headroom returns.
+- **Operator action pre-restart:** bot stopped, all resting limit orders cancelled manually. Clean start on next launch.
+- **Test impact:** none — symbol list change is pure config. Full suite 682/682 unchanged.
 
 ### 2026-04-19 (pm) — Unprotected-position hardening + 7→5 pair rollback
 
@@ -228,17 +245,17 @@ Things that aren't self-evident from the code. Inline comments cover the *what*;
 
 ## Currency pair notes
 
-5 OKX perps — BTC / ETH / SOL / ADA / BNB. BTC + ETH + BNB are market pillars (major-class book depth); SOL + ADA are altcoins gated by the cross-asset veto. DOGE + XRP pulled on 2026-04-19 (pm) after the attach-race incident — their per-symbol override maps remain in YAML (harmless when not watched) so re-adding them is one-line after the fix is proven.
+5 OKX perps — BTC / ETH / SOL / DOGE / BNB. BTC + ETH + BNB are market pillars (major-class book depth); SOL + DOGE are altcoins gated by the cross-asset veto. XRP pulled on 2026-04-19 (pm) after the attach-race incident; ADA pulled on 2026-04-19 (eve) after hitting OKX demo OI platform cap (`sCode 54031`). Their per-symbol override maps remain in YAML (harmless when not watched) so reinstating any of them is one-line once the underlying blocker clears.
 
 `max_concurrent_positions=5` (every pair can hold a position simultaneously — no slot competition; confluence gate still picks setups, but cycle isn't queue-limited). Cross margin, `per_slot ≈ total_eq / 5 ≈ $1000` on a $5k demo. R stays 1% of total equity ($50); only the notional ceiling shrinks proportionally.
 
-Cycle timing at 3m entry TF = 180s budget: typical 150–180s with 5 pairs (comfortable inside the budget after 7→5 rollback). DOGE/XRP (if reinstated) + ADA leverage-capped at 30x; SOL/BNB inherit OKX 50x cap.
+Cycle timing at 3m entry TF = 180s budget: typical 150–180s with 5 pairs (comfortable inside the budget after 7→5 rollback). DOGE + ADA (if reinstated) + XRP (if reinstated) leverage-capped at 30x; SOL/BNB inherit OKX 50x cap.
 
-Per-symbol overrides (YAML, DOGE/XRP rows kept for easy reinstatement):
-- `swing_lookback_per_symbol`: ADA=30 (thin 3m book; DOGE/XRP=30 preserved).
-- `htf_sr_buffer_atr_per_symbol`: SOL=0.10 (wide-ATR, narrower buffer); ADA=0.15; BNB inherits global 0.2.
-- `session_filter_per_symbol`: SOL + ADA=[london] only. BNB inherits global (london+new_york) as major.
-- `min_sl_distance_pct_per_symbol`: BTC 0.004, ETH 0.006, SOL 0.010, ADA 0.008, BNB 0.005.
+Per-symbol overrides (YAML, ADA/XRP rows kept for easy reinstatement):
+- `swing_lookback_per_symbol`: DOGE=30 (thin 3m book; ADA/XRP=30 preserved).
+- `htf_sr_buffer_atr_per_symbol`: SOL=0.10 (wide-ATR, narrower buffer); DOGE=0.15; BNB inherits global 0.2.
+- `session_filter_per_symbol`: SOL + DOGE=[london] only. BNB inherits global (london+new_york) as major.
+- `min_sl_distance_pct_per_symbol`: BTC 0.004, ETH 0.006, SOL 0.010, DOGE 0.008, BNB 0.005.
 
 Adding a 6th+ pair: drop into `trading.symbols`, add `okx_to_tv_symbol()` parametrized test, add `derivatives.regime_per_symbol_overrides`, add `min_sl_distance_pct_per_symbol`, watch 20-30 cycles for `htf_settle_timeout` / `set_symbol_failed`. Coinalyze free tier supports ~8 pairs at refresh_interval_s=75s; beyond that needs paid tier or longer interval.
 
@@ -331,7 +348,8 @@ These are candidates, **not commitments.** Re-evaluate after Phase 11 stability.
 - **HTF Order Block re-add** — Pine 3m OBs failed post-pivot (0% WR in Sprint 3). 15m OBs may survive; factor-audit should confirm HTF OB signal before re-enabling.
 - **Pine overlay split** — `smt_overlay.pine` → `_structure.pine` + `_levels.pine`. Parallelizes TV recompute per symbol-switch. Worth the refactor only if freshness-poll latency becomes a bottleneck.
 - **Additional pairs** — 6th+ OKX perp. Coinalyze budget allows ~6 symbols at free tier. Add parametrized instrument spec test + per-symbol YAML overrides before bringing online.
-- **Runner trail / post-TP1 re-evaluation** — dynamic exit after TP1. Deferred from 7.D5; data-driven decision after 100+ post-pivot trades. Are we leaving too much on TP2, or is BE-after-TP1 the right discipline?
+- **1m as a zone source in `setup_planner`** — add `ltf_fvg_entry` and/or `ltf_sweep_retest` as new zone sources (1m unfilled FVG or 1m sweep-reversal). Same architectural pattern as existing sources (zone + post-only limit + `max_wait_bars` cancel), just tighter stops → larger notional at flat R. Expected tradeoff: better micro-entry quality at the cost of higher cancel rate (1m FVGs fill fast). `max_wait_bars` for 1m sources likely needs to be 3-4 (not 10). Data-driven decision: revisit after Phase 9 GBT confirms 1m factors carry weight; if they don't, a 1m zone source likely won't either.
+- **1m-triggered dynamic trail / runner management** — dynamic exit after TP1 using the 1m oscillator. Currently SL-to-BE is static at TP1 fill; a 1m momentum fade could progressively tighten SL on the runner leg. Complements (does not replace) the existing `ltf_reversal_close` defensive-close gate, which is a binary veto, not a trail. Data-driven decision after 100+ post-pivot closed trades — are we leaving too much on TP2, or is BE-after-TP1 the right discipline?
 - **Multi-strategy ensemble** — after scalper matures, add a separate swing module (higher TFs, different pillar weights) and route to shared execution layer. Big scope; only meaningful once scalper is provably stable.
 - **Auto-retrain loop** — monthly RL refresh on rolling window. Cron + CI pipeline. Meaningless until Phase 11 is steady.
 - **Alt-exchange support** — Bybit / Binance futures. Current execution layer is OKX-specific; abstracting `ExchangeClient` is 2-3 weeks of careful refactor.
