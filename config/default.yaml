@@ -361,4 +361,14 @@ rl:
   # for regime comparison; reporter sees only post-cutoff rows. Cutoff set
   # just before operator's bot restart so the first post-restart cycle is
   # the first row reporter counts.
-  clean_since: "2026-04-17T23:50:00Z"
+  #
+  # 2026-04-19T06:30Z — Strategy pivot cutoff. Sprint 3 archived after
+  # 14 trades (WR 28.6%, avg R -0.60) proved the Phase 6.9 stack was
+  # regime-fragile, not mis-tuned. Post-pivot code (5-pillar factor stack,
+  # zone-based entry, cross-asset veto, ADX regime classifier, v2 journal
+  # schema, rejected-signal counter-factuals) shipped 7.A→7.D4 between
+  # 2026-04-19 morning and afternoon. All 46 pre-pivot closed trades stay
+  # in DB for historical audit; reporter + RL train on post-cutoff data
+  # only. Bump this cutoff again only if another strategy-level pivot
+  # lands.
+  clean_since: "2026-04-19T06:30:00Z"
