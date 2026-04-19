@@ -81,6 +81,104 @@ def regime_breakdown(
     }
 
 
+def win_rate_by_symbol(
+    closed: list[TradeRecord],
+) -> dict[str, dict[str, float]]:
+    """Per-symbol WR + expectancy. Same shape as `regime_breakdown`.
+
+    With 5 pairs running, per-symbol tears are invisible in the global
+    win_rate — a 70% BTC paired with a 30% DOGE averages to 'decent' and
+    hides the losing leg.
+    """
+    buckets: dict[str, list[TradeRecord]] = {}
+    for t in closed:
+        buckets.setdefault(t.symbol, []).append(t)
+    return {
+        sym: {
+            "num_trades": len(records),
+            "win_rate": win_rate(records),
+            "avg_r": avg_r(records),
+            "expectancy_r": expectancy_r(records),
+        }
+        for sym, records in buckets.items()
+    }
+
+
+def win_rate_by_factor_combo(
+    closed: list[TradeRecord], *, min_trades: int = 2,
+) -> dict[str, dict[str, float]]:
+    """WR keyed by the *set* of factors that fired together.
+
+    Key is a comma-joined, sorted string of factor names — deterministic
+    across runs, JSON-safe for the RL feature pipeline. Combos seen fewer
+    than `min_trades` times are pooled under 'RARE' so long-tail noise
+    doesn't drown the signal. Bumping `min_trades` is the knob to demand
+    more evidence per combo.
+    """
+    buckets: dict[str, list[TradeRecord]] = {}
+    for t in closed:
+        combo_key = ",".join(sorted(t.confluence_factors)) or "NONE"
+        buckets.setdefault(combo_key, []).append(t)
+    out: dict[str, dict[str, float]] = {}
+    rare: list[TradeRecord] = []
+    for combo, records in buckets.items():
+        if len(records) < min_trades:
+            rare.extend(records)
+            continue
+        out[combo] = {
+            "num_trades": len(records),
+            "win_rate": win_rate(records),
+            "avg_r": avg_r(records),
+        }
+    if rare:
+        out["RARE"] = {
+            "num_trades": len(rare),
+            "win_rate": win_rate(rare),
+            "avg_r": avg_r(rare),
+        }
+    return out
+
+
+_DEFAULT_SCORE_BUCKETS: tuple[tuple[float, float], ...] = (
+    (0.0, 2.0),
+    (2.0, 3.0),
+    (3.0, 4.0),
+    (4.0, 5.0),
+    (5.0, float("inf")),
+)
+
+
+def _bucket_label(low: float, high: float) -> str:
+    if high == float("inf"):
+        return f"{low:.1f}+"
+    return f"{low:.1f}-{high:.1f}"
+
+
+def win_rate_by_score_bucket(
+    closed: list[TradeRecord],
+    *,
+    buckets: tuple[tuple[float, float], ...] = _DEFAULT_SCORE_BUCKETS,
+) -> dict[str, dict[str, float]]:
+    """Bucket `confluence_score` into ranges → per-bucket stats.
+
+    Answers the single question "does higher confluence actually produce
+    better outcomes?" on the clean dataset. Buckets are half-open
+    `[low, high)` so adjacent ranges don't double-count. Empty buckets still
+    emit a key with num_trades=0 so the RL loop reads a stable shape every
+    window.
+    """
+    out: dict[str, dict[str, float]] = {}
+    for low, high in buckets:
+        label = _bucket_label(low, high)
+        records = [t for t in closed if low <= t.confluence_score < high]
+        out[label] = {
+            "num_trades": len(records),
+            "win_rate": win_rate(records),
+            "avg_r": avg_r(records),
+        }
+    return out
+
+
 # ── R-multiples ─────────────────────────────────────────────────────────────
 
 
@@ -231,6 +329,9 @@ def summary(closed: list[TradeRecord], starting_balance: float) -> dict:
         "win_rate_by_session": win_rate_by_session(closed),
         "win_rate_by_factor": win_rate_by_factor(closed),
         "regime_breakdown": regime_breakdown(closed),
+        "win_rate_by_symbol": win_rate_by_symbol(closed),
+        "win_rate_by_factor_combo": win_rate_by_factor_combo(closed),
+        "win_rate_by_score_bucket": win_rate_by_score_bucket(closed),
     }
 
 
@@ -281,6 +382,41 @@ def format_summary(s: dict) -> str:
                 f"    {name:<14} n={stats['num_trades']:<3}  "
                 f"win={_fmt_pct(stats['win_rate'])}  "
                 f"avg_r={stats['avg_r']:+.3f}R"
+            )
+    if s.get("win_rate_by_symbol"):
+        lines.append("")
+        lines.append("  Win rate by symbol:")
+        rows = sorted(
+            s["win_rate_by_symbol"].items(),
+            key=lambda kv: kv[1]["num_trades"], reverse=True,
+        )
+        for name, stats in rows:
+            lines.append(
+                f"    {name:<18} n={stats['num_trades']:<3}  "
+                f"win={_fmt_pct(stats['win_rate'])}  "
+                f"avg_r={stats['avg_r']:+.3f}R"
+            )
+    if s.get("win_rate_by_score_bucket"):
+        lines.append("")
+        lines.append("  Win rate by confluence-score bucket:")
+        for name, stats in s["win_rate_by_score_bucket"].items():
+            lines.append(
+                f"    {name:<10} n={stats['num_trades']:<3}  "
+                f"win={_fmt_pct(stats['win_rate'])}  "
+                f"avg_r={stats['avg_r']:+.3f}R"
+            )
+    if s.get("win_rate_by_factor_combo"):
+        lines.append("")
+        lines.append("  Win rate by factor combo (n >= 2):")
+        rows = sorted(
+            s["win_rate_by_factor_combo"].items(),
+            key=lambda kv: kv[1]["num_trades"], reverse=True,
+        )
+        for name, stats in rows:
+            lines.append(
+                f"    n={stats['num_trades']:<3}  "
+                f"win={_fmt_pct(stats['win_rate'])}  "
+                f"avg_r={stats['avg_r']:+.3f}R  {name}"
             )
     lines.append("=" * 60)
     return "\n".join(lines)

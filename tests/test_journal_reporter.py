@@ -21,7 +21,10 @@ from src.journal.reporter import (
     summary,
     win_rate,
     win_rate_by_factor,
+    win_rate_by_factor_combo,
+    win_rate_by_score_bucket,
     win_rate_by_session,
+    win_rate_by_symbol,
 )
 
 
@@ -37,10 +40,12 @@ def _rec(
     session: str | None = None,
     factors: list[str] | None = None,
     fees: float = 0.0,
+    symbol: str = "BTC-USDT-SWAP",
+    confluence_score: float = 0.0,
 ) -> TradeRecord:
     return TradeRecord(
         trade_id=f"t-{id(object())}",
-        symbol="BTC-USDT-SWAP",
+        symbol=symbol,
         direction=Direction.BULLISH,
         outcome=outcome,
         signal_timestamp=_T,
@@ -50,6 +55,7 @@ def _rec(
         rr_ratio=3.0, leverage=10, num_contracts=5,
         position_size_usdt=1_000.0, risk_amount_usdt=10.0,
         confluence_factors=factors or [],
+        confluence_score=confluence_score,
         session=session,
         pnl_usdt=pnl_usdt, pnl_r=pnl_r, fees_usdt=fees,
     )
@@ -172,6 +178,96 @@ def test_calmar_known_curve():
     assert result == -0.4
 
 
+# ── win_rate_by_symbol ──────────────────────────────────────────────────────
+
+
+def test_win_rate_by_symbol_buckets_correctly():
+    trades = [
+        _win(symbol="BTC-USDT-SWAP"),
+        _win(symbol="BTC-USDT-SWAP"),
+        _loss(symbol="ETH-USDT-SWAP"),
+        _loss(symbol="ETH-USDT-SWAP"),
+    ]
+    result = win_rate_by_symbol(trades)
+    assert result["BTC-USDT-SWAP"]["num_trades"] == 2
+    assert result["BTC-USDT-SWAP"]["win_rate"] == 1.0
+    assert result["ETH-USDT-SWAP"]["win_rate"] == 0.0
+    assert result["ETH-USDT-SWAP"]["avg_r"] == -1.0
+
+
+def test_win_rate_by_symbol_empty_returns_empty():
+    assert win_rate_by_symbol([]) == {}
+
+
+# ── win_rate_by_factor_combo ────────────────────────────────────────────────
+
+
+def test_factor_combo_key_is_sorted_and_joined():
+    trades = [
+        _win(factors=["B", "A"]),
+        _loss(factors=["A", "B"]),
+    ]
+    result = win_rate_by_factor_combo(trades, min_trades=1)
+    # keys deterministic regardless of input order — alphabetical
+    assert "A,B" in result
+    assert result["A,B"]["num_trades"] == 2
+    assert result["A,B"]["win_rate"] == 0.5
+
+
+def test_factor_combo_pools_rare_under_threshold():
+    trades = [
+        _win(factors=["A", "B"]),
+        _win(factors=["A", "B"]),  # combo seen twice → included
+        _loss(factors=["C"]),  # singleton → pooled under RARE
+    ]
+    result = win_rate_by_factor_combo(trades, min_trades=2)
+    assert "A,B" in result
+    assert result["A,B"]["num_trades"] == 2
+    assert result["A,B"]["win_rate"] == 1.0
+    assert "C" not in result
+    assert result["RARE"]["num_trades"] == 1
+    assert result["RARE"]["win_rate"] == 0.0
+
+
+def test_factor_combo_empty_factors_bucket_none():
+    trades = [_win(factors=[]), _win(factors=[])]
+    result = win_rate_by_factor_combo(trades)
+    assert "NONE" in result
+    assert result["NONE"]["num_trades"] == 2
+
+
+# ── win_rate_by_score_bucket ────────────────────────────────────────────────
+
+
+def test_score_bucket_assigns_by_range():
+    trades = [
+        _win(confluence_score=2.5),  # falls in 2.0-3.0
+        _win(confluence_score=2.5),
+        _loss(confluence_score=4.5),  # falls in 4.0-5.0
+    ]
+    result = win_rate_by_score_bucket(trades)
+    assert result["2.0-3.0"]["num_trades"] == 2
+    assert result["2.0-3.0"]["win_rate"] == 1.0
+    assert result["4.0-5.0"]["num_trades"] == 1
+    assert result["4.0-5.0"]["win_rate"] == 0.0
+    # unvisited buckets still emit stable shape with num_trades=0
+    assert result["3.0-4.0"]["num_trades"] == 0
+
+
+def test_score_bucket_half_open_boundary():
+    # upper bound is EXCLUSIVE — 3.0 belongs to 3.0-4.0, not 2.0-3.0
+    trades = [_win(confluence_score=3.0)]
+    result = win_rate_by_score_bucket(trades)
+    assert result["2.0-3.0"]["num_trades"] == 0
+    assert result["3.0-4.0"]["num_trades"] == 1
+
+
+def test_score_bucket_open_top_bucket_captures_high_scores():
+    trades = [_win(confluence_score=7.5)]
+    result = win_rate_by_score_bucket(trades)
+    assert result["5.0+"]["num_trades"] == 1
+
+
 # ── summary / format ────────────────────────────────────────────────────────
 
 
@@ -185,6 +281,8 @@ def test_summary_contains_expected_keys():
         "max_consecutive_losses", "max_drawdown_usdt", "max_drawdown_pct",
         "sharpe_r", "calmar", "starting_balance", "ending_balance",
         "total_return_pct", "win_rate_by_session", "win_rate_by_factor",
+        "win_rate_by_symbol", "win_rate_by_factor_combo",
+        "win_rate_by_score_bucket",
     }
     assert expected.issubset(s.keys())
     assert s["num_trades"] == 2
@@ -198,3 +296,19 @@ def test_format_summary_renders_nonempty_report():
     assert "Win rate" in out
     assert "LONDON" in out
     assert "OB_test" in out
+
+
+def test_format_summary_renders_new_breakdowns():
+    trades = [
+        _win(symbol="BTC-USDT-SWAP", confluence_score=3.5, factors=["OB", "FVG"]),
+        _win(symbol="BTC-USDT-SWAP", confluence_score=3.5, factors=["OB", "FVG"]),
+        _loss(symbol="ETH-USDT-SWAP", confluence_score=2.5, factors=["Sweep"]),
+    ]
+    out = format_summary(summary(trades, starting_balance=5_000.0))
+    assert "Win rate by symbol" in out
+    assert "BTC-USDT-SWAP" in out
+    assert "ETH-USDT-SWAP" in out
+    assert "Win rate by confluence-score bucket" in out
+    assert "3.0-4.0" in out
+    assert "Win rate by factor combo" in out
+    assert "FVG,OB" in out  # sorted combo key

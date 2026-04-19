@@ -22,11 +22,15 @@ from src.journal.reporter import (
     max_consecutive_wins,
     max_drawdown,
     profit_factor,
+    regime_breakdown,
     sharpe_r,
     summary,
     win_rate,
     win_rate_by_factor,
+    win_rate_by_factor_combo,
+    win_rate_by_score_bucket,
     win_rate_by_session,
+    win_rate_by_symbol,
 )
 
 __all__ = [
@@ -42,9 +46,13 @@ __all__ = [
     "max_consecutive_wins",
     "max_drawdown",
     "profit_factor",
+    "regime_breakdown",
     "sharpe_r",
     "summary",
     "win_rate",
     "win_rate_by_factor",
+    "win_rate_by_factor_combo",
+    "win_rate_by_score_bucket",
     "win_rate_by_session",
+    "win_rate_by_symbol",
 ]
