@@ -420,6 +420,8 @@ def build_zone_setup(
 def zone_limit_price(
     direction: Direction, zone: tuple[float, float],
     zone_source: Optional[str] = None,
+    vwap_long_anchor: float = 0.75,
+    vwap_short_anchor: float = 0.25,
 ) -> float:
     """Limit-entry price for `direction` inside `zone`.
 
@@ -427,16 +429,30 @@ def zone_limit_price(
       * Long: zone low (buy-limit below market).
       * Short: zone high (sell-limit above market).
 
-    Zone mid for ``liq_pool_near`` and ``vwap_retest``:
-      * liq_pool_near — the cluster IS the support/resistance target.
-      * vwap_retest — zone now spans (vwap, upper_band) for long /
-        (lower_band, vwap) for short, so zone-mid = vwap ± 0.5σ, i.e.
-        inside the VWAP band on the directional side. Previously used
-        zone.low for long which sat past VWAP on the discount side and
-        rarely filled.
+    Zone mid for ``liq_pool_near`` (cluster IS the target).
+
+    ``vwap_retest`` uses Convention X on the full symmetric VWAP band
+    [lower, upper] where 0.5 = VWAP:
+      * Long zone is (vwap, upper_band); the full band's lower edge is
+        implied at ``low - (high - low)``. Limit = ``low +
+        (2·long_anchor − 1)·(high − low)`` — at anchor 0.5 this collapses
+        to VWAP (zone.low), at 0.75 to the old 0.5σ midpoint (backwards
+        compat default), at 1.0 to the upper band.
+      * Short zone is (lower_band, vwap); limit = ``low +
+        2·short_anchor·(high − low)`` — 0.5 → VWAP, 0.25 → old midpoint,
+        0.0 → lower band.
+
+    Defaults 0.75 / 0.25 preserve the pre-2026-04-21 0.5σ midpoint
+    behaviour; production callers (runner) inject the YAML-configured
+    0.7 / 0.3 to pull entries closer to VWAP.
     """
     low, high = zone
-    if zone_source in ("liq_pool_near", "vwap_retest"):
+    if zone_source == "vwap_retest":
+        width = high - low
+        if _is_long(direction):
+            return low + (2.0 * vwap_long_anchor - 1.0) * width
+        return low + 2.0 * vwap_short_anchor * width
+    if zone_source == "liq_pool_near":
         return (low + high) / 2.0
     return low if _is_long(direction) else high
 
@@ -445,6 +461,8 @@ def apply_zone_to_plan(
     plan: TradePlan, zone: "ZoneSetup", contract_size: float,
     min_sl_distance_pct: float = 0.0,
     target_rr_cap: float = 0.0,
+    vwap_long_anchor: float = 0.75,
+    vwap_short_anchor: float = 0.25,
 ) -> TradePlan:
     """Return a new TradePlan with entry/SL/TP taken from *zone*, re-sized
     so total USDT risk on the structural SL equals `plan.risk_amount_usdt`.
@@ -477,7 +495,11 @@ def apply_zone_to_plan(
         raise ValueError(
             f"direction mismatch: plan={plan.direction} zone={zone.direction}"
         )
-    new_entry = zone_limit_price(zone.direction, zone.entry_zone, zone.zone_source)
+    new_entry = zone_limit_price(
+        zone.direction, zone.entry_zone, zone.zone_source,
+        vwap_long_anchor=vwap_long_anchor,
+        vwap_short_anchor=vwap_short_anchor,
+    )
     new_sl = zone.sl_beyond_zone
     new_tp = zone.tp_primary
     new_sl_distance = abs(new_entry - new_sl)

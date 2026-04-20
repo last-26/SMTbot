@@ -1810,6 +1810,8 @@ class BotRunner:
                 plan, zone, contract_size,
                 min_sl_distance_pct=cfg.min_sl_distance_pct_for(symbol),
                 target_rr_cap=cfg.execution.target_rr_ratio,
+                vwap_long_anchor=cfg.analysis.vwap_zone_long_anchor,
+                vwap_short_anchor=cfg.analysis.vwap_zone_short_anchor,
             )
         except Exception:
             logger.exception(

@@ -238,6 +238,38 @@ class AnalysisConfig(BaseModel):
     trend_regime_ranging_threshold: float = 20.0
     trend_regime_strong_threshold: float = 30.0
 
+    # 2026-04-21 — VWAP-band zone anchor (Convention X: absolute position on
+    # the [lower_band, upper_band] axis where 0.5 = VWAP). Long entries sit
+    # above VWAP on the upper side; short entries sit below VWAP on the
+    # lower side. Previously the `_vwap_zone` limit landed at the 0.5σ
+    # midpoint (equivalent to long_anchor=0.75 / short_anchor=0.25), chosen
+    # arbitrarily. 0.7 / 0.3 pulls the entry closer to VWAP (Fib-lite 0.6
+    # retracement from the outer band), catching the pullback before it
+    # fully retraces to VWAP. Knob is per-direction so the operator can
+    # EQ-hug further (e.g. 0.65 / 0.35) without touching the other leg.
+    vwap_zone_long_anchor: float = 0.7
+    vwap_zone_short_anchor: float = 0.3
+
+    @field_validator("vwap_zone_long_anchor")
+    @classmethod
+    def _long_anchor_on_upper_half(cls, v: float) -> float:
+        if not (0.5 <= v <= 1.0):
+            raise ValueError(
+                f"vwap_zone_long_anchor must be in [0.5, 1.0] "
+                f"(0.5=VWAP, 1.0=upper band); got {v}"
+            )
+        return v
+
+    @field_validator("vwap_zone_short_anchor")
+    @classmethod
+    def _short_anchor_on_lower_half(cls, v: float) -> float:
+        if not (0.0 <= v <= 0.5):
+            raise ValueError(
+                f"vwap_zone_short_anchor must be in [0.0, 0.5] "
+                f"(0.0=lower band, 0.5=VWAP); got {v}"
+            )
+        return v
+
     @field_validator("confluence_weights")
     @classmethod
     def _warn_unknown_weight_keys(cls, v: dict[str, float]) -> dict[str, float]:

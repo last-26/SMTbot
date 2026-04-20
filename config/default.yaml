@@ -319,6 +319,18 @@ analysis:
   trend_regime_ranging_threshold: 20.0 # ADX < this → RANGING.
   trend_regime_strong_threshold: 30.0  # ADX ≥ this → STRONG_TREND.
 
+  # 2026-04-21 — VWAP-band zone anchor (Convention X).
+  # Axis: 0.0 = lower band, 0.5 = VWAP, 1.0 = upper band. Long and short
+  # anchors control where the post-only limit sits inside the ±1σ VWAP band.
+  # 0.7 / 0.3 = 40% of band-half away from VWAP on the directional side
+  # (Fib-lite, closer to VWAP than the former 0.5σ midpoint which equals
+  # 0.75 / 0.25 in this convention). Range: long ∈ [0.5, 1.0], short ∈
+  # [0.0, 0.5]. Nudge toward 0.5 (e.g. 0.65 / 0.35) to hug VWAP tighter;
+  # nudge toward 1.0 / 0.0 to chase the outer band (earlier fills, looser
+  # structure).
+  vwap_zone_long_anchor: 0.7
+  vwap_zone_short_anchor: 0.3
+
 okx:
   base_url: https://www.okx.com
   demo_flag: "1"

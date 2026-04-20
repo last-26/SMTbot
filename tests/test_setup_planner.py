@@ -333,7 +333,9 @@ def test_liq_pool_near_entry_price_is_zone_mid():
     assert zone_limit_price(
         Direction.BULLISH, zone, zone_source="liq_pool_near",
     ) == pytest.approx(99.25)
-    # vwap_retest is now a zone-mid source too (entry at vwap + 0.5σ).
+    # vwap_retest with default anchors (0.75/0.25) collapses to the old
+    # 0.5σ midpoint — backwards-compat contract for callers that don't
+    # thread YAML config through (tests, legacy fixtures).
     assert zone_limit_price(
         Direction.BULLISH, zone, zone_source="vwap_retest",
     ) == pytest.approx(99.25)
@@ -341,6 +343,102 @@ def test_liq_pool_near_entry_price_is_zone_mid():
     assert zone_limit_price(
         Direction.BULLISH, zone, zone_source="ema21_pullback",
     ) == 99.0
+
+
+def test_vwap_retest_long_anchor_pulls_entry_toward_vwap():
+    """long_anchor=0.7 → entry at 40% above VWAP (0.4σ) using the user's
+    2026-04-21 example: VWAP=100, upper=150, long limit at 120."""
+    from src.strategy.setup_planner import zone_limit_price
+    # Long zone is (VWAP, upper_band).
+    zone = (100.0, 150.0)
+    # anchor=0.7 on full [lower=50, upper=150] axis → 50 + 0.7×100 = 120.
+    limit = zone_limit_price(
+        Direction.BULLISH, zone, zone_source="vwap_retest",
+        vwap_long_anchor=0.7, vwap_short_anchor=0.3,
+    )
+    assert limit == pytest.approx(120.0)
+
+
+def test_vwap_retest_short_anchor_pulls_entry_toward_vwap():
+    """short_anchor=0.3 → entry at 40% below VWAP. VWAP=100, lower=50 →
+    short limit at 80 (symmetric with the long=120 case)."""
+    from src.strategy.setup_planner import zone_limit_price
+    # Short zone is (lower_band, VWAP).
+    zone = (50.0, 100.0)
+    # anchor=0.3 on full axis → 50 + 0.3×100 = 80.
+    limit = zone_limit_price(
+        Direction.BEARISH, zone, zone_source="vwap_retest",
+        vwap_long_anchor=0.7, vwap_short_anchor=0.3,
+    )
+    assert limit == pytest.approx(80.0)
+
+
+def test_vwap_retest_anchor_half_collapses_to_vwap():
+    """anchor=0.5 for either direction lands the limit exactly at VWAP
+    (zone.low for long, zone.high for short) — boundary of the valid
+    anchor range."""
+    from src.strategy.setup_planner import zone_limit_price
+    long_zone = (100.0, 150.0)
+    assert zone_limit_price(
+        Direction.BULLISH, long_zone, zone_source="vwap_retest",
+        vwap_long_anchor=0.5, vwap_short_anchor=0.5,
+    ) == pytest.approx(100.0)
+    short_zone = (50.0, 100.0)
+    assert zone_limit_price(
+        Direction.BEARISH, short_zone, zone_source="vwap_retest",
+        vwap_long_anchor=0.5, vwap_short_anchor=0.5,
+    ) == pytest.approx(100.0)
+
+
+def test_vwap_retest_anchor_extremes_hit_outer_bands():
+    """anchor=1.0 for long → upper band (zone.high). anchor=0.0 for short
+    → lower band (zone.low). These are the outer edges of the valid range
+    (maximal distance from VWAP, riskiest fill targets)."""
+    from src.strategy.setup_planner import zone_limit_price
+    long_zone = (100.0, 150.0)
+    assert zone_limit_price(
+        Direction.BULLISH, long_zone, zone_source="vwap_retest",
+        vwap_long_anchor=1.0,
+    ) == pytest.approx(150.0)
+    short_zone = (50.0, 100.0)
+    assert zone_limit_price(
+        Direction.BEARISH, short_zone, zone_source="vwap_retest",
+        vwap_short_anchor=0.0,
+    ) == pytest.approx(50.0)
+
+
+def test_vwap_retest_default_anchors_preserve_midpoint_contract():
+    """Convention X sanity: 0.75 (long) / 0.25 (short) on the full band
+    axis both equal the 0.5σ midpoint — the pre-2026-04-21 behaviour. Any
+    caller that does not pass anchors (tests, legacy) gets the old mid."""
+    from src.strategy.setup_planner import zone_limit_price
+    long_zone = (100.0, 150.0)
+    # Long default 0.75 → 50 + 0.75×100 = 125 = midpoint of (100, 150).
+    assert zone_limit_price(
+        Direction.BULLISH, long_zone, zone_source="vwap_retest",
+    ) == pytest.approx(125.0)
+    short_zone = (50.0, 100.0)
+    # Short default 0.25 → 50 + 0.25×100 = 75 = midpoint of (50, 100).
+    assert zone_limit_price(
+        Direction.BEARISH, short_zone, zone_source="vwap_retest",
+    ) == pytest.approx(75.0)
+
+
+def test_vwap_retest_anchor_applies_in_atr_fallback_path():
+    """When Pine emits no 3m band, `_vwap_zone` falls back to a single-
+    sided ATR half-band ``(vwap, vwap + atr·mult)`` for long — same
+    geometry, different σ. The anchor formula uses (high − low) regardless
+    of whether σ came from the Pine band or the ATR fallback, so 0.7
+    still lands 40% above VWAP inside the synthetic band."""
+    from src.strategy.setup_planner import zone_limit_price
+    # Synthetic long zone: VWAP=100, zone_buffer_atr × ATR = 0.5.
+    zone = (100.0, 100.5)
+    limit = zone_limit_price(
+        Direction.BULLISH, zone, zone_source="vwap_retest",
+        vwap_long_anchor=0.7,
+    )
+    # 100 + (2·0.7 − 1) × 0.5 = 100 + 0.4 × 0.5 = 100.2
+    assert limit == pytest.approx(100.2)
 
 
 # ── HTF FVG (opt-in entry source) ───────────────────────────────────────────

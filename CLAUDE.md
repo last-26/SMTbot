@@ -22,6 +22,42 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 
 ## Changelog
 
+### 2026-04-21 — VWAP-band zone anchor (Convention X)
+
+- **Trigger:** operator flagged that the `_vwap_zone` limit was landing at the 0.5σ midpoint between VWAP and the ±1σ band (arbitrary 50/50 split). Wanted a Fib-lite anchor that pulls the limit closer to VWAP on the directional side — catches the pullback before it fully retraces, with VWAP acting as a natural structural pivot (SL already sits past VWAP per the zone contract). Operator quote: *"üst bant 1 eq 0.5 se ve fiyat yukarı düşünülüyorsa ve fiyat yukarıdaysa 0.7 den işlem atılacak 0.65 de olabilir vwape biraz daha yakın olması açısından. alt bant 0, eq 0.5 ken short girilecekse de yine 0.3 den girilmesi lazım."*
+- **Design decisions (documented in chat before code):**
+  - **Convention X** (absolute position on the [lower_band, upper_band] axis, 0.5 = VWAP) picked over Convention Y (single VWAP-relative scalar) — operator-sezgisel, matches how a human reads the band on a chart. Two knobs per direction, no ambiguity on "which side of VWAP".
+  - **VWAP is NOT a pozisyon-içi invalidation monitor** — only an entry anchor. Explicit rejection of the active-monitor variant (no new cycle gate, no defensive-close path). The existing OCO SL sits past VWAP per the structural zone contract, so a cross of VWAP against the trade still hits the SL naturally.
+  - **Zone width unchanged** — only the zone midpoint shifts. Mevcut ATR-tabanlı tolerans aralığı (`zone_buffer_atr × ATR`) same as before; the `(low, high)` zone still spans VWAP to the band. The anchor formula interpolates inside that existing span.
+  - **Rejim-bağımlılığı deferred** — every ADX regime (`RANGING` / `WEAK_TREND` / `STRONG_TREND` / `UNKNOWN`) uses the same anchor today. Operator's range-EQ observation (true mean-reversion entries at the outer bands with TP at the opposite band) logged as a Phase 12 candidate — needs a separate zone source and does not belong in a single-scalar shift.
+- **Fix — anchor-driven limit inside the VWAP band** (`src/strategy/setup_planner.py`, `src/bot/config.py`, `src/bot/runner.py`):
+  - `zone_limit_price` signature extended with `vwap_long_anchor: float = 0.75` and `vwap_short_anchor: float = 0.25` (defaults preserve the pre-pivot midpoint behaviour; any legacy caller without the new args gets the old 0.5σ mid). For `vwap_retest`: `long_limit = low + (2·long_anchor − 1)·(high − low)`; `short_limit = low + 2·short_anchor·(high − low)`. `liq_pool_near` still uses plain midpoint (the cluster IS the target — no anchor interpretation there).
+  - `apply_zone_to_plan` forwards both anchors (same defaults) into `zone_limit_price`.
+  - `AnalysisConfig.vwap_zone_long_anchor: float = 0.7` + `vwap_zone_short_anchor: float = 0.3`, pydantic-validated `long ∈ [0.5, 1.0]` (strictly on the upper half) and `short ∈ [0.0, 0.5]` (strictly on the lower half). Out-of-half values would place the entry on the wrong structural side of VWAP and are rejected at YAML-load time.
+  - `config/default.yaml` under `analysis:` — inline operator-note explaining 0.5 / 1.0 axis semantics + EQ-hug nudge direction (0.65 / 0.35 for tighter VWAP hug, 0.8 / 0.2 for chasing the outer band).
+  - `BotRunner._apply_zone_to_plan` call (runner.py:1809) threads `cfg.analysis.vwap_zone_long_anchor` + `vwap_zone_short_anchor` into the planner. Production path uses the operator-set 0.7 / 0.3; tests / legacy fixtures keep the 0.75 / 0.25 defaults via unchanged call sites.
+- **Expected behavior change:**
+  - Before: long limit landed at `VWAP + 0.5σ` (halfway to upper band); short at `VWAP − 0.5σ`.
+  - After: long limit lands at `VWAP + 0.4σ` (40% of the way to upper band); short at `VWAP − 0.4σ`.
+  - In user's range-example (VWAP=100, bands=50/150): old long=125 / old short=75 → new long=120 / new short=80.
+  - Fill rate: marginally deeper pullback required (~10% of band width), so fill rate dips slightly vs the 0.5σ mid. Precision: entry sits inside the Fib-lite retracement zone, so when fill does land, SL distance from VWAP is tighter on average — R per unit notional slightly improves.
+  - Relative to a hypothetical VWAP-exact limit (operator's mental baseline), 0.7 / 0.3 is meaningfully earlier — the 0.4σ offset from VWAP captures the pullback before it fully retraces, as the operator explicitly wanted.
+- **Safety rails:**
+  - `long_anchor ∈ [0.5, 1.0]` and `short_anchor ∈ [0.0, 0.5]` — enforces entry stays on the correct structural side of VWAP. An operator typo like `long_anchor=0.3` would otherwise compute `(2·0.3 − 1)·width = −0.4·width` → a long limit BELOW VWAP (below the zone.low), breaking the SL-past-zone contract. Rejected at config load.
+  - Default values preserve backwards compat — the 14 existing `zone_limit_price` / `apply_zone_to_plan` callers across tests pass no anchor args and still get the old 0.5σ midpoint. No test updates needed beyond the 6 new ones that explicitly pass 0.7 / 0.3.
+- **Tests:** 12 new, all green (792 passed, up from 780):
+  - `tests/test_setup_planner.py` — 6 new: long anchor 0.7 → VWAP+0.4σ happy path, short 0.3 → VWAP−0.4σ happy path, anchor=0.5 collapses to VWAP, anchor extremes (1.0 / 0.0) hit outer bands, default anchors preserve midpoint contract, ATR fallback path applies same formula.
+  - `tests/test_bot_config.py` — 6 new: default 0.7 / 0.3, operator EQ-hug (0.65 / 0.35) accepted, long < 0.5 rejected, long > 1.0 rejected, short > 0.5 rejected, short < 0.0 rejected.
+- **Not fixed / explicitly out of scope:**
+  - **ADX-conditional anchor** — not implemented. `RANGING` rejim could benefit from a different entry geometry (mean-reversion at the outer bands, TP at the opposite band) but that's a new zone source, not a parameter tweak. Operator explicitly agreed to rafaya kaldır.
+  - **Asymmetric band handling** — the implementation assumes Pine's symmetric `vwap ± stdev_mult·σ` bands. If a future Pine change produces asymmetric bands (e.g. separate upper/lower multipliers), the Convention X axis semantics still hold but the formula may need revisiting. Not a concern today.
+  - **Active VWAP invalidation monitor** — explicitly rejected in design discussion. If a future data cut shows the existing OCO SL isn't catching VWAP-cross reversals fast enough, revisit as a `ltf_reversal_close`-style defensive gate; not part of this change.
+- **Dataset:** `rl.clean_since` **unchanged** (`2026-04-19T19:55:00Z`). Entry-geometry shift is small (0.5σ → 0.4σ = 10% of band width) and strictly additive to the existing `vwap_retest` zone logic. Realized-R distribution should not regime-shift. Memory'deki "clean_since pin" kuralına sadık kalıyoruz. Post-deploy ilk 10 trade sonrası factor-audit'te anomali görürsek tekrar değerlendiririz.
+- **Re-evaluation:** after ≥30 post-deploy closed trades, check:
+  1. `vwap_retest` fraksiyonunun post-deploy / pre-deploy oranı (bu zone source'un seçilme frekansı). Anchor shift, seçim kriterini değiştirmez ama entry mesafesini değiştirdiği için fill rate düşerse source-priority tablosunda pozisyonu değişebilir.
+  2. `vwap_retest` kaynaklı trade'lerin avg-R'si vs diğer zone source'lar. 0.7/0.3 Fib iddiasının veri ile doğrulanması — 0.5σ midpoint'ten daha iyi R/$ üretmeli.
+  3. Anchor değerini EQ-hug'a (0.65/0.35) çekmek daha iyi mi, outer-band'a (0.8/0.2) çekmek daha iyi mi — GBT phase'de parametrik olarak öğrenilecek.
+
 ### 2026-04-20 — Resting TP limit alongside OCO (maker-TP, wick capture)
 
 - **Trigger:** BTC trade `414b4ca5` observed wicking to TP price then reversing before the OCO's market-on-trigger could fire — SL hit at BE on the pullback, realized ≈ 0R on what was structurally a +3R winner. Operator quote: *"tp seviyesindeki emire fitil gelmiş … limit order şeklinde direkt piyasaya versek olmaz mı. yüksek ihtimal tp sl kısmından girildiği için trigger tetiklenene kadar geri düşmüş olabilir fiyat."* Root cause: OCO's TP leg uses `tpOrdPx="-1"` (market-on-trigger). The trigger fires at mark==tpTriggerPx, then a market order is submitted — by the time that market fill lands, price has already reversed off the wick. Three options weighed (A: trigger-limit-at-tp, B: resting reduce-only limit at tp alongside OCO, C: last-price trigger). Operator picked B: *"resting limit nedir. Normal limit order koysak işte poz miktarı kadar tamam olması lazım."*

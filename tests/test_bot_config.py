@@ -204,6 +204,57 @@ def test_risk_amount_usdt_env_rejects_invalid_float(tmp_path, monkeypatch):
         load_config(cfg_path, env_path=empty_env)
 
 
+def test_vwap_zone_anchor_defaults():
+    """2026-04-21 default: 0.7 long / 0.3 short (pulls entry closer to VWAP
+    than the pre-pivot 0.5σ midpoint, which was 0.75 / 0.25 in Convention X)."""
+    cfg = BotConfig(**_valid_raw())
+    assert cfg.analysis.vwap_zone_long_anchor == 0.7
+    assert cfg.analysis.vwap_zone_short_anchor == 0.3
+
+
+def test_vwap_zone_anchor_accepts_operator_eq_hug():
+    """Operator-facing knob: 0.65 / 0.35 is a valid "EQ-hug" variant the
+    operator explicitly called out as a nudge option."""
+    raw = _valid_raw()
+    raw["analysis"]["vwap_zone_long_anchor"] = 0.65
+    raw["analysis"]["vwap_zone_short_anchor"] = 0.35
+    cfg = BotConfig(**raw)
+    assert cfg.analysis.vwap_zone_long_anchor == 0.65
+    assert cfg.analysis.vwap_zone_short_anchor == 0.35
+
+
+def test_vwap_zone_long_anchor_rejects_below_half():
+    """Long anchor must stay on the upper half of the band — below 0.5
+    would place a long entry below VWAP (wrong structural side)."""
+    raw = _valid_raw()
+    raw["analysis"]["vwap_zone_long_anchor"] = 0.45
+    with pytest.raises(ValidationError, match=r"vwap_zone_long_anchor"):
+        BotConfig(**raw)
+
+
+def test_vwap_zone_long_anchor_rejects_above_one():
+    raw = _valid_raw()
+    raw["analysis"]["vwap_zone_long_anchor"] = 1.1
+    with pytest.raises(ValidationError, match=r"vwap_zone_long_anchor"):
+        BotConfig(**raw)
+
+
+def test_vwap_zone_short_anchor_rejects_above_half():
+    """Short anchor must stay on the lower half — above 0.5 would place a
+    short entry above VWAP (wrong structural side)."""
+    raw = _valid_raw()
+    raw["analysis"]["vwap_zone_short_anchor"] = 0.6
+    with pytest.raises(ValidationError, match=r"vwap_zone_short_anchor"):
+        BotConfig(**raw)
+
+
+def test_vwap_zone_short_anchor_rejects_negative():
+    raw = _valid_raw()
+    raw["analysis"]["vwap_zone_short_anchor"] = -0.1
+    with pytest.raises(ValidationError, match=r"vwap_zone_short_anchor"):
+        BotConfig(**raw)
+
+
 def test_symbol_leverage_caps_lookup_missing_symbol_returns_default():
     """Unlisted symbols return the caller's default — the runner merges
     min(global, okx_cap, ...dict.get(sym, global)) so missing key = no cap."""
