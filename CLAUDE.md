@@ -22,6 +22,24 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 
 ## Changelog
 
+### 2026-04-20 — Phantom-cancel fix (orphan resting limits)
+
+- **Trigger:** operator observed 2 extra resting limit orders on BTC + DOGE while 5 positions were already open (BTC long orphan @ 74053.4 sz=12, DOGE long orphan @ 0.09345 sz=64 — both unrelated to the live positions, no OCO attached). Operator quote: *"Pozisyon olan paritede 2. bir long işlemi neden var … ben manuel olarak iptal ediyorum. Sen de kod üzerinde bir daha böyle bir şey yaşanmaması için bu sorunu düzelt."*
+- **Root cause:** `PositionMonitor.poll_pending` + `cancel_pending` emitted a CANCELED event and dropped the pending row **even when the OKX cancel call failed with a non-idempotent error** (sCode 50001 "service temporarily unavailable", or any generic exception). Smoking-gun log lines confirmed it: `pending_timeout_cancel_failed … code=50001 … emitting CANCELED anyway`. Both orphans originated from 2026-04-20 04:08 / 04:12 UTC during a brief OKX transient outage — the monitor claimed the limits were canceled, runner cleared the pending slot, next cycle placed fresh limits that eventually filled (current 5 positions), old limits remained live as unmonitored orphans. If price had drifted ~0.7-0.8% down, they'd have filled into unprotected longs (no OCO, no journal row, no MFE lock, no dynamic-TP revise).
+- **Fix** (`src/execution/position_monitor.py`):
+  - `poll_pending` — added `cancel_landed: bool` tracker. Set to True only on (a) success, or (b) idempotent-gone `OrderRejected` code in `{51400, 51401, 51402}`. Non-gone `OrderRejected` (e.g. 50001) and generic exceptions log + `continue` — pending row is preserved so the next poll retries. Old path emitted CANCELED + popped the row unconditionally after the except clause; new path only emits + pops when `cancel_landed=True`.
+  - `cancel_pending` — mirror fix, but **re-raises** on non-gone failure instead of swallow+continue (caller-driven cancel; caller needs to know the cancel didn't land so it can retry/alert). Idempotent-gone still swallowed as success. No production callers today — only test callers — so re-raise is a safe contract tightening.
+  - Log wording changed from "emitting CANCELED anyway" → "keeping tracking, retry next poll" (poll) / "re-raising" (cancel_pending). The prior wording was literally the bug description.
+- **Tests:** 5 new regressions in `tests/test_pending_monitor.py`:
+  - `test_poll_pending_keeps_row_when_timeout_cancel_fails_transient` — sCode 50001 on cancel → no event, row preserved, one cancel attempt logged.
+  - `test_poll_pending_keeps_row_when_timeout_cancel_raises_generic` — same for non-`OrderRejected` exceptions.
+  - `test_poll_pending_retries_cancel_on_next_poll_after_transient_failure` — first poll fails, second poll succeeds → row finally clears, both cancel calls recorded.
+  - `test_cancel_pending_reraises_on_non_gone_rejection` — caller-driven cancel + sCode 50001 → `pytest.raises(OrderRejected)`, row preserved.
+  - `test_cancel_pending_reraises_on_generic_exception` — same for `RuntimeError`.
+- **Probe script:** `scripts/probe_open_orders.py` — read-only diagnostic listing live positions + pending limits + pending algos. Handy for future orphan hunts without touching account state.
+- **Dataset:** `rl.clean_since` unchanged. This is a correctness fix to the cancel path; it doesn't shift scoring, sizing, or exit geometry on post-deploy trades.
+- **Operator contract:** on the next OKX transient outage, the bot will log the failure and keep retrying each poll (180s cycle cadence) until the cancel lands. Pending order stays in the monitor until OKX says it's truly gone. No phantom orphans.
+
 ### 2026-04-20 — MFE-triggered SL lock (Option A)
 
 - **Trigger:** operator observed two open shorts almost touching TP (~2.5R MFE) then reversing. With single-leg 3R OCO + dynamic TP revise + partial TP disabled, nothing protects a deep winner from round-tripping back to -1R — the static SL sits at plan distance forever. Operator quote: *"shortlar neredeyse tp seviyesin yakın bir yerden döndü … burada girişte stop olmak yerine nasıl bir geliştirme yapabiliriz"*. Four options discussed (MFE-lock, ATR-trail, momentum-fade near TP, partial-TP reinstatement at 2R); picked Option A for its simplicity + high-EV "risk removal" contract.

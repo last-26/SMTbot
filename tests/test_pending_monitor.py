@@ -241,3 +241,99 @@ def test_cancel_pending_idempotent_when_okx_reports_gone():
     assert ev is not None
     assert ev.event_type == "CANCELED"
     assert monitor.pending_count == 0
+
+
+# ── Regression: 2026-04-20 phantom-cancel bug ──────────────────────────────
+#
+# OKX sCode 50001 ("service temporarily unavailable") hit the cancel path
+# during a transient outage. The monitor previously logged the failure and
+# emitted CANCELED anyway — dropping tracking while the order stayed live
+# on OKX as a phantom orphan. When the next cycle placed a new limit at a
+# similar price, the account ended up with two resting longs on the same
+# symbol that could fill into unprotected positions.
+#
+# Fix: cancel failures that are NOT idempotent-gone (51400/1/2) must keep
+# the pending row tracked so the next poll retries.
+
+
+def test_poll_pending_keeps_row_when_timeout_cancel_fails_transient():
+    """sCode 50001 on cancel → keep the row, no event, next poll retries."""
+    monitor, fake = _mk()
+    old = datetime.now(UTC) - timedelta(seconds=300)
+    _register(monitor, max_wait_s=60.0, placed_at=old)
+    fake.order_states["LIM-1"] = {"state": "live"}
+    fake.cancel_raises = OrderRejected(
+        "service temporarily unavailable", code="50001", payload={},
+    )
+
+    events = monitor.poll_pending()
+
+    assert events == []
+    assert monitor.pending_count == 1
+    # Cancel was attempted once; row is preserved for retry.
+    assert fake.cancel_calls == [("BTC-USDT-SWAP", "LIM-1")]
+
+
+def test_poll_pending_keeps_row_when_timeout_cancel_raises_generic():
+    """Non-OrderRejected exception (network-level) — same behavior as 50001."""
+    monitor, fake = _mk()
+    old = datetime.now(UTC) - timedelta(seconds=300)
+    _register(monitor, max_wait_s=60.0, placed_at=old)
+    fake.order_states["LIM-1"] = {"state": "live"}
+    fake.cancel_raises = RuntimeError("tcp reset")
+
+    events = monitor.poll_pending()
+
+    assert events == []
+    assert monitor.pending_count == 1
+
+
+def test_poll_pending_retries_cancel_on_next_poll_after_transient_failure():
+    """Cancel fails once, succeeds on the next poll — row finally clears."""
+    monitor, fake = _mk()
+    old = datetime.now(UTC) - timedelta(seconds=300)
+    _register(monitor, max_wait_s=60.0, placed_at=old)
+    fake.order_states["LIM-1"] = {"state": "live"}
+
+    # First poll: transient failure.
+    fake.cancel_raises = OrderRejected("busy", code="50001", payload={})
+    events1 = monitor.poll_pending()
+    assert events1 == []
+    assert monitor.pending_count == 1
+
+    # Second poll: OKX recovered.
+    fake.cancel_raises = None
+    events2 = monitor.poll_pending()
+    assert len(events2) == 1
+    assert events2[0].event_type == "CANCELED"
+    assert events2[0].reason == "timeout"
+    assert monitor.pending_count == 0
+    # Cancel was attempted twice (one failed, one succeeded).
+    assert fake.cancel_calls == [
+        ("BTC-USDT-SWAP", "LIM-1"),
+        ("BTC-USDT-SWAP", "LIM-1"),
+    ]
+
+
+def test_cancel_pending_reraises_on_non_gone_rejection():
+    """Caller-driven cancel + sCode 50001 → re-raise, keep tracking. The
+    caller needs to know the cancel didn't land so they can retry or alert."""
+    monitor, fake = _mk()
+    _register(monitor)
+    fake.cancel_raises = OrderRejected("busy", code="50001", payload={})
+
+    with pytest.raises(OrderRejected):
+        monitor.cancel_pending("BTC-USDT-SWAP", "long", reason="invalidated")
+
+    assert monitor.pending_count == 1
+
+
+def test_cancel_pending_reraises_on_generic_exception():
+    monitor, fake = _mk()
+    _register(monitor)
+    fake.cancel_raises = RuntimeError("tcp reset")
+
+    with pytest.raises(RuntimeError):
+        monitor.cancel_pending("BTC-USDT-SWAP", "long", reason="manual")
+
+    assert monitor.pending_count == 1

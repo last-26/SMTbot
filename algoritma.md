@@ -386,6 +386,7 @@ Her biri silent-fail durumunda bile stratejik doğruluğu koruyan ek katman:
 7. **SL-to-BE never spins**: cancel ve place ayrı try-block'lar. `{51400,51401,51402}` idempotent. 3 cancel attempt sonrası `be_already_moved=True` (poll hammering kesilir). Place failure after cancel → UNPROTECTED + CRITICAL log (otomatik market-close yok).
 8. **Risk manager replay** (`journal.replay_for_risk_manager`): restart'ta kapanan trade'lerden `peak_balance`, `consecutive_losses`, `current_balance` yeniden kurar. Drawdown breaker permanent halt (manual clear gerekir).
 9. **SL-to-BE rehydrate preservation**: `trades.sl_moved_to_be` flag'i restart'ta `be_already_moved=True` olarak forward edilir → monitor SL'i ikinci kez taşımaz.
+10. **Pending-cancel phantom guard (2026-04-20)**: `PositionMonitor.poll_pending` + `cancel_pending` artık yalnızca cancel gerçekten landed olduğunda (OKX success veya idempotent-gone `{51400,51401,51402}`) CANCELED emit eder + pending satırını düşürür. Non-idempotent hata (sCode 50001 service-unavailable) veya generic exception durumunda satır korunur; `poll_pending` bir sonraki poll'da yeniden dener, `cancel_pending` caller'a raise eder. Öncesi: hata logla + CANCELED emit et + satırı düşür → OKX'te order canlı kalıyordu (phantom resting limit); next cycle aynı sembolde yeni limit açıyor, iki bağımsız long orphan olarak hesaba takılı kalabiliyordu. Production'da 2026-04-20 04:08-04:12 UTC transient outage'ında BTC + DOGE'de tetiklendi.
 
 ---
 

@@ -721,21 +721,35 @@ class PositionMonitor:
             if age_s < p.max_wait_s:
                 continue
 
+            cancel_landed = False
             try:
                 self.client.cancel_order(p.inst_id, p.order_id)
+                cancel_landed = True
             except OrderRejected as exc:
                 # 51400/1/2: order already gone. Treat as success.
-                if not self._cancel_error_is_already_gone(exc):
+                if self._cancel_error_is_already_gone(exc):
+                    cancel_landed = True
+                else:
                     logger.warning(
                         "pending_timeout_cancel_failed inst={} ord={} "
-                        "code={} msg={} — emitting CANCELED anyway",
+                        "code={} msg={} — keeping tracking, retry next poll",
                         p.inst_id, p.order_id, exc.code, str(exc),
                     )
             except Exception:
                 logger.exception(
-                    "pending_timeout_cancel_exception inst={} ord={}",
+                    "pending_timeout_cancel_exception inst={} ord={} "
+                    "— keeping tracking, retry next poll",
                     p.inst_id, p.order_id,
                 )
+
+            if not cancel_landed:
+                # OKX rejected the cancel with a non-idempotent error (e.g.
+                # sCode 50001 service-unavailable) or the call raised a
+                # generic exception. Previously we emitted CANCELED and
+                # dropped tracking — the order stayed live on OKX as a
+                # phantom resting limit that could later fill into an
+                # unprotected position. Keep the row; next poll retries.
+                continue
 
             # If something filled before the cancel landed, surface it as
             # FILLED so the runner places an OCO on the real remainder.
@@ -763,8 +777,12 @@ class PositionMonitor:
         """Caller-driven cancel (e.g. runner detects zone invalidation).
 
         Returns the CANCELED event on success, or None if no pending row
-        existed for that (inst_id, pos_side). Idempotent OKX errors are
-        swallowed the same way `poll_pending` swallows them.
+        existed for that (inst_id, pos_side). Idempotent OKX errors
+        (51400/1/2) are treated as success — the order is gone either way.
+        Transient / non-idempotent errors (e.g. sCode 50001) re-raise to
+        the caller; the pending row is kept so the caller can retry. If
+        we silently popped on transient failure, the order could remain
+        live on OKX as a phantom orphan (see 2026-04-20 changelog).
         """
         key = (inst_id, pos_side)
         p = self._pending.get(key)
@@ -776,14 +794,17 @@ class PositionMonitor:
             if not self._cancel_error_is_already_gone(exc):
                 logger.warning(
                     "pending_manual_cancel_failed inst={} ord={} code={} "
-                    "msg={} reason={} — emitting CANCELED anyway",
+                    "msg={} reason={} — keeping tracking, re-raising",
                     p.inst_id, p.order_id, exc.code, str(exc), reason,
                 )
+                raise
         except Exception:
             logger.exception(
-                "pending_manual_cancel_exception inst={} ord={} reason={}",
+                "pending_manual_cancel_exception inst={} ord={} reason={} "
+                "— keeping tracking, re-raising",
                 p.inst_id, p.order_id, reason,
             )
+            raise
         self._pending.pop(key, None)
         return PendingEvent(
             p.inst_id, p.pos_side, p.order_id,
