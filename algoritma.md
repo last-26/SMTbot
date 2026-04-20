@@ -1,6 +1,6 @@
 # algoritma.md — Kanonik Strateji Spesifikasyonu
 
-> **Son güncelleme:** 2026-04-20 &nbsp;|&nbsp; **CLAUDE.md hash:** `1929b66`
+> **Son güncelleme:** 2026-04-20 &nbsp;|&nbsp; **CLAUDE.md son hash:** `git log -1 --format=%h -- CLAUDE.md`
 >
 > Bu dosya, botun **an-itibarıyla çalışan** karar algoritmasının referans-manuelidir. *Niye* ve *ne zaman* sorularının tarihli cevapları [`CLAUDE.md`](./CLAUDE.md) changelog'undadır; tick-seviye akış hikâyesi [`docs/trade_lifecycle.md`](./docs/trade_lifecycle.md) dosyasındadır. **Bu dosya her zaman CLAUDE.md ile senkron kalmalıdır** — senkron dışı bıraktığınızda `.claude/settings.json` Stop hook'u uyarı verir, `git commit` yaparken de PreToolUse hook'u blok atar (bkz. §16).
 >

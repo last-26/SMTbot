@@ -78,184 +78,49 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 - **Smoke (`--dry-run --once`):** 2 PLANNED decisions (ETH short + BNB short) at ~$50 total realized target on $5000 dry-run balance. Per-symbol math: BNB `contracts=202 notional=$4663 risk_price_only=$45.41` → total incl fee reserve ≈ $50.08 (ceil overshoot $0.08). ETH `contracts=755139 risk_price_only=$42.86` → total ≈ $50 (tighter overshoot due to fine ctu).
 - **Restart note:** operator has 0 open positions + 0 pending algos at time of this change (verified earlier this session). Next fresh bot cycle will produce positions sized under ceil regime.
 
-### 2026-04-19 (late night, cont.) — Partial TP disabled
+### 2026-04-19 — Scalp-native pivot series (consolidated)
 
-- **`execution.partial_tp_enabled: true → false`** (`config/default.yaml:332`).
-- **Trigger:** post-hard-1:3-cap review of expected USDT reward per winning trade. Operator's mental model: "$55 SL risk → $165 TP reward" per position at 1% R on a $5.5k demo. With `partial_tp_enabled=true`, **full-win geometry = 2.25R** (50% @ 1.5R + 50% @ 3R = 0.75R + 1.5R). Plus int-contract rounding already shrinks actual_risk below nominal $55, so effective full-win USDT reward landed around **$97-$110**, not **$165**. Operator quote: *"tp1 tp2 olarak böldüğümüz kısımı da kaldıralım. bu sayede... beklediğim o 3R lık karı elde etmiş olurum."*
-- **Effect:** `OrderRouter._place_algos` (`src/execution/order_router.py:218-251`) already branches on the flag — with `false`, it places a single OCO covering `plan.num_contracts` at `plan.tp_price = entry ± 3 × sl_distance`. TP1 leg no longer exists; SL-to-BE callback is inert (no TP1 fill ever triggers). `move_sl_to_be_after_tp1` kept as `true` (no-op while partial is off; flipping partial back on later reinstates original BE behavior without a second toggle).
-- **Trade-off — expectancy shift, not pure upside:**
-  - *Before (partial on):* full-win = 2.25R; "almost-win" (TP1 hits, TP2 reverses to BE) = +0.75R. Loss = -1R. So a 50% WR with 50% "almost-wins" = 0.5×2.25 + 0.5×0.75 - 0 = **1.5R avg**, or 33% WR + 33% almost + 33% loss = **0.75R avg**.
-  - *After (partial off):* full-win = 3R; no "almost-win" bucket — TP1-touched-then-reverse is now a full -1R loss. 50% WR → 0.5×3 - 0.5 = **1.25R avg**, 33% WR → 0.33×3 - 0.67 = **0.33R avg**.
-  - **Break-even WR (pre-fees):** was 1/(1+rr_effective) ≈ 22% at 2.25R + 0.75R bucket; now 1/(1+3) = **25%** at pure 3R. 3-point WR threshold increase. Winners earn more; "survives without winning" paths no longer exist.
-- **Mechanical side-effects:**
-  - `_runner_size` (`src/bot/runner.py:133-145`) returns full `num_contracts` (not the TP2 slice), so dynamic TP revision (`_maybe_revise_tp_dynamic`) now covers the whole position — intended.
-  - `entry_signals._apply_partial_tp_split_feasibility` (`entry_signals.py:794`) bypassed — the `insufficient_contracts_for_split` reject reason no longer fires. No YAML/CLAUDE.md changes to the reject list needed (it stays in the unified list for historical trades; fresh trades just don't hit it).
-  - `OCOAttachResult.algo_ids` becomes a 1-element list instead of 2. `PositionMonitor._Tracked.algo_ids[-1]` still points to the (now sole) OCO, so `revise_runner_tp` cancel+place flow works unchanged.
-- **Open-positions impact:** 5 positions currently open were built with partial TP on, so each has TWO OCOs on OKX (TP1 at 1.5R + TP2/runner at 3R). This YAML flip **does not** migrate them — they keep their split structure until closed. Dynamic TP revise will continue to rewrite **only the runner leg** (TP2) to 3R per the hard cap; TP1 at 1.5R stays live on the book. Operator can manually cancel TP1 legs on OKX if they want the full 3R payout on the existing 5, but that's a destructive action and isn't automated here.
-- **Dataset:** `rl.clean_since` bumped `2026-04-19T17:30:00Z → 2026-04-19T17:35:00Z`. Rationale: single-leg 3R expectancy regime is a meaningful OCO-geometry shift from split-OCO; mixing the two in reporter or RL windows would confuse avg-R metrics. Cost: 5 mins of pre-flip clean-window is re-dirtied; no closed trades in that window (the 5 open positions opened earlier).
-- **Re-evaluation:** after ≥30 post-flip closed trades, factor-audit checks:
-  1. Post-flip WR vs. 25% break-even. If < 25% net of fees, the partial-TP "almost-win" bucket was load-bearing — flip back on.
-  2. Distribution of "max-favorable-excursion hit 1.5R then reversed" trades — if significant, that's the -0.75R swing that partial mode used to bank. Data will tell if dropping this bucket is net-positive.
-- **Tests:** no code changes; YAML-only flip. Full suite **729 passed** with new default. Tests that explicitly pass `partial_tp_enabled=True`/`=False` as kwargs (`test_partial_tp.py`, `test_entry_signals.py:551-600`) remain valid — they exercise both branches regardless of YAML default.
+Single-day rewire sequence. Detailed commits preserved in git log (`git log --oneline --grep="2026-04-19"`). 2026-04-20 MFE-lock and 2026-04-19 (late night, cont. #2) ceil-sizing kept verbatim above — re-evaluation still pending; everything below is stable.
 
-### 2026-04-19 (late night) — TP-revise hardening + demo-wick artefact cross-check
+**Scalp-native rewire (morning):**
+- Zone priority: `vwap_retest → ema21_pullback → fvg_entry (3m) → sweep_retest → liq_pool_near`. HTF 15m FVG demoted to opt-in.
+- New sources: `ema21_pullback` (EMA21/55 stack + price within `zone_atr × ATR` of EMA21), entry-TF `fvg_entry`.
+- Liquidity flipped from entry-driver to TP-driver. `liq_pool_near` gated by `liq_entry_near_max_atr=1.5` + notional `≥ 2.5× side-median`.
+- Weights rebalanced toward oscillator/overlay (`vwap_composite=1.25`, `money_flow=1.0`, `osc_HCS=1.5`, `divergence=1.25`); structure weights trimmed. Candle buffer `last(50) → last(100)` for EMA55 SMA-seed.
+- TP ladder (`tp_ladder_enabled=true`, shares `[0.40, 0.35, 0.25]`) — inert because `partial_tp_enabled=false` (disabled same day).
 
-Bundled follow-up to the 2026-04-19 fixes. Two incidents drove this:
+**Gate changes (sequential):**
+- `analysis.premium_discount_veto_enabled: true → false` — range-bound tape rejected every zone on `wrong_side_of_premium_discount`. Re-enable post-Phase-9 as soft/weighted factor (~10-15% weight).
+- `analysis.htf_sr_ceiling_enabled: true → false` — hard 1:3 + tight 15m levels killed nearly all longs via `htf_tp_ceiling`; flag also gates `_push_sl_past_htf_zone`. `min_sl_distance_pct_per_symbol` floors still primary wick protection. Re-evaluate Phase-9; consider splitting flag into TP-ceiling vs SL-push.
 
-1. **BNB 17:50 UNPROTECTED after dynamic TP revise**: runner OCO cancelled, replacement rejected with OKX `51277` (trigger on wrong side of mark) because the revise path computed `new_tp = entry + target_rr × sl_distance` where `sl_distance` had collapsed to ~0. Root cause: after SL-to-BE, `_Tracked.sl_price` was mutated to the BE price — the same field dynamic TP used for ratio math. Post-BE the "SL distance" was entry − BE ≈ 0, producing a TP target essentially on top of mark.
-2. **Demo-wick poisoning**: OKX demo book produces wicks that never hit real exchanges. SL/TP triggered at `last` price fired on these fake ticks; the journal then recorded artefact fills that would poison RL training data.
+**Unprotected-position hardening (pm):**
+- **Zone SL floor re-apply** — `apply_zone_to_plan(min_sl_distance_pct=…)` re-widens structural SL past per-symbol floor (mirrors entry_signals widening; R flat via notional re-size).
+- **Pre-attach mark-vs-SL guard** — `runner._handle_pending_filled` reads mark before `attach_algos`; if already breached, skip + best-effort close.
+- **Coinalyze 429 non-blocking** — `self._rate_pause_until` replaces `asyncio.sleep(retry_after)` (event loop no longer stalls 57s).
+- **Inline pending drain** — `run_once` drains pending between symbols, not once-per-tick; fill→OCO-attach latency 180s → <10s.
+- **Attach-failure log enrichment** — `OrderRejected.code` + `.payload` surfaced.
+- Symbol count 7→5 (dropped DOGE+XRP; per-slot margin +40%). Later ADA↔DOGE swap (`sCode 54031` OI cap). Per-symbol overrides for absent symbols kept in YAML.
 
-**Fix A — Immutable `plan_sl_price` for TP ratio math** (`src/execution/position_monitor.py`, `src/bot/runner.py`)
-- `_Tracked` gained immutable `plan_sl_price` — set once at `register_open`, never mutated by SL-to-BE. The existing `sl_price` remains the *active* SL leg (BE-aware) used by the real SL/TP order.
-- `register_open(... plan_sl_price: Optional[float] = None)` with sentinel semantics: `None` → fall back to `sl_price` (legacy callers), explicit `0.0` → "unknown, disable revise" (rehydrate path for BE-moved positions after restart).
-- `get_tracked_runner` exposes `plan_sl_price` verbatim (no fallback) so the runner sees 0.0 when unknown.
-- `runner._maybe_revise_tp_dynamic` reads `plan_sl_price`; `plan_sl <= 0` short-circuits revise (avoids posting degenerate-RR OCOs).
-- Three `register_open` call sites thread `plan_sl_price`: `_try_place_zone_entry` (`plan.sl_price`), `_handle_pending_filled` (`plan.sl_price`), `_rehydrate_open_positions` (`0.0` if `sl_moved_to_be` else `rec.sl_price`).
+**Hard 1:3 RR cap + dynamic TP revision (night):**
+- `apply_zone_to_plan(target_rr_cap=3.0)` — zone-derived TP force-clamped to `entry ± 3 × sl_distance`. `execution.target_rr_ratio` + `trading.default_rr_ratio` both 3.0 (guarded by `test_default_yaml_runner_tp_is_hard_1_3`).
+- `PositionMonitor.revise_runner_tp` — runner OCO cancel+place per cycle, gates: `tp_revise_min_delta_atr=0.5`, cooldown 30s, floor 1.5R. BE-aware via `_Tracked.sl_price`.
 
-**Fix B — Enriched CRITICAL place-failure logs** (`src/execution/position_monitor.py`)
-- SL-to-BE and revise place-failure paths now log `code=` and `payload=` from `OrderRejected`. Previously `err={!r}` dropped those fields, so every `51277`/`51008`/etc. looked identical in the log.
+**VWAP band-based zone (night):**
+- Pine `ta.vwap(src, anchor, stdev_mult=1.0)` emits `vwap_3m_upper/lower` in SMT Signals.
+- `_vwap_zone` uses bands when 3m VWAP is nearest; zone mid = `vwap ± 0.5σ`. ATR fallback when Pine bands missing.
+- Entry distance from market `0.77-1.54%` → `0.52-0.63%`.
 
-**Fix C — Verify 51400 against live algos before placing replacement** (`src/execution/position_monitor.py`, `src/execution/okx_client.py`)
-- OKX demo has been observed returning `51400` ("algo does not exist") on a cancel call while the algo is still on the book. Placing a replacement OCO at that point leaves **two** stops on the position, both firing back-to-back at the next adverse wick.
-- New `OKXClient.list_pending_algos(inst_id, ord_type="oco")` + `PositionMonitor._verify_algo_gone(inst_id, algo_id)` helper. When cancel returns an idempotent code (`51400/51401/51402`), we now query the live pending algos; only if the specific `algoId` is truly absent do we proceed to place the replacement. Network/API failure on the verify query is treated as NOT-gone (conservative; retry next poll).
+**Partial TP disabled (late night):**
+- `execution.partial_tp_enabled: true → false`. Full-win payout 2.25R → 3R; "almost-win" +0.75R bucket gone (TP1-reversal now full -1R). Break-even WR shift 22% → 25%.
+- `move_sl_to_be_after_tp1` flag kept but inert. Runner coverage bumped to full `num_contracts`. Existing split positions keep 2-OCO structure until closed.
 
-**Katman 1 — Mark-price SL/TP triggers** (`src/execution/okx_client.py`, `src/execution/order_router.py`, `src/execution/position_monitor.py`, `src/bot/config.py`, `config/default.yaml`)
-- `place_oco_algo(..., trigger_px_type: str = "mark")` now emits `slTriggerPxType`/`tpTriggerPxType` when set. OKX defaults to `last` which means a single demo-book wick fires SL/TP. `mark` uses the exchange's index-weighted mark which is immune to demo-only wicks.
-- Threaded top-to-bottom: `RouterConfig.algo_trigger_px_type`, `PositionMonitor.__init__(algo_trigger_px_type=...)`. `ExecutionConfig.algo_trigger_px_type: "mark"` (YAML-overridable; flip to `"last"` to restore legacy behavior).
-- SL-to-BE replacement OCO and runner-TP revision OCO both now use the configured trigger type.
+**TP-revise hardening + demo-wick artefact cross-check (late night):**
+- **Immutable `plan_sl_price`** — `_Tracked` preserves plan SL distance for dynamic TP math even after SL-to-BE mutates `sl_price`. Sentinel `0.0` = unknown, disables revise.
+- **51400 verify-before-replace** — `OKXClient.list_pending_algos` + `_verify_algo_gone` confirms algo truly absent after idempotent cancel code before placing replacement OCO (prevents double-stops).
+- **Mark-price SL/TP triggers** — `place_oco_algo(trigger_px_type="mark")` on all OCO paths. Demo last-price-only wicks no longer fire.
+- **Binance artefact cross-check** — new `BinancePublicClient.get_kline_around`; `_cross_check_close_artefacts` validates entry+exit inside concurrent Binance USD-M 1m candle (tolerance 5 bps). Journal schema v3 adds `demo_artifact`, `artifact_reason`. `scripts/report.py --exclude-artifacts`.
 
-**Katman 2 — Post-close Binance cross-check for artefact detection** (new: `src/data/public_market_feed.py`; updates: `src/journal/models.py`, `src/journal/database.py`, `src/bot/config.py`, `src/bot/runner.py`, `scripts/report.py`)
-- New `BinancePublicClient.get_kline_around(binance_symbol, ts_ms)` fetches the concurrent Binance USD-M futures 1m kline for a given timestamp. Failure-isolated: every method returns `None` on network error, non-200, parse failure, empty list.
-- `okx_swap_to_binance_futures("BTC-USDT-SWAP") → "BTCUSDT"`; rejects non-SWAP symbols (returns `None` → cross-check skips).
-- Journal schema v3 additions on `trades`: `real_market_entry_valid INTEGER`, `real_market_exit_valid INTEGER`, `demo_artifact INTEGER`, `artifact_reason TEXT`. Idempotent `ALTER TABLE` migrations; `_row_to_record` tri-state bool parser (`None`/`0`/`1`).
-- `BotRunner._cross_check_close_artefacts` runs after `journal.record_close`: maps symbol, fetches entry + exit candles via `asyncio.to_thread`, applies `price_inside_candle(price, candle, tolerance_pct)`. Both sides invalid → `demo_artifact=True` with reason like `"exit_above_binance_high"`. Any checked side invalid → flag set. Both feed-down → flag stays `None` (tri-state). Failure swallowed (never breaks journal close).
-- `execution.artefact_check_enabled=true`, `artefact_check_timeout_s=5.0`, `artefact_check_tolerance_pct=0.0005` (5 bps — catches blatant demo wicks without flagging routine OKX-vs-Binance microstructure skew).
-- `scripts/report.py --exclude-artifacts` filters `demo_artifact=1` rows out of the summary so operator can compare artefact-excluded vs raw PnL.
-
-**Tests:** 30 new + 7 existing updated.
-- `tests/test_public_market_feed.py` (19 cases): symbol mapping, `price_inside_candle` band + tolerance, `get_kline_around` happy path + 4 failure modes.
-- `tests/test_journal_artifact_flags.py` (4 cases): round-trip, all-None, unknown-id raises `KeyError`, mixed-validity tri-state.
-- `tests/test_runner_artefact_cross_check.py` (6 cases): client=None, unmappable symbol, both sides inside (valid), exit above real high (flagged), partial feed None, both sides missing.
-- FakeClients in `test_order_router.py`, `test_partial_tp.py`, `test_position_monitor.py`, `test_sl_to_be.py` gained `trigger_px_type` kwarg; `test_sl_to_be.py` and `test_position_monitor.py::FakeRevisableClient` gained `list_pending_algos` stub.
-- `tests/conftest.py:FakeMonitor.register_open` accepts `plan_sl_price`.
-- Full suite **729 passed**.
-
-**Dataset:** `rl.clean_since` unchanged (`2026-04-19T17:30:00Z`) — no trading-behavior regression from these changes; they're defensive. Mark-trigger switch is expected to *reduce* artefact SL/TP fills; the Binance cross-check labels any remaining artefacts for filtering at report/RL time.
-
-**Re-evaluation:** after ≥30 closed post-deploy trades, inspect `demo_artifact` distribution. If it's >5% the mark-trigger switch didn't help enough and we should tighten tolerance or investigate instrument-specific OKX demo behavior. If it's ~0%, mark-trigger did its job and the cross-check is belt-and-suspenders — keep it on, low-cost.
-
-**Restart note:** existing open positions rehydrate with `plan_sl_price=0.0` when `sl_moved_to_be=True` (dynamic TP revise disabled for them — safer than reviving with degenerate sl_distance). Fresh entries post-restart get the full protection chain.
-
-### 2026-04-19 (night) — VWAP band-based zone for `vwap_retest`
-
-- **Trigger:** post-1:3-RR-cap demo pass 16:26Z → 17:00Z (~34min). All 4 limit orders (BTC/ETH/SOL/DOGE) placed at `vwap_retest` zones **0.77%–1.54% below market** timed out after 10 bars with zero fills. Operator quote: *"giriş yerleri neye göre belirlendi belki biraz daha yakına getirilebilir… vwap cidden işleyen bir metrik, TradingView'deki gibi high-eq-low bantları bizde de olsun."*
-- **Root cause:** `_vwap_zone` returned `(target − 0.25·ATR, target + 0.25·ATR)` and `zone_limit_price` picked `zone.low` for long → entry sat *past* VWAP on the discount side. A static ATR buffer has no relationship to session-realised VWAP volatility, so tight tape sessions never retest down to the limit. Fill rate <5% observed.
-- **Fix — Pine (3m VWAP ±1σ bands):**
-  - `pine/smt_overlay.pine:149-154` — 3m VWAP switched to 3-arg `ta.vwap(src, anchor=timeframe.change("D"), stdev_mult=1.0)`. Returns `[vwap, upper_band, lower_band]` via tuple-returning function inside `request.security`.
-  - `pine/smt_overlay.pine:1136-1148` — two new SMT Signals rows: `vwap_3m_upper`, `vwap_3m_lower`. `sigTable` capacity 23 → still fits (22/23 used).
-  - 1m / 15m VWAPs kept as single-value (bands scoped to entry TF).
-- **Fix — Python:**
-  - `src/data/models.py:SignalTableData` — `vwap_3m_upper`, `vwap_3m_lower` fields (default 0.0 = missing).
-  - `src/data/structured_reader.py` — parses new rows with `_parse_leading_float`.
-  - `src/strategy/setup_planner.py:_vwap_zone` — rewritten: long zone = `(vwap, upper_band)`, short zone = `(lower_band, vwap)`. When 3m is the nearest VWAP *and* Pine emitted bands, band-based zone fires. Otherwise: single-sided ATR half-band on the directional side of VWAP (still above VWAP for long, below for short — never past VWAP on the far side like the old zone).
-  - `src/strategy/setup_planner.py:zone_limit_price` — `vwap_retest` added to mid-entry list alongside `liq_pool_near`. Entry sits at zone mid = `vwap ± 0.5σ` when bands available, or `vwap ± 0.5·0.25·ATR` on fallback. Pullback-edge sources (`ema21_pullback`, `sweep_retest`, `fvg_entry`) still use near-edge — unchanged.
-  - SL math unchanged: `sl_beyond_zone` = `zone.low − sl_buffer·ATR` for long. With new zone shape, this puts SL just below VWAP (structurally meaningful — long thesis broken if VWAP fully reclaimed from above).
-- **Tests:** 4 new — band-based long zone, band-based short zone, ATR fallback when 3m bands missing (session too young / older Pine), 3m bands ignored when 1m is nearer. 5 existing tests updated for new entry-mid math (vwap_retest apply_zone_to_plan cases). Full suite **699 passed**.
-- **Smoke (`--dry-run --once`):** entry distances from market price dropped from **0.77%–1.54%** (pre-fix) to **0.52%–0.63%** (post-fix) on ATR fallback alone. Live Pine bands will further adapt to realised session volatility — tight tape → band narrows → entry closer; volatile tape → band widens → entry farther (protects against false fills).
-- **Dataset:** `rl.clean_since` bumped `2026-04-19T16:15:00Z → 2026-04-19T17:30:00Z`. Cost: pre-rewire post-disable window (~1h15m) falls out of clean data. The 4 timed-out limits never opened positions so no trade data lost.
-- **Re-evaluation:** after ≥50 closed post-rewire trades, Phase 9 GBT checks whether `vwap_retest` WR diverges from other sources. If band-based entries show positive lift over ATR-fallback entries (same source, different zone shape), treat the stdev-band path as canonical and drop ATR fallback; if no meaningful difference, keep fallback for resilience.
-- **Restart note:** 2 open positions at time of deploy — OCOs on OKX side are live and independent of bot. Bot reconciles on startup via `OKXClient.get_positions` + `monitor.register_open`. `sl_moved_to_be` flag preserved via DB. Safe to restart.
-
-### 2026-04-19 (night) — HTF TP/SR ceiling temporarily disabled
-
-- **`analysis.htf_sr_ceiling_enabled: true → false`** (`config/default.yaml:121`).
-- **Trigger:** post-restart demo pass 14:16Z → 16:10Z (~2h) produced **17 NO_TRADE decisions across 5 pairs, 10 of which rejected on `htf_tp_ceiling`** with confluence 3.95–6.50 (well above threshold 3.0). Only 1 order placed (BNB BULLISH via `vwap_retest` at 14:58Z) — the one pair whose direction flipped mid-window. Other 4 pairs stuck in a 0.2% range with 15m resistance sitting inside 1.5R of entry — `_apply_htf_tp_ceiling` trimmed TP below `min_rr_ratio=1.5` → plan rejected.
-- **Root cause:** the new hard 1:3 RR cap (this morning) + tight-tape 15m-level clustering combine poorly. The gate was correct in principle (don't TP past a 15m resistance), but against a 1:3 contract with the 15m pool acting as the range ceiling it kills almost every long. Operator wants indicator-reversal signals to execute cleanly during data collection rather than wait for the range to break.
-- **Side effect:** flag also gates `_push_sl_past_htf_zone` (`entry_signals.py:745`) — so SL is no longer auto-widened past HTF zones on entry. `min_sl_distance_pct_per_symbol` floors (BTC 0.4%, ETH 0.6%, SOL 1.0%, DOGE 0.8%, BNB 0.5%) remain the primary wick-protection layer. Dynamic TP revision (`tp_dynamic_enabled`) and `ltf_reversal_close` still active for post-fill defense.
-- **Dataset:** `rl.clean_since` bumped `2026-04-19T13:10:00Z → 2026-04-19T16:15:00Z`. Cost: all pre-disable trades from this demo run (incl. the BNB 14:58Z open position) fall out of clean window. Post-disable trades train on the new gate regime only.
-- **Re-evaluation:** after ≥50 post-disable closed trades, Phase 9 GBT factor audit decides the path. Three outcomes:
-  1. HTF-ceiling distance has positive WR impact → restore as hard gate.
-  2. Only the SL-push side has lift → split the flag into `htf_sr_tp_ceiling_enabled` + `htf_sr_sl_push_enabled` (code change, 1 new flag + 2 branches in `plan_and_size_entry`).
-  3. Neither shows lift → leave off permanently, update CLAUDE.md hard-gate list to drop the reference.
-- **Tests:** no code changes — YAML flag flip only. `test_entry_signals.py` still passes its HTF-ceiling tests with `htf_sr_ceiling_enabled=True` passed explicitly. `test_default_yaml_runner_tp_is_hard_1_3` unaffected (guards `target_rr_ratio`/`default_rr_ratio` alignment only).
-
-### 2026-04-19 (night) — Hard 1:3 RR cap + dynamic TP revision
-
-- **Trigger:** post-restart demo log showed 5 zone_limit_placed orders all sized off heatmap clusters that landed 8-12R away from entry (e.g. BTC `sl=$300 → tp=$3600`, 12:1 effective) despite `symbol_decision` claiming RR=4.5. Operator quote: *"100 dolar stop loss başına 300 dolar kar yani 1:3 olacak şekilde setuplar kurulmasını istiyorum. Ayrıca illaki bu tp seviyeleri tek seferlik eklenmesi yerine anlık gelen verilerle yorumlanıp dinamik bir şekilde öne veya arkaya çekilebilmeli."*
-- **Root cause:** `apply_zone_to_plan` overrode `plan.tp_price` with `zone.tp_primary` (= nearest unswept liq cluster from heatmap) with no RR bound. The `default_rr_ratio=4.5` knob never reached the runner because the zone path bypassed it entirely.
-- **Fix — hard 1:N cap:**
-  - `src/strategy/setup_planner.py:apply_zone_to_plan` — new `target_rr_cap` param. When > 0, primary TP is forced to `entry ± cap × sl_distance` and every ladder rung is clamped to the same boundary.
-  - `src/bot/config.py:ExecutionConfig` — new `target_rr_ratio` (default 0.0 = off; YAML sets 3.0).
-  - `config/default.yaml` — `execution.target_rr_ratio: 3.0` + `trading.default_rr_ratio: 4.5 → 3.0` (entry_signals fallback aligned). Guard test `test_default_yaml_runner_tp_is_hard_1_3` enforces both knobs match.
-  - `src/bot/runner.py:_try_place_zone_entry` — threads `cfg.execution.target_rr_ratio` into the planner.
-- **Fix — dynamic TP revision:**
-  - `src/execution/position_monitor.py:revise_runner_tp(inst_id, pos_side, new_tp)` — cancels `algo_ids[-1]` (runner OCO), places fresh OCO using the **active** SL (BE-aware via `_Tracked.sl_price`) and `_Tracked.runner_size`. Idempotent cancel codes `{51400, 51401, 51402}` treated as success. Place failure after cancel → trim algo_ids, CRITICAL log "runner unprotected" — no auto market-close.
-  - `_Tracked` extended with `sl_price` + `runner_size` + `last_tp_revise_at`; `register_open` accepts both as kwargs; SL-to-BE updates `t.sl_price` in place.
-  - `src/bot/runner.py:_maybe_revise_tp_dynamic(symbol, pos_side, state)` — recomputes target from live state each cycle (`new_tp = entry + sign × target_rr × sl_dist`), gates on `tp_revise_min_delta_atr × ATR` (avoid OCO churn) + `tp_revise_cooldown_s` rate-limit + `tp_min_rr_floor` (don't revise into sub-floor RR if mark drifted past entry). Dispatched via `asyncio.to_thread(monitor.revise_runner_tp, ...)`. Wired into `_run_one_symbol` between LTF reversal close and dedup.
-  - `config/default.yaml` — `execution.tp_dynamic_enabled: true`, `tp_min_rr_floor: 1.5`, `tp_revise_min_delta_atr: 0.5`, `tp_revise_cooldown_s: 30.0`.
-- **Tests:** 13 new — 5 `apply_zone_to_plan(target_rr_cap=)` cases (long/short clamp, ladder collapse, off-mode, post-widening recompute), 7 `revise_runner_tp` cases (happy path, no-op, untracked, idempotent cancel, unknown cancel error, place-fail unprotect, BE-aware SL preservation), 1 YAML guard. `tests/conftest.py:FakeMonitor` extended with `sl_price`/`runner_size` kwargs + `revise_runner_tp` + `get_tracked_runner` stubs. `runner._DryRunRouter` gained `place_limit_entry` + `attach_algos` stubs so the smoke test exercises the zone path. Full suite **695 passed**.
-- **Smoke (`--dry-run --once`):** all 5 symbols place zone limits at exactly 1:3. Example BTC: `entry=75332.49 sl=75633.82 tp=74428.50 rr=3.00` vs. operator log's `tp=71698.52 ≈ 12R` pre-fix.
-- **Re-tuning:** to change RR contract (e.g. 1:2 or 1:4), flip `execution.target_rr_ratio` AND `trading.default_rr_ratio` together — the guard test will catch drift. Do NOT introduce weighted-reward calculations as a substitute for the hard cap.
-
-### 2026-04-19 (eve) — `vwap_1m_alignment` re-opened at 0.2
-
-- **Change:** `config/default.yaml:196` — `vwap_1m_alignment: 0.0 → 0.2`. Other per-TF VWAP slots (3m/15m) remain at 0.0; composite (1.25) unchanged.
-- **Rationale:** 1m LTF currently contributes to confluence via only two factors (`ltf_pattern` 0.75 + `ltf_momentum_alignment` 0.75). `vwap_1m_alignment` was zeroed in the scalp-native rewire because the composite was intended to carry the multi-TF VWAP signal. Re-opening it at a **low-weight probe value** (0.2) gives Phase 9 GBT a per-TF VWAP signal to evaluate independently of the composite — answers "is 1m VWAP directionality distinct alpha, or fully absorbed by composite?" on clean data.
-- **Scoring impact:** ~0.2 point bump on bullish-aligned-to-1m-VWAP trades; trades near the `min_confluence_score=3` threshold may marginally increase. Not a pivot; no architectural change.
-- **Dataset:** `rl.clean_since` bumped `2026-04-19T06:30:00Z → 2026-04-19T13:10:00Z` so post-change trades aren't mixed with pre-change scoring. Cost: 1 closed post-pivot trade (BTC WIN 12:56Z) falls out of clean window.
-- **Re-evaluation:** after Phase 8 gate (50 clean trades + factor-audit), if `vwap_1m_alignment` shows positive SHAP / partial-dependence, raise toward 0.3; if flat or noisy, zero again. This is a probe, not a commitment.
-
-### 2026-04-19 (eve) — ADA ↔ DOGE swap (demo OI cap)
-
-- **Trigger:** post-restart demo run, ADA-USDT-SWAP every cycle rejected with OKX `sCode 54031` — "Order failed. The open interest of ADA-USDT-SWAP has reached the platform's limit." Post-only + limit fallback both hit the same cap. Other 4 pairs unaffected.
-- **Root cause:** OKX demo instrument-level OI ceiling for ADA perp exhausted (demo pool much smaller than live). Not a sizing/margin/leverage issue — platform-side supply block.
-- **Fix:** `config/default.yaml:17` — `ADA-USDT-SWAP` → `DOGE-USDT-SWAP` in `trading.symbols`. `max_concurrent_positions` stays at 5. DOGE per-symbol overrides (leverage cap 30x, swing_lookback 30, session=london, htf_sr_buffer_atr 0.15, min_sl_distance_pct 0.008, regime capitulation_liq_notional $8M) were already present in YAML from the 7→5 rollback — no new overrides needed.
-- **ADA override retention:** ADA rows kept intact in YAML (per the "harmless when not watched" pattern). Reinstating ADA later = single-line flip in `trading.symbols` once OI headroom returns.
-- **Operator action pre-restart:** bot stopped, all resting limit orders cancelled manually. Clean start on next launch.
-- **Test impact:** none — symbol list change is pure config. Full suite 682/682 unchanged.
-
-### 2026-04-19 (pm) — Unprotected-position hardening + 7→5 pair rollback
-
-- **Trigger:** post-scalp-native demo pass surfaced 3 UNPROTECTED positions (BTC / DOGE / XRP). Log pattern: `pending_fill_algo_attach_failed_position_UNPROTECTED err=OrderRejected('place_algo_order: (no message)')` → OKX sCode 51277 (trigger already on wrong side of mark between fill and OCO attach).
-- **Root causes diagnosed:**
-  1. **Zone SL floor bypass** — `apply_zone_to_plan` overrode entry_signals' widened SL with a tighter structural SL (`zone.sl_beyond_zone` = sl_buffer_atr × ATR past zone edge); sub-floor stops got wicked out instantly.
-  2. **Coinalyze 429 blocked the entire event loop** for up to 57s via `asyncio.sleep(retry_after)` in the shared request path → pending-poll + monitor + all symbol cycles stalled together.
-  3. **Pending poll only ran once per `run_once`** (~180-240s per full cycle), so a fill could sit that long before `attach_algos` fired — long enough for mark to cross the SL trigger.
-  4. **Single-balance-query 51008 race** with 7 concurrent zone entries competing for cross-margin free-margin.
-  5. **Logger stripped `OrderRejected.code` / `.payload`** (`err={!r}`) — failures were unactionable.
-- **Fixes applied:**
-  - **Phase A (quick wins)**
-    - `config/default.yaml` — `trading.symbols` 7→5 (dropped DOGE + XRP, kept BTC/ETH/SOL/ADA/BNB); `max_concurrent_positions` 7→5. Per-slot margin $714 → $1000 (+40%), cycle time comes in under 180s budget.
-    - `src/bot/runner.py` — attach-algo CRITICAL log extended with `getattr(exc, 'code', None)` + `getattr(exc, 'payload', None)`.
-  - **Phase B (safety)**
-    - `src/strategy/setup_planner.py:apply_zone_to_plan` — new `min_sl_distance_pct` parameter; widens zone SL to per-symbol floor when structural SL lands inside it (mirrors `entry_signals.py` widening pattern, R stays flat via notional re-size). Call site `runner.py:1576` threads `cfg.min_sl_distance_pct_for(symbol)`.
-    - `src/bot/runner.py:_handle_pending_filled` — pre-attach mark-vs-SL guard: `client.get_mark_price` before `attach_algos`; if mark already breached `plan.sl_price`, skip attach and best-effort `close_position`. Second `close_position` failure → CRITICAL log, manual intervention (emergency close not automated).
-  - **Phase C (infra)**
-    - `src/data/derivatives_api.py` — 429 no longer awaits `asyncio.sleep(retry_after)`. Sets `self._rate_pause_until = now + retry_after`, returns None immediately; subsequent requests short-circuit while the pause is active. Callers fall back to stale/None snapshots (their existing failure-isolation path).
-    - `src/bot/runner.py:run_once` — `_process_pending()` now drains inline between symbols, not just once per tick. Fill → OCO-attach latency drops from ~180-240s to single-digit seconds.
-- **Tests:** `tests/test_derivatives_api.py::test_request_retries_on_429_with_retry_after` rewritten → `test_request_429_short_circuits_without_blocking` (asserts no inline sleep, `_rate_pause_until` set, subsequent calls short-circuit). Full suite 682/682 still green.
-- **Operator action pre-deploy:** manually closed the 3 UNPROTECTED positions + 5 resting limit orders (~$500 profit). No open positions / no pending orders on restart.
-- **Re-tightening (future):** 7→5 is a mitigation, not a verdict on DOGE/XRP. After 50 post-fix closed trades, revisit adding them back; momentum wick + thin book were never the root cause — the attach race was.
-
-### 2026-04-19 — Premium/discount gate temporarily disabled
-
-- **`analysis.premium_discount_veto_enabled: true → false`** (`config/default.yaml:245`).
-- **Reason:** range-bound tape after scalp-native rewire → all 7 symbols chronically rejecting on `wrong_side_of_premium_discount`; zone-based entries (VWAP retest, EMA21 pullback, FVG, sweep) never got to fire. Operator opted to let the zone layer take over for data collection.
-- **Re-enable plan:** bring back as a *soft / weighted* factor, **not** a hard gate. Target weight equivalent ~**10-15%** of final confluence contribution (exact form — inverse distance from midpoint, scaled penalty, or pillar-style factor — to be chosen from Phase 9 GBT output).
-- **Dataset implication:** trades opened during this window are NOT P/D-disciplined. If factor-audit shows "premium long / discount short" bleeding WR, bump `rl.clean_since` forward before RL training so Phase 10 doesn't learn chase-the-move behavior.
-- **Other gates unchanged:** displacement, EMA momentum, VWAP, cross-asset opposition still active. No code changes, no test changes.
-
-### 2026-04-19 — Scalp-native rewire
-
-- **Zone priority reordered** (`src/strategy/setup_planner.py`): `vwap_retest → ema21_pullback → fvg_entry (entry-TF) → sweep_retest → liq_pool_near`. HTF FVG demoted to opt-in (`htf_fvg_entry_enabled=false`).
-- **New source `ema21_pullback`**: fires when EMA21/55 stack aligns with direction and price is within `zone_atr × ATR` of EMA21 (half-ATR band around EMA21).
-- **New source `fvg_entry`**: entry-TF (3m) unfilled FVG from `state.active_*_fvgs()`. HTF 15m FVG stays available but behind the flag.
-- **Liquidity role flipped**: primary use is TP, not entry. `liq_pool_near` now gated by two filters — `liq_entry_near_max_atr=1.5` (distance) AND `liq_entry_magnitude_mult=2.5` (notional ≥ 2.5× side-median). Entry price = zone mid, not edge.
-- **TP ladder from liquidity heatmap** (`tp_ladder_enabled=true`, shares `[0.40, 0.35, 0.25]`, `min_notional_frac=0.30`). `TradePlan.tp_ladder` + `ZoneSetup.tp_ladder` added; falls back to single-leg when heatmap absent.
-- **Weights rebalanced** (`src/analysis/multi_timeframe.py` DEFAULT_WEIGHTS): oscillator/overlay dominant — `vwap_composite_alignment=1.25`, `money_flow_alignment=1.0`, `oscillator_high_conviction_signal=1.5`, `divergence_signal=1.25`; structure weights trimmed (`htf_trend_alignment=0.5`, `at_order_block=0.6`, `at_fvg=0.75`).
-- **Runner**: candle buffer bumped `last(50) → last(100)` so EMA55 SMA-seed has clean history.
-- **Config surface**: `execution.ema21_pullback_enabled`, `execution.htf_fvg_entry_enabled`, `execution.liq_entry_near_max_atr`, `execution.liq_entry_magnitude_mult`, `execution.tp_ladder_*`.
-- **Tests**: `tests/test_setup_planner.py` rewritten (30 cases covering new priority, gates, ladder). Full suite 682/682.
+**`vwap_1m_alignment` re-opened at 0.2 (eve):** low-weight probe for Phase-9 GBT to evaluate per-TF VWAP alpha independent of composite.
 
 ---
 
