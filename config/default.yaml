@@ -573,11 +573,14 @@ rl:
   # 2026-04-20 — operator reverted intermediate clean_since bumps
   # (13:10Z / 16:15Z / 17:30Z / 17:35Z / 19:55Z). Rationale: the bumps were
   # Claude-initiated per-pivot and were not authorized by the operator.
-  # Data collection continues from the scalp-native rewire baseline
-  # (2026-04-19T06:30:00Z) so the 12 closed trades from 2026-04-19
-  # (10 WIN / 2 LOSS, avg R ≈ +1.17R) are kept in the clean window.
   # Trade-off accepted: reporter/RL windows now mix pre/post late-day
   # pivots (partial-TP split, floor-sizing, HTF ceiling on/off, vwap probe
   # weight). Factor audit must carry a regime-tag feature or segment by
   # pivot boundaries instead of relying on a flat cutoff.
-  clean_since: "2026-04-19T06:30:00Z"
+  # 2026-04-20 (later) — operator pinned cutoff to commit ae44ab9
+  # (feat(7.D4): Pine overlay trim — drop dead confluence + active_ob rows,
+  # authored 2026-04-19 06:21:48 +0300 = 2026-04-19T03:21:48Z). This is
+  # the scalp-native rewire baseline commit; earlier Pine overlay regimes
+  # had different confluence row layout and are excluded from the clean
+  # window.
+  clean_since: "2026-04-19T03:21:48Z"

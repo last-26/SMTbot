@@ -223,3 +223,73 @@ def test_get_positions_raises_on_envelope_error():
 def test_get_mark_price_parses_float():
     client, _ = _make_client()
     assert client.get_mark_price("BTC-USDT-SWAP") == pytest.approx(67250.5)
+
+
+# ── TP resting limit (2026-04-20 maker-TP alongside OCO) ───────────────────
+
+
+def test_place_reduce_only_limit_long_sends_sell_side_post_only():
+    client, sdk = _make_client()
+    res = client.place_reduce_only_limit(
+        inst_id="BTC-USDT-SWAP", pos_side="long",
+        size_contracts=3, px=73000.0, td_mode="cross",
+    )
+    assert res.order_id == "42"
+    name, kw = sdk.trade.calls[-1]
+    assert name == "place_order"
+    assert kw["instId"] == "BTC-USDT-SWAP"
+    assert kw["side"] == "sell"
+    assert kw["posSide"] == "long"
+    assert kw["ordType"] == "post_only"
+    assert kw["reduceOnly"] is True
+    assert kw["sz"] == "3"
+    assert kw["px"] == "73000.0"
+    assert kw["tdMode"] == "cross"
+    assert kw["clOrdId"].startswith("smttp")
+
+
+def test_place_reduce_only_limit_short_sends_buy_side():
+    client, sdk = _make_client()
+    client.place_reduce_only_limit(
+        inst_id="ETH-USDT-SWAP", pos_side="short",
+        size_contracts=10, px=2200.5,
+    )
+    _, kw = sdk.trade.calls[-1]
+    assert kw["side"] == "buy"
+    assert kw["posSide"] == "short"
+
+
+def test_place_reduce_only_limit_plain_limit_when_post_only_false():
+    client, sdk = _make_client()
+    client.place_reduce_only_limit(
+        inst_id="BTC-USDT-SWAP", pos_side="long",
+        size_contracts=1, px=73000.0, post_only=False,
+    )
+    _, kw = sdk.trade.calls[-1]
+    assert kw["ordType"] == "limit"
+
+
+def test_place_reduce_only_limit_uses_caller_client_order_id():
+    client, sdk = _make_client()
+    client.place_reduce_only_limit(
+        inst_id="BTC-USDT-SWAP", pos_side="long",
+        size_contracts=1, px=73000.0,
+        client_order_id="custom_cli_123",
+    )
+    _, kw = sdk.trade.calls[-1]
+    assert kw["clOrdId"] == "custom_cli_123"
+
+
+def test_place_reduce_only_limit_raises_on_envelope_error():
+    client, sdk = _make_client()
+    sdk.trade.place_order_resp = {
+        "code": "1",
+        "msg": "post_only would take liquidity",
+        "data": [{"sCode": "51124", "sMsg": "post_only reject", "ordId": ""}],
+    }
+    with pytest.raises(OrderRejected) as exc:
+        client.place_reduce_only_limit(
+            inst_id="BTC-USDT-SWAP", pos_side="long",
+            size_contracts=1, px=73000.0,
+        )
+    assert exc.value.code == "51124"

@@ -251,6 +251,120 @@ async def test_startup_rehydrates_open_positions_to_monitor(monkeypatch, tmp_pat
     assert ("BTC-USDT-SWAP", "long") in ctx.open_trade_ids
 
 
+async def test_rehydrate_places_fresh_tp_limit_for_open_position(
+    monkeypatch, tmp_path, make_ctx,
+):
+    """Resting TP limits don't survive restart (orphan-pending-limit sweep
+    wipes them). Rehydrate must re-place one per journal OPEN row that has
+    not moved SL to BE, so maker-TP coverage is restored."""
+    db = tmp_path / "trades.db"
+    t0 = datetime(2026, 4, 16, 9, tzinfo=UTC)
+    async with TradeJournal(str(db)) as seed:
+        await seed.record_open(
+            make_plan(), make_report(),
+            symbol="BTC-USDT-SWAP",
+            signal_timestamp=t0, entry_timestamp=t0,
+        )
+    cfg = make_config()
+    journal = TradeJournal(str(db))
+    ctx, fakes = make_ctx(journal=journal, config=cfg)
+    runner = BotRunner(ctx)
+    async with ctx.journal:
+        await runner._prime()
+
+    assert len(fakes.okx_client.tp_limits_placed) == 1
+    placed = fakes.okx_client.tp_limits_placed[0]
+    assert placed["inst_id"] == "BTC-USDT-SWAP"
+    assert placed["pos_side"] == "long"
+    assert placed["post_only"] is True
+    # Monitor got the fresh TP limit id threaded through register_open.
+    extras = fakes.monitor.register_extras[0]
+    assert extras["tp_limit_order_id"] == "TP_LIMIT_1"
+
+
+async def test_rehydrate_skips_tp_limit_when_be_already_moved(
+    monkeypatch, tmp_path, make_ctx,
+):
+    """Post-BE positions lost their plan_sl_price in the journal, so the
+    rehydrate path explicitly skips TP-limit re-placement — the runner OCO
+    (with BE stop) still protects."""
+    db = tmp_path / "trades.db"
+    t0 = datetime(2026, 4, 16, 9, tzinfo=UTC)
+    async with TradeJournal(str(db)) as seed:
+        rec = await seed.record_open(
+            make_plan(), make_report(),
+            symbol="BTC-USDT-SWAP",
+            signal_timestamp=t0, entry_timestamp=t0,
+        )
+        # update_algo_ids side-effect: sets sl_moved_to_be=1 (TP1-fill path).
+        await seed.update_algo_ids(rec.trade_id, ["ALG-1", "BE_NEW"])
+    cfg = make_config()
+    journal = TradeJournal(str(db))
+    ctx, fakes = make_ctx(journal=journal, config=cfg)
+    runner = BotRunner(ctx)
+    async with ctx.journal:
+        await runner._prime()
+
+    # Post-BE → no TP-limit re-placement; monitor still registered normally.
+    assert fakes.okx_client.tp_limits_placed == []
+    extras = fakes.monitor.register_extras[0]
+    assert extras["be_already_moved"] is True
+    assert extras["tp_limit_order_id"] == ""
+
+
+async def test_rehydrate_skips_tp_limit_when_feature_disabled(
+    monkeypatch, tmp_path, make_ctx,
+):
+    """Config flag `tp_resting_limit_enabled=False` disables the rehydrate
+    TP-limit re-placement entirely."""
+    db = tmp_path / "trades.db"
+    t0 = datetime(2026, 4, 16, 9, tzinfo=UTC)
+    async with TradeJournal(str(db)) as seed:
+        await seed.record_open(
+            make_plan(), make_report(),
+            symbol="BTC-USDT-SWAP",
+            signal_timestamp=t0, entry_timestamp=t0,
+        )
+    cfg = make_config()
+    cfg.execution.tp_resting_limit_enabled = False
+    journal = TradeJournal(str(db))
+    ctx, fakes = make_ctx(journal=journal, config=cfg)
+    runner = BotRunner(ctx)
+    async with ctx.journal:
+        await runner._prime()
+
+    assert fakes.okx_client.tp_limits_placed == []
+    extras = fakes.monitor.register_extras[0]
+    assert extras["tp_limit_order_id"] == ""
+
+
+async def test_rehydrate_tolerates_tp_limit_place_failure(
+    monkeypatch, tmp_path, make_ctx,
+):
+    """If the TP-limit place fails on rehydrate (e.g. 51124 post_only
+    reject because book has already reached TP), the monitor still gets
+    registered — OCO market-TP still protects."""
+    db = tmp_path / "trades.db"
+    t0 = datetime(2026, 4, 16, 9, tzinfo=UTC)
+    async with TradeJournal(str(db)) as seed:
+        await seed.record_open(
+            make_plan(), make_report(),
+            symbol="BTC-USDT-SWAP",
+            signal_timestamp=t0, entry_timestamp=t0,
+        )
+    cfg = make_config()
+    client = FakeOKXClient(tp_limit_place_raises=RuntimeError("51124"))
+    journal = TradeJournal(str(db))
+    ctx, fakes = make_ctx(journal=journal, config=cfg, okx_client=client)
+    runner = BotRunner(ctx)
+    async with ctx.journal:
+        await runner._prime()
+
+    assert len(fakes.monitor.registered) == 1
+    extras = fakes.monitor.register_extras[0]
+    assert extras["tp_limit_order_id"] == ""
+
+
 async def test_rehydrate_passes_be_already_moved_from_journal(monkeypatch, tmp_path, make_ctx):
     """If the journal row shows SL-to-BE already completed pre-restart, the
     rehydrate path must forward `be_already_moved=True` to the monitor so it

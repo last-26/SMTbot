@@ -383,6 +383,19 @@ class ExecutionConfig(BaseModel):
     # can pick "last" if it wants book-native triggering.
     algo_trigger_px_type: str = "mark"
 
+    # 2026-04-20 — resting TP limit alongside OCO. Trigger-market TP (OCO
+    # tpOrdPx=-1) fires a market order when mark crosses the trigger; on a
+    # fast wick-reversal the market order slips badly (or the mark-smoothed
+    # trigger never fires at all). A reduce-only post-only limit at the TP
+    # price, resting in the book from entry onward, fills as a maker the
+    # instant bid/ask touches TP — capturing wicks that the OCO trigger
+    # misses. The OCO stays in place as the SL leg + a market-TP fallback;
+    # whichever exits first wins (reduce-only prevents double-close). The
+    # bot tracks the limit order id via `_Tracked.tp_limit_order_id` and
+    # cancels it on close / cancel-replaces it alongside the OCO on
+    # dynamic-TP revise. MFE-lock leaves the TP limit alone (TP unchanged).
+    tp_resting_limit_enabled: bool = True
+
     # Katman 2 — post-close demo-wick artefact cross-check. When True, on
     # every trade close we fetch the concurrent 1m candle from Binance
     # USD-M futures and stamp `demo_artifact=True` when entry or exit

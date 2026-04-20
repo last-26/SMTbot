@@ -263,6 +263,50 @@ class OKXClient:
         resp = self.trade.cancel_order(instId=inst_id, ordId=order_id)
         return _check(resp, "cancel_order")
 
+    def place_reduce_only_limit(
+        self,
+        inst_id: str,
+        pos_side: str,            # "long" / "short"
+        size_contracts: int,
+        px: float,
+        td_mode: str = "isolated",
+        post_only: bool = True,
+        client_order_id: Optional[str] = None,
+    ) -> OrderResult:
+        """Place a reduce-only limit order on an open position.
+
+        Used as the TP leg alongside the OCO SL trigger: a resting limit
+        at the TP price fills as a maker the instant bid/ask touches it,
+        bypassing the mark-trigger latency that lets wicks slip through
+        `place_oco_algo`'s tpOrdPx=-1 market fallback. Reduce-only means
+        OKX will refuse to flip the position if the resting limit somehow
+        outlives the closing fill (or races an OCO trigger).
+
+        `side` is the closing side of the position — sell for long, buy
+        for short. `post_only=True` forces maker-only (rejected if it
+        would take liquidity, sCode 51124 family); callers can retry as
+        plain limit if the book has already reached TP. A `smttp<hash>`
+        client order id tags it as a TP limit so the orphan-pending-limit
+        sweep can distinguish it from entry limits (`smtbot<hash>`).
+        """
+        closing_side = "sell" if pos_side == "long" else "buy"
+        cl_ord_id = client_order_id or f"smttp{uuid.uuid4().hex[:21]}"
+        ord_type = "post_only" if post_only else "limit"
+        resp = self.trade.place_order(
+            instId=inst_id, tdMode=td_mode,
+            side=closing_side, posSide=pos_side, ordType=ord_type,
+            sz=str(size_contracts), px=str(px),
+            reduceOnly=True,
+            clOrdId=cl_ord_id,
+        )
+        data = _check(resp, "place_reduce_only_limit")
+        return OrderResult(
+            order_id=str(data.get("ordId", "")),
+            client_order_id=str(data.get("clOrdId", cl_ord_id)),
+            status=OrderStatus.PENDING,
+            raw=resp,
+        )
+
     def get_order(self, inst_id: str, order_id: str) -> dict:
         """Fetch the current state of one order (Phase 7.C3 — pending poll).
 

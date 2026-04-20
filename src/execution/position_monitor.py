@@ -77,6 +77,11 @@ class _Tracked:
     # tighten further. A true trailing mechanic (Phase 12 Option B) would
     # keep moving; this is the simpler "one-time risk removal" contract.
     sl_lock_applied: bool = False
+    # 2026-04-20 — resting TP limit (reduce-only post-only) co-placed with
+    # the OCO. Bypasses the OCO tpOrdPx=-1 market-on-trigger path for
+    # wick-captures. Empty string when disabled or the resting-limit leg
+    # failed to place (position still protected by OCO, just no maker-TP).
+    tp_limit_order_id: str = ""
 
 
 @dataclass
@@ -158,6 +163,7 @@ class PositionMonitor:
         sl_price: float = 0.0,
         runner_size: int = 0,
         plan_sl_price: Optional[float] = None,
+        tp_limit_order_id: str = "",
     ) -> None:
         # plan_sl_price semantics: None → caller didn't provide one, default to
         # sl_price (correct at fill time). An explicit 0.0 → "unknown, disable
@@ -169,6 +175,7 @@ class PositionMonitor:
             be_already_moved=be_already_moved,
             sl_price=sl_price, runner_size=runner_size or int(size),
             plan_sl_price=resolved_plan_sl,
+            tp_limit_order_id=tp_limit_order_id,
         )
 
     def poll(self, inst_id: Optional[str] = None) -> list[CloseFill]:
@@ -191,6 +198,15 @@ class PositionMonitor:
             if key not in live_snaps:
                 # Tracked position no longer live → it closed.
                 fills.append(self._close_fill_from(tracked))
+                # Best-effort cancel the resting TP limit so it doesn't
+                # linger as an orphan when the OCO closed us first.
+                # Reduce-only keeps it inert even if the cancel races, but
+                # leaving resting orders behind trips the next startup's
+                # orphan-pending-limit sweep.
+                if tracked.tp_limit_order_id:
+                    self._cancel_tp_limit_best_effort(
+                        tracked.inst_id, tracked.tp_limit_order_id,
+                    )
                 to_remove.append(key)
             else:
                 snap = live_snaps[key]
@@ -437,6 +453,34 @@ class PositionMonitor:
         t.algo_ids = t.algo_ids[:-1] + [new_algo.algo_id]
         t.tp2_price = new_tp
         t.last_tp_revise_at = now or _utc_now()
+        # 2026-04-20 — if a resting TP limit was co-placed with the old OCO,
+        # move it to the new TP price in lockstep. Leave stale on failure
+        # rather than double-canceling: old limit still protects at the
+        # prior level; the new OCO's market-on-trigger is the safety net.
+        if t.tp_limit_order_id:
+            old_tp_ord = t.tp_limit_order_id
+            self._cancel_tp_limit_best_effort(t.inst_id, old_tp_ord)
+            t.tp_limit_order_id = ""
+            try:
+                new_tp_ord = self.client.place_reduce_only_limit(
+                    inst_id=t.inst_id, pos_side=t.pos_side,
+                    size_contracts=int(t.runner_size),
+                    px=new_tp, td_mode=self.margin_mode,
+                    post_only=True,
+                )
+                t.tp_limit_order_id = new_tp_ord.order_id
+                logger.info(
+                    "tp_limit_replaced inst={} side={} new_tp={} "
+                    "old_ord={} new_ord={}",
+                    t.inst_id, t.pos_side, new_tp,
+                    old_tp_ord, new_tp_ord.order_id,
+                )
+            except Exception:
+                logger.exception(
+                    "tp_limit_replace_failed inst={} side={} new_tp={} — "
+                    "OCO market-TP still protects, maker fill lost this cycle",
+                    t.inst_id, t.pos_side, new_tp,
+                )
         logger.info(
             "tp_revised inst={} side={} new_tp={} sl={} new_algo={}",
             t.inst_id, t.pos_side, new_tp, t.sl_price, new_algo.algo_id,
@@ -617,6 +661,41 @@ class PositionMonitor:
             if str(row.get("algoId", "")) == str(algo_id):
                 return False
         return True
+
+    def _cancel_tp_limit_best_effort(self, inst_id: str, order_id: str) -> None:
+        """Cancel a resting TP limit. Tolerates all non-fatal paths:
+
+        * Already filled / already canceled (`_ALGO_GONE_CODES` family) —
+          log-only, that's the expected terminal state on a normal close.
+        * Any other exception — log it; the resting limit is reduce-only,
+          so in the worst case it sits on the book until the next startup
+          `_cancel_orphan_pending_limits` sweep catches it.
+        """
+        if not order_id:
+            return
+        try:
+            self.client.cancel_order(inst_id, order_id)
+            logger.info(
+                "tp_limit_canceled inst={} ord={}",
+                inst_id, order_id,
+            )
+        except OrderRejected as exc:
+            if self._cancel_error_is_already_gone(exc):
+                logger.debug(
+                    "tp_limit_cancel_already_gone inst={} ord={} code={}",
+                    inst_id, order_id, exc.code,
+                )
+            else:
+                logger.warning(
+                    "tp_limit_cancel_failed inst={} ord={} code={} — "
+                    "reduce-only will stay inert; next startup sweeps it",
+                    inst_id, order_id, exc.code,
+                )
+        except Exception:
+            logger.exception(
+                "tp_limit_cancel_exception inst={} ord={}",
+                inst_id, order_id,
+            )
 
     def _close_fill_from(self, t: _Tracked) -> CloseFill:
         # At close time, OKX has already removed the position row. Best we

@@ -183,13 +183,15 @@ class FakeMonitor:
                       be_already_moved: bool = False,
                       sl_price: float = 0.0,
                       runner_size: int = 0,
-                      plan_sl_price: Optional[float] = None) -> None:
+                      plan_sl_price: Optional[float] = None,
+                      tp_limit_order_id: str = "") -> None:
         self.registered.append((inst_id, pos_side, size, entry_price))
         self.register_extras.append(
             {"algo_ids": list(algo_ids or []), "tp2_price": tp2_price,
              "be_already_moved": be_already_moved,
              "sl_price": sl_price, "runner_size": runner_size,
-             "plan_sl_price": plan_sl_price}
+             "plan_sl_price": plan_sl_price,
+             "tp_limit_order_id": tp_limit_order_id}
         )
 
     def poll(self, inst_id: Optional[str] = None) -> list[CloseFill]:
@@ -212,12 +214,16 @@ class FakeOKXClient:
 
     def __init__(self, positions: Optional[list[PositionSnapshot]] = None,
                  enrich_return: Optional[CloseFill] = None,
-                 balance: float = 10_000.0):
+                 balance: float = 10_000.0,
+                 tp_limit_place_raises: Optional[Exception] = None):
         self.positions = positions or []
         self.enrich_return = enrich_return
         self.balance = balance
         self.cancel_algo_calls: list[tuple[str, str]] = []
         self.close_position_calls: list[tuple[str, str]] = []
+        self.tp_limits_placed: list[dict] = []
+        self.tp_limit_place_raises = tp_limit_place_raises
+        self._next_tp_limit_id = 0
 
     def get_positions(self, inst_id: Optional[str] = None) -> list[PositionSnapshot]:
         return list(self.positions)
@@ -236,6 +242,31 @@ class FakeOKXClient:
                        td_mode: str = "isolated") -> dict:
         self.close_position_calls.append((inst_id, pos_side))
         return {}
+
+    def place_reduce_only_limit(
+        self,
+        inst_id: str,
+        pos_side: str,
+        size_contracts: int,
+        px: float,
+        td_mode: str = "isolated",
+        post_only: bool = True,
+        client_order_id: Optional[str] = None,
+    ):
+        self.tp_limits_placed.append({
+            "inst_id": inst_id, "pos_side": pos_side,
+            "size_contracts": size_contracts, "px": px,
+            "td_mode": td_mode, "post_only": post_only,
+        })
+        if self.tp_limit_place_raises is not None:
+            raise self.tp_limit_place_raises
+        self._next_tp_limit_id += 1
+        oid = f"TP_LIMIT_{self._next_tp_limit_id}"
+        from src.execution.models import OrderResult, OrderStatus
+        return OrderResult(
+            order_id=oid, client_order_id=oid,
+            status=OrderStatus.PENDING,
+        )
 
 
 # ── Composite helper ────────────────────────────────────────────────────────

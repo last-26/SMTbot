@@ -5,7 +5,9 @@ from __future__ import annotations
 import pytest
 
 from src.execution.errors import OrderRejected
-from src.execution.models import AlgoResult, PositionSnapshot, PositionState
+from src.execution.models import (
+    AlgoResult, OrderResult, OrderStatus, PositionSnapshot, PositionState,
+)
 from src.execution.position_monitor import PositionMonitor
 
 
@@ -97,13 +99,43 @@ class FakeRevisableClient(FakeClient):
     """Records cancel_algo + place_oco_algo calls for revise tests."""
 
     def __init__(self, *, cancel_raises=None, place_raises=None,
-                 next_algo_id="NEW_ALGO"):
+                 next_algo_id="NEW_ALGO",
+                 tp_limit_cancel_raises=None,
+                 tp_limit_place_raises=None,
+                 next_tp_limit_order_id="NEW_TP_LIMIT"):
         super().__init__()
         self.cancelled: list[tuple[str, str]] = []
         self.placed: list[dict] = []
         self.cancel_raises = cancel_raises
         self.place_raises = place_raises
         self._next_algo_id = next_algo_id
+        self.cancelled_orders: list[tuple[str, str]] = []
+        self.tp_limits_placed: list[dict] = []
+        self.tp_limit_cancel_raises = tp_limit_cancel_raises
+        self.tp_limit_place_raises = tp_limit_place_raises
+        self._next_tp_limit_order_id = next_tp_limit_order_id
+
+    def cancel_order(self, inst_id, order_id):
+        self.cancelled_orders.append((inst_id, order_id))
+        if self.tp_limit_cancel_raises is not None:
+            raise self.tp_limit_cancel_raises
+        return {}
+
+    def place_reduce_only_limit(self, *, inst_id, pos_side, size_contracts,
+                                 px, td_mode, post_only=True,
+                                 client_order_id=None):
+        self.tp_limits_placed.append({
+            "inst_id": inst_id, "pos_side": pos_side,
+            "size_contracts": size_contracts, "px": px,
+            "td_mode": td_mode, "post_only": post_only,
+        })
+        if self.tp_limit_place_raises is not None:
+            raise self.tp_limit_place_raises
+        return OrderResult(
+            order_id=self._next_tp_limit_order_id,
+            client_order_id=self._next_tp_limit_order_id,
+            status=OrderStatus.PENDING,
+        )
 
     def cancel_algo(self, inst_id, algo_id):
         self.cancelled.append((inst_id, algo_id))
@@ -460,3 +492,155 @@ def test_revise_runner_tp_swallows_on_sl_moved_exception():
     ok = mon.revise_runner_tp("BTC-USDT-SWAP", "long", new_tp=71500.0)
     assert ok is True
     assert len(client.placed) == 1
+
+
+# ── TP resting limit (2026-04-20 maker-TP alongside OCO) ────────────────────
+
+
+def test_poll_cancels_tp_limit_when_position_closes():
+    """On close detection, the resting TP limit must be cancelled best-effort
+    so it doesn't linger as an orphan."""
+    client = FakeRevisableClient()
+    client.snapshots = [_snap()]
+    mon = PositionMonitor(client)
+    mon.register_open(
+        "BTC-USDT-SWAP", "long", 3.0, 67000.0,
+        tp_limit_order_id="TP_LIMIT_ORD_123",
+    )
+    mon.poll()  # still open
+    client.snapshots = []  # position closed
+    fills = mon.poll()
+    assert len(fills) == 1
+    assert client.cancelled_orders == [("BTC-USDT-SWAP", "TP_LIMIT_ORD_123")]
+
+
+def test_poll_skips_tp_limit_cancel_when_not_registered():
+    """If no TP limit was co-placed (disabled config or place failure), the
+    close path must not attempt a cancel."""
+    client = FakeRevisableClient()
+    client.snapshots = [_snap()]
+    mon = PositionMonitor(client)
+    mon.register_open("BTC-USDT-SWAP", "long", 3.0, 67000.0)
+    mon.poll()
+    client.snapshots = []
+    mon.poll()
+    assert client.cancelled_orders == []
+
+
+def test_poll_tolerates_idempotent_tp_limit_cancel_failure():
+    """TP limit already filled (51400 family) is the expected terminal state
+    on a normal close — close path must still emit the fill."""
+    client = FakeRevisableClient(
+        tp_limit_cancel_raises=OrderRejected("gone", code="51400"),
+    )
+    client.snapshots = [_snap()]
+    mon = PositionMonitor(client)
+    mon.register_open(
+        "BTC-USDT-SWAP", "long", 3.0, 67000.0,
+        tp_limit_order_id="TP_LIMIT_FILLED",
+    )
+    mon.poll()
+    client.snapshots = []
+    fills = mon.poll()
+    assert len(fills) == 1
+
+
+def test_poll_tolerates_generic_tp_limit_cancel_exception():
+    """Any exception during TP-limit cancel must not block close emission —
+    the reduce-only limit is inert once the position is flat."""
+    client = FakeRevisableClient(
+        tp_limit_cancel_raises=RuntimeError("network down"),
+    )
+    client.snapshots = [_snap()]
+    mon = PositionMonitor(client)
+    mon.register_open(
+        "BTC-USDT-SWAP", "long", 3.0, 67000.0,
+        tp_limit_order_id="TP_LIMIT_XYZ",
+    )
+    mon.poll()
+    client.snapshots = []
+    fills = mon.poll()
+    assert len(fills) == 1
+
+
+def test_revise_runner_tp_cancels_and_replaces_tp_limit():
+    """When revise changes TP, the co-placed resting limit must be cancelled
+    and re-placed at the new TP price alongside the replacement OCO."""
+    client = FakeRevisableClient(
+        next_algo_id="REPLACEMENT_ID",
+        next_tp_limit_order_id="TP_LIMIT_V2",
+    )
+    mon = PositionMonitor(client, margin_mode="cross")
+    mon.register_open(
+        "BTC-USDT-SWAP", "long", size=3.0, entry_price=70000.0,
+        algo_ids=["TP1_ID", "RUNNER_ID"], tp2_price=73000.0,
+        sl_price=69000.0, runner_size=2,
+        tp_limit_order_id="TP_LIMIT_V1",
+    )
+    ok = mon.revise_runner_tp("BTC-USDT-SWAP", "long", new_tp=71500.0)
+    assert ok is True
+    assert client.cancelled_orders == [("BTC-USDT-SWAP", "TP_LIMIT_V1")]
+    assert len(client.tp_limits_placed) == 1
+    p = client.tp_limits_placed[0]
+    assert p["px"] == 71500.0
+    assert p["size_contracts"] == 2
+    assert p["pos_side"] == "long"
+    assert p["td_mode"] == "cross"
+    assert p["post_only"] is True
+    t = mon._tracked[("BTC-USDT-SWAP", "long")]
+    assert t.tp_limit_order_id == "TP_LIMIT_V2"
+
+
+def test_revise_runner_tp_skips_tp_limit_when_none_registered():
+    """If the original position had no TP limit (feature off / place failed),
+    revise must not attempt cancel or re-place."""
+    client = FakeRevisableClient(next_algo_id="REPL")
+    mon = PositionMonitor(client)
+    mon.register_open(
+        "BTC-USDT-SWAP", "long", size=3.0, entry_price=70000.0,
+        algo_ids=["TP1_ID", "RUNNER_ID"], tp2_price=73000.0,
+        sl_price=69000.0, runner_size=2,
+    )
+    mon.revise_runner_tp("BTC-USDT-SWAP", "long", new_tp=71500.0)
+    assert client.cancelled_orders == []
+    assert client.tp_limits_placed == []
+
+
+def test_revise_runner_tp_swallows_tp_limit_place_failure():
+    """Re-place failure for the TP limit must NOT unwind the successful OCO
+    revise — OCO market-TP still protects."""
+    client = FakeRevisableClient(
+        next_algo_id="REPL",
+        tp_limit_place_raises=RuntimeError("post_only rejected 51124"),
+    )
+    mon = PositionMonitor(client)
+    mon.register_open(
+        "BTC-USDT-SWAP", "long", size=3.0, entry_price=70000.0,
+        algo_ids=["TP1_ID", "RUNNER_ID"], tp2_price=73000.0,
+        sl_price=69000.0, runner_size=2,
+        tp_limit_order_id="TP_LIMIT_OLD",
+    )
+    ok = mon.revise_runner_tp("BTC-USDT-SWAP", "long", new_tp=71500.0)
+    assert ok is True
+    assert client.cancelled_orders == [("BTC-USDT-SWAP", "TP_LIMIT_OLD")]
+    t = mon._tracked[("BTC-USDT-SWAP", "long")]
+    assert t.tp_limit_order_id == ""
+
+
+def test_lock_sl_at_leaves_tp_limit_untouched():
+    """MFE-lock only replaces the runner OCO (SL change); the resting TP
+    limit stays in place at the same price."""
+    client = FakeRevisableClient(next_algo_id="LOCKED_OCO")
+    mon = PositionMonitor(client, margin_mode="cross")
+    mon.register_open(
+        "BTC-USDT-SWAP", "long", size=3.0, entry_price=70000.0,
+        algo_ids=["RUNNER_ID"], tp2_price=73000.0,
+        sl_price=69000.0, runner_size=3, plan_sl_price=69000.0,
+        tp_limit_order_id="TP_LIMIT_PRESERVED",
+    )
+    ok = mon.lock_sl_at("BTC-USDT-SWAP", "long", new_sl=70000.0)
+    assert ok is True
+    assert client.cancelled_orders == []
+    assert client.tp_limits_placed == []
+    t = mon._tracked[("BTC-USDT-SWAP", "long")]
+    assert t.tp_limit_order_id == "TP_LIMIT_PRESERVED"

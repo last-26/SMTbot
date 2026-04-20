@@ -1677,8 +1677,12 @@ class BotRunner:
         )
         if self.clear_halt:
             self._apply_clear_halt()
-        await self._rehydrate_open_positions()
+        # Reconcile BEFORE rehydrate: the orphan-pending-limit sweep wipes
+        # every resting limit on OKX (including any pre-restart TP limits),
+        # so we must let it run first — then rehydrate re-places fresh TP
+        # limits for each tracked position as it rebuilds monitor state.
         await self._reconcile_orphans()
+        await self._rehydrate_open_positions()
         await self._load_contract_sizes()
 
     def _apply_clear_halt(self) -> None:
@@ -1983,11 +1987,48 @@ class BotRunner:
 
         algo_ids = [a.algo_id for a in algos if a.algo_id]
         runner_size = _runner_size(plan.num_contracts, self.ctx.config)
+
+        # 2026-04-20 — co-place a resting reduce-only limit at the runner TP
+        # so wicks fill maker at the exact price instead of tripping the
+        # OCO's mark-trigger → market-on-fire path (which slips, or fails
+        # to fire at all when demo last-wick never moves mark). OCO stays
+        # as SL + market-TP fallback. Best-effort: a failure here is NOT
+        # fatal — OCO still protects, we just lose the maker-TP capture
+        # for this trade. Only placed for the runner-size slice; partial
+        # TP1 algo (if re-enabled) keeps its own market-on-trigger TP.
+        tp_limit_order_id = ""
+        cfg_exec = self.ctx.config.execution
+        if (
+            cfg_exec.tp_resting_limit_enabled
+            and runner_size > 0
+            and plan.tp_price > 0
+        ):
+            try:
+                tp_limit_res = await asyncio.to_thread(
+                    self.ctx.okx_client.place_reduce_only_limit,
+                    ev.inst_id, ev.pos_side, int(runner_size),
+                    float(plan.tp_price), cfg_exec.margin_mode, True, None,
+                )
+                tp_limit_order_id = tp_limit_res.order_id
+                logger.info(
+                    "tp_limit_placed inst={} side={} size={} tp={} ord={}",
+                    ev.inst_id, ev.pos_side, runner_size,
+                    plan.tp_price, tp_limit_order_id,
+                )
+            except Exception as exc:
+                code = getattr(exc, "code", None)
+                logger.warning(
+                    "tp_limit_place_failed inst={} side={} tp={} err={!r} "
+                    "code={} — OCO market-TP still protects, no maker-TP",
+                    ev.inst_id, ev.pos_side, plan.tp_price, exc, code,
+                )
+
         self.ctx.monitor.register_open(
             ev.inst_id, ev.pos_side, float(plan.num_contracts), fill_px,
             algo_ids=algo_ids, tp2_price=plan.tp_price,
             sl_price=plan.sl_price, runner_size=runner_size,
             plan_sl_price=plan.sl_price,
+            tp_limit_order_id=tp_limit_order_id,
         )
         self.ctx.risk_mgr.register_trade_opened()
 
@@ -2271,6 +2312,7 @@ class BotRunner:
         `replay_for_risk_manager` already walked CLOSED trades; this covers
         OPEN rows so we know what to expect on the next poll.
         """
+        cfg_exec = self.ctx.config.execution
         for rec in await self.ctx.journal.list_open_trades():
             pos_side = _direction_to_pos_side(rec.direction)
             runner_size = _runner_size(int(rec.num_contracts), self.ctx.config)
@@ -2279,6 +2321,37 @@ class BotRunner:
             # dynamic TP revision no-ops for this position (safer than reviving
             # with a near-zero sl_distance that OKX rejects).
             plan_sl = 0.0 if rec.sl_moved_to_be else rec.sl_price
+            # 2026-04-20 — TP-limit is in-memory only; `_cancel_orphan_pending_limits`
+            # wipes every resting limit at startup, so any TP limit we placed
+            # pre-restart is already gone by the time we rehydrate. Re-place a
+            # fresh one here so the maker-TP coverage survives restart.
+            tp_limit_order_id = ""
+            if (
+                cfg_exec.tp_resting_limit_enabled
+                and runner_size > 0
+                and rec.tp_price > 0
+                and not rec.sl_moved_to_be
+            ):
+                try:
+                    tp_limit_res = await asyncio.to_thread(
+                        self.ctx.okx_client.place_reduce_only_limit,
+                        rec.symbol, pos_side, int(runner_size),
+                        float(rec.tp_price), cfg_exec.margin_mode, True, None,
+                    )
+                    tp_limit_order_id = tp_limit_res.order_id
+                    logger.info(
+                        "tp_limit_replaced_on_rehydrate inst={} side={} "
+                        "size={} tp={} ord={}",
+                        rec.symbol, pos_side, runner_size,
+                        rec.tp_price, tp_limit_order_id,
+                    )
+                except Exception as exc:
+                    code = getattr(exc, "code", None)
+                    logger.warning(
+                        "tp_limit_rehydrate_place_failed inst={} side={} "
+                        "tp={} err={!r} code={} — OCO still protects",
+                        rec.symbol, pos_side, rec.tp_price, exc, code,
+                    )
             self.ctx.monitor.register_open(
                 rec.symbol, pos_side,
                 float(rec.num_contracts), rec.entry_price,
@@ -2287,6 +2360,7 @@ class BotRunner:
                 be_already_moved=rec.sl_moved_to_be,
                 sl_price=rec.sl_price, runner_size=runner_size,
                 plan_sl_price=plan_sl,
+                tp_limit_order_id=tp_limit_order_id,
             )
             self.ctx.open_trade_ids[(rec.symbol, pos_side)] = rec.trade_id
             self.ctx.open_trade_opened_at[(rec.symbol, pos_side)] = rec.entry_timestamp
@@ -2321,7 +2395,18 @@ class BotRunner:
             logger.exception("reconcile_fetch_failed")
             return
         live_keys = {(p.inst_id, p.pos_side) for p in live if p.size != 0}
-        journal_keys = set(self.ctx.open_trade_ids.keys())
+        # Read journal OPEN rows directly — `open_trade_ids` is empty here
+        # because reconcile now runs BEFORE rehydrate (so the pending-limit
+        # sweep can't nuke freshly-placed TP limits).
+        try:
+            open_recs = await self.ctx.journal.list_open_trades()
+        except Exception:
+            logger.exception("reconcile_journal_read_failed")
+            return
+        journal_keys = {
+            (rec.symbol, _direction_to_pos_side(rec.direction))
+            for rec in open_recs
+        }
         for k in live_keys - journal_keys:
             logger.error("orphan_live_position_no_journal_row key={}", k)
         for k in journal_keys - live_keys:
