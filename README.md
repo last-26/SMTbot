@@ -16,8 +16,8 @@ TradingView (Eyes)        Python Bot (Brain)         OKX Exchange (Hands)
 └──────────────────┘      └─────────────────┘        └──────────────────┘
 ```
 
-Two production Pine indicators live in `pine/` (overlay + oscillator); the five
-earlier standalone scripts are preserved under `pine/legacy/` as design history.
+Two production Pine indicators live in `pine/` (overlay + oscillator). Earlier
+single-purpose scripts (pre-consolidation) are archived in git history.
 
 ## Quick Start
 

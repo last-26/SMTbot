@@ -15,7 +15,7 @@ once per poll. If it returns None, we sit the bar out.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 from src.analysis.fvg import FVG
@@ -34,6 +34,7 @@ from src.data.models import (
     OrderBlock,
     Session,
 )
+from src.strategy._indicators import ema
 from src.strategy.position_sizer import (
     recent_swing_price,
     sl_from_atr,
@@ -273,18 +274,6 @@ def _vwap_hard_veto(state: MarketState, direction: Direction, price: float) -> b
 # momentum regime; neutral / insufficient data fails open (no veto).
 
 
-def _ema(values: list[float], period: int) -> Optional[float]:
-    """EMA of the last `period` samples. Returns None when input is shorter
-    than the period (not enough data to seed a stable EMA)."""
-    if period <= 0 or len(values) < period:
-        return None
-    k = 2.0 / (period + 1.0)
-    ema = sum(values[:period]) / period        # SMA seed
-    for price in values[period:]:
-        ema = price * k + ema * (1.0 - k)
-    return ema
-
-
 def _ema_momentum_veto(
     candles: Optional[list[Candle]],
     direction: Direction,
@@ -297,8 +286,8 @@ def _ema_momentum_veto(
     if not candles or price <= 0:
         return False
     closes = [c.close for c in candles if getattr(c, "close", None) is not None]
-    ema_fast = _ema(closes, fast_period)
-    ema_slow = _ema(closes, slow_period)
+    ema_fast = ema(closes, fast_period)
+    ema_slow = ema(closes, slow_period)
     if ema_fast is None or ema_slow is None:
         return False
     bull_stack = price > ema_fast > ema_slow

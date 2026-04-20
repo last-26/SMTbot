@@ -32,6 +32,7 @@ from typing import Any, Literal, Optional
 
 from src.analysis.liquidity_heatmap import LiquidityHeatmap
 from src.data.models import Direction, MarketState
+from src.strategy._indicators import ema
 from src.strategy.trade_plan import TradePlan
 
 
@@ -112,17 +113,6 @@ def _vwap_zone(
     return (target - half, target)
 
 
-def _ema(values: list[float], period: int) -> Optional[float]:
-    """EMA of `values` with SMA seed. None when series shorter than period."""
-    if period <= 0 or len(values) < period:
-        return None
-    k = 2.0 / (period + 1.0)
-    ema = sum(values[:period]) / period
-    for v in values[period:]:
-        ema = v * k + ema * (1.0 - k)
-    return ema
-
-
 def _ema21_pullback_zone(
     direction: Direction, price: float, atr: float,
     candles: Optional[list[Any]], zone_atr: float,
@@ -138,8 +128,8 @@ def _ema21_pullback_zone(
     if not candles:
         return None
     closes = [c.close for c in candles if getattr(c, "close", None) is not None]
-    ema_fast = _ema(closes, fast_period)
-    ema_slow = _ema(closes, slow_period)
+    ema_fast = ema(closes, fast_period)
+    ema_slow = ema(closes, slow_period)
     if ema_fast is None or ema_slow is None:
         return None
     if _is_long(direction):

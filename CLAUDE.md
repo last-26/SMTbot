@@ -314,7 +314,7 @@ Two indicators on the chart. Bot reads their tables; drawings (OB/FVG boxes, liq
 | SMT Master Overlay | `pine/smt_overlay.pine` | 19-row "SMT Signals" table + OB/FVG boxes + liquidity/sweep drawings |
 | SMT Master Oscillator | `pine/smt_oscillator.pine` | 15-row "SMT Oscillator" table (WaveTrend + RSI/MFI + Stoch + divergences) |
 
-Pine is source-of-truth for **structure**; Python scores confluence and plans zones. Legacy single-purpose scripts are under `pine/legacy/` (not loaded).
+Pine is source-of-truth for **structure**; Python scores confluence and plans zones. Earlier single-purpose scripts (pre-consolidation) are archived in git history.
 
 **Critical:** Table cells use `str.tostring(val, "#.########")` not `"#.##"` — truncation zeroes DOGE/XRP ATR and causes `no_sl_source` every cycle.
 
