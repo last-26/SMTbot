@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import pytest
 
@@ -294,6 +295,133 @@ async def test_reconcile_logs_orphan_live_without_journal(monkeypatch, caplog, m
         async with ctx.journal:
             await runner._reconcile_orphans()
         assert any("orphan_live_position_no_journal_row" in m for m in messages)
+    finally:
+        logger.remove(sink_id)
+
+
+# ── Startup orphan cancels (pending limits + surplus OCOs) ─────────────────
+
+
+class _TradeSubStub:
+    """Drop-in for `client.trade` — exposes get_order_list only."""
+    def __init__(self, rows: list[dict]):
+        self._rows = rows
+
+    def get_order_list(self, instType: str = "SWAP") -> dict:
+        return {"code": "0", "data": list(self._rows)}
+
+
+class FakeOKXClientWithPending(FakeOKXClient):
+    """FakeOKXClient + the surfaces `_reconcile_orphans` touches:
+    `trade.get_order_list`, `cancel_order`, `list_pending_algos`,
+    plus call logs so tests can assert."""
+
+    def __init__(
+        self, *,
+        positions: Optional[list[PositionSnapshot]] = None,
+        pending_limits: Optional[list[dict]] = None,
+        pending_algos: Optional[list[dict]] = None,
+    ):
+        super().__init__(positions=positions)
+        self.trade = _TradeSubStub(pending_limits or [])
+        self._pending_algos = pending_algos or []
+        self.cancel_order_calls: list[tuple[str, str]] = []
+        self.list_pending_algos_calls: list[str] = []
+
+    def cancel_order(self, inst_id: str, order_id: str) -> dict:
+        self.cancel_order_calls.append((inst_id, order_id))
+        return {}
+
+    def list_pending_algos(
+        self, inst_id: Optional[str] = None, ord_type: str = "oco",
+    ) -> list[dict]:
+        self.list_pending_algos_calls.append(ord_type)
+        return list(self._pending_algos)
+
+
+async def test_reconcile_cancels_every_resting_pending_limit(make_ctx):
+    """The monitor's in-memory _pending is empty at startup, so any resting
+    limit on OKX can't be tracked — reconcile must cancel them so they
+    can't fill into an untracked (unprotected) position."""
+    # Need Optional import for the helper class
+    client = FakeOKXClientWithPending(
+        pending_limits=[
+            {"instId": "ETH-USDT-SWAP", "ordId": "ORPH_ETH",
+             "px": "2280.04", "sz": "29"},
+            {"instId": "BNB-USDT-SWAP", "ordId": "ORPH_BNB",
+             "px": "620.3", "sz": "1182"},
+        ],
+    )
+    ctx, fakes = make_ctx(okx_client=client)
+    runner = BotRunner(ctx)
+    async with ctx.journal:
+        await runner._reconcile_orphans()
+    assert ("ETH-USDT-SWAP", "ORPH_ETH") in client.cancel_order_calls
+    assert ("BNB-USDT-SWAP", "ORPH_BNB") in client.cancel_order_calls
+
+
+async def test_reconcile_cancels_surplus_oco_not_in_journal(tmp_path, make_ctx):
+    """A tracked position has journal.algo_ids = [ACTIVE_ID]. OKX has both
+    ACTIVE_ID and ORPH_ID for the same (inst, posSide). Reconcile must
+    cancel only the orphan."""
+    db = tmp_path / "trades.db"
+    t0 = datetime(2026, 4, 16, 9, tzinfo=UTC)
+    async with TradeJournal(str(db)) as seed:
+        rec = await seed.record_open(
+            make_plan(), make_report(),
+            symbol="DOGE-USDT-SWAP",
+            signal_timestamp=t0, entry_timestamp=t0,
+        )
+        await seed.update_algo_ids(rec.trade_id, ["ACTIVE_ID"])
+
+    client = FakeOKXClientWithPending(
+        positions=[
+            PositionSnapshot(
+                inst_id="DOGE-USDT-SWAP", pos_side="long",
+                size=64.0, entry_price=0.0937, mark_price=0.095,
+                unrealized_pnl=1.0, leverage=13,
+            ),
+        ],
+        pending_algos=[
+            {"algoId": "ACTIVE_ID", "instId": "DOGE-USDT-SWAP",
+             "posSide": "long", "slTriggerPx": "0.0937",
+             "tpTriggerPx": "0.0959"},
+            {"algoId": "ORPH_ID", "instId": "DOGE-USDT-SWAP",
+             "posSide": "long", "slTriggerPx": "0.0929",
+             "tpTriggerPx": "0.0959"},
+        ],
+    )
+    journal = TradeJournal(str(db))
+    ctx, fakes = make_ctx(okx_client=client, journal=journal)
+    runner = BotRunner(ctx)
+    async with ctx.journal:
+        await runner._prime()
+    assert ("DOGE-USDT-SWAP", "ORPH_ID") in client.cancel_algo_calls
+    assert ("DOGE-USDT-SWAP", "ACTIVE_ID") not in client.cancel_algo_calls
+
+
+async def test_reconcile_leaves_oco_for_keys_without_journal_row(make_ctx):
+    """If OKX has an OCO for a (inst, posSide) that has no journal OPEN
+    row, reconcile log-only flags it — does not cancel, since it might
+    be a legitimate live position the journal lost track of and auto-
+    canceling its stop could liquidate it."""
+    from loguru import logger
+    messages: list[str] = []
+    sink_id = logger.add(lambda m: messages.append(m), level="ERROR")
+    try:
+        client = FakeOKXClientWithPending(
+            pending_algos=[
+                {"algoId": "UNTRACKED", "instId": "XRP-USDT-SWAP",
+                 "posSide": "long", "slTriggerPx": "0.5",
+                 "tpTriggerPx": "0.6"},
+            ],
+        )
+        ctx, fakes = make_ctx(okx_client=client)
+        runner = BotRunner(ctx)
+        async with ctx.journal:
+            await runner._reconcile_orphans()
+        assert client.cancel_algo_calls == []
+        assert any("orphan_oco_no_journal_row" in m for m in messages)
     finally:
         logger.remove(sink_id)
 

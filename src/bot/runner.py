@@ -2294,10 +2294,26 @@ class BotRunner:
             # replay already paired every recorded open with its close.
 
     async def _reconcile_orphans(self) -> None:
-        """Log-only: compare live OKX positions against journal OPEN rows.
+        """Reconcile OKX state against the journal at startup.
 
-        Never auto-closes — operator decides. We only emit one error per
-        mismatch so restart logs are actionable.
+        Three passes:
+
+        1. Positions mismatch — log-only (operator decides). Unknown live
+           positions with no journal row, or stale journal OPEN rows whose
+           live position is gone.
+        2. Orphan resting limit orders — CANCEL. The monitor's in-memory
+           `_pending` dict is empty at startup, so any live pending limit
+           on OKX at this moment cannot be tracked by this process; if it
+           filled we'd get an untracked (= unprotected) position. Safer to
+           cancel now than to discover it as an orphan later.
+        3. Surplus OCOs — CANCEL those not referenced by the journal's
+           `algo_ids` for a (symbol, posSide) that has an OPEN row. This
+           covers the 2026-04-20 DOGE 2-OCO bug: a pre-restart
+           revise/lock placed a replacement OCO whose new algoId never made
+           it to the journal, so rehydrate missed it and the unreferenced
+           algo lives on as a phantom stop.
+
+        Never auto-closes *positions* — that stays operator-decides.
         """
         try:
             live = await asyncio.to_thread(self.ctx.okx_client.get_positions)
@@ -2310,3 +2326,104 @@ class BotRunner:
             logger.error("orphan_live_position_no_journal_row key={}", k)
         for k in journal_keys - live_keys:
             logger.error("journal_open_but_no_live_position key={} (stale row)", k)
+
+        await self._cancel_orphan_pending_limits()
+        await self._cancel_surplus_ocos(journal_keys)
+
+    async def _cancel_orphan_pending_limits(self) -> None:
+        """Cancel every resting limit order on OKX at startup.
+
+        The monitor's `_pending` dict is in-memory only and lost on
+        restart, so any resting limit found here is untrackable — if it
+        fills, `_handle_pending_filled` will never fire and the position
+        is born unprotected.
+        """
+        try:
+            resp = await asyncio.to_thread(
+                self.ctx.okx_client.trade.get_order_list, instType="SWAP",
+            )
+        except Exception:
+            logger.exception("orphan_pending_limits_scan_failed")
+            return
+        for row in (resp.get("data") or []):
+            ord_id = row.get("ordId")
+            inst_id = row.get("instId")
+            if not ord_id or not inst_id:
+                continue
+            try:
+                await asyncio.to_thread(
+                    self.ctx.okx_client.cancel_order, inst_id, ord_id,
+                )
+                logger.warning(
+                    "orphan_pending_limit_canceled inst={} ord={} px={} sz={}",
+                    inst_id, ord_id, row.get("px"), row.get("sz"),
+                )
+            except Exception:
+                logger.exception(
+                    "orphan_pending_limit_cancel_failed inst={} ord={}",
+                    inst_id, ord_id,
+                )
+
+    async def _cancel_surplus_ocos(
+        self, journal_keys: set[tuple[str, str]],
+    ) -> None:
+        """Cancel any OCO on OKX that isn't referenced by the journal's
+        `algo_ids` for a tracked (inst_id, pos_side).
+
+        Surplus OCOs happen when a pre-restart revise/lock placed a
+        replacement whose new algoId was never persisted (bug class fixed
+        in `revise_runner_tp` 2026-04-20). Acts as a safety net even when
+        the primary fix regresses.
+
+        OCOs for keys with no journal row (`live_position_no_journal_row`)
+        are left alone — operator intervenes on those via log alert.
+        """
+        try:
+            okx_algos = await asyncio.to_thread(
+                self.ctx.okx_client.list_pending_algos, ord_type="oco",
+            )
+        except Exception:
+            logger.exception("surplus_oco_scan_failed")
+            return
+        try:
+            open_recs = await self.ctx.journal.list_open_trades()
+        except Exception:
+            logger.exception("surplus_oco_journal_read_failed")
+            return
+
+        tracked_by_key: dict[tuple[str, str], set[str]] = {}
+        for rec in open_recs:
+            pos_side = _direction_to_pos_side(rec.direction)
+            tracked_by_key.setdefault((rec.symbol, pos_side), set()).update(
+                str(x) for x in (rec.algo_ids or [])
+            )
+
+        for algo in okx_algos:
+            algo_id = str(algo.get("algoId") or "")
+            inst_id = str(algo.get("instId") or "")
+            pos_side = str(algo.get("posSide") or "")
+            if not algo_id or not inst_id or not pos_side:
+                continue
+            key = (inst_id, pos_side)
+            if key not in journal_keys:
+                logger.error(
+                    "orphan_oco_no_journal_row inst={} pos={} algo={}",
+                    inst_id, pos_side, algo_id,
+                )
+                continue
+            if algo_id in tracked_by_key.get(key, set()):
+                continue
+            try:
+                await asyncio.to_thread(
+                    self.ctx.okx_client.cancel_algo, inst_id, algo_id,
+                )
+                logger.warning(
+                    "surplus_oco_canceled inst={} pos={} algo={} sl={} tp={}",
+                    inst_id, pos_side, algo_id,
+                    algo.get("slTriggerPx"), algo.get("tpTriggerPx"),
+                )
+            except Exception:
+                logger.exception(
+                    "surplus_oco_cancel_failed inst={} pos={} algo={}",
+                    inst_id, pos_side, algo_id,
+                )

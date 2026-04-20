@@ -392,3 +392,71 @@ def test_lock_sl_at_idempotent_cancel_proceeds_to_place():
     ok = mon.lock_sl_at("BTC-USDT-SWAP", "long", new_sl=70000.0)
     assert ok is True
     assert len(client.placed) == 1
+
+
+# ── revise_runner_tp must persist the new algoId via on_sl_moved ───────────
+
+
+def test_revise_runner_tp_invokes_on_sl_moved_with_new_algo_ids():
+    """Regression for 2026-04-20 DOGE 2-OCO postmortem. When revise_runner_tp
+    replaces the runner OCO successfully, the in-memory algo_ids change and
+    the journal must be updated too — otherwise a restart rehydrates the
+    pre-revise algoId, the next revise cancels a ghost, and the actually-
+    live replacement becomes an orphan OCO on OKX."""
+    client = FakeRevisableClient(next_algo_id="JOURNALED_REVISE")
+    captured: list[tuple[str, str, list[str]]] = []
+
+    def _on_sl_moved(inst_id, pos_side, new_algo_ids):
+        captured.append((inst_id, pos_side, list(new_algo_ids)))
+
+    mon = PositionMonitor(client, on_sl_moved=_on_sl_moved)
+    mon.register_open(
+        "BTC-USDT-SWAP", "long", size=3.0, entry_price=70000.0,
+        algo_ids=["TP1_ID", "RUNNER_ID"], tp2_price=73000.0,
+        sl_price=69000.0, runner_size=2,
+    )
+    ok = mon.revise_runner_tp("BTC-USDT-SWAP", "long", new_tp=71500.0)
+    assert ok is True
+    assert captured == [("BTC-USDT-SWAP", "long", ["TP1_ID", "JOURNALED_REVISE"])]
+
+
+def test_revise_runner_tp_does_not_invoke_callback_on_place_failure():
+    """If the place leg fails, algo_ids is trimmed but the journal already
+    held the stale runner id — the callback must not fire with a partially-
+    updated list that'd push `algo_ids=[TP1_ID]` without the new runner."""
+    client = FakeRevisableClient(place_raises=RuntimeError("OCO rejected"))
+    captured: list[tuple] = []
+
+    def _on_sl_moved(inst_id, pos_side, new_algo_ids):
+        captured.append((inst_id, pos_side, list(new_algo_ids)))
+
+    mon = PositionMonitor(client, on_sl_moved=_on_sl_moved)
+    mon.register_open(
+        "BTC-USDT-SWAP", "long", size=3.0, entry_price=70000.0,
+        algo_ids=["TP1_ID", "RUNNER_ID"], tp2_price=73000.0,
+        sl_price=69000.0, runner_size=2,
+    )
+    ok = mon.revise_runner_tp("BTC-USDT-SWAP", "long", new_tp=71500.0)
+    assert ok is False
+    assert captured == []
+
+
+def test_revise_runner_tp_swallows_on_sl_moved_exception():
+    """Journal write failures must not break the revise contract — the
+    revise itself succeeded on OKX, we just can't persist. Logs the
+    exception and returns True so the caller doesn't re-attempt the
+    OCO cancel+replace on the next cycle."""
+    client = FakeRevisableClient(next_algo_id="JOURNALED_REVISE")
+
+    def _boom(inst_id, pos_side, new_algo_ids):
+        raise RuntimeError("journal down")
+
+    mon = PositionMonitor(client, on_sl_moved=_boom)
+    mon.register_open(
+        "BTC-USDT-SWAP", "long", size=3.0, entry_price=70000.0,
+        algo_ids=["TP1_ID", "RUNNER_ID"], tp2_price=73000.0,
+        sl_price=69000.0, runner_size=2,
+    )
+    ok = mon.revise_runner_tp("BTC-USDT-SWAP", "long", new_tp=71500.0)
+    assert ok is True
+    assert len(client.placed) == 1

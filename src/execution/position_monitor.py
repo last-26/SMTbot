@@ -441,6 +441,16 @@ class PositionMonitor:
             "tp_revised inst={} side={} new_tp={} sl={} new_algo={}",
             t.inst_id, t.pos_side, new_tp, t.sl_price, new_algo.algo_id,
         )
+        # Persist the new runner algo id to the journal so a restart's rehydrate
+        # reads the *live* algo, not the pre-revise one. Without this, the next
+        # rehydrate reads a stale id and the next revise cancels a ghost while
+        # the actually-live replacement keeps running → orphan OCO on OKX.
+        # (2026-04-20 DOGE 2-OCO postmortem.)
+        if self._on_sl_moved is not None:
+            try:
+                self._on_sl_moved(t.inst_id, t.pos_side, list(t.algo_ids))
+            except Exception:
+                logger.exception("on_sl_moved_callback_failed_after_tp_revise")
         return True
 
     def get_tracked_runner(

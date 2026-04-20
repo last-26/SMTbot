@@ -22,6 +22,70 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 
 ## Changelog
 
+### 2026-04-20 — Stale-algoId + orphan pending-limit reconciliation (DOGE 2-OCO postmortem)
+
+- **Trigger:** operator spotted two DOGE OCOs for the same live long position — `3495282693644861440` (sl=0.09379, MFE-locked, active) *and* `3494715650050920448` (sl=0.09296, older). Both with sz=64 sharing the same TP (0.0959). After a manual restart, also two pre-restart resting limits stuck on OKX (ETH@2280.04 sz=29, BNB@620.3 sz=1182). Operator quote: *"dogede 2 tane sl var gibi yine güncel pozisyon ve emirleri kontrol eder misin. (botu yeniden başlattığıma rağmen, başlatmadan önce emirleri silmiştim.)"*
+- **Root cause — stale algoId in journal** (`src/execution/position_monitor.py:revise_runner_tp`):
+  - DOGE timeline reconstructed from log:
+    1. 02:15 long fill → initial OCO `3494658137318264832` placed + journaled (`algo_ids=["3494658137318264832"]`).
+    2. 05:44 dynamic-TP revise → cancels initial, places `3494715650050920448`. **In-memory `_tracked.algo_ids` updated; journal NOT touched.** Journal still shows `["3494658137318264832"]`.
+    3. 07:07 bot restart → `_rehydrate_open_positions` reads journal → `_tracked.algo_ids = ["3494658137318264832"]`. The actually-live `3494715650050920448` is now untracked orphan.
+    4. 07:09 next revise fires → attempts to cancel `algo_ids[-1] = 3494658137318264832`. OKX returns 51400 (already_gone — truly gone since 05:44). `_verify_algo_gone` confirms. Proceeds, places `3494887702514929664`. In-memory `algo_ids` now `["3494887702514929664"]`; journal still stale.
+    5. 10:25 MFE-lock fires → cancels `3494887702514929664`, places `3495282693644861440`. MFE-lock's success path *does* call `_on_sl_moved` → journal updates to `["3495282693644861440"]`. But `3494715650050920448` is still orphan on OKX.
+  - Code-level bug: `revise_runner_tp` updates `_tracked.algo_ids` on line 437 but never calls `self._on_sl_moved(...)` like `lock_sl_at` does on line 570-574. Callback writes `journal.update_algo_ids` — without it, every restart rewinds the journal's view of `algo_ids` to the initial attach.
+- **Root cause — no startup reconciliation for pending limits** (`src/bot/runner.py:_reconcile_orphans`):
+  - `_rehydrate_open_positions` restores the monitor's tracked **positions** from journal OPEN rows. It does not touch `_pending` (the in-memory dict of resting limit orders). `_pending` is lost on restart by design — limit orders are short-lived and the monitor re-registers on fresh `place_limit_entry` calls.
+  - Result: any limit order resting on OKX at restart time is invisible to the restarted bot. If it fills, `_handle_pending_filled` never fires → no OCO attach → unprotected position. Same class as the phantom-cancel orphans, different root.
+  - Operator's *"manuel sildim"* observation partially true: they deleted the live MFE-locked OCO in the UI (which bot then recreated on next cycle) but couldn't see the orphan from 05:44 since OKX's algo page groups by symbol, not by algoId — the two stacked OCOs looked like one row.
+- **Fix A — journal algoId after every OCO replacement** (`src/execution/position_monitor.py:444`):
+  - Added `self._on_sl_moved(t.inst_id, t.pos_side, list(t.algo_ids))` right after the `tp_revised` log in `revise_runner_tp`. Matches `lock_sl_at`'s existing pattern. Callback failures are swallowed (logged as `on_sl_moved_callback_failed_after_tp_revise`) — the OKX-side revise already succeeded, returning False would cause the next cycle to re-try cancel+replace against an already-new algo.
+  - Contract tightening: after revise, journal's `algo_ids` and in-memory `_tracked.algo_ids` stay in sync. Next restart's rehydrate reads the live algo, next revise cancels the correct ghost, no orphan.
+- **Fix B — startup reconciliation for orphans** (`src/bot/runner.py:_reconcile_orphans`):
+  - Existing log-only pass for position mismatch unchanged.
+  - New pass 1: `_cancel_orphan_pending_limits` — scan `client.trade.get_order_list(instType="SWAP")`, cancel every resting limit. Safe because `_pending` is empty at startup (first cycle hasn't run yet); any live limit is orphan by construction.
+  - New pass 2: `_cancel_surplus_ocos` — scan `list_pending_algos("oco")`. For each (inst_id, pos_side) with a journal OPEN row, compare algoIds to `journal.algo_ids` and cancel surplus. OCOs for keys *without* a journal row get log-only (`orphan_oco_no_journal_row`) — never auto-cancel a stop that might be protecting an untracked-but-legitimate position; operator intervenes via log alert. This is defense-in-depth: even if Fix A regresses, the next restart self-heals.
+- **Immediate remediation (one-shot):** `scripts/cancel_orphans.py` canceled the three live orphans found via `probe_open_orders.py`:
+  - DOGE OCO `3494715650050920448` (surplus stop).
+  - ETH resting limit `3495274735394340864` (@2280.04 sz=29).
+  - BNB resting limit `3495272138516185088` (@620.3 sz=1182).
+  - Post-cleanup probe: 5 positions each with one OCO, 0 pending limits.
+- **Tests:** 6 new, all green.
+  - `test_position_monitor.py` — `test_revise_runner_tp_invokes_on_sl_moved_with_new_algo_ids` (regression), `test_revise_runner_tp_does_not_invoke_callback_on_place_failure` (callback only fires on success), `test_revise_runner_tp_swallows_on_sl_moved_exception` (journal failure doesn't re-try the OCO).
+  - `test_bot_runner.py` — `test_reconcile_cancels_every_resting_pending_limit`, `test_reconcile_cancels_surplus_oco_not_in_journal`, `test_reconcile_leaves_oco_for_keys_without_journal_row`.
+  - Full suite **763 passed** (up from 757).
+- **Dataset:** `rl.clean_since` unchanged. These are correctness fixes to restart reconciliation + journal write-back — they don't alter scoring, sizing, entry, or exit geometry. Post-deploy trades sit on the same regime.
+- **Operator contract (restart):** when the bot restarts, logs will now show `orphan_pending_limit_canceled` or `surplus_oco_canceled` warnings if any resting orders / surplus OCOs existed pre-restart. Zero warnings = clean state. `orphan_oco_no_journal_row` ERROR still needs manual investigation (a live OCO without a tracked position is either a legitimate un-journaled position or a leftover from a manual UI action).
+- **What this does NOT fix:** the `tp_revise_runner_already_gone` verified=true pathway at 07:09 UTC in the root cause was OKX correctly reporting a truly-gone algo; the bug wasn't there. It's a harmless side-effect of the stale-algoId bug but would remain even with both fixes applied. When `revise_runner_tp` successfully journals the new algoId (Fix A), rehydrate won't produce stale tracking anymore, so 07:09-class logs should disappear post-deploy.
+
+### 2026-04-20 — Postmortem: 3rd phantom-cancel orphan (fix shipped, bot not restarted)
+
+- **Trigger:** operator observed a BTC position with no OCO attached (live long 11 contracts, entry 74274.9) and reported *"emrin yarısı tp olmuş diğer yarısı da iptal edilmiş … tp sl siz bir btc pozu var şu anda"*. Asked for detailed diagnosis of how another unprotected BTC emerged after the phantom-cancel fix.
+- **Root cause (operational, not a code regression):**
+  - The phantom-cancel fix (commit `a624385`) was authored at **2026-04-20 07:06 local** (04:06 UTC). The bot had been running continuously since 2026-04-18 02:55 and **was never restarted**, so the running instance still contained the old buggy `poll_pending` that emitted `CANCELED` + dropped tracking whenever `cancel_order` raised a generic `Exception`.
+  - Between bot start and the fix timestamp, three `pending_timeout_cancel_(failed|exception)` events occurred in the log:
+    1. 04:08:25 local — BTC ord 3494461668590866432, sCode 50001 → the operator found + manually canceled this one (captured in the original phantom-cancel changelog).
+    2. 04:12:56 local — DOGE ord 3494471132685520896, sCode 50001 → also found + manually canceled.
+    3. **05:53:30 local — BTC ord 3494673746828185600, generic exception** → **not noticed at the time**. Limit was at 74268.1, sl 73971.0, tp 75159.3.
+  - Orphan #3's timeline:
+    - 05:53:30 local: cancel attempt threw generic exception under old code → `logger.exception(pending_timeout_cancel_exception…)` followed by `pending_canceled reason=timeout` emitted 3 ms later. Pending row popped. Order **still live on OKX**.
+    - 06:06:07 local (03:06:07 UTC): orphan limit filled naturally at 74268 (price retraced through the zone on its own).
+    - 06:04:29 local (22 seconds earlier): a fresh BTC limit B at 74281.8 also filled. Journal records trade `7bc9d5bb051a486fb03437866a23a102` for B with `num_contracts=11`. OCO attached to B.
+    - OKX aggregated both longs into a single position: `size=22 entry=74274.9` (weighted average of 74268 × 11 and 74281.8 × 11). Bot believed `runner_size=11`.
+  - Today's closing half:
+    - 07:18:25 local: dynamic TP revise replaced B's OCO (new algo 3494905668732227584, tp 75145.53, sl 73984.69). sz still 11.
+    - 10:21:05 local: MFE-lock fired (price crossed +2R MFE). Cancel + replace worked (`sl_locked_via_replace … new_algo=3495273429333295104 new_sl=74349.17 tp=75145.53`).
+    - 10:21:21 local: BTC wicked to 75163.4 → new OCO's TP triggered → reduce-only market sell 11 contracts at 75163.4. OKX position went 22 → 11. Journal trade 7bc9d5bb remained `OPEN` because the monitor's tracked size was 11 (not 22); OKX reporting 11 looked like "no change" to the old-code monitor.
+  - Result: 11 orphan contracts from limit A (entry 74268) remain live as BTC long with no OCO. Aggregated entry reads 74274.9 in the UI because OKX didn't split the avg basis when half closed.
+- **What the operator saw:** in the OKX algo history, the MFE-locked OCO `3495273429333295104` shows as split: TP leg → effective/filled at 75163.4, SL leg → auto-canceled (standard OCO contract). This is the "half TP, half iptal" view. Underneath, the position didn't close — half the aggregate was just never tracked.
+- **Why the phantom-cancel fix doesn't cover this retroactively:** the fix only prevents *future* dropped rows. Orphan #3 was already dropped before the fix existed. The running bot also wouldn't benefit from the fix without a restart — so a 4th+ orphan could happen on any further transient OKX outage until the process restarts.
+- **Immediate remediation (operator):**
+  1. Close the unprotected 11 BTC long manually on OKX (market close, reduce-only).
+  2. Restart bot — this picks up both the phantom-cancel fix (`a624385`) *and* the flat-USDT $R override (`4c0e971`, needed for the operator's new `RISK_AMOUNT_USDT=60` in .env).
+  3. Journal cleanup for trade `7bc9d5bb`: either mark closed manually (WIN, exit 75163.4, pnl ≈ +$135) or let the reconcile-orphans path log it and adjust later from the OKX fills history. Risk replay will reset correctly on restart from `journal.replay_for_risk_manager`.
+- **Process learning added:** after any code change to execution-path modules (`position_monitor.py`, `runner.py`, `okx_client.py`), a bot restart is required for the fix to apply. `.env` changes (e.g. `RISK_AMOUNT_USDT`) also need a restart. Add to operator checklist: *"kod commit'i = bot yeniden başlat; yeniden başlatmadan fix canlı değildir."*
+- **Secondary journal inconsistency (logged, not critical):** MFE-lock's `_on_sl_moved` callback set `sl_moved_to_be=1` in the journal but did **not** update `sl_price` — journal still shows original plan SL (73984.69) while the live OCO had new SL (74349.17). Separate fix to journal the replaced SL price alongside the flag. Tracked as a future cleanup (no trade-correctness impact today because the trade closed on TP, not SL).
+- **No code change in this entry** — this is a postmortem. The preventive fix is already in `a624385` and activates on the next bot restart.
+
 ### 2026-04-20 — Flat-USDT $R override + zone-resize ceil parity
 
 - **Trigger:** operator observed 5 open positions with notional spread from $4,280 (SOL) to $16,381-ish (BTC) and mis-read this as unequal $R. Digging into the journal showed notionals were *correct* (bigger notional ↔ tighter sl_pct gives equal $R per construction), but planned `risk_amount_usdt` actually varied $32.68 → $47.98 across the 5 positions — a $15 spread on a nominal $50 target. Operator quote: *"R=\$50 belirliyorsam stopu buna göre ayarlamasını sağla … bakiye arttıkça oradaki istediğim r miktarını manuel olarak elle değiştirip buna göre devam edebilirim."*
