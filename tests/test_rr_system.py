@@ -288,6 +288,105 @@ def test_equal_realized_loss_across_heterogeneous_symbols():
     assert max(realized_totals) - min(realized_totals) < 3.5
 
 
+def test_override_replaces_balance_times_pct():
+    """Operator-set flat $R override bypasses balance × risk_pct (2026-04-20).
+
+    The override path is the operator-facing fix for the $13 spread between
+    open positions: instead of `balance × risk_pct` shimmering as unrealized
+    drawdown on concurrent open positions pulls total equity around, every
+    position sizes off the same constant $R the operator pinned in env/YAML.
+    """
+    plan = calculate_trade_plan(
+        Direction.BULLISH, 100.0, 99.0, 10_000.0,
+        risk_pct=0.01,  # Would yield $100 — override wins.
+        risk_amount_usdt_override=50.0,
+    )
+    assert plan.max_risk_usdt == pytest.approx(50.0)
+    # Un-capped ceil still applies on top of the override.
+    assert plan.risk_amount_usdt >= 50.0 - 1e-6
+
+
+def test_override_equal_r_across_heterogeneous_symbols():
+    """5-symbol matrix: override=$50 yields realized loss ≈ $50 on every
+    symbol with spread bounded by widest per-contract step — the operator's
+    on-screen contract for the $5k demo × 1% R regime (2026-04-20).
+    """
+    symbols = [
+        ("BTC", 68_000.0, 0.004, 0.01),
+        ("ETH",  2_400.0, 0.006, 0.10),
+        ("SOL",    140.0, 0.010, 1.00),
+        ("DOGE",     0.35, 0.008, 1.00),
+        ("BNB",    700.0, 0.005, 0.10),
+    ]
+    override = 50.0
+    fee_reserve_pct = 0.001
+    realized_totals = []
+    for _sym, entry, sl_pct, ctval in symbols:
+        plan = calculate_trade_plan(
+            direction=Direction.BULLISH,
+            entry_price=entry, sl_price=entry * (1.0 - sl_pct),
+            account_balance=5_000.0, risk_pct=0.01,
+            rr_ratio=3.0, max_leverage=75, contract_size=ctval,
+            margin_balance=1_000.0, fee_reserve_pct=fee_reserve_pct,
+            risk_amount_usdt_override=override,
+        )
+        assert not plan.capped
+        effective_sl_pct = plan.sl_pct + plan.fee_reserve_pct
+        total_realized = plan.position_size_usdt * effective_sl_pct
+        assert total_realized >= override - 1e-6
+        realized_totals.append(total_realized)
+    assert max(realized_totals) - min(realized_totals) < 3.5
+
+
+def test_override_bypasses_balance_shimmer():
+    """Override makes $R immune to account_balance drift from concurrent
+    open-position unrealized drawdown — same override, different balances,
+    identical plan (bar the 10% safety-rail floor on balance)."""
+    args = dict(
+        direction=Direction.BULLISH,
+        entry_price=100.0, sl_price=99.0, risk_pct=0.01,
+        risk_amount_usdt_override=50.0,
+    )
+    plan_hi = calculate_trade_plan(account_balance=10_000.0, **args)
+    plan_lo = calculate_trade_plan(account_balance=1_000.0, **args)
+    # Max_risk and sizing identical — override is authoritative.
+    assert plan_hi.max_risk_usdt == plan_lo.max_risk_usdt == pytest.approx(50.0)
+    assert plan_hi.num_contracts == plan_lo.num_contracts
+
+
+def test_override_safety_rail_rejects_above_10pct_of_balance():
+    """Override > 10% of account_balance must raise — a stale too-high
+    override on a crashed balance could size a position beyond the
+    per-trade loss cap that the `risk_pct <= 0.1` ceiling enforces."""
+    with pytest.raises(ValueError, match="exceeds 10%"):
+        calculate_trade_plan(
+            Direction.BULLISH, 100.0, 99.0, 400.0,  # 10% = $40 ceiling
+            risk_amount_usdt_override=50.0,
+        )
+
+
+def test_override_non_positive_raises():
+    with pytest.raises(ValueError, match="must be > 0"):
+        calculate_trade_plan(
+            Direction.BULLISH, 100.0, 99.0, 10_000.0,
+            risk_amount_usdt_override=0.0,
+        )
+    with pytest.raises(ValueError, match="must be > 0"):
+        calculate_trade_plan(
+            Direction.BULLISH, 100.0, 99.0, 10_000.0,
+            risk_amount_usdt_override=-5.0,
+        )
+
+
+def test_override_none_falls_back_to_percent_mode():
+    """None (default) preserves legacy balance × risk_pct behavior."""
+    plan = calculate_trade_plan(
+        Direction.BULLISH, 100.0, 99.0, 10_000.0,
+        risk_pct=0.01, risk_amount_usdt_override=None,
+    )
+    assert plan.max_risk_usdt == pytest.approx(100.0)
+
+
 def test_tp_distance_equals_rr_times_sl_distance():
     plan = calculate_trade_plan(
         Direction.BULLISH, 100, 99, 1000, rr_ratio=4.0,

@@ -1445,6 +1445,7 @@ class BotRunner:
                 contract_size=self.ctx.contract_sizes.get(
                     symbol, cfg.trading.contract_size),
                 margin_balance=margin_balance,
+                risk_amount_usdt_override=cfg.trading.risk_amount_usdt,
                 swing_lookback=cfg.swing_lookback_for(symbol),
                 allowed_sessions=cfg.allowed_sessions_for(symbol) or None,
                 htf_sr_zones=self.ctx.htf_sr_cache.get(symbol),

@@ -41,6 +41,14 @@ class TradingConfig(BaseModel):
     htf_timeframe: str                            # e.g. "15m"
     ltf_timeframe: str = "1m"                     # low-TF reversal (Madde F)
     risk_per_trade_pct: float                     # percent (e.g. 1.0 → 1 %)
+    # Operator-set absolute USDT risk per trade. When populated (either via
+    # YAML `trading.risk_amount_usdt` or the `RISK_AMOUNT_USDT` env var),
+    # bypasses the `balance × risk_per_trade_pct` sizing path and uses this
+    # number directly as max_risk. Null/absent = legacy percent mode.
+    # Operator-controlled: pin $R to a flat number (e.g. 50) regardless of
+    # unrealized drawdown on other open positions. Safety rail enforces
+    # override ≤ 10% of account_balance inside `calculate_trade_plan`.
+    risk_amount_usdt: Optional[float] = None
     max_leverage: int
     default_rr_ratio: float
     min_rr_ratio: float
@@ -91,6 +99,16 @@ class TradingConfig(BaseModel):
                     "(or legacy trading.symbol set)"
                 )
         return self
+
+    @field_validator("risk_amount_usdt")
+    @classmethod
+    def _risk_amount_positive(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and v <= 0:
+            raise ValueError(
+                "trading.risk_amount_usdt must be > 0 when set "
+                "(use null/absent to fall back to percent mode)"
+            )
+        return v
 
 
 class CircuitBreakerSection(BaseModel):
@@ -626,5 +644,20 @@ def load_config(path: str | Path, *, env_path: Optional[str | Path] = None) -> B
     if env_finnhub:
         cal_section["finnhub_api_key"] = env_finnhub
     raw["economic_calendar"] = cal_section
+
+    # Operator-set absolute $R override — env wins over YAML so an operator
+    # can bump the number between bot restarts without editing config. Empty
+    # string / unset → YAML value (or None → legacy percent mode).
+    env_risk_amount = os.environ.get("RISK_AMOUNT_USDT", "").strip()
+    if env_risk_amount:
+        try:
+            parsed_risk_amount = float(env_risk_amount)
+        except ValueError as exc:
+            raise ValueError(
+                f"RISK_AMOUNT_USDT={env_risk_amount!r} is not a valid float"
+            ) from exc
+        trading_section = dict(raw.get("trading") or {})
+        trading_section["risk_amount_usdt"] = parsed_risk_amount
+        raw["trading"] = trading_section
 
     return BotConfig(**raw)

@@ -22,6 +22,40 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 
 ## Changelog
 
+### 2026-04-20 — Flat-USDT $R override + zone-resize ceil parity
+
+- **Trigger:** operator observed 5 open positions with notional spread from $4,280 (SOL) to $16,381-ish (BTC) and mis-read this as unequal $R. Digging into the journal showed notionals were *correct* (bigger notional ↔ tighter sl_pct gives equal $R per construction), but planned `risk_amount_usdt` actually varied $32.68 → $47.98 across the 5 positions — a $15 spread on a nominal $50 target. Operator quote: *"R=\$50 belirliyorsam stopu buna göre ayarlamasını sağla … bakiye arttıkça oradaki istediğim r miktarını manuel olarak elle değiştirip buna göre devam edebilirim."*
+- **Root cause (two stacked bugs):**
+  1. `runner.py:1413` — `risk_balance = min(total_eq, risk_mgr.current_balance)`. Live OKX equity includes unrealized PnL on concurrent open positions. When 5 symbols open in quick succession (multi-open window 02:12–03:06 UTC), each subsequent symbol sees `total_eq` dragged down by the prior positions' floating drawdown (entry spread + fees). Each entry sized off a slightly different balance snapshot → different `max_risk_usdt` → different `plan.risk_amount_usdt`.
+  2. `setup_planner.apply_zone_to_plan` — zone path is the PRIMARY execution path (scalp-native rewire 2026-04-19), but it still floor-rounded contracts (`max(1, int(notional / ctu))`) even after rr_system's 2026-04-19 ceil contract flipped elsewhere. Any ceil work in `calculate_trade_plan` got undone immediately when the zone re-sized.
+- **Fix — operator-set flat $R override (bypasses mechanism #1 entirely):**
+  - New optional knob: `trading.risk_amount_usdt` (YAML) + `RISK_AMOUNT_USDT` (env). Env wins over YAML. Null/absent = legacy `balance × risk_per_trade_pct`.
+  - `calculate_trade_plan` (`src/strategy/rr_system.py`) accepts `risk_amount_usdt_override`: when provided, bypasses `account_balance × risk_pct` and uses the override as `max_risk_usdt` directly. Safety rail: override ≤ 10% of `account_balance` (mirrors the existing `risk_pct ≤ 0.1` ceiling) — raises `ValueError` if exceeded so a stale too-high override on a crashed balance can't size past the per-trade loss cap. Threaded through `build_trade_plan_with_reason` → `runner.py` → read from `cfg.trading.risk_amount_usdt`.
+  - `.env.example` — new `RISK_AMOUNT_USDT=` entry with docstring: operator-visible $R constant, bump manually as balance grows (demo $5k → $50; live $10k → $50/$100 per your own ramp plan).
+  - `config/default.yaml` — new `trading.risk_amount_usdt: null` with inline operator note.
+- **Fix — zone-resize ceil parity (bypasses mechanism #2):**
+  - `setup_planner.apply_zone_to_plan` now mirrors `calculate_trade_plan`'s 2026-04-19 ceil contract: `plan.capped=False` → `num_contracts = ceil(risk / per_contract_cost)`; `capped=True` → floor (respects leverage/margin ceiling). Removes the silent `max(1, …)` minimum that would sometimes size 1 contract above the override.
+  - Keeps equal-$R guarantee through the zone re-size — was the load-bearing gap between rr_system's ceil and the execution path's floor that produced the residual $2-$13 spread even after mechanism #1 was hypothetically fixed.
+- **Expected behavior change:**
+  - Before: 5 sequential opens at balance $3,268–$4,798 produced `risk_amount_usdt` ∈ [$32.68, $47.98]; zone re-size floored below target; operator saw $15 spread across 5 live positions on a nominal $50 target.
+  - After (with `RISK_AMOUNT_USDT=50`): every position sizes at `max_risk_usdt = $50` regardless of live equity or position-open sequence; zone re-size ceil lands at $50 + ≤ one per_contract_cost step (< $3 per current symbol universe); operator sees $50-$53 band across all 5 positions. TP still zone/heatmap-driven via `tp_dynamic_enabled=true` + `target_rr_cap=3.0` — override *only* controls $R, not TP geometry.
+  - Percent mode unchanged when override is null — no impact on tests or downstream callers that don't pass the override.
+- **Safety rail specifics:**
+  - Override must be > 0 (ValueError on ≤ 0).
+  - Override must be ≤ `account_balance × 0.1` (ValueError on exceed). Prevents the "balance crashed to $500, stale $50 override sizes at 10%" scenario from silently sliding past the per-trade loss ceiling.
+  - `TradingConfig._risk_amount_positive` pydantic validator rejects non-positive YAML values at load time.
+  - `load_config` parses `RISK_AMOUNT_USDT` env var; raises `ValueError("not a valid float")` on garbage input (e.g. `RISK_AMOUNT_USDT=notanumber`). Empty string / unset preserves YAML value.
+- **Tests:** 11 new, all green (757 passed total, up from 738):
+  - `test_rr_system.py` — `test_override_replaces_balance_times_pct`, `test_override_equal_r_across_heterogeneous_symbols` (5-symbol matrix, spread < $3.50), `test_override_bypasses_balance_shimmer` (same override on $1k vs $10k balances → identical plan), `test_override_safety_rail_rejects_above_10pct_of_balance`, `test_override_non_positive_raises`, `test_override_none_falls_back_to_percent_mode`.
+  - `test_setup_planner.py` — `test_apply_zone_to_plan_ceil_keeps_risk_at_or_above_target_uncapped`, `test_apply_zone_to_plan_capped_plan_still_floors` (capped path still uses floor).
+  - `test_bot_config.py` — `test_risk_amount_usdt_null_default`, `test_risk_amount_usdt_parsed_from_yaml`, `test_risk_amount_usdt_rejects_non_positive`, `test_risk_amount_usdt_env_wins_over_yaml`, `test_risk_amount_usdt_env_empty_falls_back_to_yaml`, `test_risk_amount_usdt_env_rejects_invalid_float`.
+- **Operator playbook:**
+  - Demo (balance $3k-$8k): add `RISK_AMOUNT_USDT=50` to `.env`. Every SL loses ≈ $50, every TP pays ≈ $150 (3R hard cap, before fees).
+  - Bakiye $8k → $15k'ya çıktığında: R'yi manuel olarak $75 veya $100'e çıkar (`RISK_AMOUNT_USDT=75.0`), bot'u yeniden başlat. Safety rail 10% ceiling'i (dolayısıyla $8k'da max $800) vurmadığı sürece sorunsuz.
+  - Live'a geçerken: boş bırak veya `RISK_AMOUNT_USDT=` ile sil, `trading.risk_per_trade_pct: 0.5` (demo'dan düşürülmüş) percent mode yeterli. Override'ı live'da açmak operatörün sermaye rampaya göre tercihi.
+- **Dataset:** `rl.clean_since` unchanged. Override is a *sizing input*, not a scoring/exit regime shift; the ceil parity fix in `apply_zone_to_plan` tightens an existing invariant rather than flipping it. Post-deploy `risk_amount_usdt` distribution will cluster tighter (spread $15 → ≤ $3) but max-R ceiling and TP geometry are identical.
+- **What's explicitly NOT fixed:** the `min(total_eq, current_balance)` anomaly in runner.py (mechanism #1) is *bypassed* by the override but not repaired for percent mode. Future work when live/percent-mode matters; on demo with override active the anomaly is mooted. Tracked as a Phase 11 prerequisite before cutting to live percent mode.
+
 ### 2026-04-20 — Phantom-cancel fix (orphan resting limits)
 
 - **Trigger:** operator observed 2 extra resting limit orders on BTC + DOGE while 5 positions were already open (BTC long orphan @ 74053.4 sz=12, DOGE long orphan @ 0.09345 sz=64 — both unrelated to the live positions, no OCO attached). Operator quote: *"Pozisyon olan paritede 2. bir long işlemi neden var … ben manuel olarak iptal ediyorum. Sen de kod üzerinde bir daha böyle bir şey yaşanmaması için bu sorunu düzelt."*

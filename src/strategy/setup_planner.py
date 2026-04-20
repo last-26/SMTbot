@@ -26,6 +26,7 @@ specifically asked for.
 
 from __future__ import annotations
 
+import math
 import statistics
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
@@ -497,11 +498,26 @@ def apply_zone_to_plan(
     if target_rr_cap > 0.0:
         new_tp = new_entry + sign * target_rr_cap * new_sl_distance
     new_sl_pct = new_sl_distance / new_entry
+    # Mirror rr_system's 2026-04-19 ceil-sizing contract here: when the
+    # original plan was ceil-sized (not capped), re-size with ceil so the
+    # zone-adjusted realized loss stays ≥ plan.risk_amount_usdt with
+    # bounded overshoot (< one per_contract_cost). Capped plans keep
+    # floor — respecting the leverage/margin ceiling wins over the
+    # equal-risk target. Without this mirror, zone entries floor-rounded
+    # while market/legacy entries ceiled, producing the $2-$13 $R spread
+    # the operator observed across the 5 open positions on 2026-04-20.
     risk = plan.risk_amount_usdt
     denom = new_sl_pct + plan.fee_reserve_pct
-    notional = risk / denom if denom > 0 else risk / new_sl_pct
-    num_contracts = max(1, int(notional / (new_entry * contract_size)))
-    actual_notional = num_contracts * new_entry * contract_size
+    per_contract_usdt = new_entry * contract_size
+    per_contract_cost = denom * per_contract_usdt
+    if per_contract_cost <= 0 or per_contract_usdt <= 0:
+        num_contracts = 0
+    elif plan.capped:
+        notional = risk / denom if denom > 0 else risk / new_sl_pct
+        num_contracts = int(notional / per_contract_usdt)
+    else:
+        num_contracts = math.ceil(risk / per_contract_cost)
+    actual_notional = num_contracts * per_contract_usdt
     actual_risk = actual_notional * new_sl_pct
     tp_distance = abs(new_tp - new_entry)
     new_rr = tp_distance / new_sl_distance if new_sl_distance > 0 else 0.0

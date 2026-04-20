@@ -130,6 +130,80 @@ def test_symbol_leverage_caps_parsed_from_yaml():
     assert cfg.trading.symbol_leverage_caps["SOL-USDT-SWAP"] == 25
 
 
+def test_risk_amount_usdt_null_default():
+    """Absent → None (legacy percent mode)."""
+    cfg = BotConfig(**_valid_raw())
+    assert cfg.trading.risk_amount_usdt is None
+
+
+def test_risk_amount_usdt_parsed_from_yaml():
+    raw = _valid_raw()
+    raw["trading"]["risk_amount_usdt"] = 50.0
+    cfg = BotConfig(**raw)
+    assert cfg.trading.risk_amount_usdt == 50.0
+
+
+def test_risk_amount_usdt_rejects_non_positive():
+    raw = _valid_raw()
+    raw["trading"]["risk_amount_usdt"] = 0.0
+    with pytest.raises(ValidationError, match="must be > 0"):
+        BotConfig(**raw)
+    raw["trading"]["risk_amount_usdt"] = -5.0
+    with pytest.raises(ValidationError, match="must be > 0"):
+        BotConfig(**raw)
+
+
+def test_risk_amount_usdt_env_wins_over_yaml(tmp_path, monkeypatch):
+    """RISK_AMOUNT_USDT env var overrides YAML so operator can bump $R
+    between restarts without editing checked-in config."""
+    raw = _valid_raw()
+    raw["trading"]["risk_amount_usdt"] = 50.0   # YAML says $50
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    monkeypatch.setenv("RISK_AMOUNT_USDT", "75.5")  # env says $75.5
+    for v in ("OKX_API_KEY", "OKX_API_SECRET", "OKX_PASSPHRASE"):
+        monkeypatch.setenv(v, "x")
+    empty_env = tmp_path / ".env"
+    empty_env.write_text("", encoding="utf-8")
+
+    cfg = load_config(cfg_path, env_path=empty_env)
+    assert cfg.trading.risk_amount_usdt == 75.5
+
+
+def test_risk_amount_usdt_env_empty_falls_back_to_yaml(tmp_path, monkeypatch):
+    """Unset / empty env var preserves YAML behavior so dev boxes without
+    .env entries keep percent-mode defaults."""
+    raw = _valid_raw()
+    raw["trading"]["risk_amount_usdt"] = 50.0
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    monkeypatch.delenv("RISK_AMOUNT_USDT", raising=False)
+    for v in ("OKX_API_KEY", "OKX_API_SECRET", "OKX_PASSPHRASE"):
+        monkeypatch.setenv(v, "x")
+    empty_env = tmp_path / ".env"
+    empty_env.write_text("", encoding="utf-8")
+
+    cfg = load_config(cfg_path, env_path=empty_env)
+    assert cfg.trading.risk_amount_usdt == 50.0
+
+
+def test_risk_amount_usdt_env_rejects_invalid_float(tmp_path, monkeypatch):
+    raw = _valid_raw()
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    monkeypatch.setenv("RISK_AMOUNT_USDT", "notanumber")
+    for v in ("OKX_API_KEY", "OKX_API_SECRET", "OKX_PASSPHRASE"):
+        monkeypatch.setenv(v, "x")
+    empty_env = tmp_path / ".env"
+    empty_env.write_text("", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not a valid float"):
+        load_config(cfg_path, env_path=empty_env)
+
+
 def test_symbol_leverage_caps_lookup_missing_symbol_returns_default():
     """Unlisted symbols return the caller's default — the runner merges
     min(global, okx_cap, ...dict.get(sym, global)) so missing key = no cap."""

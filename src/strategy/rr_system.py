@@ -16,6 +16,12 @@ Design rules (CLAUDE.md):
     so realized loss ≥ max_risk_usdt; overshoot bounded by one per-contract
     cost step (< $3 for current symbol universe). This keeps SL/TP USDT
     amounts equalized across symbols instead of varying $40-$54 by symbol.
+  - `risk_amount_usdt_override` (post-2026-04-20 operator contract): when
+    provided, bypass `account_balance × risk_pct` and use the override as
+    max_risk directly. Gives the operator a flat-dollar $R across all
+    symbols and all cycles, immune to unrealized-drawdown balance shimmer
+    from concurrent open positions. Safety rail: override ≤ 10% of
+    account_balance (mirrors the existing `risk_pct <= 0.1` ceiling).
   - OKX BTC-USDT-SWAP: 1 contract = 0.01 BTC notional. Integer contracts only.
 
 This module is pure: no I/O, no async, safe to import from anywhere.
@@ -86,6 +92,7 @@ def calculate_trade_plan(
     contract_size: float = 0.01,
     margin_balance: Optional[float] = None,
     fee_reserve_pct: float = 0.0,
+    risk_amount_usdt_override: Optional[float] = None,
     sl_source: str = "",
     confluence_score: float = 0.0,
     confluence_factors: list[str] | None = None,
@@ -112,6 +119,11 @@ def calculate_trade_plan(
             sl_pct when computing notional, so the stop-out loss stays inside
             the risk budget *after* fees. Set to 2 × taker_pct (≈0.001) for
             OKX demo taker orders. 0 disables (legacy behavior).
+        risk_amount_usdt_override: operator-set flat $R. When provided (and
+            > 0), bypasses `account_balance × risk_pct` and uses this number
+            as max_risk directly. None = legacy percent mode. Safety rail:
+            override must not exceed 10% of account_balance (same ceiling
+            as the `risk_pct <= 0.1` rule above), raises ValueError if so.
         sl_source: label for journal/telemetry ("order_block", "fvg", …).
         confluence_score: score that led to this trade (for journal).
         confluence_factors: names of factors that contributed (for journal).
@@ -133,7 +145,25 @@ def calculate_trade_plan(
     sl_distance = abs(entry_price - sl_price)
     sl_pct = sl_distance / entry_price
 
-    max_risk_usdt = account_balance * risk_pct
+    # Operator-set flat $R overrides balance × risk_pct when present. Safety
+    # rail: override ≤ 10% of account_balance (mirrors `risk_pct <= 0.1`).
+    # Rejecting loudly here keeps a stale/too-high override from silently
+    # sizing a position beyond the per-trade loss cap.
+    if risk_amount_usdt_override is not None:
+        if risk_amount_usdt_override <= 0:
+            raise ValueError(
+                "risk_amount_usdt_override must be > 0 when set "
+                "(pass None to fall back to balance × risk_pct)"
+            )
+        if risk_amount_usdt_override > account_balance * 0.1:
+            raise ValueError(
+                f"risk_amount_usdt_override={risk_amount_usdt_override} "
+                f"exceeds 10% of account_balance={account_balance}; lower "
+                "the override or top up balance before continuing."
+            )
+        max_risk_usdt = risk_amount_usdt_override
+    else:
+        max_risk_usdt = account_balance * risk_pct
 
     if direction == Direction.BULLISH:
         tp_price = entry_price + sl_distance * rr_ratio

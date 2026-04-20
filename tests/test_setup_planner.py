@@ -644,3 +644,56 @@ def test_apply_zone_to_plan_target_rr_cap_after_sl_widening():
     assert new_plan.sl_price == pytest.approx(98.2575)
     assert new_plan.tp_price == pytest.approx(102.2275)
     assert new_plan.rr_ratio == pytest.approx(3.0)
+
+
+def test_apply_zone_to_plan_ceil_keeps_risk_at_or_above_target_uncapped():
+    """Zone re-sizing mirrors rr_system's 2026-04-19 ceil contract — un-capped
+    plans round contracts UP so realized risk ≥ plan.risk_amount_usdt,
+    overshoot bounded by one per_contract_cost step. Before this fix, the
+    zone path floored contracts, undoing the ceil elsewhere and producing
+    the $2-$13 spread the operator flagged on 2026-04-20 across 5 open
+    positions."""
+    zone = ZoneSetup(
+        direction=Direction.BULLISH,
+        entry_zone=(99.0, 99.5),            # vwap_retest mid = 99.25
+        trigger_type="zone_touch",
+        sl_beyond_zone=98.5,                # sl_dist at entry = 0.75 → sl_pct ≈ 0.756%
+        tp_primary=102.25,                  # cap at 3R landing
+        max_wait_bars=10,
+        zone_source="vwap_retest",
+    )
+    plan = _plan()                          # risk_amount_usdt=50, fee_reserve_pct=0.001, not capped
+    new_plan = apply_zone_to_plan(plan, zone, contract_size=0.01)
+    effective_sl_pct = new_plan.sl_pct + new_plan.fee_reserve_pct
+    total_realized = new_plan.position_size_usdt * effective_sl_pct
+    assert total_realized >= plan.risk_amount_usdt - 1e-6
+    # Overshoot bounded by one per_contract_cost step.
+    ctu = new_plan.entry_price * 0.01
+    per_contract_cost = effective_sl_pct * ctu
+    assert total_realized <= plan.risk_amount_usdt + per_contract_cost + 1e-6
+
+
+def test_apply_zone_to_plan_capped_plan_still_floors():
+    """Capped plans (leverage/margin ceiling bound) keep the floor so the
+    zone re-size never silently breaches the original leverage cap."""
+    plan = TradePlan(
+        direction=Direction.BULLISH, entry_price=100.0, sl_price=99.0,
+        tp_price=102.0, rr_ratio=2.0, sl_distance=1.0, sl_pct=0.01,
+        position_size_usdt=5000.0, leverage=10, required_leverage=10.0,
+        num_contracts=50, risk_amount_usdt=50.0, max_risk_usdt=50.0,
+        capped=True, fee_reserve_pct=0.001,
+    )
+    zone = ZoneSetup(
+        direction=Direction.BULLISH,
+        entry_zone=(99.0, 99.5),
+        trigger_type="zone_touch",
+        sl_beyond_zone=98.5,
+        tp_primary=102.25,
+        max_wait_bars=10,
+        zone_source="vwap_retest",
+    )
+    new_plan = apply_zone_to_plan(plan, zone, contract_size=0.01)
+    effective_sl_pct = new_plan.sl_pct + new_plan.fee_reserve_pct
+    total_realized = new_plan.position_size_usdt * effective_sl_pct
+    # Floor ⇒ realized ≤ target (strictly < when ceil would have crossed).
+    assert total_realized <= plan.risk_amount_usdt + 1e-6
