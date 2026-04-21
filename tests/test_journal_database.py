@@ -431,3 +431,71 @@ async def test_replay_for_risk_manager_rebuilds_streaks_and_peak():
     assert mgr.peak_balance == pytest.approx(1_030.0)        # after 3 wins
     assert mgr.consecutive_losses == 2
     assert mgr.open_positions == 0                           # every open paired with a close
+
+
+# ── on_chain_context column (2026-04-21 Arkham integration — Phase A) ──────
+
+
+async def test_record_open_persists_on_chain_context_dict_as_json():
+    async with TradeJournal(":memory:") as j:
+        ctx = {
+            "daily_macro_bias": "bullish",
+            "stablecoin_pulse_1h_usd": 75_000_000.0,
+            "cex_btc_netflow_24h_usd": -120_000_000.0,
+            "whale_blackout_active": False,
+            "snapshot_age_s": 300,
+        }
+        rec = await j.record_open(
+            _plan(), _report(),
+            symbol="BTC-USDT-SWAP",
+            signal_timestamp=datetime(2026, 4, 21, 10, tzinfo=UTC),
+            entry_timestamp=datetime(2026, 4, 21, 10, tzinfo=UTC),
+            on_chain_context=ctx,
+        )
+        assert rec.on_chain_context == ctx
+        # Round-trip through SQLite → same dict structure.
+        fetched = await j.get_trade(rec.trade_id)
+        assert fetched is not None
+        assert fetched.on_chain_context == ctx
+
+
+async def test_record_open_defaults_on_chain_context_to_none():
+    async with TradeJournal(":memory:") as j:
+        rec = await j.record_open(
+            _plan(), _report(),
+            symbol="BTC-USDT-SWAP",
+            signal_timestamp=datetime(2026, 4, 21, 10, tzinfo=UTC),
+            entry_timestamp=datetime(2026, 4, 21, 10, tzinfo=UTC),
+        )
+        assert rec.on_chain_context is None
+        fetched = await j.get_trade(rec.trade_id)
+        assert fetched is not None
+        assert fetched.on_chain_context is None
+
+
+async def test_record_rejected_signal_persists_on_chain_context():
+    async with TradeJournal(":memory:") as j:
+        ctx = {"daily_macro_bias": "bearish", "snapshot_age_s": 100}
+        rec = await j.record_rejected_signal(
+            symbol="ETH-USDT-SWAP",
+            direction=Direction.BULLISH,
+            reject_reason="below_confluence",
+            signal_timestamp=datetime(2026, 4, 21, 11, tzinfo=UTC),
+            confluence_score=1.5,
+            on_chain_context=ctx,
+        )
+        assert rec.on_chain_context == ctx
+        fetched = await j.list_rejected_signals()
+        assert len(fetched) == 1
+        assert fetched[0].on_chain_context == ctx
+
+
+async def test_record_rejected_signal_on_chain_context_none_default():
+    async with TradeJournal(":memory:") as j:
+        rec = await j.record_rejected_signal(
+            symbol="ETH-USDT-SWAP",
+            direction=Direction.BULLISH,
+            reject_reason="below_confluence",
+            signal_timestamp=datetime(2026, 4, 21, 11, tzinfo=UTC),
+        )
+        assert rec.on_chain_context is None

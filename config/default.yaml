@@ -541,6 +541,59 @@ economic_calendar:
   faireconomy_timeout_s: 10.0
   faireconomy_max_retries: 3
 
+# ───────────────────────────────────────────────────────────────────
+# 2026-04-21 — Arkham on-chain intelligence (trial 30-day key).
+# Master kill switch: `enabled: false` → no Arkham HTTP requests, no
+# WebSocket connection, MarketState.on_chain stays None, every gate /
+# modifier reads as inert. Rolling back after the trial window = flip
+# `enabled: false` and restart. Schema columns + journal writes stay
+# in place so historical `on_chain_context` on pre-rollback trades is
+# preserved (data loss = zero).
+#
+# Sub-features (each flag-gated independently — master must also be on):
+#   * daily_bias_enabled       → Phase C confluence ±delta modifier.
+#   * stablecoin_pulse_enabled → Phase E below_confluence penalty.
+#   * whale_blackout_enabled   → Phase D hard gate via WS listener.
+# Phase B (journal enrichment) rides the master flag — no separate flag;
+# `on_chain_context` column stays NULL whenever snapshot is unavailable.
+#
+# Safety rails:
+#   * api_usage_auto_disable_pct: auto-disable when reported label-usage
+#     fraction crosses this %, prevents trial-key exhaustion.
+#   * whale_threshold_usd ≥ 10M enforced by pydantic validator (Arkham
+#     WS `usdGte` minimum). 100M default keeps signal high-SNR.
+#   * daily_bias_modifier_delta ∈ [0.0, 0.5] — delta > 0.5 would swap
+#     long/short rather than nudge.
+# ───────────────────────────────────────────────────────────────────
+on_chain:
+  enabled: false                                  # master kill switch
+
+  # Phase C — daily macro bias ± delta confluence modifier.
+  # Bullish day → long scores × (1 + delta), short × (1 - delta); mirror for bearish.
+  # Neutral or stale (>snapshot_staleness_threshold_s) → 1.0 (inert).
+  daily_bias_enabled: false
+  daily_bias_modifier_delta: 0.10
+  daily_bias_stablecoin_threshold_usd: 50000000.0  # ≥ this → bullish contribution
+  daily_bias_btc_netflow_threshold_usd: 50000000.0 # ≤ -this → bullish (BTC leaving CEX)
+
+  # Phase E — stablecoin hourly pulse; misaligned → +penalty on min_confluence threshold.
+  stablecoin_pulse_enabled: false
+  stablecoin_pulse_refresh_s: 3600
+  stablecoin_pulse_threshold_usd: 50000000.0
+  stablecoin_pulse_penalty: 0.5
+
+  # Phase D — whale-transfer blackout hard gate. WS listener pushes
+  # qualifying transfers to the shared WhaleBlackoutState registry;
+  # entry_signals reads via is_active on every entry attempt.
+  whale_blackout_enabled: false
+  whale_threshold_usd: 100000000.0                 # WS filter (usdGte); ≥10M minimum
+  whale_blackout_duration_s: 600                   # 10 min after event
+
+  # Safety / budget controls.
+  api_usage_auto_disable_pct: 95.0
+  api_client_timeout_s: 10.0
+  snapshot_staleness_threshold_s: 7200             # 2h — older snapshot reads inert
+
 rl:
   # Phase 6.9 D1 — dirty-data cutoff for RL training + reporter.
   # Trades opened BEFORE this ISO-8601 timestamp are ignored by

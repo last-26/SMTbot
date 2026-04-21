@@ -158,6 +158,15 @@ class TradeRecord(BaseModel):
     demo_artifact: Optional[bool] = None
     artifact_reason: Optional[str] = None
 
+    # 2026-04-21 — Arkham on-chain enrichment. Opaque dict serialised as
+    # JSON when persisted; kept as a dict in the model for structured
+    # read-back. None whenever `on_chain.enabled=false` at open time or
+    # the snapshot was missing. Downstream tooling (factor_audit.py,
+    # GBT feature extraction) can index by the known keys without a
+    # schema contract — the runner is the single writer, so the shape
+    # stays stable across a single datasets.
+    on_chain_context: Optional[dict] = None
+
     @property
     def is_open(self) -> bool:
         return self.outcome == TradeOutcome.OPEN
@@ -241,3 +250,9 @@ class RejectedSignal(BaseModel):
     hypothetical_outcome: Optional[str] = None
     hypothetical_bars_to_tp: Optional[int] = None
     hypothetical_bars_to_sl: Optional[int] = None
+
+    # 2026-04-21 — mirrors TradeRecord.on_chain_context. Carried on
+    # rejects so factor_audit.py can segment reject reasons by on-chain
+    # context (e.g., were `cross_asset_opposition` rejects concentrated
+    # on days with bearish daily_macro_bias?).
+    on_chain_context: Optional[dict] = None

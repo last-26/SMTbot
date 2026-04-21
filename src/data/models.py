@@ -203,6 +203,12 @@ class MarketState(BaseModel):
     # Typed as Any so the Pydantic model doesn't need to import the dataclasses.
     derivatives: Optional[Any] = None           # DerivativesState
     liquidity_heatmap: Optional[Any] = None     # LiquidityHeatmap
+    # 2026-04-21 — Arkham on-chain snapshot (OnChainSnapshot frozen dataclass
+    # from `src.data.on_chain_types`). None when master flag is off, client
+    # is unavailable, or fetch failed. Typed as Any to keep the pydantic
+    # model free of the on_chain_types import dependency.
+    on_chain: Optional[Any] = None              # OnChainSnapshot
+    whale_blackout: Optional[Any] = None        # WhaleBlackoutState
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 

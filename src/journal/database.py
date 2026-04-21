@@ -104,7 +104,9 @@ CREATE TABLE IF NOT EXISTS trades (
     real_market_entry_valid INTEGER,
     real_market_exit_valid  INTEGER,
     demo_artifact           INTEGER,
-    artifact_reason         TEXT
+    artifact_reason         TEXT,
+
+    on_chain_context        TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_trades_outcome      ON trades(outcome);
@@ -150,7 +152,9 @@ CREATE TABLE IF NOT EXISTS rejected_signals (
 
     hypothetical_outcome    TEXT,
     hypothetical_bars_to_tp INTEGER,
-    hypothetical_bars_to_sl INTEGER
+    hypothetical_bars_to_sl INTEGER,
+
+    on_chain_context        TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_rejected_symbol_ts  ON rejected_signals(symbol, signal_timestamp);
@@ -181,6 +185,7 @@ _COLUMNS = [
     "notes", "screenshot_entry", "screenshot_exit",
     "real_market_entry_valid", "real_market_exit_valid",
     "demo_artifact", "artifact_reason",
+    "on_chain_context",
 ]
 
 
@@ -196,6 +201,7 @@ _REJECTED_COLUMNS = [
     "nearest_liq_cluster_above_distance_atr", "nearest_liq_cluster_below_distance_atr",
     "pillar_btc_bias", "pillar_eth_bias",
     "hypothetical_outcome", "hypothetical_bars_to_tp", "hypothetical_bars_to_sl",
+    "on_chain_context",
 ]
 
 
@@ -231,6 +237,14 @@ _MIGRATIONS = [
     "ALTER TABLE trades ADD COLUMN real_market_exit_valid INTEGER",
     "ALTER TABLE trades ADD COLUMN demo_artifact INTEGER",
     "ALTER TABLE trades ADD COLUMN artifact_reason TEXT",
+    # 2026-04-21 — Arkham on-chain enrichment. JSON-serialised dict
+    # (daily_macro_bias, stablecoin_pulse_1h_usd, cex_*_netflow_24h_usd,
+    # whale_blackout_active, snapshot_age_s). NULL on rows written
+    # before the Arkham pipeline was enabled, or when `on_chain.enabled`
+    # was off at open-time. Present on both trades and rejected_signals
+    # so factor-audit can segment rejects by on-chain context too.
+    "ALTER TABLE trades ADD COLUMN on_chain_context TEXT",
+    "ALTER TABLE rejected_signals ADD COLUMN on_chain_context TEXT",
 ]
 
 
@@ -268,6 +282,8 @@ def _record_to_row(rec: TradeRecord) -> tuple:
          else int(rec.real_market_exit_valid)),
         (None if rec.demo_artifact is None else int(rec.demo_artifact)),
         rec.artifact_reason,
+        (json.dumps(rec.on_chain_context)
+         if rec.on_chain_context is not None else None),
     )
 
 
@@ -287,6 +303,8 @@ def _rejected_to_row(rec: RejectedSignal) -> tuple:
         rec.nearest_liq_cluster_above_distance_atr, rec.nearest_liq_cluster_below_distance_atr,
         rec.pillar_btc_bias, rec.pillar_eth_bias,
         rec.hypothetical_outcome, rec.hypothetical_bars_to_tp, rec.hypothetical_bars_to_sl,
+        (json.dumps(rec.on_chain_context)
+         if rec.on_chain_context is not None else None),
     )
 
 
@@ -325,7 +343,24 @@ def _row_to_rejected(row: aiosqlite.Row) -> RejectedSignal:
         hypothetical_outcome=row["hypothetical_outcome"],
         hypothetical_bars_to_tp=row["hypothetical_bars_to_tp"],
         hypothetical_bars_to_sl=row["hypothetical_bars_to_sl"],
+        on_chain_context=_parse_on_chain_context(row),
     )
+
+
+def _parse_on_chain_context(row: aiosqlite.Row) -> Optional[dict]:
+    """Decode the JSON `on_chain_context` column; None on missing / null /
+    invalid JSON so legacy rows and migration edges read as absent rather
+    than erroring."""
+    raw = _safe_col(row, "on_chain_context")
+    if raw is None:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
 
 
 def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
@@ -389,6 +424,7 @@ def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
         real_market_exit_valid=_safe_bool(row, "real_market_exit_valid"),
         demo_artifact=_safe_bool(row, "demo_artifact"),
         artifact_reason=_safe_col(row, "artifact_reason"),
+        on_chain_context=_parse_on_chain_context(row),
     )
 
 
@@ -497,6 +533,7 @@ class TradeJournal:
         nearest_liq_cluster_above_distance_atr: Optional[float] = None,
         nearest_liq_cluster_below_distance_atr: Optional[float] = None,
         trend_regime_at_entry: Optional[str] = None,
+        on_chain_context: Optional[dict] = None,
     ) -> TradeRecord:
         """Insert an OPEN row describing a freshly-placed trade.
 
@@ -547,6 +584,7 @@ class TradeJournal:
             nearest_liq_cluster_above_distance_atr=nearest_liq_cluster_above_distance_atr,
             nearest_liq_cluster_below_distance_atr=nearest_liq_cluster_below_distance_atr,
             trend_regime_at_entry=trend_regime_at_entry,
+            on_chain_context=on_chain_context,
         )
         placeholders = ", ".join("?" * len(_COLUMNS))
         cols = ", ".join(_COLUMNS)
@@ -682,6 +720,7 @@ class TradeJournal:
         nearest_liq_cluster_below_distance_atr: Optional[float] = None,
         pillar_btc_bias: Optional[str] = None,
         pillar_eth_bias: Optional[str] = None,
+        on_chain_context: Optional[dict] = None,
     ) -> RejectedSignal:
         """Insert a single row into `rejected_signals`.
 
@@ -722,6 +761,7 @@ class TradeJournal:
             nearest_liq_cluster_below_distance_atr=nearest_liq_cluster_below_distance_atr,
             pillar_btc_bias=pillar_btc_bias,
             pillar_eth_bias=pillar_eth_bias,
+            on_chain_context=on_chain_context,
         )
         placeholders = ", ".join("?" * len(_REJECTED_COLUMNS))
         cols = ", ".join(_REJECTED_COLUMNS)

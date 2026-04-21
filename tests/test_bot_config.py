@@ -343,3 +343,104 @@ def test_rl_unknown_keys_still_tolerated():
     raw["rl"] = {"clean_since": None, "foo": "bar", "hyperparams": {"lr": 0.01}}
     cfg = BotConfig(**raw)
     assert cfg.rl_clean_since() is None
+
+
+# ── OnChainConfig (2026-04-21 Arkham integration — Phase A) ─────────────────
+
+
+def test_on_chain_defaults_master_and_subfeatures_all_off():
+    raw = _valid_raw()
+    cfg = BotConfig(**raw)
+    assert cfg.on_chain.enabled is False
+    assert cfg.on_chain.daily_bias_enabled is False
+    assert cfg.on_chain.stablecoin_pulse_enabled is False
+    assert cfg.on_chain.whale_blackout_enabled is False
+    # Default threshold / duration values match documented pivot.
+    assert cfg.on_chain.daily_bias_modifier_delta == 0.10
+    assert cfg.on_chain.whale_threshold_usd == 100_000_000.0
+    assert cfg.on_chain.whale_blackout_duration_s == 600
+    assert cfg.on_chain.api_usage_auto_disable_pct == 95.0
+
+
+def test_on_chain_flags_load_from_yaml():
+    raw = _valid_raw()
+    raw["on_chain"] = {
+        "enabled": True,
+        "daily_bias_enabled": True,
+        "daily_bias_modifier_delta": 0.15,
+        "whale_blackout_enabled": True,
+        "whale_threshold_usd": 200_000_000.0,
+    }
+    cfg = BotConfig(**raw)
+    assert cfg.on_chain.enabled is True
+    assert cfg.on_chain.daily_bias_enabled is True
+    assert cfg.on_chain.daily_bias_modifier_delta == 0.15
+    assert cfg.on_chain.whale_threshold_usd == 200_000_000.0
+
+
+def test_on_chain_daily_bias_delta_out_of_range_rejected():
+    raw = _valid_raw()
+    raw["on_chain"] = {"daily_bias_modifier_delta": 0.6}  # > 0.5
+    with pytest.raises(ValidationError):
+        BotConfig(**raw)
+
+    raw["on_chain"] = {"daily_bias_modifier_delta": -0.1}
+    with pytest.raises(ValidationError):
+        BotConfig(**raw)
+
+
+def test_on_chain_whale_threshold_below_arkham_minimum_rejected():
+    raw = _valid_raw()
+    raw["on_chain"] = {"whale_threshold_usd": 5_000_000.0}  # < 10M
+    with pytest.raises(ValidationError):
+        BotConfig(**raw)
+
+
+def test_on_chain_whale_threshold_at_minimum_accepted():
+    raw = _valid_raw()
+    raw["on_chain"] = {"whale_threshold_usd": 10_000_000.0}
+    cfg = BotConfig(**raw)
+    assert cfg.on_chain.whale_threshold_usd == 10_000_000.0
+
+
+def test_on_chain_durations_must_be_positive():
+    for field in ("whale_blackout_duration_s", "stablecoin_pulse_refresh_s",
+                  "snapshot_staleness_threshold_s"):
+        raw = _valid_raw()
+        raw["on_chain"] = {field: 0}
+        with pytest.raises(ValidationError):
+            BotConfig(**raw)
+
+
+def test_on_chain_auto_disable_pct_must_be_in_open_100():
+    for bad in (0.0, -5.0, 101.0, 200.0):
+        raw = _valid_raw()
+        raw["on_chain"] = {"api_usage_auto_disable_pct": bad}
+        with pytest.raises(ValidationError):
+            BotConfig(**raw)
+
+    # Boundary: exactly 100 is accepted (no-op), 0.0 is not (would disable
+    # immediately). Keeping the open-left / closed-right contract.
+    raw = _valid_raw()
+    raw["on_chain"] = {"api_usage_auto_disable_pct": 100.0}
+    cfg = BotConfig(**raw)
+    assert cfg.on_chain.api_usage_auto_disable_pct == 100.0
+
+
+def test_on_chain_thresholds_reject_negatives():
+    for field in ("daily_bias_stablecoin_threshold_usd",
+                  "daily_bias_btc_netflow_threshold_usd",
+                  "stablecoin_pulse_threshold_usd",
+                  "stablecoin_pulse_penalty"):
+        raw = _valid_raw()
+        raw["on_chain"] = {field: -1.0}
+        with pytest.raises(ValidationError):
+            BotConfig(**raw)
+
+
+def test_on_chain_section_absent_still_produces_default():
+    raw = _valid_raw()
+    raw.pop("on_chain", None)
+    cfg = BotConfig(**raw)
+    # Default factory gives us the fully-off OnChainConfig.
+    assert cfg.on_chain.enabled is False

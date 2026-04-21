@@ -513,6 +513,110 @@ class EconomicCalendarConfig(BaseModel):
     faireconomy_max_retries: int = 3
 
 
+class OnChainConfig(BaseModel):
+    """Arkham on-chain integration (2026-04-21, trial 30-day key).
+
+    All flags default OFF. `enabled=false` (master switch) keeps the
+    entire pipeline idle: no HTTP requests, no WebSocket connection,
+    no modifier effects, MarketState.on_chain stays None. Rolling back
+    after the trial window = set `enabled: false` and restart. No code
+    removal required; schema columns stay in place for the historical
+    `on_chain_context` JSON on pre-rollback trades.
+
+    Sub-features (layered on top of master):
+      * daily_bias_enabled         — Phase C: ±delta confluence modifier.
+      * stablecoin_pulse_enabled   — Phase E: below_confluence penalty.
+      * whale_blackout_enabled     — Phase D: hard gate via WS listener.
+    Phase B (journal enrichment) is always-on when `enabled=true` — no
+    separate flag, the `on_chain_context` JSON column just stays NULL
+    whenever the snapshot is unavailable.
+    """
+
+    enabled: bool = False
+
+    # Phase C — daily macro bias (see src/analysis/multi_timeframe.py).
+    daily_bias_enabled: bool = False
+    daily_bias_modifier_delta: float = 0.10
+    daily_bias_stablecoin_threshold_usd: float = 50_000_000.0
+    daily_bias_btc_netflow_threshold_usd: float = 50_000_000.0
+
+    # Phase E — stablecoin pulse cross-asset penalty.
+    stablecoin_pulse_enabled: bool = False
+    stablecoin_pulse_refresh_s: int = 3600
+    stablecoin_pulse_threshold_usd: float = 50_000_000.0
+    stablecoin_pulse_penalty: float = 0.5
+
+    # Phase D — whale-transfer blackout (WebSocket listener feeds the gate).
+    # Arkham's WS filter requires `usdGte >= 10_000_000` per the API docs;
+    # the validator enforces this. Runtime default 100M keeps the signal
+    # high-SNR — sub-100M moves are too common to block entries on.
+    whale_blackout_enabled: bool = False
+    whale_threshold_usd: float = 100_000_000.0
+    whale_blackout_duration_s: int = 600  # 10 minutes
+
+    # Safety / budget controls.
+    # Auto-disable the master when the reported label-usage fraction
+    # crosses this percent. Prevents the trial key from being exhausted
+    # and the paid plan from over-spending on bot telemetry.
+    api_usage_auto_disable_pct: float = 95.0
+    api_client_timeout_s: float = 10.0
+    # Snapshots older than this are considered stale by downstream
+    # gates (daily_bias modifier falls through to 1.0, penalty to 0.0).
+    snapshot_staleness_threshold_s: int = 7200
+
+    @field_validator("daily_bias_modifier_delta")
+    @classmethod
+    def _daily_bias_delta_sane(cls, v: float) -> float:
+        if not (0.0 <= v <= 0.5):
+            raise ValueError(
+                f"on_chain.daily_bias_modifier_delta must be in [0.0, 0.5] "
+                f"(delta >0.5 would swap long/short rather than nudge); got {v}"
+            )
+        return v
+
+    @field_validator("daily_bias_stablecoin_threshold_usd",
+                     "daily_bias_btc_netflow_threshold_usd",
+                     "stablecoin_pulse_threshold_usd",
+                     "stablecoin_pulse_penalty")
+    @classmethod
+    def _non_negative(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError(
+                f"on_chain thresholds / penalties must be ≥ 0; got {v}"
+            )
+        return v
+
+    @field_validator("whale_threshold_usd")
+    @classmethod
+    def _whale_threshold_meets_ws_minimum(cls, v: float) -> float:
+        # Arkham WS filter requires `usdGte >= 10M` per API documentation.
+        if v < 10_000_000.0:
+            raise ValueError(
+                f"on_chain.whale_threshold_usd must be ≥ 10_000_000 "
+                f"(Arkham WS `usdGte` minimum); got {v}"
+            )
+        return v
+
+    @field_validator("whale_blackout_duration_s", "stablecoin_pulse_refresh_s",
+                     "snapshot_staleness_threshold_s")
+    @classmethod
+    def _positive_duration(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(
+                f"on_chain duration fields must be > 0 seconds; got {v}"
+            )
+        return v
+
+    @field_validator("api_usage_auto_disable_pct")
+    @classmethod
+    def _usage_pct_in_range(cls, v: float) -> float:
+        if not (0.0 < v <= 100.0):
+            raise ValueError(
+                f"on_chain.api_usage_auto_disable_pct must be in (0, 100]; got {v}"
+            )
+        return v
+
+
 class ReentryConfig(BaseModel):
     """Per-side reentry gate (Madde C).
 
@@ -564,6 +668,7 @@ class BotConfig(BaseModel):
     derivatives: DerivativesConfig = Field(default_factory=DerivativesConfig)
     economic_calendar: EconomicCalendarConfig = Field(
         default_factory=EconomicCalendarConfig)
+    on_chain: OnChainConfig = Field(default_factory=OnChainConfig)
     rl: RLConfig = Field(default_factory=RLConfig)
 
     @field_validator("okx")
@@ -704,5 +809,11 @@ def load_config(path: str | Path, *, env_path: Optional[str | Path] = None) -> B
         trading_section = dict(raw.get("trading") or {})
         trading_section["risk_amount_usdt"] = parsed_risk_amount
         raw["trading"] = trading_section
+
+    # Arkham on-chain — the API key stays in env only. YAML carries every
+    # on_chain.* flag/threshold but never the secret; ArkhamClient reads
+    # `ARKHAM_API_KEY` directly at construction time (matches Coinalyze's
+    # COINALYZE_API_KEY handling). load_config stays out of the secret
+    # path so `cfg.on_chain` never carries credentials.
 
     return BotConfig(**raw)
