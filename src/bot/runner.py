@@ -47,6 +47,12 @@ from src.data.economic_calendar import (
 from src.data.liquidation_stream import LiquidationStream
 from src.data.ltf_reader import LTFReader, LTFState
 from src.data.models import Direction, MarketState, Session
+from src.data.on_chain import (
+    ArkhamClient,
+    fetch_daily_snapshot,
+    fetch_hourly_stablecoin_pulse,
+)
+from src.data.on_chain_types import OnChainSnapshot, WhaleBlackoutState
 from src.data.public_market_feed import (
     BinancePublicClient,
     RealCandle,
@@ -382,6 +388,25 @@ class BotContext:
     # Katman 2 — Binance public futures client for the demo-wick artefact
     # cross-check (set by from_config). Optional in tests.
     binance_public: Any = None
+    # 2026-04-21 — Arkham on-chain subsystem (Phase B).
+    # Instantiated in `from_config` when `on_chain.enabled=true`. None
+    # keeps the scheduler inert and every snapshot field None.
+    arkham_client: Any = None
+    # Cached snapshots refreshed on UTC-day boundary (daily) + refresh
+    # cadence (stablecoin pulse). The runner attaches these to each
+    # MarketState before the per-symbol cycle so gates / modifiers see
+    # the same snapshot across all symbols in one tick.
+    on_chain_snapshot: Any = None                     # OnChainSnapshot
+    stablecoin_pulse_1h_usd: Optional[float] = None
+    # WhaleBlackoutState — the in-memory registry the Phase D WS listener
+    # writes to and entry_signals reads from. Stays as a default (empty)
+    # instance so the gate can unconditionally check `.is_active()`
+    # without None-guarding every call site.
+    whale_blackout_state: Any = None
+    # Scheduler bookkeeping. UTC date of the last daily fetch + monotonic
+    # timestamp of the last pulse fetch. Zero / None means "never fetched".
+    last_on_chain_daily_date: Any = None              # datetime.date
+    last_on_chain_pulse_ts: float = 0.0
 
 
 # ── Runner ──────────────────────────────────────────────────────────────────
@@ -561,6 +586,22 @@ class BotRunner:
             # runner calls `ensure_schema` through `_start_derivatives`.
             cache._deriv_journal_bootstrap = deriv_journal
 
+        # 2026-04-21 — Arkham on-chain subsystem (Phase B).
+        # Master `on_chain.enabled=false` keeps `arkham_client=None` and
+        # the runner's `_refresh_on_chain_snapshots` short-circuits. When
+        # true, the client reads ARKHAM_API_KEY from env at construction;
+        # missing key → ArkhamClient warns and every fetch returns None
+        # (fail-open, identical shape to a disabled-master tick).
+        # `whale_blackout_state` stays allocated even when the Phase D WS
+        # listener isn't wired so `entry_signals` can unconditionally
+        # query `.is_active()` without per-call None guards.
+        ctx.whale_blackout_state = WhaleBlackoutState()
+        if cfg.on_chain.enabled:
+            ctx.arkham_client = ArkhamClient(
+                timeout_s=cfg.on_chain.api_client_timeout_s,
+                auto_disable_pct=cfg.on_chain.api_usage_auto_disable_pct,
+            )
+
         # Macro event blackout — independent of the derivatives subsystem.
         if cfg.economic_calendar.enabled:
             finnhub = (
@@ -651,6 +692,7 @@ class BotRunner:
         finally:
             await self._stop_economic_calendar()
             await self._stop_derivatives()
+            await self._stop_on_chain()
 
     async def _start_derivatives(self) -> None:
         """Boot the Phase 1.5 derivatives tasks. Safe to call when disabled."""
@@ -730,6 +772,18 @@ class BotRunner:
         except Exception:
             logger.exception("economic_calendar_close_failed")
 
+    async def _stop_on_chain(self) -> None:
+        """Release the Arkham HTTP client on shutdown. Best-effort, never
+        raises. No-op when the client was never instantiated (master
+        `on_chain.enabled=false` path)."""
+        client = self.ctx.arkham_client
+        if client is None:
+            return
+        try:
+            await client.close()
+        except Exception:
+            logger.exception("arkham_client_close_failed")
+
     async def run_once_then_exit(self) -> None:
         """Smoke-test entry point: one full tick, then clean shutdown."""
         async with self.ctx.journal:
@@ -748,6 +802,13 @@ class BotRunner:
         # transition into OPEN (OCO attach + journal); canceled pendings clear
         # the pending_setups slot so the symbol can re-plan the next cycle.
         await self._process_pending()
+
+        # 2026-04-21 — Arkham on-chain snapshot refresh (Phase B). Runs
+        # BEFORE the per-symbol loop so every symbol in this tick sees the
+        # same snapshot (keeps journal `on_chain_context` consistent across
+        # a BTC trade and a parallel SOL reject on the same tick).
+        # Inert when `on_chain.enabled=false` or client was never built.
+        await self._refresh_on_chain_snapshots()
 
         # Data-collection mode: stream + cache still run in the background via
         # _start_derivatives; here we just skip the entry/exit pipeline. Close
@@ -1060,6 +1121,7 @@ class BotRunner:
             nearest_liq_cluster_below_distance_atr=enrichment["nearest_liq_cluster_below_distance_atr"],
             pillar_btc_bias=self._pillar_bias_label("BTC-USDT-SWAP"),
             pillar_eth_bias=self._pillar_bias_label("ETH-USDT-SWAP"),
+            on_chain_context=self._on_chain_context_dict(),
         )
 
     def _is_ltf_reversal(self, ltf: LTFState, open_side: str, max_age: int) -> bool:
@@ -1302,6 +1364,14 @@ class BotRunner:
         except Exception:
             logger.exception("fetch_failed symbol={}", symbol)
             return
+        # 2026-04-21 — attach the cached Arkham snapshot + whale blackout
+        # registry to MarketState so downstream consumers (Phase C
+        # calculate_confluence modifier, Phase D / E gates) see the same
+        # values already accounted in this tick's `_refresh_on_chain_snapshots`.
+        # In Phase B both fields are carried but no gate / modifier reads
+        # them — the attachment is for journal write consistency only.
+        state.on_chain = self.ctx.on_chain_snapshot
+        state.whale_blackout = self.ctx.whale_blackout_state
         buf = self.ctx.multi_tf.get_buffer(tf_key)
         # 100 candles is enough for EMA55 seeding in the zone builder's
         # ema21_pullback source; legacy confluence consumers only read the tail.
@@ -1657,6 +1727,7 @@ class BotRunner:
                     if trend_regime and trend_regime != TrendRegime.UNKNOWN
                     else None
                 ),
+                on_chain_context=self._on_chain_context_dict(),
                 **_derive_enrichment(state),
             )
             self.ctx.open_trade_ids[(symbol, pos_side)] = rec.trade_id
@@ -1754,6 +1825,149 @@ class BotRunner:
             return
         for fill in fills:
             await self._handle_close(fill)
+
+    # ── Arkham on-chain snapshot scheduler (Phase B) ────────────────────────
+
+    async def _refresh_on_chain_snapshots(self) -> None:
+        """Refresh daily + hourly Arkham snapshots on their own cadences.
+
+        Contract:
+          * master `on_chain.enabled=false` → no-op, `on_chain_snapshot`
+            stays whatever it was (expected None).
+          * `arkham_client is None` (master flag flipped on but client
+            not built, or hard-disabled at 95% label usage) → no-op.
+          * daily snapshot refreshes when the current UTC day differs
+            from `last_on_chain_daily_date` (one fetch per wall-clock
+            day, regardless of tick cadence).
+          * hourly pulse refreshes when `now_monotonic -
+            last_on_chain_pulse_ts >= refresh_s` (default 3600s).
+          * Every fetch is wrapped in a broad try/except — Arkham outage
+            can never crash the tick. Last-known snapshot stays cached
+            through an outage; `fresh` flag falls through to False once
+            `snapshot_age_s` exceeds the staleness threshold.
+        """
+        cfg = self.ctx.config
+        if not cfg.on_chain.enabled:
+            return
+        client = self.ctx.arkham_client
+        if client is None:
+            return
+        if getattr(client, "hard_disabled", False):
+            return
+
+        now_utc = _utc_now()
+        today = now_utc.date()
+        # Daily fetch — once per UTC day.
+        if self.ctx.last_on_chain_daily_date != today:
+            try:
+                snap = await fetch_daily_snapshot(
+                    client,
+                    stablecoin_threshold_usd=(
+                        cfg.on_chain.daily_bias_stablecoin_threshold_usd),
+                    btc_netflow_threshold_usd=(
+                        cfg.on_chain.daily_bias_btc_netflow_threshold_usd),
+                    stale_threshold_s=(
+                        cfg.on_chain.snapshot_staleness_threshold_s),
+                    snapshot_age_s=0,
+                )
+            except Exception:
+                logger.exception("arkham_daily_snapshot_failed")
+                snap = None
+            if snap is not None:
+                # Preserve any live stablecoin-pulse field we already
+                # carry — the daily build returns None for pulse, we
+                # patch it back in from the cached value.
+                self.ctx.on_chain_snapshot = OnChainSnapshot(
+                    daily_macro_bias=snap.daily_macro_bias,
+                    stablecoin_pulse_1h_usd=self.ctx.stablecoin_pulse_1h_usd,
+                    cex_btc_netflow_24h_usd=snap.cex_btc_netflow_24h_usd,
+                    cex_eth_netflow_24h_usd=snap.cex_eth_netflow_24h_usd,
+                    coinbase_asia_skew_usd=snap.coinbase_asia_skew_usd,
+                    bnb_self_flow_24h_usd=snap.bnb_self_flow_24h_usd,
+                    snapshot_age_s=0,
+                    stale_threshold_s=snap.stale_threshold_s,
+                )
+                self.ctx.last_on_chain_daily_date = today
+                logger.info(
+                    "arkham_daily_snapshot_refreshed bias={} "
+                    "btc_netflow={} eth_netflow={}",
+                    snap.daily_macro_bias,
+                    snap.cex_btc_netflow_24h_usd,
+                    snap.cex_eth_netflow_24h_usd,
+                )
+            # else: leave last-known snapshot in place; caller sees
+            # stale snapshot flagged via `.fresh`.
+
+        # Hourly stablecoin pulse — `refresh_s` cadence.
+        now_mono = time.monotonic()
+        refresh_s = float(cfg.on_chain.stablecoin_pulse_refresh_s)
+        elapsed = now_mono - self.ctx.last_on_chain_pulse_ts
+        if elapsed >= refresh_s:
+            try:
+                pulse = await fetch_hourly_stablecoin_pulse(client)
+            except Exception:
+                logger.exception("arkham_pulse_fetch_failed")
+                pulse = None
+            if pulse is not None:
+                self.ctx.stablecoin_pulse_1h_usd = pulse
+                self.ctx.last_on_chain_pulse_ts = now_mono
+                # Patch the cached daily snapshot so downstream reads
+                # see a consistent pulse value without a second daily
+                # refresh.
+                prev = self.ctx.on_chain_snapshot
+                if prev is not None:
+                    self.ctx.on_chain_snapshot = OnChainSnapshot(
+                        daily_macro_bias=prev.daily_macro_bias,
+                        stablecoin_pulse_1h_usd=pulse,
+                        cex_btc_netflow_24h_usd=prev.cex_btc_netflow_24h_usd,
+                        cex_eth_netflow_24h_usd=prev.cex_eth_netflow_24h_usd,
+                        coinbase_asia_skew_usd=prev.coinbase_asia_skew_usd,
+                        bnb_self_flow_24h_usd=prev.bnb_self_flow_24h_usd,
+                        snapshot_age_s=prev.snapshot_age_s,
+                        stale_threshold_s=prev.stale_threshold_s,
+                    )
+                logger.info(
+                    "arkham_stablecoin_pulse_refreshed pulse_usd={:.2f}",
+                    float(pulse),
+                )
+
+    def _on_chain_context_dict(self) -> Optional[dict]:
+        """Build the dict that gets JSON-serialised into
+        `trades.on_chain_context` / `rejected_signals.on_chain_context`.
+
+        Returns None when the master flag is off or no snapshot is
+        cached — journal column writes NULL in that case, matching the
+        pre-Arkham row shape exactly. When populated, the dict carries
+        scalar fields only so downstream tooling can index by name
+        without a schema contract.
+        """
+        cfg = self.ctx.config
+        if not cfg.on_chain.enabled:
+            return None
+        snap = self.ctx.on_chain_snapshot
+        if snap is None:
+            return None
+        blackout = self.ctx.whale_blackout_state
+        blackout_active = False
+        if blackout is not None and blackout.blackouts:
+            # Summary flag — "any symbol currently blacked out". Per-symbol
+            # detail lives in the separate `rejected_signals` reason
+            # path; this dict is for cross-row audit, not per-gate trace.
+            now_ms = int(_utc_now().timestamp() * 1000)
+            blackout_active = any(
+                v > now_ms for v in blackout.blackouts.values()
+            )
+        return {
+            "daily_macro_bias": snap.daily_macro_bias,
+            "stablecoin_pulse_1h_usd": snap.stablecoin_pulse_1h_usd,
+            "cex_btc_netflow_24h_usd": snap.cex_btc_netflow_24h_usd,
+            "cex_eth_netflow_24h_usd": snap.cex_eth_netflow_24h_usd,
+            "coinbase_asia_skew_usd": snap.coinbase_asia_skew_usd,
+            "bnb_self_flow_24h_usd": snap.bnb_self_flow_24h_usd,
+            "snapshot_age_s": int(snap.snapshot_age_s),
+            "fresh": bool(snap.fresh),
+            "whale_blackout_active": blackout_active,
+        }
 
     # ── Pending-entry lifecycle (Phase 7.C4) ────────────────────────────────
 
@@ -2062,6 +2276,7 @@ class BotRunner:
                 session=_session_str(state),
                 market_structure=_structure_str(state),
                 trend_regime_at_entry=meta.trend_regime_at_entry,
+                on_chain_context=self._on_chain_context_dict(),
                 **_derive_enrichment(state),
             )
             self.ctx.open_trade_ids[key] = rec.trade_id
@@ -2128,6 +2343,7 @@ class BotRunner:
                 nearest_liq_cluster_below_distance_atr=enrichment["nearest_liq_cluster_below_distance_atr"],
                 pillar_btc_bias=self._pillar_bias_label("BTC-USDT-SWAP"),
                 pillar_eth_bias=self._pillar_bias_label("ETH-USDT-SWAP"),
+                on_chain_context=self._on_chain_context_dict(),
             )
         except Exception:
             logger.debug(

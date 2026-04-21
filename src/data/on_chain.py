@@ -237,3 +237,168 @@ class ArkhamClient:
             await self._client.aclose()
         except Exception:
             pass
+
+
+# ── Snapshot fetchers (Phase B) ────────────────────────────────────────────
+#
+# Thin wrappers over ArkhamClient.get_entity_balance_changes that build the
+# OnChainSnapshot / stablecoin-pulse scalar used by downstream gates and
+# modifiers. Keep these as module-level functions (not ArkhamClient
+# methods) so the client stays transport-only; snapshot-derivation rules
+# live outside the HTTP layer, making them easy to unit-test with a
+# mocked client.
+
+from src.data.on_chain_types import OnChainSnapshot  # noqa: E402 — after class def
+
+
+# Arkham entity IDs for the major CEXes tracked in the daily snapshot.
+# Kept as a module constant so tests can monkeypatch and the operator can
+# tweak without touching the fetcher logic. Binance + Coinbase + OKX +
+# Bybit + Kraken + Bitfinex cover ~80% of stablecoin flow volume per
+# Arkham's own coverage; one missing exchange degrades gracefully because
+# the daily_macro_bias rule operates on NET change, not per-exchange
+# resolution.
+DEFAULT_CEX_ENTITY_IDS: list[str] = [
+    "binance", "coinbase", "okx", "bybit", "kraken", "bitfinex",
+]
+
+# Stablecoin + BTC + ETH pricing IDs for the daily macro-bias snapshot.
+# `tether` + `usd-coin` together represent ~90% of CEX stablecoin
+# volume on a typical day.
+DEFAULT_STABLECOIN_PRICING_IDS: list[str] = ["tether", "usd-coin"]
+DEFAULT_DAILY_PRICING_IDS: list[str] = [
+    "tether", "usd-coin", "bitcoin", "ethereum",
+]
+
+
+def _extract_net_change_usd(
+    data: dict,
+    pricing_id: str,
+) -> Optional[float]:
+    """Pull the aggregate `balance_change_usd` for `pricing_id` out of a
+    balance-changes response. Returns None when the response shape is
+    unexpected (a future API change should degrade, not crash).
+
+    Arkham's response nests entities → pricing rows; we sum across
+    entities for a single aggregated flow number.
+    """
+    try:
+        entities = data.get("entities") if isinstance(data, dict) else None
+        if not isinstance(entities, dict):
+            return None
+        total = 0.0
+        any_seen = False
+        for _, rows in entities.items():
+            if not isinstance(rows, dict):
+                continue
+            row = rows.get(pricing_id)
+            if row is None:
+                continue
+            if isinstance(row, dict):
+                change = row.get("balance_change_usd")
+            else:
+                change = row
+            if change is None:
+                continue
+            try:
+                total += float(change)
+                any_seen = True
+            except (TypeError, ValueError):
+                continue
+        return total if any_seen else None
+    except Exception:
+        return None
+
+
+async def fetch_daily_snapshot(
+    client: "ArkhamClient",
+    *,
+    stablecoin_threshold_usd: float,
+    btc_netflow_threshold_usd: float,
+    stale_threshold_s: int,
+    snapshot_age_s: int = 0,
+    entity_ids: Optional[list[str]] = None,
+) -> Optional[OnChainSnapshot]:
+    """Build the daily macro-bias snapshot.
+
+    Rule (mirrors plan §1 / Phase C):
+      * bullish  when stablecoin CEX balance Δ ≥ `stablecoin_threshold`
+                 AND BTC netflow ≤ `-btc_netflow_threshold` (BTC leaving CEX)
+      * bearish  when the mirror holds (stablecoins leaving, BTC arriving)
+      * neutral  otherwise (or any component missing)
+
+    Returns None when the underlying HTTP call fails — caller sees the
+    whole snapshot as absent rather than a partial / inconsistent view.
+    """
+    eids = entity_ids if entity_ids is not None else DEFAULT_CEX_ENTITY_IDS
+    data = await client.get_entity_balance_changes(
+        entity_ids=eids,
+        pricing_ids=DEFAULT_DAILY_PRICING_IDS,
+        interval="24h",
+    )
+    if data is None:
+        return None
+    stablecoin_change = 0.0
+    saw_any_stable = False
+    for sid in DEFAULT_STABLECOIN_PRICING_IDS:
+        v = _extract_net_change_usd(data, sid)
+        if v is not None:
+            stablecoin_change += v
+            saw_any_stable = True
+    btc_netflow = _extract_net_change_usd(data, "bitcoin")
+    eth_netflow = _extract_net_change_usd(data, "ethereum")
+    if not saw_any_stable and btc_netflow is None:
+        return None
+    # Netflow convention: Arkham's sign is from the CEX's point of view
+    # (positive = asset arriving at CEX, negative = leaving). BTC leaving
+    # = bullish, mirroring the plan's rule `cex_btc_netflow < -thr`.
+    bias: str = "neutral"
+    if (saw_any_stable
+            and stablecoin_change >= stablecoin_threshold_usd
+            and btc_netflow is not None
+            and btc_netflow <= -btc_netflow_threshold_usd):
+        bias = "bullish"
+    elif (saw_any_stable
+            and stablecoin_change <= -stablecoin_threshold_usd
+            and btc_netflow is not None
+            and btc_netflow >= btc_netflow_threshold_usd):
+        bias = "bearish"
+    return OnChainSnapshot(
+        daily_macro_bias=bias,
+        stablecoin_pulse_1h_usd=None,  # filled by fetch_hourly_stablecoin_pulse
+        cex_btc_netflow_24h_usd=btc_netflow,
+        cex_eth_netflow_24h_usd=eth_netflow,
+        coinbase_asia_skew_usd=None,   # reserved for future per-venue pulls
+        bnb_self_flow_24h_usd=None,    # reserved for future per-venue pulls
+        snapshot_age_s=int(snapshot_age_s),
+        stale_threshold_s=int(stale_threshold_s),
+    )
+
+
+async def fetch_hourly_stablecoin_pulse(
+    client: "ArkhamClient",
+    *,
+    entity_ids: Optional[list[str]] = None,
+) -> Optional[float]:
+    """Aggregate USDT + USDC 1h CEX balance delta. Returns a signed USD
+    number (positive = stablecoins entering CEXes, risk-on buying ammo;
+    negative = leaving, risk-off). None on HTTP failure or empty response.
+    """
+    eids = entity_ids if entity_ids is not None else DEFAULT_CEX_ENTITY_IDS
+    data = await client.get_entity_balance_changes(
+        entity_ids=eids,
+        pricing_ids=DEFAULT_STABLECOIN_PRICING_IDS,
+        interval="1h",
+    )
+    if data is None:
+        return None
+    total = 0.0
+    saw_any = False
+    for sid in DEFAULT_STABLECOIN_PRICING_IDS:
+        v = _extract_net_change_usd(data, sid)
+        if v is not None:
+            total += v
+            saw_any = True
+    if not saw_any:
+        return None
+    return total
