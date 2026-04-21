@@ -42,13 +42,17 @@ trading:
   max_leverage: 75
   # TP2 (runner) RR. With partial_tp_enabled=true (default), half the position
   # exits at partial_tp_rr (1.5R) and the remaining half runs to this value.
-  # 2026-04-19 (post-pivot): hard 1:3 RR enforced via execution.target_rr_ratio.
-  # `apply_zone_to_plan` now forces the final primary TP to entry ± 3 × sl_dist
+  # 2026-04-19 (post-pivot): hard 1:N RR enforced via execution.target_rr_ratio.
+  # `apply_zone_to_plan` now forces the final primary TP to entry ± N × sl_dist
   # regardless of heatmap geometry, after operator log showed actual TP landing
-  # at 8-12R despite the symbol_decision claiming 4.5. Keeping default_rr_ratio
-  # at 3.0 here as the pre-zone fallback (entry_signals path) so any code path
-  # that bypasses the zone planner also stays at the hard 1:3 contract.
-  default_rr_ratio: 3.0
+  # at 8-12R despite the symbol_decision claiming 4.5. Keep default_rr_ratio
+  # aligned with execution.target_rr_ratio so the pre-zone fallback
+  # (entry_signals path) also enforces the same hard cap.
+  # 2026-04-21 (eve): hard cap tightened 3.0 → 2.0. Operator observation:
+  # most wins wicked TP3 and reversed before the OCO market-trigger could
+  # fill (maker-TP helps but 3R TP is still far from 2R MFE-lock). 1:2 RR
+  # brings TP closer to the typical post-zone-fill momentum envelope.
+  default_rr_ratio: 2.0
   # 2026-04-18: lowered 2.0 → 1.5 to ease `htf_tp_ceiling` rejections on 15m
   # HTF. With buffer=0.2×ATR the clipped-TP RR often lands 1.6-1.9 on
   # DOGE/SOL/XRP — legitimate setups that still clear 2× round-trip fees +
@@ -175,7 +179,11 @@ analysis:
   # ~1–1.5× typical 3m ATR-as-% per symbol. Unlisted → global.
   min_sl_distance_pct_per_symbol:
     BTC-USDT-SWAP: 0.004
-    ETH-USDT-SWAP: 0.006
+    # 2026-04-21 (eve): 0.006 → 0.008. Operator flagged ETH stops writing
+    # losses too fast — floor was tighter than typical 3m noise envelope
+    # (~0.7-0.9% on current vol). Widened to DOGE level (0.008), still
+    # below SOL's 0.010. Notional auto-shrinks to keep $R flat.
+    ETH-USDT-SWAP: 0.008
     SOL-USDT-SWAP: 0.010
     DOGE-USDT-SWAP: 0.008
     XRP-USDT-SWAP: 0.008
@@ -421,7 +429,8 @@ execution:
   # symbol_decision claiming 4.5R. `apply_zone_to_plan` now forces
   # tp_price = entry ± target_rr_ratio × sl_distance and clamps every
   # ladder rung to that boundary. 0.0 = off (legacy heatmap-cluster TP).
-  target_rr_ratio: 3.0
+  # 2026-04-21 (eve): 3.0 → 2.0 (operator tune, see trading.default_rr_ratio).
+  target_rr_ratio: 2.0
 
   # Dynamic TP revision (live-data-driven). When true, the runner
   # periodically recomputes a fresh target from the live mark + the
@@ -432,7 +441,11 @@ execution:
   # rate-limits revisions per position; `tp_min_rr_floor` prevents
   # revising into a sub-floor RR if mark drifts past entry.
   tp_dynamic_enabled: true
-  tp_min_rr_floor: 1.5
+  # 2026-04-21 (eve): 1.5 → 1.0 after hard RR cap dropped 3.0 → 2.0.
+  # Under 1:2, a 1.5R floor would bind on almost every revise attempt
+  # (mark drift past entry on a 2R target routinely leaves <1.5R headroom).
+  # 1.0R floor keeps revise active under the tighter ceiling.
+  tp_min_rr_floor: 1.0
   tp_revise_min_delta_atr: 0.5
   tp_revise_cooldown_s: 30.0
 
@@ -444,8 +457,12 @@ execution:
   # fee buffer) — trade becomes risk-free. Set >0 to lock in profit
   # (e.g. 0.5 = guaranteed +0.5R). One-shot per position; subsequent
   # tightening would need a full trailing mechanic (Phase 12 Option B).
+  # 2026-04-21 (eve): 2.0 → 1.3 after RR cap dropped to 2.0. Old threshold
+  # coincided with the 2R TP — lock would never fire before TP. 1.3R ≈ 65%
+  # of the 2R TP, preserving the "almost-win → risk-free" design intent
+  # (old proportion was 2R / 3R = 67%).
   sl_lock_enabled: true
-  sl_lock_mfe_r: 2.0
+  sl_lock_mfe_r: 1.3
   sl_lock_at_r: 0.0
 
   # 2026-04-19 — OCO trigger price source. "mark" uses OKX's index-weighted

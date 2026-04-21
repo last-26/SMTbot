@@ -136,18 +136,13 @@ def test_partial_mode_bearish_tp1_direction():
 # ── Weighted-reward invariant (YAML contract) ──────────────────────────────
 
 
-def test_default_yaml_runner_tp_is_hard_1_3():
-    """Guard: config/default.yaml must enforce a hard 1:3 RR on the runner
-    leg via `execution.target_rr_ratio`. The pre-2026-04-19 contract was a
-    weighted 3.0R via the partial split (1.5R + 4.5R = avg 3.0R); operator
-    log on 2026-04-19 showed the heatmap-cluster TP source drove the runner
-    to 8-12R despite the 4.5R config knob, so the contract was rewritten:
-    every setup is `entry ± target_rr_ratio × sl_distance`, not a weighted
-    average.
-
-    Tune `target_rr_ratio` if the desired runner RR changes; keep
-    `default_rr_ratio` (entry_signals path fallback) aligned for non-zone
-    code paths.
+def test_default_yaml_runner_tp_is_hard_1_2():
+    """Guard: config/default.yaml must enforce a hard 1:N RR on the runner
+    leg via `execution.target_rr_ratio`, and the trading fallback
+    `default_rr_ratio` must stay aligned. Hard cap was 3.0 from 2026-04-19;
+    tightened to 2.0 on 2026-04-21 (eve) — operator tune bringing TP closer
+    to the typical post-fill momentum envelope. Keep `execution.target_rr_ratio`
+    and `trading.default_rr_ratio` in lockstep for the pre-zone fallback.
     """
     import pathlib
     import yaml
@@ -157,12 +152,12 @@ def test_default_yaml_runner_tp_is_hard_1_3():
 
     target_rr = float(raw["execution"]["target_rr_ratio"])
     default_rr = float(raw["trading"]["default_rr_ratio"])
-    assert target_rr == pytest.approx(3.0), (
-        f"execution.target_rr_ratio = {target_rr}, expected 3.0 — runner TP "
-        "must enforce hard 1:3 RR per CLAUDE.md changelog 2026-04-19."
+    assert target_rr == pytest.approx(2.0), (
+        f"execution.target_rr_ratio = {target_rr}, expected 2.0 — runner TP "
+        "must enforce hard 1:2 RR per CLAUDE.md changelog 2026-04-21 (eve)."
     )
     assert default_rr == pytest.approx(target_rr), (
         f"trading.default_rr_ratio ({default_rr}) drifted from "
         f"execution.target_rr_ratio ({target_rr}). Keep them aligned so the "
-        "entry_signals fallback path also enforces 1:3 when zones aren't used."
+        "entry_signals fallback path also enforces 1:2 when zones aren't used."
     )

@@ -12,7 +12,7 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 - **Pairs:** 5 OKX perps — `BTC / ETH / SOL / DOGE / BNB`. 5 concurrent slots on cross margin (all active, no queue).
 - **Entry TF:** 3m. HTF context 15m, LTF confirmation 1m.
 - **Scoring:** 5 pillars (Market Structure, Liquidity, Money Flow, VWAP, Divergence) + hard gates (displacement, EMA momentum, VWAP, cross-asset opposition) + ADX regime-conditional weights. *Premium/discount gate and HTF TP/SR ceiling temporarily disabled 2026-04-19 — see changelog; P/D to be re-enabled as a soft/weighted factor (~10-15%) post-Phase-9, HTF ceiling re-evaluated after Phase 9 GBT.*
-- **Execution:** post-only limit → regular limit → market-at-edge fallback. Single-leg OCO SL/TP at hard 1:3 RR (partial TP disabled 2026-04-19 late-night — see changelog; `move_sl_to_be_after_tp1` flag kept but inert while partial off). Dynamic TP revision re-anchors the runner OCO to `entry ± 3 × sl_distance` every cycle. **MFE-triggered SL lock (Option A, 2026-04-20)**: once MFE ≥ 2R, the runner OCO's SL is pulled to entry (+fee buffer) so the remaining 1R of target is risk-free. One-shot per position. **Maker-TP resting limit (2026-04-20)**: post-only reduce-only limit sits at TP price alongside the OCO — captures wicks as maker, avoids market-trigger latency.
+- **Execution:** post-only limit → regular limit → market-at-edge fallback. Single-leg OCO SL/TP at hard **1:2 RR** (tightened 1:3→1:2 on 2026-04-21 eve; partial TP disabled 2026-04-19 late-night — see changelog; `move_sl_to_be_after_tp1` flag kept but inert while partial off). Dynamic TP revision re-anchors the runner OCO to `entry ± 2 × sl_distance` every cycle, floor at 1.0R. **MFE-triggered SL lock (Option A, 2026-04-20)**: once MFE ≥ 1.3R (scaled from 2R when RR cap tightened), the runner OCO's SL is pulled to entry (+fee buffer) so the remaining 0.7R of target is risk-free. One-shot per position. **Maker-TP resting limit (2026-04-20)**: post-only reduce-only limit sits at TP price alongside the OCO — captures wicks as maker, avoids market-trigger latency.
 - **Sizing:** fee-aware ceil on per-contract total cost so total realized SL loss (price + fee reserve) ≥ target_risk across every symbol (2026-04-19 late-night-2). Overshoot bounded by one per-contract step (< $3 per position). Operator override via `RISK_AMOUNT_USDT` env (2026-04-20) bypasses percent-mode sizing; 10%-of-balance safety ceiling.
 - **Journal:** async SQLite, schema v3 (+ `on_chain_context`, `demo_artifact`). `rejected_signals` table with counter-factual outcome pegging.
 - **On-chain (Arkham):** integrated end-to-end (daily bias ±15%, hourly stablecoin pulse +0.75 threshold penalty, altcoin-index +0.5 penalty on misaligned altcoin trades, whale blackout hard gate 100M+ / 10 min). Credit-safe via v2 persistent WS streams. Weights tuned 1.5× 2026-04-21 (eve) for visibility; see changelog for re-eval triggers.
@@ -23,7 +23,29 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 
 ## Changelog
 
-### 2026-04-21 (eve) — Arkham weight bump (×1.5 on bias + pulse penalty)
+### 2026-04-21 (eve, late) — Hard RR 1:3 → 1:2 + ETH SL floor widening
+
+- **Trigger:** operator review of early session. Wins were wicking TP and reversing before the market-trigger TP could fill (maker-TP limit now handles this but 3R TP still far from typical post-fill momentum envelope). ETH losses were hitting the 0.6% floor too often — stops writing faster than 3m noise envelope.
+- **Fix — `config/default.yaml` + pydantic defaults:**
+  - `execution.target_rr_ratio: 3.0 → 2.0` (hard RR cap)
+  - `trading.default_rr_ratio: 3.0 → 2.0` (pre-zone fallback; test guard renamed `test_default_yaml_runner_tp_is_hard_1_2`)
+  - `execution.sl_lock_mfe_r: 2.0 → 1.3` — 2R threshold would coincide with 2R TP (lock never fires). 1.3R preserves "65% of the way to TP" proportion (old was 2R/3R = 67%).
+  - `execution.tp_min_rr_floor: 1.5 → 1.0` — under 1:2, a 1.5R floor would bind on nearly every revise.
+  - `min_sl_distance_pct_per_symbol.ETH-USDT-SWAP: 0.006 → 0.008` — DOGE level, still below SOL's 0.010. Notional auto-shrinks to keep $R flat (per SL widening contract).
+- **Expected behavior change:**
+  - Winners: TP closer, higher fill rate (maker-TP or market-trigger). Full-win payout 3R → 2R. Break-even WR 25% → 33%.
+  - MFE lock fires at 1.3R instead of 2R — "almost-win → BE" more sensitive. More trades locked to BE; fewer "locked and fell back to BE" vs "walked on to TP" bucket (since TP is now closer).
+  - ETH: wider stop envelope. Same $R, smaller notional. Fewer false stops from noise.
+- **Safety rails:** hard-RR test (`test_default_yaml_runner_tp_is_hard_1_2`) locks the contract — if anyone drifts one value without the other, test fails at CI. MFE lock + floor scaled together so lock still fires before TP and revise still has headroom.
+- **Dataset:** `rl.clean_since` **unchanged**. Exit-geometry tune (R distribution re-centered at 2R max instead of 3R max), same entry contract. Factor-audit will pick up the regime shift via `target_rr_ratio` categorical.
+- **Re-eval triggers:**
+  1. Win-rate post-flip. Old break-even (25%) was challenging; 33% should be within reach but tighter. If WR post-flip < 30%, tighten confluence threshold or re-examine zone sources.
+  2. Avg realized R on wins. Should land 1.8-2.0R (with maker-TP, closer to 2.0). Anything systematically below 1.5R suggests early TP revise shrinking it further — bump `tp_revise_min_delta_atr`.
+  3. MFE-lock fire rate. Expected up vs old config (threshold lowered 35%). If >80% of trades lock, consider bumping to 1.5R; if <40%, reconsider threshold.
+  4. ETH stop-out rate on bias-aligned trades. Should drop 15-25% with wider floor. If unchanged, the issue wasn't floor-related; re-eval zone sources for ETH.
+- **Tests:** 946 passing. Guard test renamed + asserts 2.0.
+
+
 
 - **Trigger:** first post-activation observation — all 5 bullish-day shorts cleared confluence despite Arkham penalties (bias ×0.9 + pulse +0.5 threshold). Operator flagged that 10% bias + 0.5 penalty on a raw 5.0+ score is effectively ignored; if this stays invisible in data, Phase 9 GBT won't have signal to learn from.
 - **Fix — `config/default.yaml` + `src/bot/config.py` defaults:**
@@ -345,7 +367,7 @@ Per-symbol overrides (YAML, ADA/XRP rows kept for easy reinstatement):
 - `swing_lookback_per_symbol`: DOGE=30 (thin 3m book; ADA/XRP=30 preserved).
 - `htf_sr_buffer_atr_per_symbol`: SOL=0.10 (wide-ATR, narrower buffer); DOGE=0.15; BNB inherits global 0.2.
 - `session_filter_per_symbol`: SOL + DOGE=[london] only. BNB inherits global (london+new_york) as major.
-- `min_sl_distance_pct_per_symbol`: BTC 0.004, ETH 0.006, SOL 0.010, DOGE 0.008, BNB 0.005.
+- `min_sl_distance_pct_per_symbol`: BTC 0.004, ETH 0.008 (bumped 2026-04-21 eve), SOL 0.010, DOGE 0.008, BNB 0.005.
 
 Adding a 6th+ pair: drop into `trading.symbols`, add `okx_to_tv_symbol()` parametrized test, add `derivatives.regime_per_symbol_overrides`, add `min_sl_distance_pct_per_symbol`, extend `affected_symbols_for` in `on_chain_types.py` for chain-native tokens, watch 20-30 cycles for `htf_settle_timeout` / `set_symbol_failed`. Coinalyze free tier supports ~8 pairs at refresh_interval_s=75s; Arkham at current cadence ≤6 pairs comfortable.
 

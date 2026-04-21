@@ -389,7 +389,9 @@ class ExecutionConfig(BaseModel):
     # `tp_min_rr_floor` prevents revising into a sub-floor RR if the live
     # mark drifts past the entry. 0 = off (don't revise).
     tp_dynamic_enabled: bool = False
-    tp_min_rr_floor: float = 1.5
+    # Default dropped 1.5 → 1.0 on 2026-04-21 (eve) alongside hard RR cap
+    # 3.0 → 2.0. Under 1:2, a 1.5R floor would bind on almost every revise.
+    tp_min_rr_floor: float = 1.0
     tp_revise_min_delta_atr: float = 0.5
     tp_revise_cooldown_s: float = 30.0
 
@@ -403,7 +405,10 @@ class ExecutionConfig(BaseModel):
     # on the same position (subsequent tightening would need a proper trail,
     # see Phase 12 Option B). `plan_sl_price <= 0` (post-BE rehydrate) skips.
     sl_lock_enabled: bool = False
-    sl_lock_mfe_r: float = 2.0
+    # Default dropped 2.0 → 1.3 on 2026-04-21 (eve) alongside RR cap
+    # 3.0 → 2.0. Old 2R threshold coincided with new 2R TP (lock would
+    # never fire before TP). 1.3R ≈ 65% of 2R TP.
+    sl_lock_mfe_r: float = 1.3
     sl_lock_at_r: float = 0.0
 
     # OKX OCO trigger-price source. "mark" = index-weighted price across
