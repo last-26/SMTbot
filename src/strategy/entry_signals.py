@@ -362,6 +362,33 @@ def _cross_asset_opposes(
 # ── Full pipeline ───────────────────────────────────────────────────────────
 
 
+def _stablecoin_pulse_penalty(
+    *,
+    direction: Direction,
+    pulse_usd: Optional[float],
+    threshold_usd: float,
+    penalty: float,
+) -> float:
+    """Return the additive confluence-threshold penalty when the hourly
+    stablecoin pulse opposes the proposed direction.
+
+    Rule (mirrors plan §2):
+      * Long + pulse <= -threshold → misaligned, +penalty.
+      * Short + pulse >= +threshold → misaligned, +penalty.
+      * otherwise (aligned / below threshold / None) → 0.
+    """
+    if penalty <= 0.0:
+        return 0.0
+    if pulse_usd is None:
+        return 0.0
+    is_long = direction == Direction.BULLISH
+    misaligned = (
+        (is_long and pulse_usd <= -float(threshold_usd))
+        or (not is_long and pulse_usd >= float(threshold_usd))
+    )
+    return penalty if misaligned else 0.0
+
+
 def generate_entry_intent(
     state: MarketState,
     candles: Optional[list[Candle]] = None,
@@ -386,6 +413,10 @@ def generate_entry_intent(
     trend_regime_conditional_scoring_enabled: bool = False,
     daily_bias_enabled: bool = False,
     daily_bias_delta: float = 0.0,
+    stablecoin_pulse_enabled: bool = False,
+    stablecoin_pulse_usd: Optional[float] = None,
+    stablecoin_pulse_threshold_usd: float = 50_000_000.0,
+    stablecoin_pulse_penalty: float = 0.5,
 ) -> Optional[EntryIntent]:
     """Compute confluence + pick an SL. Returns None when not tradable."""
     if state.current_price <= 0:
@@ -412,7 +443,23 @@ def generate_entry_intent(
         daily_bias_enabled=daily_bias_enabled,
         daily_bias_delta=daily_bias_delta,
     )
-    if not confluence.is_tradable(min_confluence_score):
+    # 2026-04-21 — Arkham stablecoin-pulse cross-asset penalty (Phase E).
+    # When the hourly stablecoin pulse opposes the winning direction
+    # (long + stablecoins leaving CEX, or short + stablecoins arriving),
+    # bump the effective confluence threshold by `penalty`. Aligned /
+    # below-threshold / None → no penalty. Applied AFTER calculate_confluence
+    # so direction is already resolved. Uses the SAME threshold as the
+    # baseline rejection — below-threshold setups still reject under
+    # `below_confluence` but via an adjusted bar.
+    effective_min_conf = float(min_confluence_score)
+    if stablecoin_pulse_enabled:
+        effective_min_conf += _stablecoin_pulse_penalty(
+            direction=confluence.direction,
+            pulse_usd=stablecoin_pulse_usd,
+            threshold_usd=stablecoin_pulse_threshold_usd,
+            penalty=stablecoin_pulse_penalty,
+        )
+    if not confluence.is_tradable(effective_min_conf):
         return None
 
     entry_price = state.current_price
@@ -628,6 +675,10 @@ def build_trade_plan_with_reason(
     whale_blackout_enabled: bool = False,
     whale_blackout: Optional[Any] = None,
     whale_blackout_symbol: Optional[str] = None,
+    stablecoin_pulse_enabled: bool = False,
+    stablecoin_pulse_usd: Optional[float] = None,
+    stablecoin_pulse_threshold_usd: float = 50_000_000.0,
+    stablecoin_pulse_penalty: float = 0.5,
 ) -> tuple[Optional[TradePlan], str]:
     """Same as `build_trade_plan_from_state` but returns `(plan, reason)`.
 
@@ -683,6 +734,10 @@ def build_trade_plan_with_reason(
         trend_regime_conditional_scoring_enabled=trend_regime_conditional_scoring_enabled,
         daily_bias_enabled=daily_bias_enabled,
         daily_bias_delta=daily_bias_delta,
+        stablecoin_pulse_enabled=stablecoin_pulse_enabled,
+        stablecoin_pulse_usd=stablecoin_pulse_usd,
+        stablecoin_pulse_threshold_usd=stablecoin_pulse_threshold_usd,
+        stablecoin_pulse_penalty=stablecoin_pulse_penalty,
     )
     if intent is None:
         # Distinguish the three upstream `generate_entry_intent` None paths.
@@ -703,7 +758,17 @@ def build_trade_plan_with_reason(
             daily_bias_enabled=daily_bias_enabled,
             daily_bias_delta=daily_bias_delta,
         )
-        if not conf.is_tradable(min_confluence_score):
+        # Apply the same stablecoin-pulse penalty to the diagnostic
+        # check so reject reasons stay consistent with the primary path.
+        effective_min_conf = float(min_confluence_score)
+        if stablecoin_pulse_enabled:
+            effective_min_conf += _stablecoin_pulse_penalty(
+                direction=conf.direction,
+                pulse_usd=stablecoin_pulse_usd,
+                threshold_usd=stablecoin_pulse_threshold_usd,
+                penalty=stablecoin_pulse_penalty,
+            )
+        if not conf.is_tradable(effective_min_conf):
             return None, "below_confluence"
         if allowed_sessions and state.active_session not in allowed_sessions:
             return None, "session_filter"

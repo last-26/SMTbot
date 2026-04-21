@@ -1594,6 +1594,15 @@ class BotRunner:
                 ),
                 whale_blackout=self.ctx.whale_blackout_state,
                 whale_blackout_symbol=symbol,
+                stablecoin_pulse_enabled=(
+                    cfg.on_chain.enabled
+                    and cfg.on_chain.stablecoin_pulse_enabled
+                ),
+                stablecoin_pulse_usd=self.ctx.stablecoin_pulse_1h_usd,
+                stablecoin_pulse_threshold_usd=(
+                    cfg.on_chain.stablecoin_pulse_threshold_usd),
+                stablecoin_pulse_penalty=(
+                    cfg.on_chain.stablecoin_pulse_penalty),
             )
         except Exception:
             logger.exception("plan_build_failed symbol={}", symbol)

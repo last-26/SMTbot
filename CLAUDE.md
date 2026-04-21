@@ -22,6 +22,46 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 
 ## Changelog
 
+### 2026-04-21 — Arkham on-chain integration, Phase E (stablecoin pulse cross-asset penalty)
+
+- **Trigger:** Phase D shipped (35d18fd). Phase E is the last sub-feature — a soft cross-asset-style penalty that bumps the effective confluence threshold when the hourly stablecoin pulse opposes the winning direction. Reuses the Phase B pulse fetch + cached value; no new fetchers. Completes the 5-phase Arkham integration.
+- **Design decisions (documented in chat before code):**
+  - **Penalty bumps threshold, doesn't flag a new reject reason.** The plan was explicit about this: misaligned setups reject under existing `below_confluence` via an adjusted threshold rather than a new `stablecoin_pulse_misaligned` string. Rationale: factor_audit.py already segments `below_confluence` by `on_chain_context.stablecoin_pulse_1h_usd` (stored since Phase B); a distinct reject string would fragment the bucket without giving new signal. The context dict is the enrichment vector, not the reject reason vocabulary.
+  - **Applied AFTER `calculate_confluence`, inside `generate_entry_intent`.** The penalty is direction-dependent (long + pulse leaving = misalignment; short + pulse arriving = misalignment). Direction isn't known until the scorer picks a winner, so the check runs post-score. The same check is mirrored in the diagnostic `below_confluence` path in `build_trade_plan_with_reason` so reject reasons stay consistent whether the primary or diagnostic path fires.
+  - **Helper is a pure function: `_stablecoin_pulse_penalty(direction, pulse_usd, threshold_usd, penalty) -> float`.** Returns either 0.0 (penalty disabled / aligned / below-magnitude / None) or the configured penalty value. Unit-tested in 8 cases independent of the entry pipeline. Keeps the business rule (misalignment definition) in one place — if Arkham's sign convention changes or operator wants an asymmetric rule (e.g. only penalize longs, not shorts), the helper is the one file to edit.
+  - **At-threshold is misaligned.** `pulse_usd <= -threshold` uses `<=` not `<` — a pulse exactly at negative threshold counts. Symmetric for short + `>= +threshold`. Avoids the "just barely below threshold" edge case where signal strength is equal in both directions.
+  - **Aligned direction passes without penalty.** A long trade on a day when stablecoins are flowing INTO CEXes gets no bump — that's the expected "risk-on" signal. The penalty is asymmetric: you can only be punished for trading against the signal, never rewarded for trading with it (that's what Phase C's bullish daily bias already does via the multiplier).
+  - **Delta = 0.5 bumps threshold 3.0 → 3.5 on default config.** Means a setup at confluence 3.2 gets rejected for `below_confluence` when it would have cleared otherwise. Operator-tunable via YAML.
+- **Fix — Phase E deliverables (16 new tests, 903 → 919):**
+  - `src/strategy/entry_signals.py:_stablecoin_pulse_penalty` — new pure helper. Returns `penalty` when misaligned, 0.0 otherwise. Tested in isolation.
+  - `src/strategy/entry_signals.py:generate_entry_intent` — 4 new kwargs: `stablecoin_pulse_enabled`, `stablecoin_pulse_usd`, `stablecoin_pulse_threshold_usd`, `stablecoin_pulse_penalty`. Applied AFTER `calculate_confluence` as `effective_min_conf = min_confluence_score + _stablecoin_pulse_penalty(...)`. `is_tradable(effective_min_conf)` replaces `is_tradable(min_confluence_score)`.
+  - `src/strategy/entry_signals.py:build_trade_plan_with_reason` — same 4 kwargs, threaded into `generate_entry_intent` AND into the diagnostic `below_confluence` check in the `intent is None` branch. Both paths see the bumped threshold.
+  - `src/bot/runner.py` — primary `build_trade_plan_with_reason` call site threads `stablecoin_pulse_enabled = cfg.on_chain.enabled AND cfg.on_chain.stablecoin_pulse_enabled`, `stablecoin_pulse_usd = self.ctx.stablecoin_pulse_1h_usd` (from Phase B scheduler), `stablecoin_pulse_threshold_usd`, `stablecoin_pulse_penalty`.
+- **Expected behavior change:**
+  - All flags off (default): bit-identical to pre-commit. 919 tests green.
+  - Master on, `stablecoin_pulse_enabled=false`: Phase B pulse still fetched and journal-written, gate inert.
+  - Master on, `stablecoin_pulse_enabled=true`, aligned direction: no change from Phase D behavior (penalty = 0).
+  - Master on, `stablecoin_pulse_enabled=true`, misaligned direction with `|pulse| ≥ threshold`: effective threshold bumps by `penalty` (default 0.5). Setups that would have cleared at 3.0 confluence now need 3.5. Reject reason stays `below_confluence` — journal's `on_chain_context.stablecoin_pulse_1h_usd` carries the signed pulse value so downstream analysis can distinguish "clean below_confluence" from "penalty-induced below_confluence".
+- **Safety rails:**
+  * Pure function, no side effects. Can't mutate shared state.
+  * Null pulse (never fetched / fetcher failed) → penalty 0. Misconfigured runner path can't force a penalty without actual data.
+  * Penalty = 0 in config → helper returns 0 regardless of direction / pulse. Short-circuit protects against accidental fire.
+  * Pydantic validator (Phase A) rejects negative penalty at config load.
+- **Tests:** 16 new, all green (919 passed total, up from 903):
+  - `tests/test_stablecoin_pulse_penalty.py` (16 new):
+    * `_stablecoin_pulse_penalty` — 8 tests: zero penalty config, None pulse, aligned long, aligned short, under-threshold magnitude (both signs × both directions), misaligned long, misaligned short, at-exact-threshold boundary.
+    * `build_trade_plan_with_reason` integration — 8 tests: gate disabled never applies (even with misaligned pulse), borderline-above-baseline still clears with flag off, aligned direction passes without penalty, misaligned intent-stub bypasses penalty (stub short-circuits generate_entry_intent), misaligned diagnostic path fires `below_confluence` (3.2 + penalty 0.5 = 3.5 reject), aligned diagnostic path labels `no_sl_source` (no penalty), under-threshold pulse ignored, None pulse ignored.
+- **Not fixed / explicitly out of scope (Phase E boundaries):**
+  - Asymmetric penalty (long-only or short-only). Current implementation penalises both sides symmetrically. If Phase 9 shows shorts benefit more from the veto than longs, an asymmetric config field can be added without re-architecting.
+  - Per-symbol penalty override (BNB different from BTC). Pulse is a market-wide signal; per-symbol tuning would need a per-symbol pulse source, which Arkham doesn't expose via this endpoint.
+  - Graded penalty (e.g., penalty scales with pulse magnitude above threshold). Current is binary: either penalty or 0. A graded version (penalty × abs(pulse - threshold) / threshold) could smooth the rejection cliff but is premature tuning before seeing Phase 9 data.
+- **Dataset:** `rl.clean_since` **unchanged**. Segment by `on_chain_context.stablecoin_pulse_1h_usd` + `reject_reason` in Phase 9 GBT.
+- **Re-evaluation (after ≥10 closed trades with gate enabled):**
+  1. Fraction of `below_confluence` rejects that are penalty-induced (identifiable via `on_chain_context.stablecoin_pulse_1h_usd` sign vs direction). If <10% of baseline `below_confluence`, the penalty is rarely biting — fine, stays defensive. If >40%, we're rejecting too much borderline work — drop penalty to 0.25 or threshold to 100M.
+  2. Counter-factual WR on penalty-induced rejects (peg_rejected_outcomes.py). They should underperform baseline `below_confluence` (which averages WR = 0 by definition of "not taken"). If they would have won at baseline WR or better, the penalty is anti-correlated with edge — turn off.
+  3. Symmetric check: are long-misaligned rejects showing similar WR to short-misaligned rejects? If asymmetric, consider a direction-specific penalty knob in a future phase.
+- **Integration complete.** All 5 Arkham phases shipped. Rollback from any state: flip `on_chain.enabled: false` and restart. Verified behavior: no Arkham log lines, no gate fires, no modifier effects, journal writes `on_chain_context=NULL`, historical rows preserved.
+
 ### 2026-04-21 — Arkham on-chain integration, Phase D (whale-transfer blackout hard gate + WS listener)
 
 - **Trigger:** Phase C shipped (c7dbf5c). Phase D adds the event-driven hard gate `whale_transfer_blackout` and the WebSocket listener that feeds it. Gate sits in `build_trade_plan_with_reason` just after `cross_asset_opposition` and just before `crowded_skip` — semantically event-driven (like `macro_event_blackout`) but higher-priority because whale moves can lead the macro tape by minutes.
