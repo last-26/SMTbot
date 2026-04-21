@@ -376,3 +376,151 @@ async def test_stop_on_chain_swallows_close_exception():
     runner = _make_runner(cfg, arkham_client=_RaisesOnClose())
     # Must not propagate.
     await runner._stop_on_chain()
+
+
+# ── on_chain_snapshots journal write (2026-04-21 eve late) ─────────────────
+
+
+async def _make_runner_with_connected_journal(
+    cfg: BotConfig, arkham_client: Any
+) -> BotRunner:
+    """Variant of `_make_runner` that connects the in-memory journal so the
+    snapshot-row writer can actually exercise the SQLite layer."""
+    runner = _make_runner(cfg, arkham_client=arkham_client)
+    await runner.ctx.journal.connect()
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_refresh_writes_snapshot_row_on_first_fetch(monkeypatch):
+    cfg = _make_on_chain_cfg()
+    runner = await _make_runner_with_connected_journal(
+        cfg, arkham_client=_FakeArkhamClient(),
+    )
+
+    async def _daily(client, **kw):
+        return OnChainSnapshot(
+            daily_macro_bias="bullish",
+            stablecoin_pulse_1h_usd=None,
+            cex_btc_netflow_24h_usd=-100_000_000.0,
+            cex_eth_netflow_24h_usd=-50_000_000.0,
+            snapshot_age_s=0, stale_threshold_s=7200,
+        )
+
+    async def _pulse(client, **kw):
+        return 75_000_000.0
+
+    monkeypatch.setattr("src.bot.runner.fetch_daily_snapshot", _daily)
+    monkeypatch.setattr("src.bot.runner.fetch_hourly_stablecoin_pulse", _pulse)
+
+    await runner._refresh_on_chain_snapshots()
+    rows = await runner.ctx.journal.list_on_chain_snapshots()
+    assert len(rows) == 1
+    assert rows[0]["daily_macro_bias"] == "bullish"
+    assert rows[0]["stablecoin_pulse_1h_usd"] == 75_000_000.0
+    assert runner.ctx.last_on_chain_snapshot_fingerprint is not None
+    await runner.ctx.journal.close()
+
+
+@pytest.mark.asyncio
+async def test_refresh_dedups_unchanged_snapshot(monkeypatch):
+    cfg = _make_on_chain_cfg(stablecoin_pulse_refresh_s=3600)
+    runner = await _make_runner_with_connected_journal(
+        cfg, arkham_client=_FakeArkhamClient(),
+    )
+
+    async def _daily(client, **kw):
+        return OnChainSnapshot(
+            daily_macro_bias="neutral",
+            stablecoin_pulse_1h_usd=None,
+            snapshot_age_s=0, stale_threshold_s=7200,
+        )
+
+    async def _pulse(client, **kw):
+        return 10_000_000.0
+
+    monkeypatch.setattr("src.bot.runner.fetch_daily_snapshot", _daily)
+    monkeypatch.setattr("src.bot.runner.fetch_hourly_stablecoin_pulse", _pulse)
+
+    # First tick — both fetches fire, one row written.
+    await runner._refresh_on_chain_snapshots()
+    # Second tick — daily cached (same UTC day), pulse cooldown not elapsed.
+    # Fingerprint unchanged → no new journal row.
+    await runner._refresh_on_chain_snapshots()
+    await runner._refresh_on_chain_snapshots()
+    rows = await runner.ctx.journal.list_on_chain_snapshots()
+    assert len(rows) == 1, "unchanged snapshot must not churn the table"
+    await runner.ctx.journal.close()
+
+
+@pytest.mark.asyncio
+async def test_refresh_writes_new_row_when_pulse_changes(monkeypatch):
+    cfg = _make_on_chain_cfg(stablecoin_pulse_refresh_s=3600)
+    runner = await _make_runner_with_connected_journal(
+        cfg, arkham_client=_FakeArkhamClient(),
+    )
+
+    async def _daily(client, **kw):
+        return OnChainSnapshot(
+            daily_macro_bias="bullish",
+            stablecoin_pulse_1h_usd=None,
+            snapshot_age_s=0, stale_threshold_s=7200,
+        )
+
+    pulse_values = iter([10_000_000.0, 80_000_000.0])
+
+    async def _pulse(client, **kw):
+        return next(pulse_values)
+
+    monkeypatch.setattr("src.bot.runner.fetch_daily_snapshot", _daily)
+    monkeypatch.setattr("src.bot.runner.fetch_hourly_stablecoin_pulse", _pulse)
+
+    # First tick — daily + pulse=10M.
+    await runner._refresh_on_chain_snapshots()
+    # Rewind the cooldown so pulse fetches again with a new value.
+    runner.ctx.last_on_chain_pulse_ts -= 3601.0
+    await runner._refresh_on_chain_snapshots()
+
+    rows = await runner.ctx.journal.list_on_chain_snapshots()
+    assert len(rows) == 2
+    assert rows[0]["stablecoin_pulse_1h_usd"] == 10_000_000.0
+    assert rows[1]["stablecoin_pulse_1h_usd"] == 80_000_000.0
+    await runner.ctx.journal.close()
+
+
+@pytest.mark.asyncio
+async def test_refresh_snapshot_journal_skipped_when_master_disabled(monkeypatch):
+    cfg = make_config()  # master off
+    runner = await _make_runner_with_connected_journal(
+        cfg, arkham_client=_FakeArkhamClient(),
+    )
+
+    # Manually seed a snapshot — if the guard mis-fires it would still
+    # be written despite master being off.
+    runner.ctx.on_chain_snapshot = OnChainSnapshot(
+        daily_macro_bias="bullish",
+        snapshot_age_s=0, stale_threshold_s=7200,
+    )
+
+    await runner._maybe_record_on_chain_snapshot()
+    rows = await runner.ctx.journal.list_on_chain_snapshots()
+    assert rows == []
+    await runner.ctx.journal.close()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_journal_failure_does_not_raise():
+    """Journal hiccup must never crash the tick."""
+    cfg = _make_on_chain_cfg()
+    runner = _make_runner(cfg, arkham_client=_FakeArkhamClient())
+    # Journal intentionally NOT connected — `record_on_chain_snapshot` will
+    # raise RuntimeError("TradeJournal not connected..."). The helper must
+    # swallow that via `arkham_snapshot_journal_failed` log.
+    runner.ctx.on_chain_snapshot = OnChainSnapshot(
+        daily_macro_bias="bullish",
+        snapshot_age_s=0, stale_threshold_s=7200,
+    )
+    # Must not propagate.
+    await runner._maybe_record_on_chain_snapshot()
+    # Fingerprint stays None — we only set it on successful write.
+    assert runner.ctx.last_on_chain_snapshot_fingerprint is None

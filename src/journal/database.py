@@ -160,6 +160,30 @@ CREATE TABLE IF NOT EXISTS rejected_signals (
 CREATE INDEX IF NOT EXISTS idx_rejected_symbol_ts  ON rejected_signals(symbol, signal_timestamp);
 CREATE INDEX IF NOT EXISTS idx_rejected_reason     ON rejected_signals(reject_reason);
 CREATE INDEX IF NOT EXISTS idx_rejected_outcome    ON rejected_signals(hypothetical_outcome);
+
+-- 2026-04-21 — Arkham on-chain snapshot time-series (Phase 8 data layer).
+-- One row per detected snapshot MUTATION (not per tick). Runner writes
+-- through `record_on_chain_snapshot` only when the fingerprint changes,
+-- so cadence matches Arkham's own refresh rhythm (~hourly pulse, hourly
+-- altcoin index, daily bias). Phase 9 joins this onto `trades` via
+-- `entry_timestamp <= captured_at <= exit_timestamp` to reconstruct
+-- what on-chain regime the trade lived through.
+CREATE TABLE IF NOT EXISTS on_chain_snapshots (
+    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at                TEXT NOT NULL,
+    daily_macro_bias           TEXT,
+    stablecoin_pulse_1h_usd    REAL,
+    cex_btc_netflow_24h_usd    REAL,
+    cex_eth_netflow_24h_usd    REAL,
+    coinbase_asia_skew_usd     REAL,
+    bnb_self_flow_24h_usd      REAL,
+    altcoin_index              REAL,
+    snapshot_age_s             INTEGER,
+    fresh                      INTEGER,
+    whale_blackout_active      INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_on_chain_snap_captured_at ON on_chain_snapshots(captured_at);
 """
 
 
@@ -841,6 +865,85 @@ class TradeJournal:
         await conn.commit()
         if cur.rowcount == 0:
             raise KeyError(f"No trade with id={trade_id!r}")
+
+    async def record_on_chain_snapshot(
+        self,
+        *,
+        captured_at: datetime,
+        daily_macro_bias: Optional[str],
+        stablecoin_pulse_1h_usd: Optional[float],
+        cex_btc_netflow_24h_usd: Optional[float],
+        cex_eth_netflow_24h_usd: Optional[float],
+        coinbase_asia_skew_usd: Optional[float],
+        bnb_self_flow_24h_usd: Optional[float],
+        altcoin_index: Optional[float],
+        snapshot_age_s: Optional[int],
+        fresh: bool,
+        whale_blackout_active: bool,
+    ) -> int:
+        """Append one row to `on_chain_snapshots` — time-series of Arkham state.
+
+        Intended cadence: ONLY when the upstream snapshot fingerprint actually
+        changes. Runner's `_maybe_record_on_chain_snapshot` owns dedup; this
+        method is a dumb writer and will insert whatever it's given. Returns
+        the new row's `id` for callers that want to reference it.
+        """
+        conn = self._require_conn()
+        cur = await conn.execute(
+            """INSERT INTO on_chain_snapshots (
+                   captured_at,
+                   daily_macro_bias,
+                   stablecoin_pulse_1h_usd,
+                   cex_btc_netflow_24h_usd,
+                   cex_eth_netflow_24h_usd,
+                   coinbase_asia_skew_usd,
+                   bnb_self_flow_24h_usd,
+                   altcoin_index,
+                   snapshot_age_s,
+                   fresh,
+                   whale_blackout_active
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                _iso(captured_at),
+                daily_macro_bias,
+                stablecoin_pulse_1h_usd,
+                cex_btc_netflow_24h_usd,
+                cex_eth_netflow_24h_usd,
+                coinbase_asia_skew_usd,
+                bnb_self_flow_24h_usd,
+                altcoin_index,
+                snapshot_age_s,
+                int(fresh),
+                int(whale_blackout_active),
+            ),
+        )
+        await conn.commit()
+        return int(cur.lastrowid or 0)
+
+    async def list_on_chain_snapshots(
+        self,
+        *,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+    ) -> list[dict]:
+        """Read on-chain snapshots in capture order, optionally bounded by a
+        `[since, until]` window. Returns plain dicts — this table has no
+        model class since it's consumed by Phase 9 analysis scripts, not
+        by the runtime strategy.
+        """
+        conn = self._require_conn()
+        sql = "SELECT * FROM on_chain_snapshots WHERE 1=1"
+        params: list = []
+        if since is not None:
+            sql += " AND captured_at >= ?"
+            params.append(_iso(since))
+        if until is not None:
+            sql += " AND captured_at <= ?"
+            params.append(_iso(until))
+        sql += " ORDER BY captured_at ASC, id ASC"
+        async with conn.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
 
     # ── Reads ───────────────────────────────────────────────────────────────
 

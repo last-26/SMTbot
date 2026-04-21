@@ -416,6 +416,11 @@ class BotContext:
     # whale_blackout_enabled`. Writes to `whale_blackout_state`; the
     # entry_signals gate reads from that registry via MarketState.
     arkham_ws: Any = None                             # ArkhamWebSocketListener
+    # 2026-04-21 (eve, late) — on_chain_snapshots time-series dedup key.
+    # Tuple of (bias, pulse, btc_flow, eth_flow, coinbase_skew, bnb_flow,
+    # altcoin_idx, fresh, whale_blackout_active). Unchanged tick → skip
+    # journal write; mutation → append a row. None on startup.
+    last_on_chain_snapshot_fingerprint: Any = None
 
 
 # ── Runner ──────────────────────────────────────────────────────────────────
@@ -2030,6 +2035,76 @@ class BotRunner:
                     "arkham_stablecoin_pulse_refreshed pulse_usd={:.2f}",
                     float(pulse),
                 )
+
+        # Time-series journal row — appends only when the composite
+        # fingerprint actually changes. Cadence thus matches Arkham's
+        # own refresh rhythm (≈ hourly pulse + hourly altcoin-index +
+        # once-per-UTC-day bias) rather than the much faster tick loop.
+        await self._maybe_record_on_chain_snapshot()
+
+    async def _maybe_record_on_chain_snapshot(self) -> None:
+        """Append one row to `on_chain_snapshots` when Arkham state mutates.
+
+        Fingerprint-gated: a tuple of content-only fields (age excluded so
+        no-op ticks don't churn rows) is compared against the last-written
+        fingerprint on `ctx.last_on_chain_snapshot_fingerprint`. Match →
+        skip; differ → write + update fingerprint. Phase 9 will join this
+        table onto `trades` via `entry_timestamp <= captured_at <=
+        exit_timestamp` to reconstruct the on-chain regime each trade
+        lived through.
+
+        Failures log + swallow — a journal hiccup must never crash the
+        tick.
+        """
+        cfg = self.ctx.config
+        if not cfg.on_chain.enabled:
+            return
+        snap = self.ctx.on_chain_snapshot
+        if snap is None:
+            return
+        journal = getattr(self.ctx, "journal", None)
+        if journal is None:
+            return
+
+        blackout = self.ctx.whale_blackout_state
+        blackout_active = False
+        if blackout is not None and blackout.blackouts:
+            now_ms = int(_utc_now().timestamp() * 1000)
+            blackout_active = any(
+                v > now_ms for v in blackout.blackouts.values()
+            )
+
+        fp = (
+            snap.daily_macro_bias,
+            snap.stablecoin_pulse_1h_usd,
+            snap.cex_btc_netflow_24h_usd,
+            snap.cex_eth_netflow_24h_usd,
+            snap.coinbase_asia_skew_usd,
+            snap.bnb_self_flow_24h_usd,
+            self.ctx.altcoin_index_value,
+            bool(snap.fresh),
+            blackout_active,
+        )
+        if self.ctx.last_on_chain_snapshot_fingerprint == fp:
+            return
+
+        try:
+            await journal.record_on_chain_snapshot(
+                captured_at=_utc_now(),
+                daily_macro_bias=snap.daily_macro_bias,
+                stablecoin_pulse_1h_usd=snap.stablecoin_pulse_1h_usd,
+                cex_btc_netflow_24h_usd=snap.cex_btc_netflow_24h_usd,
+                cex_eth_netflow_24h_usd=snap.cex_eth_netflow_24h_usd,
+                coinbase_asia_skew_usd=snap.coinbase_asia_skew_usd,
+                bnb_self_flow_24h_usd=snap.bnb_self_flow_24h_usd,
+                altcoin_index=self.ctx.altcoin_index_value,
+                snapshot_age_s=int(snap.snapshot_age_s),
+                fresh=bool(snap.fresh),
+                whale_blackout_active=blackout_active,
+            )
+            self.ctx.last_on_chain_snapshot_fingerprint = fp
+        except Exception:
+            logger.exception("arkham_snapshot_journal_failed")
 
     def _on_chain_context_dict(self) -> Optional[dict]:
         """Build the dict that gets JSON-serialised into

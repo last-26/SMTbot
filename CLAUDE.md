@@ -14,7 +14,7 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 - **Scoring:** 5 pillars (Market Structure, Liquidity, Money Flow, VWAP, Divergence) + hard gates (displacement, EMA momentum, VWAP, cross-asset opposition) + ADX regime-conditional weights. *Premium/discount gate and HTF TP/SR ceiling temporarily disabled 2026-04-19 — see changelog; P/D to be re-enabled as a soft/weighted factor (~10-15%) post-Phase-9, HTF ceiling re-evaluated after Phase 9 GBT.*
 - **Execution:** post-only limit → regular limit → market-at-edge fallback. Single-leg OCO SL/TP at hard **1:2 RR** (tightened 1:3→1:2 on 2026-04-21 eve; partial TP disabled 2026-04-19 late-night — see changelog; `move_sl_to_be_after_tp1` flag kept but inert while partial off). Dynamic TP revision re-anchors the runner OCO to `entry ± 2 × sl_distance` every cycle, floor at 1.0R. **MFE-triggered SL lock (Option A, 2026-04-20)**: once MFE ≥ 1.3R (scaled from 2R when RR cap tightened), the runner OCO's SL is pulled to entry (+fee buffer) so the remaining 0.7R of target is risk-free. One-shot per position. **Maker-TP resting limit (2026-04-20)**: post-only reduce-only limit sits at TP price alongside the OCO — captures wicks as maker, avoids market-trigger latency.
 - **Sizing:** fee-aware ceil on per-contract total cost so total realized SL loss (price + fee reserve) ≥ target_risk across every symbol (2026-04-19 late-night-2). Overshoot bounded by one per-contract step (< $3 per position). Operator override via `RISK_AMOUNT_USDT` env (2026-04-20) bypasses percent-mode sizing; 10%-of-balance safety ceiling.
-- **Journal:** async SQLite, schema v3 (+ `on_chain_context`, `demo_artifact`). `rejected_signals` table with counter-factual outcome pegging.
+- **Journal:** async SQLite, schema v3 (+ `on_chain_context`, `demo_artifact`). `rejected_signals` table with counter-factual outcome pegging. Separate `on_chain_snapshots` time-series table captures every Arkham state mutation for Phase 9 trade-lifetime joins.
 - **On-chain (Arkham):** integrated end-to-end (daily bias ±15%, hourly stablecoin pulse +0.75 threshold penalty, altcoin-index +0.5 penalty on misaligned altcoin trades, whale blackout hard gate 100M+ / 10 min). Credit-safe via v2 persistent WS streams. Weights tuned 1.5× 2026-04-21 (eve) for visibility; see changelog for re-eval triggers.
 - **Tests:** 946, all green. Demo-runnable end-to-end.
 - **Data cutoff (`rl.clean_since`):** `2026-04-19T19:55:00Z` (bumped after ceil sizing flipped — realized-R distribution shifts from clustered-below-target to clustered-at-or-above-target). Arkham activation did NOT bump — dataset segments by `arkham_active` categorical.
@@ -22,6 +22,19 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 ---
 
 ## Changelog
+
+### 2026-04-21 (eve, late-2) — `on_chain_snapshots` time-series table (Phase 8 data layer)
+
+- **Trigger:** operator flagged that on-chain context is frozen at entry-time on each `trades` row — pozisyon ömrü boyunca bias flip / whale event / pulse misalignment görünmez. Exit-time snapshot ayrı kolonda tutmak az değer (causality yok, kapanış deterministik). Daha temiz çözüm: ayrı time-series tablo.
+- **New table — `on_chain_snapshots`:** `captured_at`, `daily_macro_bias`, `stablecoin_pulse_1h_usd`, `cex_btc_netflow_24h_usd`, `cex_eth_netflow_24h_usd`, `coinbase_asia_skew_usd`, `bnb_self_flow_24h_usd`, `altcoin_index`, `snapshot_age_s`, `fresh`, `whale_blackout_active`. Index on `captured_at`. Created via `CREATE TABLE IF NOT EXISTS` in `_SCHEMA` (no ALTER migration — same idempotent startup path hits new + existing DBs).
+- **Dedup-gated writer.** Runner's `_refresh_on_chain_snapshots` calls `_maybe_record_on_chain_snapshot` at tail. Fingerprint tuple `(bias, pulse, btc_flow, eth_flow, coinbase_skew, bnb_flow, altcoin_idx, fresh, whale_blackout_active)` compared against `ctx.last_on_chain_snapshot_fingerprint`. Match → skip; differ → single insert + fingerprint update. `snapshot_age_s` deliberately NOT in fingerprint (grows every tick; would churn ~1 row / 180s even on no-op ticks). `fresh` bool IS in fingerprint — staleness flip is a meaningful observation. Journal failures log + swallow via `arkham_snapshot_journal_failed`.
+- **Expected cadence:** ~hourly pulse + hourly altcoin-index + once-per-UTC-day bias → 2-3 rows/hour typical, ~72/day, ~2200/month. Well inside SQLite comfort zone.
+- **Phase 9 usage (documented intent, not shipped).** Analysis scripts will join `trades` onto this table via `entry_timestamp ≤ captured_at ≤ exit_timestamp`, reconstructing "which on-chain regimes did this trade live through." Enables hypothesis: "entry'de bullish bias → mid-trade flip → did outcome change?" GBT features: bias-flip-during-lifetime bool, whale-event-during-lifetime bool, pulse-sign-change-during-lifetime bool. NO runtime reaction mechanism yet — Phase 12 candidate pending Phase 9 signal validation.
+- **Dataset:** `rl.clean_since` **unchanged**. Additive read-only table, zero entry/exit geometry change. Existing `on_chain_context` on trade rows preserved (complementary — entry snapshot vs lifetime journey).
+- **Re-eval triggers:**
+  1. Row count growth. <1 row/hour average over 24h = dedup too aggressive OR Arkham fetcher failing. Inspect `arkham_*_refreshed` log lines vs table row count.
+  2. Phase 9 signal. If `bias_flipped_during_lifetime` segment shows < 5% outcome delta vs `no_flip` segment, reactive mechanism isn't worth building. If > 10%, promote to Phase 12 design.
+- **Tests:** 953 passing (+7: 2 journal, 5 runner). `test_refresh_dedups_unchanged_snapshot` locks the no-churn contract.
 
 ### 2026-04-21 (eve, late) — Hard RR 1:3 → 1:2 + ETH SL floor widening
 
@@ -251,7 +264,7 @@ Modules have docstrings; a tour for orientation:
 - `src/analysis/` — Structure (MSS/BOS/CHoCH), FVG, OB, liquidity, ATR-scaled S/R, multi-TF confluence + regime-conditional weights + **daily-bias modifier**, derivatives regime, **ADX trend regime**, **EMA momentum veto**, **displacement / premium-discount** gates.
 - `src/strategy/` — R:R math, SL hierarchy, entry orchestration (+ **stablecoin-pulse / altcoin-index penalties + whale-blackout gate**), **setup planner** (zone-based limit-order plans), cross-asset snapshot veto, risk manager.
 - `src/execution/` — python-okx wrapper (sync → `asyncio.to_thread`), order router (`place_limit_entry` / `cancel_pending_entry` / `place_reduce_only_limit` / market fallback), REST-poll position monitor with **PENDING** state + **MFE-lock + TP-revise + maker-TP tracking**, typed errors.
-- `src/journal/` — async SQLite, schema v3 trade records (+ `on_chain_context`, `demo_artifact`), `rejected_signals` + counter-factual stamps, pure-function reporter.
+- `src/journal/` — async SQLite, schema v3 trade records (+ `on_chain_context`, `demo_artifact`), `rejected_signals` + counter-factual stamps, `on_chain_snapshots` time-series, pure-function reporter.
 - `src/bot/` — YAML/env config, async outer loop (`BotRunner.run_once` — closes → snapshot → pending → per-symbol cycle), on-chain snapshot scheduler, CLI entry.
 
 End-to-end tick walkthrough: see `docs/trade_lifecycle.md`.
@@ -419,6 +432,7 @@ The bot is ready to run. Everything below is sequenced and gated — don't skip 
 - Run demo bot. `rl.clean_since=2026-04-19T19:55:00Z` keeps reporter + RL on post-pivot data only.
 - Run `scripts/factor_audit.py` every ~10 closed trades — early-warning on factor regressions before they eat the dataset.
 - Run `scripts/peg_rejected_outcomes.py --commit` weekly to stamp counter-factual outcomes on rejected signals.
+- `on_chain_snapshots` table passively accumulates Arkham state mutations (~2200 rows/month). Phase 9 joins this onto `trades` via `entry_timestamp ≤ captured_at ≤ exit_timestamp` to test whether mid-trade on-chain shifts (bias flip, whale event, pulse sign change) correlate with outcome. No runtime reaction until signal is validated.
 
 **Gate to leave:** ≥50 closed post-pivot trades, WR ≥ 45%, avg R ≥ 0, ≥2 trend-regimes represented, net PnL ≥ 0.
 

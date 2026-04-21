@@ -499,3 +499,78 @@ async def test_record_rejected_signal_on_chain_context_none_default():
             signal_timestamp=datetime(2026, 4, 21, 11, tzinfo=UTC),
         )
         assert rec.on_chain_context is None
+
+
+# ── on_chain_snapshots time-series (2026-04-21 eve late, Phase 8 data layer) ──
+
+
+async def test_record_on_chain_snapshot_roundtrip():
+    async with TradeJournal(":memory:") as j:
+        ts = datetime(2026, 4, 21, 19, 30, tzinfo=UTC)
+        row_id = await j.record_on_chain_snapshot(
+            captured_at=ts,
+            daily_macro_bias="bullish",
+            stablecoin_pulse_1h_usd=437_239_070.5,
+            cex_btc_netflow_24h_usd=-609_349_951.8,
+            cex_eth_netflow_24h_usd=None,
+            coinbase_asia_skew_usd=20_000_000.0,
+            bnb_self_flow_24h_usd=-5_000_000.0,
+            altcoin_index=42,
+            snapshot_age_s=60,
+            fresh=True,
+            whale_blackout_active=False,
+        )
+        assert row_id >= 1
+        rows = await j.list_on_chain_snapshots()
+        assert len(rows) == 1
+        r = rows[0]
+        assert r["daily_macro_bias"] == "bullish"
+        assert r["stablecoin_pulse_1h_usd"] == 437_239_070.5
+        assert r["cex_btc_netflow_24h_usd"] == -609_349_951.8
+        assert r["cex_eth_netflow_24h_usd"] is None
+        assert r["altcoin_index"] == 42
+        assert r["snapshot_age_s"] == 60
+        assert r["fresh"] == 1  # SQLite INTEGER mirror of the bool
+        assert r["whale_blackout_active"] == 0
+        assert r["captured_at"] == ts.isoformat()
+
+
+async def test_list_on_chain_snapshots_filters_by_time_window():
+    async with TradeJournal(":memory:") as j:
+        base = datetime(2026, 4, 21, 12, tzinfo=UTC)
+        for i, bias in enumerate(["bullish", "neutral", "bearish"]):
+            await j.record_on_chain_snapshot(
+                captured_at=base + timedelta(hours=i),
+                daily_macro_bias=bias,
+                stablecoin_pulse_1h_usd=1.0,
+                cex_btc_netflow_24h_usd=0.0,
+                cex_eth_netflow_24h_usd=0.0,
+                coinbase_asia_skew_usd=None,
+                bnb_self_flow_24h_usd=None,
+                altcoin_index=None,
+                snapshot_age_s=0,
+                fresh=True,
+                whale_blackout_active=False,
+            )
+
+        # Unbounded → all 3.
+        assert len(await j.list_on_chain_snapshots()) == 3
+
+        # `since` excludes the first row.
+        rows = await j.list_on_chain_snapshots(
+            since=base + timedelta(minutes=30),
+        )
+        assert [r["daily_macro_bias"] for r in rows] == ["neutral", "bearish"]
+
+        # `until` excludes the last row.
+        rows = await j.list_on_chain_snapshots(
+            until=base + timedelta(hours=1, minutes=30),
+        )
+        assert [r["daily_macro_bias"] for r in rows] == ["bullish", "neutral"]
+
+        # Both bounds → middle row only.
+        rows = await j.list_on_chain_snapshots(
+            since=base + timedelta(minutes=30),
+            until=base + timedelta(hours=1, minutes=30),
+        )
+        assert [r["daily_macro_bias"] for r in rows] == ["neutral"]
