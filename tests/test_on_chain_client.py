@@ -28,6 +28,10 @@ class _FakeResponse:
         self.status_code = status_code
         self._json = json_body if json_body is not None else {}
         self.headers = headers or {}
+        # httpx.Response-like: `content` is the raw body bytes. The
+        # client uses `bool(resp.content)` to distinguish 204 / empty
+        # payloads from real bodies.
+        self.content = b"{}" if json_body is not None else b""
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
@@ -40,16 +44,15 @@ class _FakeResponse:
 class _FakeClient:
     """Queue-backed fake for httpx.AsyncClient.
 
-    Each `get` pops the next response from `queued`. Raise by enqueueing
-    an Exception instance instead of a response; the fake re-raises.
+    `get` / `post` / `delete` each pop the next response from `queued`.
+    Raise by enqueueing an Exception instance instead of a response.
     """
 
     def __init__(self, queued: Optional[list] = None):
         self.queued: list = queued or []
-        self.calls: list[tuple[str, dict]] = []
+        self.calls: list[tuple[str, str, dict]] = []  # (method, path, params)
 
-    async def get(self, path: str, params: Optional[dict] = None) -> _FakeResponse:
-        self.calls.append((path, params or {}))
+    def _next(self) -> _FakeResponse:
         if not self.queued:
             return _FakeResponse(status_code=200, json_body={"empty": True})
         item = self.queued.pop(0)
@@ -57,14 +60,20 @@ class _FakeClient:
             raise item
         return item
 
-    async def delete(self, path: str) -> _FakeResponse:
-        self.calls.append((path, {"__method__": "DELETE"}))
-        if not self.queued:
-            return _FakeResponse(status_code=200, json_body={})
-        item = self.queued.pop(0)
-        if isinstance(item, Exception):
-            raise item
-        return item
+    async def get(self, path: str, params: Optional[dict] = None) -> _FakeResponse:
+        self.calls.append(("GET", path, params or {}))
+        return self._next()
+
+    async def post(self, path: str, *, params: Optional[dict] = None,
+                   json: Optional[dict] = None) -> _FakeResponse:
+        self.calls.append(("POST", path, {"params": params or {},
+                                           "json": json or {}}))
+        return self._next()
+
+    async def delete(self, path: str,
+                     params: Optional[dict] = None) -> _FakeResponse:
+        self.calls.append(("DELETE", path, params or {}))
+        return self._next()
 
     async def aclose(self) -> None:
         pass

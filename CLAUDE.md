@@ -22,6 +22,49 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 
 ## Changelog
 
+### 2026-04-21 — Arkham client patched against real v1.1 API shape (post-rollback recovery)
+
+- **Trigger:** rollback commit `27e5c8b` turned master off after 405 spam. Operator then shared the real docs URL (`https://intel.arkm.com/api/docs`) and the machine-readable variant at `intel.arkm.com/llms-full.txt` — which revealed every assumption in the original integration plan was wrong on shape details (paths, methods, params, response fields, WS URL, subscribe envelope). This commit rewrites the client against the real API and verifies end-to-end with live probes.
+- **Root-cause diagnosis (from the real docs + live probes):**
+  - **Path mismatch.** Plan used `/intel/entity-balance-changes` and `/intel/ws-session`. Real endpoints are `/intelligence/entity_balance_changes` (GET) and `/ws/sessions` (POST). The `/intel/*` prefix simply doesn't exist on the Arkham API, which is why every call returned 405 Method Not Allowed.
+  - **Interval constraint.** Plan assumed arbitrary duration strings (`1h` / `24h` / `7d`). Real endpoint only accepts `7d`, `14d`, `30d` — confirmed via a direct probe that returned 400 with the error message `"valid values: 7d, 14d, 30d"`. This *kills* the hourly stablecoin pulse design (Phase E) — no 1h window is available here. Daily bias (Phase C) survives but becomes a 7-day rolling signal instead of 24-hour.
+  - **Undocumented required param.** Real endpoint returns 400 with `"orderBy parameter is required"` when `orderBy` is omitted — this requirement isn't in the public docs text. Confirmed by probe. Adding `orderBy=balanceUsd` + `orderDir=desc` unblocked the 200 response.
+  - **Response shape.** Plan parser assumed `{"entities": {"<id>": {"<pricing>": {"balance_change_usd": ...}}}}` (dict-of-dicts). Real response is `[{entityId, entityName, entityType, balanceUsd, prevBalanceUsd, tokenBalances: [{tokenId, tokenSymbol, balanceUsd, prevBalanceUsd}]}]` (list of entities with nested per-token breakdown). Balance change is computed as `balanceUsd − prevBalanceUsd`, not a pre-computed `balance_change_usd` field.
+  - **WebSocket URL + session handshake.** Plan used `wss://ws.arkm.com/intel/transfers` with a `sessionId`-in-payload subscribe. Real: `wss://api.arkm.com/ws/transfers?session_id=<sid>`, session created via `POST /ws/sessions` with an empty body, `API-Key` header on handshake, v1 subscribe envelope is `{"id":"1","type":"subscribe","payload":{"filters":{"usdGte":<int>,"tokens":[...]}}}`.
+  - **Transfer payload fields.** Plan parser read `token`, `usdValue`, and millisecond `timestamp`. Real: `tokenSymbol`, `historicalUSD`, ISO-8601 `blockTimestamp`. Parser rewrite handles both shapes (real + plan's alternate keys) defensively.
+- **Fix — `src/data/on_chain.py`:**
+  - `_request` now takes `method` kwarg, supports GET / POST / DELETE. Adds a 400-specific branch that logs the response body (first 400 chars) for operator visibility — Arkham's 400s carry useful error messages like `"valid values: 7d, 14d, 30d"` and `"orderBy parameter is required"`. Adds 405-specific branch that short-circuits without retry (method mismatch is deterministic — no point burning attempts).
+  - `get_entity_balance_changes` now hits `/intelligence/entity_balance_changes` (GET). New signature includes required `order_by` / `order_dir` (defaults `balanceUsd` / `desc`) and optional `entity_types` (`["cex"]` for the daily snapshot, auto-captures new CEXes Arkham starts tracking). Passes list-typed params so httpx emits them as repeated query strings (`entityIds=binance&entityIds=coinbase`) instead of comma-joined (which the real API rejects).
+  - `create_ws_session` now `POST /ws/sessions` with empty body; accepts `session_id` / `sessionId` / `id` in the response (defensive).
+  - `delete_ws_session` calls `DELETE /ws/sessions/{id}` (was `/intel/ws-session/{id}`).
+  - `_extract_net_change_usd` rewritten. Primary path: walk the list → for each entity, walk `tokenBalances[]` → sum `balanceUsd − prevBalanceUsd` for rows matching `tokenId` / `tokenSymbol`. Falls back to flat / legacy dict shapes for backwards-compat with dev fixtures.
+  - `fetch_daily_snapshot` now takes `interval` arg (default `"7d"`). Docstring notes the server constraint. `entity_types=["cex"]` filter keeps the call tight.
+  - `fetch_hourly_stablecoin_pulse` **is now a deliberate stub returning None** — the Arkham endpoint can't serve sub-7d windows. Phase E penalty stays inert (no pulse → penalty 0) until a real hourly source lands. Signature preserved so the runner scheduler doesn't need to change. Candidate future source: `/transfers/histogram` or in-process aggregation of the WS transfer stream.
+- **Fix — `src/data/on_chain_ws.py`:**
+  - New module-level `ARKHAM_WS_BASE = "wss://api.arkm.com/ws/transfers"` (was `wss://ws.arkm.com/intel/transfers`).
+  - New pure function `build_ws_url(session_id, base)` — URL with `?session_id=<sid>`.
+  - `build_subscribe_message` rewritten to v1 shape: `{"id":"1","type":"subscribe","payload":{"filters":{"tokens":[...],"usdGte":<int>}}}`. No more `sessionId` in the payload (it's in the URL). `usdGte` is serialised as an integer per docs example.
+  - `parse_transfer_message` rewritten to unwrap `{"type":"transfer","payload":{"transfer":{...}}}` and read `tokenSymbol` / `historicalUSD` / `blockTimestamp` (ISO string → epoch ms via `_parse_iso_to_ms`). Still accepts alternate keys (`tokenId` / `usdValue` / `ts_ms`) for forward-compat.
+  - `ArkhamWebSocketListener._run` now constructs the URL via `build_ws_url(sid)` and passes `API-Key` via `additional_headers=` on `websockets.connect`. Tokens filter defaults to empty (usdGte alone satisfies Arkham's "at least one filter" constraint at our 100M threshold).
+- **Verification (live probes against the operator's trial key):**
+  1. `POST /ws/sessions` with `{}` → returns `{"session_id": "ws_pTyE0ru6_..."}` ✓
+  2. `DELETE /ws/sessions/{sid}` → 204 No Content ✓
+  3. `GET /intelligence/entity_balance_changes?interval=7d&orderBy=balanceUsd&orderDir=desc&limit=3` → 200 with a list of entities (Binance, …), each with `tokenBalances` breakdown ✓
+  4. Runner smoke test `--dry-run --once`: `arkham_daily_snapshot_refreshed bias=neutral btc_netflow=8209883564 eth_netflow=1190678770` logs on first tick. Signed weekly aggregates captured correctly; bias=neutral because stablecoin + BTC netflows don't both clear thresholds in aligned directions.
+  5. Standalone WS listener probe: `arkham_whale_ws_connected url=wss://api.arkm.com/ws/transfers?session_id=ws_pTyE0ru6_...`. No errors, listener.disabled=False. 100M+ transfers are rare so no blackouts fired in the 8s window (expected).
+- **Behavior after this commit:**
+  - Daily bias modifier (Phase C): **LIVE** — 7d rolling signal, slower than the originally-planned 24h but directional. Bullish / bearish classification fires when both stablecoin + BTC netflows cross thresholds in aligned directions.
+  - Whale blackout gate (Phase D): **LIVE** — WebSocket listener connects, subscribes with `usdGte=100M`, writes to WhaleBlackoutState on matching transfers, entry pipeline vetoes with `whale_transfer_blackout`.
+  - Stablecoin pulse penalty (Phase E): **EFFECTIVELY INERT** — fetcher returns None, penalty never fires. Flag stays on so when a proper hourly source is wired, zero config change needed to re-activate.
+  - Journal enrichment (Phase B): **LIVE** — every `record_open` / `record_rejected_signal` carries populated `on_chain_context` JSON.
+- **Tests:** 924 passing (was 919). 5-test delta: 2 hourly-pulse happy-path tests removed (now stub), 2 hourly-pulse stub tests added, 3 new WS shape tests, 5 test fakes updated for new `method`/`post`/`content` shape. Test suite catches client ↔ server contract drift via shape asserts but not actual API method correctness (no live integration test by design — that's the probe script's job).
+- **Config:** `config/default.yaml` master flipped back `on_chain.enabled: true`. All 3 sub-feature flags stay at true. Rollback path: flip `enabled: false` + restart.
+- **Limits / follow-ups:**
+  1. Hourly stablecoin pulse: no Arkham endpoint with sub-7d windows exists today. Candidate sources: `/transfers/histogram` (bucketed, probably accepts shorter intervals), WS stream aggregator (count/sum transfers client-side per 1h bucket). Phase E effectively inert until one lands.
+  2. "daily" bias is really a 7d rolling signal — longer half-life than the original design. Operator can bump to `14d` / `30d` via the `interval` arg but not shorten.
+  3. No WS filter on `tokens` yet (empty list passes usdGte-only filter per Arkham's "at least one filter" rule). Reducing bandwidth + credit cost is possible once we know Arkham's accepted token filter format — requires a successful probe of the `tokens` field shape. Not urgent since 100M+ transfers are rare enough that bandwidth is negligible.
+  4. Bot `run_once_then_exit` (smoke) doesn't start the WS listener — by design, WS runs under `run()` only. Don't expect `arkham_whale_ws_connected` logs from `--dry-run --once`; real run does start the listener.
+
 ### 2026-04-21 — Arkham activation rollback: HTTP 405 on every endpoint, master back to OFF
 
 - **Trigger:** first post-activation restart log showed `arkham_request_failed … HTTPStatusError('Client error 405 Method Not Allowed')` on both `/intel/ws-session` and `/intel/entity-balance-changes`. All three attempts (base path + exponential backoff) returned 405. `ArkhamWebSocketListener._run` consequently hit its 3-strike disable after 3 failed `create_ws_session` attempts → `arkham_ws_disabled consecutive_failures=3`. Daily snapshot + hourly pulse fetchers also failed the same way → `state.on_chain` stayed None → Phase C/D/E gates and modifier degraded to fail-open per design.

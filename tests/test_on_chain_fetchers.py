@@ -21,6 +21,7 @@ class _FakeResponse:
         self.status_code = status_code
         self._json = json_body if json_body is not None else {}
         self.headers = headers or {}
+        self.content = b"{}" if json_body is not None else b""
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
@@ -35,13 +36,22 @@ class _FakeClient:
         self.queued: list = queued or []
         self.calls: list[tuple[str, dict]] = []
 
-    async def get(self, path: str, params: Optional[dict] = None) -> _FakeResponse:
-        self.calls.append((path, params or {}))
+    def _next(self) -> _FakeResponse:
         if not self.queued:
             return _FakeResponse(status_code=200, json_body={"empty": True})
         return self.queued.pop(0)
 
-    async def delete(self, path: str) -> _FakeResponse:
+    async def get(self, path: str, params: Optional[dict] = None) -> _FakeResponse:
+        self.calls.append((path, params or {}))
+        return self._next()
+
+    async def post(self, path: str, *, params: Optional[dict] = None,
+                   json: Optional[dict] = None) -> _FakeResponse:
+        self.calls.append((path, {"params": params or {}, "json": json or {}}))
+        return self._next()
+
+    async def delete(self, path: str,
+                     params: Optional[dict] = None) -> _FakeResponse:
         return _FakeResponse(status_code=200)
 
     async def aclose(self) -> None:
@@ -62,23 +72,34 @@ def _build_client_with_response(body: dict) -> ArkhamClient:
 
 
 def _balance_body(stable_total_usd: float, btc_netflow_usd: float,
-                  eth_netflow_usd: float = 0.0) -> dict:
-    """Build an entity-balance-changes response skeleton matching the
-    fetcher's extraction shape — `entities[name][pricing_id].balance_change_usd`.
+                  eth_netflow_usd: float = 0.0) -> list:
+    """Build a response mirroring Arkham's real v1.1 shape (verified
+    via live probe 2026-04-21):
+      [{entityId, tokenBalances: [{tokenId, balanceUsd, prevBalanceUsd}]}]
+    Balance change = balanceUsd − prevBalanceUsd.
     """
-    # Split the stablecoin total evenly across tether / usd-coin so the
-    # fetcher sums both.
     half_stable = stable_total_usd / 2.0
-    return {
-        "entities": {
-            "binance": {
-                "tether": {"balance_change_usd": half_stable},
-                "usd-coin": {"balance_change_usd": half_stable},
-                "bitcoin": {"balance_change_usd": btc_netflow_usd},
-                "ethereum": {"balance_change_usd": eth_netflow_usd},
-            }
-        }
-    }
+    # Convert deltas to a (now, prev) pair. Using (delta, 0) keeps
+    # tests simple; fetcher subtracts prev from now.
+    return [
+        {
+            "entityId": "binance",
+            "entityName": "Binance",
+            "entityType": "cex",
+            "balanceUsd": 1.0e11,
+            "prevBalanceUsd": 0.99e11,
+            "tokenBalances": [
+                {"tokenId": "tether", "tokenSymbol": "usdt",
+                 "balanceUsd": half_stable, "prevBalanceUsd": 0.0},
+                {"tokenId": "usd-coin", "tokenSymbol": "usdc",
+                 "balanceUsd": half_stable, "prevBalanceUsd": 0.0},
+                {"tokenId": "bitcoin", "tokenSymbol": "btc",
+                 "balanceUsd": btc_netflow_usd, "prevBalanceUsd": 0.0},
+                {"tokenId": "ethereum", "tokenSymbol": "eth",
+                 "balanceUsd": eth_netflow_usd, "prevBalanceUsd": 0.0},
+            ],
+        },
+    ]
 
 
 # ── fetch_daily_snapshot — classification rules ────────────────────────────
@@ -202,55 +223,28 @@ async def test_daily_snapshot_stale_threshold_propagates():
 
 
 @pytest.mark.asyncio
-async def test_hourly_pulse_happy_path_sums_usdt_plus_usdc():
-    body = {
-        "entities": {
-            "binance": {
-                "tether": {"balance_change_usd": 40_000_000.0},
-                "usd-coin": {"balance_change_usd": 35_000_000.0},
-            }
-        }
-    }
+async def test_hourly_pulse_returns_none_stub():
+    """fetch_hourly_stablecoin_pulse is a deliberate stub since the
+    real Arkham endpoint only supports 7d+ windows. Returns None so
+    Phase E penalty stays inert until a real hourly source lands
+    (likely /transfers/histogram or WS aggregation)."""
+    body = [
+        {"entityId": "binance", "tokenBalances": [
+            {"tokenId": "tether",
+             "balanceUsd": 40_000_000.0, "prevBalanceUsd": 0.0},
+        ]},
+    ]
     client = _build_client_with_response(body)
     pulse = await fetch_hourly_stablecoin_pulse(client)
-    assert pulse == 75_000_000.0
+    assert pulse is None
 
 
 @pytest.mark.asyncio
-async def test_hourly_pulse_returns_none_on_http_failure():
+async def test_hourly_pulse_stub_does_not_hit_api():
     client = ArkhamClient(api_key="test-key")
-    client._client = _FakeClient(queued=[  # type: ignore
-        _FakeResponse(status_code=500),
-        _FakeResponse(status_code=500),
-        _FakeResponse(status_code=500),
-    ])
+    fake = _FakeClient(queued=[])
+    client._client = fake  # type: ignore
     pulse = await fetch_hourly_stablecoin_pulse(client)
     assert pulse is None
-
-
-@pytest.mark.asyncio
-async def test_hourly_pulse_returns_none_on_empty_entities():
-    client = _build_client_with_response({"entities": {}})
-    pulse = await fetch_hourly_stablecoin_pulse(client)
-    assert pulse is None
-
-
-@pytest.mark.asyncio
-async def test_hourly_pulse_request_uses_1h_interval():
-    body = {
-        "entities": {
-            "binance": {
-                "tether": {"balance_change_usd": 10_000_000.0},
-                "usd-coin": {"balance_change_usd": 10_000_000.0},
-            }
-        }
-    }
-    client = _build_client_with_response(body)
-    await fetch_hourly_stablecoin_pulse(client)
-    # Inspect the call parameters on the fake client.
-    fake = client._client
-    assert len(fake.calls) == 1
-    _, params = fake.calls[0]
-    assert params["interval"] == "1h"
-    assert "tether" in params["pricingIds"]
-    assert "usd-coin" in params["pricingIds"]
+    # Stub must not make any HTTP calls.
+    assert fake.calls == []
