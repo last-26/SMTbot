@@ -388,7 +388,7 @@ execution:
   # reject list). When `false`, missing-zone signals fall back to the
   # legacy market-order path (hybrid mode — not what CLAUDE.md describes).
   zone_require_setup: true
-  zone_max_wait_bars: 10
+  zone_max_wait_bars: 7
   zone_buffer_atr: 0.25
   zone_sl_buffer_atr: 0.5
   zone_default_rr: 2.0

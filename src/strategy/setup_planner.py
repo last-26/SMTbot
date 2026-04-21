@@ -348,7 +348,7 @@ def build_zone_setup(
     ltf_candles: Optional[list[Any]] = None,
     zone_buffer_atr: float = 0.25,
     sl_buffer_atr: float = 0.5,
-    max_wait_bars: int = 10,
+    max_wait_bars: int = 7,
     default_rr: float = 2.0,
     liq_entry_near_max_atr: float = 1.5,
     liq_entry_magnitude_mult: float = 2.5,

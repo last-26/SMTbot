@@ -22,6 +22,20 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 
 ## Changelog
 
+### 2026-04-21 — Pending zone timeout 10 → 7 bars
+
+- **Trigger:** operator quote: *"emir girildikten sonra 10 tane 3 dakikalık mum bekleniyor şu anda. bu da 30 dakika yapıyor. ben bunu 7 mum ve 21 dakikaya çekmek istiyorum."* Rationale: on the 3m entry TF, 30 dakikalık bir fill penceresi scalp-native zone kaynaklarının (`vwap_retest`, `ema21_pullback`, `fvg_entry`) yarı-ömründen uzun; zone'un "stale" olması durumunda confluence yeniden hesaplanıp daha yeni bir setup sunulabilmeli. 21 dakika (7 bar) aynı ritmi koruyor ama eskimiş bir zone'a yapışıp kalma süresini ~%30 kısaltıyor.
+- **Fix — tek satırlık default kırpma:**
+  - `config/default.yaml:391` — `execution.zone_max_wait_bars: 10 → 7`.
+  - `src/bot/config.py:340` — `ExecutionConfig.zone_max_wait_bars: int = 10 → 7` (pydantic default; YAML override ile aynı değer).
+  - `src/strategy/setup_planner.py:351` — `build_zone_setup(max_wait_bars: int = 10 → 7)` (yalnız planner-native default; runner zaten `cfg.execution.zone_max_wait_bars`'ı geçiyor — bu değişiklik doğrudan caller'lar olmadan çağrılan yerler için güvenli fallback).
+  - `algoritma.md` §5, §10, §12 — tablo değerleri ve lifecycle diyagramı 10 → 7 (21 dk) açıklamasıyla birlikte güncellendi.
+- **Expected behavior change:** kullanılmayan zone limit emirleri 30 dk yerine 21 dk sonra cancel olur. 3m TF'de bu, zone confluence hesaplarının 3 bar daha erken yenilenmesi demek. Fill rate beklentisi: hızlı retrace'ler (zone'un 2-3 bar içinde touch olduğu senaryolar) zaten 7 bar'ın altında kalıyor — bu grup etkilenmez. 7-10 bar aralığında fill olacak "yavaş retrace" grubu cancel'a gidecek, ardından bir sonraki cycle'da güncel confluence + güncel zone'la yeniden değerlendirilecek. Net etki: ya daha taze bir setup yakalanır (pozitif), ya cancel kalır (nötr, R harcanmadı).
+- **Safety rails:** yok; zaman parametresi, kontrat/geometri yok. Cancel path idempotent (`_reconcile_orphans` + `poll_pending` mevcut). Restart-safe — `_pending` bellekte tutuluyor, restart'ta 7-bar saat sıfırlanır ama bu pre-deploy davranışından farklı değil.
+- **Tests:** yeni test eklenmedi. Mevcut `test_runner_zone_entry.py` ve `test_setup_planner.py` caller'ları `max_wait_bars` parametresini açıkça 10 olarak geçiyor — default değişikliği bu testlerin davranışını etkilemez, mevcut 730+ test geçmeye devam eder. Default'un yansıması için `config/default.yaml`'ı doğrudan okuyan bir test de yok (pydantic validator'lar pozitiflik kontrolü yapmıyor — int>0 varsayımı implicit).
+- **Dataset:** `rl.clean_since` **değişmedi** (`2026-04-19T19:55:00Z`). Sadece pending-fill penceresi kısalıyor; entry geometrisi, scoring, sizing, SL/TP mesafesi, MFE lock, TP revise — hiçbirine dokunulmadı. Fill rate dağılımı hafif kayabilir ama regime-shift seviyesinde değil.
+- **Re-evaluation:** ≥30 post-deploy kapalı trade sonrası journal'da `zone_timeout_cancel` reject oranı kontrol edilecek. Eğer cancel oranı %30'un üstünde seyrederse 7 bar fazla agresif demek — 8'e çıkarma veya zone kaynağına göre parametre yapma (1m sources için 3-4 bar, 3m için 7, HTF için daha uzun) gündeme gelebilir. Cancel oranı %10'un altında kalırsa 7 bar yeterince rahat ve daha da kırpılabilir (5-6).
+
 ### 2026-04-21 — VWAP-band zone anchor (Convention X)
 
 - **Trigger:** operator flagged that the `_vwap_zone` limit was landing at the 0.5σ midpoint between VWAP and the ±1σ band (arbitrary 50/50 split). Wanted a Fib-lite anchor that pulls the limit closer to VWAP on the directional side — catches the pullback before it fully retraces, with VWAP acting as a natural structural pivot (SL already sits past VWAP per the zone contract). Operator quote: *"üst bant 1 eq 0.5 se ve fiyat yukarı düşünülüyorsa ve fiyat yukarıdaysa 0.7 den işlem atılacak 0.65 de olabilir vwape biraz daha yakın olması açısından. alt bant 0, eq 0.5 ken short girilecekse de yine 0.3 den girilmesi lazım."*

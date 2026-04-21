@@ -337,7 +337,7 @@ class ExecutionConfig(BaseModel):
     # levels, and places a maker-preferred limit order. Pending entries
     # time out after `zone_max_wait_bars` (entry-TF bars) if unfilled.
     zone_entry_enabled: bool = False
-    zone_max_wait_bars: int = 10
+    zone_max_wait_bars: int = 7
     zone_buffer_atr: float = 0.25
     zone_sl_buffer_atr: float = 0.5
     zone_default_rr: float = 2.0
