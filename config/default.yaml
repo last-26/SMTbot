@@ -566,18 +566,21 @@ economic_calendar:
 #     long/short rather than nudge.
 # ───────────────────────────────────────────────────────────────────
 on_chain:
-  enabled: false                                  # master kill switch
+  # 2026-04-21 — operator flipped all 4 flags ON at trial activation.
+  # Master + 3 sub-features all TRUE. Rollback path: flip `enabled: false`
+  # and restart; historical `on_chain_context` rows preserved.
+  enabled: true                                   # master kill switch
 
   # Phase C — daily macro bias ± delta confluence modifier.
   # Bullish day → long scores × (1 + delta), short × (1 - delta); mirror for bearish.
   # Neutral or stale (>snapshot_staleness_threshold_s) → 1.0 (inert).
-  daily_bias_enabled: false
+  daily_bias_enabled: true
   daily_bias_modifier_delta: 0.10
   daily_bias_stablecoin_threshold_usd: 50000000.0  # ≥ this → bullish contribution
   daily_bias_btc_netflow_threshold_usd: 50000000.0 # ≤ -this → bullish (BTC leaving CEX)
 
   # Phase E — stablecoin hourly pulse; misaligned → +penalty on min_confluence threshold.
-  stablecoin_pulse_enabled: false
+  stablecoin_pulse_enabled: true
   stablecoin_pulse_refresh_s: 3600
   stablecoin_pulse_threshold_usd: 50000000.0
   stablecoin_pulse_penalty: 0.5
@@ -585,7 +588,7 @@ on_chain:
   # Phase D — whale-transfer blackout hard gate. WS listener pushes
   # qualifying transfers to the shared WhaleBlackoutState registry;
   # entry_signals reads via is_active on every entry attempt.
-  whale_blackout_enabled: false
+  whale_blackout_enabled: true
   whale_threshold_usd: 100000000.0                 # WS filter (usdGte); ≥10M minimum
   whale_blackout_duration_s: 600                   # 10 min after event
 

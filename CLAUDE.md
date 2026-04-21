@@ -22,6 +22,27 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 
 ## Changelog
 
+### 2026-04-21 — Arkham on-chain integration: master + 3 sub-features flipped ON (trial activation)
+
+- **Trigger:** operator dropped `ARKHAM_API_KEY` into `.env` post-Phase-E ship and requested activation of every sub-feature at once. Bot restart pending the `RISK_AMOUNT_USDT=60S` typo fix (unrelated — `.env` line needs the trailing `S` dropped).
+- **Config flip (`config/default.yaml` on_chain section):**
+  - `enabled: false → true`  (master)
+  - `daily_bias_enabled: false → true`  (Phase C ±δ modifier active)
+  - `stablecoin_pulse_enabled: false → true`  (Phase E below_confluence penalty active)
+  - `whale_blackout_enabled: false → true`  (Phase D hard gate + WS listener)
+  - All threshold / delta / penalty values kept at Phase A defaults: `daily_bias_modifier_delta=0.10`, `stablecoin_pulse_threshold_usd=50_000_000`, `stablecoin_pulse_penalty=0.5`, `whale_threshold_usd=100_000_000`, `whale_blackout_duration_s=600`.
+- **Expected behavior change on first restart:**
+  - `arkham_daily_snapshot_refreshed` INFO fires once at startup (cache miss on first tick); `arkham_stablecoin_pulse_refreshed` fires alongside.
+  - `arkham_whale_ws_connected` INFO fires when the WebSocket listener's first session succeeds. Then silence until a whale transfer ≥ 100M USD hits — at which point `arkham_whale_blackout_set` INFO + 600s window on affected symbol(s).
+  - Every `record_open` + `record_rejected_signal` from that point carries populated `on_chain_context` JSON (daily_macro_bias + pulse + netflows + fresh flag + blackout_active bool).
+  - `calculate_confluence` applies ±10% multiplier on bullish / bearish days; `below_confluence` threshold bumps by 0.5 on misaligned-pulse direction; `whale_transfer_blackout` rejects fire during WS-driven blackout windows.
+- **Rollback:** flip all 4 back to `false` (or just `enabled: false` — cuts the master) and restart. Historical `on_chain_context` JSON preserved on trade / rejected rows.
+- **Tests:** no new code — config-only flip. Existing 919 Phase A-E tests remain green.
+- **Operator checklist before next restart:**
+  1. Fix `.env` → `RISK_AMOUNT_USDT=60` (strip the `S` typo). Load blocks otherwise with `ValueError: RISK_AMOUNT_USDT='60S' is not a valid float`.
+  2. Confirm `ARKHAM_API_KEY` is on its own line in `.env`, no quotes needed.
+  3. First-tick log should show `arkham_daily_snapshot_refreshed bias=...`; if instead `arkham_api_key_missing` WARN appears, python-dotenv didn't pick up the env (check `.env` path, no typos in the key name).
+
 ### 2026-04-21 — Arkham on-chain integration, Phase E (stablecoin pulse cross-asset penalty)
 
 - **Trigger:** Phase D shipped (35d18fd). Phase E is the last sub-feature — a soft cross-asset-style penalty that bumps the effective confluence threshold when the hourly stablecoin pulse opposes the winning direction. Reuses the Phase B pulse fetch + cached value; no new fetchers. Completes the 5-phase Arkham integration.
