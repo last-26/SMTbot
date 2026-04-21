@@ -53,6 +53,7 @@ from src.data.on_chain import (
     fetch_hourly_stablecoin_pulse,
 )
 from src.data.on_chain_types import OnChainSnapshot, WhaleBlackoutState
+from src.data.on_chain_ws import ArkhamWebSocketListener
 from src.data.public_market_feed import (
     BinancePublicClient,
     RealCandle,
@@ -407,6 +408,11 @@ class BotContext:
     # timestamp of the last pulse fetch. Zero / None means "never fetched".
     last_on_chain_daily_date: Any = None              # datetime.date
     last_on_chain_pulse_ts: float = 0.0
+    # 2026-04-21 — Arkham whale-transfer WS listener (Phase D). Only
+    # instantiated + started when `on_chain.enabled AND
+    # whale_blackout_enabled`. Writes to `whale_blackout_state`; the
+    # entry_signals gate reads from that registry via MarketState.
+    arkham_ws: Any = None                             # ArkhamWebSocketListener
 
 
 # ── Runner ──────────────────────────────────────────────────────────────────
@@ -601,6 +607,17 @@ class BotRunner:
                 timeout_s=cfg.on_chain.api_client_timeout_s,
                 auto_disable_pct=cfg.on_chain.api_usage_auto_disable_pct,
             )
+            # Phase D — whale WS listener. Only spun up when the sub-
+            # feature flag is on; otherwise the gate inside
+            # entry_signals never fires even with an allocated
+            # WhaleBlackoutState.
+            if cfg.on_chain.whale_blackout_enabled:
+                ctx.arkham_ws = ArkhamWebSocketListener(
+                    ctx.arkham_client,
+                    ctx.whale_blackout_state,
+                    usd_gte=cfg.on_chain.whale_threshold_usd,
+                    blackout_duration_s=cfg.on_chain.whale_blackout_duration_s,
+                )
 
         # Macro event blackout — independent of the derivatives subsystem.
         if cfg.economic_calendar.enabled:
@@ -651,6 +668,7 @@ class BotRunner:
                 await self._prime()
                 await self._start_derivatives()
                 await self._start_economic_calendar()
+                await self._start_on_chain_ws()
                 interval = self.ctx.config.bot.poll_interval_seconds
                 deadline = (
                     time.monotonic() + self.duration_seconds
@@ -772,10 +790,29 @@ class BotRunner:
         except Exception:
             logger.exception("economic_calendar_close_failed")
 
+    async def _start_on_chain_ws(self) -> None:
+        """Boot the Phase D whale-transfer WS listener if configured.
+
+        Safe to call when `arkham_ws is None` (master off or sub-feature
+        off) — early-returns.
+        """
+        ws = self.ctx.arkham_ws
+        if ws is None:
+            return
+        try:
+            await ws.start()
+        except Exception:
+            logger.exception("arkham_whale_ws_start_failed")
+
     async def _stop_on_chain(self) -> None:
-        """Release the Arkham HTTP client on shutdown. Best-effort, never
-        raises. No-op when the client was never instantiated (master
-        `on_chain.enabled=false` path)."""
+        """Release the Arkham HTTP client + WS listener on shutdown.
+        Best-effort, never raises. No-op when nothing was wired."""
+        ws = self.ctx.arkham_ws
+        if ws is not None:
+            try:
+                await ws.stop()
+            except Exception:
+                logger.exception("arkham_whale_ws_stop_failed")
         client = self.ctx.arkham_client
         if client is None:
             return
@@ -1551,6 +1588,12 @@ class BotRunner:
                     and cfg.on_chain.daily_bias_enabled
                 ),
                 daily_bias_delta=cfg.on_chain.daily_bias_modifier_delta,
+                whale_blackout_enabled=(
+                    cfg.on_chain.enabled
+                    and cfg.on_chain.whale_blackout_enabled
+                ),
+                whale_blackout=self.ctx.whale_blackout_state,
+                whale_blackout_symbol=symbol,
             )
         except Exception:
             logger.exception("plan_build_failed symbol={}", symbol)

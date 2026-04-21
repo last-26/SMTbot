@@ -16,7 +16,7 @@ once per poll. If it returns None, we sit the bar out.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from src.analysis.fvg import FVG
 from src.analysis.multi_timeframe import (
@@ -625,6 +625,9 @@ def build_trade_plan_with_reason(
     trend_regime_conditional_scoring_enabled: bool = False,
     daily_bias_enabled: bool = False,
     daily_bias_delta: float = 0.0,
+    whale_blackout_enabled: bool = False,
+    whale_blackout: Optional[Any] = None,
+    whale_blackout_symbol: Optional[str] = None,
 ) -> tuple[Optional[TradePlan], str]:
     """Same as `build_trade_plan_from_state` but returns `(plan, reason)`.
 
@@ -732,6 +735,28 @@ def build_trade_plan_with_reason(
 
     if _cross_asset_opposes(pillar_opposition, intent.direction):
         return None, "cross_asset_opposition"
+
+    # 2026-04-21 — Arkham whale-transfer blackout (Phase D). Event-
+    # driven preemptive veto: when Arkham's WebSocket has recorded a
+    # qualifying whale transfer (notional ≥ `whale_threshold_usd`) for
+    # this symbol in the last `whale_blackout_duration_s`, block new
+    # entries. Open positions are untouched (their OCO handles exit).
+    # Fails open on flag=False or blackout state absent; per-symbol
+    # check protects chain-native assets (BTC event → only BTC blocks)
+    # while stablecoin events expand to every watched perp.
+    if (
+        whale_blackout_enabled
+        and whale_blackout is not None
+        and whale_blackout_symbol is not None
+    ):
+        try:
+            import time as _time  # localised to keep module imports clean
+            now_ms = int(_time.time() * 1000)
+            if whale_blackout.is_active(whale_blackout_symbol, now_ms):
+                return None, "whale_transfer_blackout"
+        except Exception:
+            # A corrupt blackout state must not crash entry pipeline.
+            pass
 
     if _should_skip_for_derivatives(
         getattr(state, "derivatives", None),
