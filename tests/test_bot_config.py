@@ -356,7 +356,8 @@ def test_on_chain_defaults_master_and_subfeatures_all_off():
     assert cfg.on_chain.stablecoin_pulse_enabled is False
     assert cfg.on_chain.whale_blackout_enabled is False
     # Default threshold / duration values match documented pivot.
-    assert cfg.on_chain.daily_bias_modifier_delta == 0.10
+    assert cfg.on_chain.daily_bias_modifier_delta == 0.15
+    assert cfg.on_chain.stablecoin_pulse_penalty == 0.75
     assert cfg.on_chain.whale_threshold_usd == 100_000_000.0
     assert cfg.on_chain.whale_blackout_duration_s == 600
     assert cfg.on_chain.api_usage_auto_disable_pct == 95.0
@@ -367,14 +368,14 @@ def test_on_chain_flags_load_from_yaml():
     raw["on_chain"] = {
         "enabled": True,
         "daily_bias_enabled": True,
-        "daily_bias_modifier_delta": 0.15,
+        "daily_bias_modifier_delta": 0.20,
         "whale_blackout_enabled": True,
         "whale_threshold_usd": 200_000_000.0,
     }
     cfg = BotConfig(**raw)
     assert cfg.on_chain.enabled is True
     assert cfg.on_chain.daily_bias_enabled is True
-    assert cfg.on_chain.daily_bias_modifier_delta == 0.15
+    assert cfg.on_chain.daily_bias_modifier_delta == 0.20
     assert cfg.on_chain.whale_threshold_usd == 200_000_000.0
 
 

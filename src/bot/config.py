@@ -535,16 +535,20 @@ class OnChainConfig(BaseModel):
     enabled: bool = False
 
     # Phase C — daily macro bias (see src/analysis/multi_timeframe.py).
+    # Default delta bumped 0.10 → 0.15 on 2026-04-21 (eve) after observing
+    # every bias-opposed setup still cleared the threshold. GBT-tunable.
     daily_bias_enabled: bool = False
-    daily_bias_modifier_delta: float = 0.10
+    daily_bias_modifier_delta: float = 0.15
     daily_bias_stablecoin_threshold_usd: float = 50_000_000.0
     daily_bias_btc_netflow_threshold_usd: float = 50_000_000.0
 
     # Phase E — stablecoin pulse cross-asset penalty.
+    # Default penalty bumped 0.5 → 0.75 on 2026-04-21 (eve), paired with the
+    # daily_bias_modifier_delta bump. Effective threshold 3.0 → 3.75 on misaligned.
     stablecoin_pulse_enabled: bool = False
     stablecoin_pulse_refresh_s: int = 3600
     stablecoin_pulse_threshold_usd: float = 50_000_000.0
-    stablecoin_pulse_penalty: float = 0.5
+    stablecoin_pulse_penalty: float = 0.75
 
     # Phase D — whale-transfer blackout (WebSocket listener feeds the gate).
     # Arkham's WS filter requires `usdGte >= 10_000_000` per the API docs;

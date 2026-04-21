@@ -575,16 +575,22 @@ on_chain:
   # Phase C — daily macro bias ± delta confluence modifier.
   # Bullish day → long scores × (1 + delta), short × (1 - delta); mirror for bearish.
   # Neutral or stale (>snapshot_staleness_threshold_s) → 1.0 (inert).
+  # 2026-04-21 (eve) — bumped 0.10 → 0.15 after observing every daily-bias-opposed
+  # setup still cleared the threshold. 1.5× makes penalty visible in the dataset
+  # without over-filtering. Phase 9 GBT will dial in the final value.
   daily_bias_enabled: true
-  daily_bias_modifier_delta: 0.10
+  daily_bias_modifier_delta: 0.15
   daily_bias_stablecoin_threshold_usd: 50000000.0  # ≥ this → bullish contribution
   daily_bias_btc_netflow_threshold_usd: 50000000.0 # ≤ -this → bullish (BTC leaving CEX)
 
   # Phase E — stablecoin hourly pulse; misaligned → +penalty on min_confluence threshold.
+  # 2026-04-21 (eve) — bumped 0.5 → 0.75 paired with daily_bias bump. Re-eval
+  # trigger: if penalty-induced below_confluence fraction is <5% of total rejects
+  # after 30 closed trades, bump to 1.0; if >30%, drop back to 0.5.
   stablecoin_pulse_enabled: true
   stablecoin_pulse_refresh_s: 3600
   stablecoin_pulse_threshold_usd: 50000000.0
-  stablecoin_pulse_penalty: 0.5
+  stablecoin_pulse_penalty: 0.75
 
   # Phase D — whale-transfer blackout hard gate. WS listener pushes
   # qualifying transfers to the shared WhaleBlackoutState registry;
