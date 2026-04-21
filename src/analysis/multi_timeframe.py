@@ -723,6 +723,8 @@ def calculate_confluence(
     divergence_max_bars: int = DEFAULT_DIVERGENCE_MAX_BARS,
     trend_regime: Optional[TrendRegime] = None,
     trend_regime_conditional_scoring_enabled: bool = False,
+    daily_bias_enabled: bool = False,
+    daily_bias_delta: float = 0.0,
 ) -> ConfluenceScore:
     """Compute confluence for BOTH directions and return the winning side.
 
@@ -731,6 +733,17 @@ def calculate_confluence(
 
     When neither side has contributing factors, returns score 0.0 with
     direction UNDEFINED (strategy engine skips the bar).
+
+    **2026-04-21 — Arkham daily macro-bias modifier (Phase C).** When
+    `daily_bias_enabled=True` AND `state.on_chain` carries a fresh
+    snapshot AND `daily_bias_delta > 0`, the two directional scores are
+    multiplied by ±(1 + delta):
+      * bullish day → bull score × (1 + delta), bear × (1 − delta)
+      * bearish day → mirror
+      * neutral / stale / absent → both × 1.0 (no-op)
+    The modifier is applied BEFORE the tie-break + threshold compare
+    downstream so `below_confluence` rejections reflect the adjusted
+    score.
     """
     bull = score_direction(
         state, Direction.BULLISH,
@@ -765,6 +778,27 @@ def calculate_confluence(
         trend_regime_conditional_scoring_enabled=trend_regime_conditional_scoring_enabled,
     )
 
+    # 2026-04-21 — Arkham daily macro-bias modifier. Kept out of
+    # `score_direction` so per-pillar weights stay pure and the modifier
+    # is introspectable as a single scalar multiply. Stale snapshots +
+    # neutral bias + master-off all fall through via `mult_long=mult_short=1.0`.
+    mult_long, mult_short = _daily_bias_multipliers(
+        state.on_chain if daily_bias_enabled else None,
+        delta=daily_bias_delta,
+    )
+    if mult_long != 1.0:
+        bull = ConfluenceScore(
+            direction=bull.direction,
+            score=bull.score * mult_long,
+            factors=bull.factors,
+        )
+    if mult_short != 1.0:
+        bear = ConfluenceScore(
+            direction=bear.direction,
+            score=bear.score * mult_short,
+            factors=bear.factors,
+        )
+
     if bull.score == 0 and bear.score == 0:
         return ConfluenceScore(direction=Direction.UNDEFINED, score=0.0)
 
@@ -777,3 +811,34 @@ def calculate_confluence(
     if state.trend_htf == Direction.BULLISH:
         return bull
     return bear
+
+
+def _daily_bias_multipliers(
+    on_chain: Optional[Any],
+    *,
+    delta: float,
+) -> tuple[float, float]:
+    """Return (mult_long, mult_short) scalars for the daily macro-bias
+    modifier. Both 1.0 when the snapshot is absent, stale, neutral, or
+    delta is 0.0 — the caller can short-circuit on `mult_long == 1.0
+    and mult_short == 1.0` to skip the wrapping ConfluenceScore rebuild.
+
+    Rule:
+      * bullish   → (1 + delta, 1 - delta)
+      * bearish   → (1 - delta, 1 + delta)
+      * neutral / absent / stale / delta=0 → (1.0, 1.0)
+    """
+    if delta <= 0.0:
+        return 1.0, 1.0
+    if on_chain is None:
+        return 1.0, 1.0
+    # `fresh` is a property on OnChainSnapshot — absent → falsy on
+    # getattr fallback.
+    if not getattr(on_chain, "fresh", False):
+        return 1.0, 1.0
+    bias = getattr(on_chain, "daily_macro_bias", "neutral")
+    if bias == "bullish":
+        return 1.0 + delta, 1.0 - delta
+    if bias == "bearish":
+        return 1.0 - delta, 1.0 + delta
+    return 1.0, 1.0

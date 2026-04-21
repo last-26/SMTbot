@@ -1546,6 +1546,11 @@ class BotRunner:
                 trend_regime=trend_regime,
                 trend_regime_conditional_scoring_enabled=
                     cfg.analysis.trend_regime_conditional_scoring_enabled,
+                daily_bias_enabled=(
+                    cfg.on_chain.enabled
+                    and cfg.on_chain.daily_bias_enabled
+                ),
+                daily_bias_delta=cfg.on_chain.daily_bias_modifier_delta,
             )
         except Exception:
             logger.exception("plan_build_failed symbol={}", symbol)
@@ -1575,6 +1580,11 @@ class BotRunner:
                     trend_regime=trend_regime,
                     trend_regime_conditional_scoring_enabled=
                         cfg.analysis.trend_regime_conditional_scoring_enabled,
+                    daily_bias_enabled=(
+                        cfg.on_chain.enabled
+                        and cfg.on_chain.daily_bias_enabled
+                    ),
+                    daily_bias_delta=cfg.on_chain.daily_bias_modifier_delta,
                 )
                 logger.info(
                     "symbol_decision symbol={} NO_TRADE reason={} price={:.4f} "
@@ -1673,6 +1683,11 @@ class BotRunner:
                         trend_regime=trend_regime,
                         trend_regime_conditional_scoring_enabled=
                             cfg.analysis.trend_regime_conditional_scoring_enabled,
+                        daily_bias_enabled=(
+                            cfg.on_chain.enabled
+                            and cfg.on_chain.daily_bias_enabled
+                        ),
+                        daily_bias_delta=cfg.on_chain.daily_bias_modifier_delta,
                     )
                     await self._record_reject(
                         symbol=symbol, reject_reason="no_setup_zone",

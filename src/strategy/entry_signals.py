@@ -384,6 +384,8 @@ def generate_entry_intent(
     divergence_max_bars: int = 9,
     trend_regime: Optional[TrendRegime] = None,
     trend_regime_conditional_scoring_enabled: bool = False,
+    daily_bias_enabled: bool = False,
+    daily_bias_delta: float = 0.0,
 ) -> Optional[EntryIntent]:
     """Compute confluence + pick an SL. Returns None when not tradable."""
     if state.current_price <= 0:
@@ -407,6 +409,8 @@ def generate_entry_intent(
         divergence_max_bars=divergence_max_bars,
         trend_regime=trend_regime,
         trend_regime_conditional_scoring_enabled=trend_regime_conditional_scoring_enabled,
+        daily_bias_enabled=daily_bias_enabled,
+        daily_bias_delta=daily_bias_delta,
     )
     if not confluence.is_tradable(min_confluence_score):
         return None
@@ -619,6 +623,8 @@ def build_trade_plan_with_reason(
     divergence_max_bars: int = 9,
     trend_regime: Optional[TrendRegime] = None,
     trend_regime_conditional_scoring_enabled: bool = False,
+    daily_bias_enabled: bool = False,
+    daily_bias_delta: float = 0.0,
 ) -> tuple[Optional[TradePlan], str]:
     """Same as `build_trade_plan_from_state` but returns `(plan, reason)`.
 
@@ -672,6 +678,8 @@ def build_trade_plan_with_reason(
         divergence_max_bars=divergence_max_bars,
         trend_regime=trend_regime,
         trend_regime_conditional_scoring_enabled=trend_regime_conditional_scoring_enabled,
+        daily_bias_enabled=daily_bias_enabled,
+        daily_bias_delta=daily_bias_delta,
     )
     if intent is None:
         # Distinguish the three upstream `generate_entry_intent` None paths.
@@ -689,6 +697,8 @@ def build_trade_plan_with_reason(
             divergence_max_bars=divergence_max_bars,
             trend_regime=trend_regime,
             trend_regime_conditional_scoring_enabled=trend_regime_conditional_scoring_enabled,
+            daily_bias_enabled=daily_bias_enabled,
+            daily_bias_delta=daily_bias_delta,
         )
         if not conf.is_tradable(min_confluence_score):
             return None, "below_confluence"

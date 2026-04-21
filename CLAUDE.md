@@ -22,6 +22,47 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 
 ## Changelog
 
+### 2026-04-21 — Arkham on-chain integration, Phase C (daily macro-bias confluence modifier)
+
+- **Trigger:** Phase B shipped (c094753) — snapshots cached + journal enriched + zero decision impact. Phase C starts reading the snapshot: `calculate_confluence` applies a ±δ multiplier to long / short scores based on `on_chain.daily_macro_bias`, gated by `on_chain.daily_bias_enabled`. Master still defaults off; operator flips when ready for live impact.
+- **Design decisions (documented in chat before code):**
+  - **Multiplier at `calculate_confluence` top-level, not per-pillar.** Applying inside `score_direction` would have conflated the per-pillar weight interpretation (`htf_trend_alignment=0.5` etc.) with a macro-bias modifier that's not pillar-specific. Top-level multiply is a single scalar twiddle, introspectable in one line, trivially reversible. `ConfluenceScore.factors` list stays pure — shows the raw pillar breakdown; modifier is the wrapper around the aggregate.
+  - **Multiplier applied BEFORE tie-break + threshold compare.** `below_confluence` rejections reflect the *adjusted* score. This is the point of the modifier — a setup below threshold on baseline can cross it under favorable bias, or vice versa. If we applied it after the threshold check, the modifier would only shuffle factor breakdowns without affecting decision outcomes.
+  - **Stale snapshots skip silently.** `_daily_bias_multipliers` reads `on_chain.fresh` (property on OnChainSnapshot) and returns (1.0, 1.0) when False. So a 24-hour Arkham outage leaves the modifier inert without logging errors per cycle — the `fresh` flag is the contract for "is this snapshot load-bearing". Downstream consumers just need to know the result is (1.0, 1.0), not why.
+  - **Delta range enforced at config time, not modifier time.** `OnChainConfig.daily_bias_modifier_delta` validator rejects values outside [0.0, 0.5] at YAML-load. At runtime the modifier just trusts the value. Removes a branch, keeps the hot path clean.
+  - **Neutral bias always = no-op.** Even with delta = 0.5, neutral bias produces (1.0, 1.0). The Arkham rule classifies a day as bullish / bearish ONLY when stablecoin flow + BTC netflow both clear their thresholds in aligned directions — neutral is the default when one or both are ambiguous. Honoring neutral as no-op is the correct read: "we don't know, don't lean".
+  - **Threaded through `build_trade_plan_with_reason` not just the diagnostic path.** Two call sites to `calculate_confluence` exist in `entry_signals.py`: one inside `generate_entry_intent` (the primary "is this tradable") and one after the reject path for diagnostic labeling. Both get the modifier so the primary decision uses the adjusted score, and the diagnostic reports the adjusted score consistently. Missing the primary call would have made the modifier purely cosmetic.
+- **Fix — Phase C deliverables (15 new tests, 860 → 875):**
+  - `src/analysis/multi_timeframe.py:calculate_confluence` — new `daily_bias_enabled: bool = False` + `daily_bias_delta: float = 0.0` kwargs. Modifier branch wraps bull / bear ConfluenceScore via `_daily_bias_multipliers` helper. Default (both flags false / delta zero) short-circuits at `mult_long == 1.0 and mult_short == 1.0` without constructing replacement ConfluenceScore objects — zero GC overhead when disabled.
+  - `src/analysis/multi_timeframe.py:_daily_bias_multipliers` — new module-level helper. Reads `on_chain.fresh` via getattr with False fallback, `on_chain.daily_macro_bias` with "neutral" fallback. Pure function, no side effects — tested in isolation without needing a MarketState.
+  - `src/strategy/entry_signals.py:generate_entry_intent` — added `daily_bias_enabled` + `daily_bias_delta` kwargs, threaded into the primary `calculate_confluence` call inside the function.
+  - `src/strategy/entry_signals.py:build_trade_plan_with_reason` — added same kwargs, forwarded to `generate_entry_intent` AND to the diagnostic `calculate_confluence` call in the `intent is None` branch. Both call sites see the modifier; rejects reflect adjusted scores.
+  - `src/bot/runner.py` — 3 `calculate_confluence` / `build_trade_plan_with_reason` call sites updated:
+    1. `build_trade_plan_with_reason` at ~1500 (primary entry decision) — threads `daily_bias_enabled = cfg.on_chain.enabled AND cfg.on_chain.daily_bias_enabled` + `cfg.on_chain.daily_bias_modifier_delta`.
+    2. `calculate_confluence` at ~1562 (post-reject diagnostic) — same threading.
+    3. `calculate_confluence` at ~1665 (no_setup_zone diagnostic) — same threading.
+  - Composite guard `cfg.on_chain.enabled AND cfg.on_chain.daily_bias_enabled` — this is the safety knot. Modifier only fires when master is on AND sub-feature flag is on. Flipping master without flipping sub-feature leaves Phase C inert. Flipping sub-feature without master leaves it inert too.
+- **Expected behavior change:**
+  - `on_chain.enabled=false` (default): bit-identical to pre-commit. All 875 tests green, `--dry-run --once` smoke is noise-free.
+  - `on_chain.enabled=true, daily_bias_enabled=false`: Phase B / A behavior unchanged. Snapshots fetched + journal enriched, but confluence scoring identical to pre-C.
+  - `on_chain.enabled=true, daily_bias_enabled=true, bullish snapshot, delta=0.10`: long confluence scores × 1.10, short × 0.90. A setup at baseline 2.85 clears `min_confluence_score=3.0` → trade taken (previously reject). Short setups at borderline get pushed below threshold → reject with `below_confluence`.
+  - Symmetric mirror for bearish snapshot.
+- **Safety rails:** `OnChainConfig._daily_bias_delta_sane` validator at config-load (already from Phase A) rejects delta < 0 or > 0.5. `_daily_bias_multipliers` is a pure function, can't mutate state. Modifier short-circuits on stale / absent snapshot — no unbounded behavior when Arkham is down. Failed `calculate_confluence` call still propagates to the `except Exception` in runner.py:1550 (pre-existing behavior preserved).
+- **Tests:** 15 new, all green (875 passed total, up from 860):
+  - `tests/test_daily_bias_modifier.py` (15 new):
+    * `_daily_bias_multipliers` — 6 tests: delta=0 → (1.0, 1.0), absent snapshot → (1.0, 1.0), stale snapshot → (1.0, 1.0), bullish boosts long / dampens short, bearish mirrors, neutral → (1.0, 1.0).
+    * `calculate_confluence` integration (with mocked `score_direction`) — 9 tests: flag off unchanged, flag on + no snapshot unchanged, bullish bias boosts long, bearish bias dampens long (verified exact 0.90 mult), strong enough bearish bias can FLIP winner from bull to bear, stale snapshot skipped, factors list preserved through modifier, borderline setup lifts to tradable (2.85 × 1.10 = 3.135 > 3.0), symmetric for bear setup.
+- **Not fixed / explicitly out of scope (Phase C boundaries):**
+  - No whale blackout gate (Phase D).
+  - No stablecoin pulse penalty (Phase E).
+  - Modifier is symmetric — both long AND short get adjusted. A variant that only boosts the aligned side and leaves the opposite untouched could reduce "over-penalizing" borderline reverse-bias trades, but that would bias the sizing distribution. Symmetric multiply is the principled choice until GBT shows otherwise.
+  - No per-symbol override. If `BTC` should react to macro bias differently than `DOGE` (stablecoin day affects majors differently than memecoins), that's a Phase 12 candidate, not a Phase C deliverable.
+- **Dataset:** `rl.clean_since` **unchanged**. Modifier is off-by-default; when operator flips it on post-deploy, Phase 9 GBT will segment by `on_chain_context.daily_macro_bias` categorical + `modifier_applied` boolean, not by a `clean_since` cut.
+- **Re-evaluation (after ≥10 enabled-modifier closed trades):**
+  1. `below_confluence` reject-to-open ratio segmented by `daily_macro_bias` — on bullish days we expect MORE longs and FEWER shorts to clear; on bearish days the mirror. Reject rates tilting the wrong way = modifier is anti-correlated with actual edge, reconsider delta.
+  2. WR by `daily_macro_bias` + direction cross-tab. Longs on bullish days should show higher WR than longs on bearish days; shorts mirror. Equal WR across the cross-tab = the signal has no predictive value at the current delta, shrink or turn off.
+  3. Borderline setups (confluence in [threshold, threshold × 1.10]) — how many got lifted to trades by the modifier, and what was their realized avg R vs baseline-clearing trades? If lifted-to-tradable setups underperform, delta is too aggressive.
+
 ### 2026-04-21 — Arkham on-chain integration, Phase B (snapshot pipeline + journal enrichment)
 
 - **Trigger:** Phase A foundation shipped as b54a0ae. Phase B wires the snapshot-fetch scheduler + attaches the cached snapshot to MarketState + threads the on-chain context through all four journal write paths. Still zero decision impact — no gate, no modifier, no penalty reads the snapshot yet. Objective: by the end of this commit, flipping `on_chain.enabled=true` with `ARKHAM_API_KEY` in env produces journal rows with populated `on_chain_context` JSON while leaving every trading decision identical to pre-commit.
