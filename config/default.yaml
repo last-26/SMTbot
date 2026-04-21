@@ -566,10 +566,15 @@ economic_calendar:
 #     long/short rather than nudge.
 # ───────────────────────────────────────────────────────────────────
 on_chain:
-  # 2026-04-21 — operator flipped all 4 flags ON at trial activation.
-  # Master + 3 sub-features all TRUE. Rollback path: flip `enabled: false`
-  # and restart; historical `on_chain_context` rows preserved.
-  enabled: true                                   # master kill switch
+  # 2026-04-21 — master temporarily flipped back to FALSE after runtime
+  # check showed Arkham returning 405 Method Not Allowed on every
+  # endpoint. Root cause: ArkhamClient uses GET; Arkham's real API
+  # likely uses POST. Operator needs to run `scripts/probe_arkham.py`
+  # (discovers the correct method/path) and report back so the client
+  # can be fixed. Until then, master off keeps the bot quiet and the
+  # 4 sub-features stay ready to re-enable via a single flag flip once
+  # the client is patched.
+  enabled: false                                  # master kill switch
 
   # Phase C — daily macro bias ± delta confluence modifier.
   # Bullish day → long scores × (1 + delta), short × (1 - delta); mirror for bearish.

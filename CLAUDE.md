@@ -22,6 +22,23 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 
 ## Changelog
 
+### 2026-04-21 — Arkham activation rollback: HTTP 405 on every endpoint, master back to OFF
+
+- **Trigger:** first post-activation restart log showed `arkham_request_failed … HTTPStatusError('Client error 405 Method Not Allowed')` on both `/intel/ws-session` and `/intel/entity-balance-changes`. All three attempts (base path + exponential backoff) returned 405. `ArkhamWebSocketListener._run` consequently hit its 3-strike disable after 3 failed `create_ws_session` attempts → `arkham_ws_disabled consecutive_failures=3`. Daily snapshot + hourly pulse fetchers also failed the same way → `state.on_chain` stayed None → Phase C/D/E gates and modifier degraded to fail-open per design.
+- **Net runtime impact:** zero trading behavior change. Bot entries + exits are identical to pre-activation. The `symbol_decision symbol=BTC-USDT-SWAP PLANNED direction=BEARISH … confluence=5.30` line landing seconds after the 405 spam confirms the pipeline ran normally. Only the Arkham layer is inert.
+- **Root cause:** ArkhamClient assumes `GET` for both endpoints. The public Arkham API docs (`codex.arkm.com`) are gated behind "Apply for access" — the implementation plan's endpoint spec was best-guess. `405 Method Not Allowed` is an authoritative server-side "this URL exists but not for this method" reply; on POST-create endpoints (like `ws-session`) GET is almost always wrong.
+- **Fix (short-term):** `config/default.yaml` master `on_chain.enabled: true → false`. Sub-feature flags kept at `true` so flipping master back to `true` after the client is patched re-enables everything with one change. Bot stopped spamming 405 warnings.
+- **Fix (long-term — pending operator action):** `scripts/probe_arkham.py` added. Reads `ARKHAM_API_KEY` from `.env`, iterates a matrix of HTTP methods (GET / POST / PUT) × URL paths × auth header formats against both endpoints, prints one-line-per-probe with status + first 120 chars of body. Any `2xx` row is the correct shape. Operator runs the probe, shares the winning rows, ArkhamClient gets patched (method + path + header fix), master flipped back on.
+- **Unrelated operator fix:** `.env` had `RISK_AMOUNT_USDT=60S` (stray `S`) which blocks bot start with `ValueError: RISK_AMOUNT_USDT='60S' is not a valid float`. Operator corrected to `RISK_AMOUNT_USDT=60` before this restart; bot booted cleanly.
+- **Tests:** no code change to the client itself — all 919 Phase A-E tests still green. The tests mock `httpx.AsyncClient.get`, so they can't catch a method mismatch with the real API. Adding an integration test against the live API would require the key in CI which we don't do; the probe script is the right layer for this class of bug.
+- **Dataset:** `rl.clean_since` unchanged. `on_chain_context` on post-activation rows is NULL since master was off by the first trade (live mode already started placing a BTC short at 75981 with zone `vwap_retest` per the log).
+- **Lessons / operator contract:**
+  * The 4 sub-feature flags are defensive: even if master is flipped without the client being patched, misalignment between flag state and real API shape is harmless (state.on_chain stays None, gates fail-open).
+  * Next time an integration hits persistent 405 at startup, the `arkham_ws_disabled` auto-disable is the correct operator signal — whale gate silently degrades. Other fetchers need the same pattern (currently they retry every tick, burning a rate-limit slot for each 405); follow-up work tracked in "what's NOT fixed" below.
+- **What's explicitly NOT fixed in this commit:**
+  * `ArkhamClient` retries 405s per tick rather than self-disabling on N consecutive deterministic failures. Adding 405-specific auto-disable is a 10-line change to `_request` but requires 2-3 new tests, deferred until we know the correct method anyway.
+  * The probe script doesn't cover WebSocket URL variants. If 405 was the tip of the iceberg and the WS URL is also wrong, a second probe pass against `wss://` URLs will be needed — out of scope for this commit.
+
 ### 2026-04-21 — Arkham on-chain integration: master + 3 sub-features flipped ON (trial activation)
 
 - **Trigger:** operator dropped `ARKHAM_API_KEY` into `.env` post-Phase-E ship and requested activation of every sub-feature at once. Bot restart pending the `RISK_AMOUNT_USDT=60S` typo fix (unrelated — `.env` line needs the trailing `S` dropped).
