@@ -1,27 +1,36 @@
-"""Arkham whale-transfer WebSocket listener (Phase D).
+"""Arkham whale-transfer WebSocket listener (Phase D, v2 rewrite).
 
-Subscribes to Arkham's real-time `/ws/transfers` feed (API v1.1),
-filters by the configured `usdGte` threshold, and writes per-symbol
-blackout windows into the shared `WhaleBlackoutState` registry. The
-entry_signals gate reads that registry via `state.whale_blackout` —
-fully decoupled from the listener's own lifecycle. A dropped
-connection, a 429, or an unparseable message must never crash the
-bot; reconnect with exponential backoff up to `reconnect_max_s`.
+Subscribes to Arkham's real-time `/ws/v2/transfers` feed, filters by
+the configured `usdGte` threshold, and writes per-symbol blackout
+windows into the shared `WhaleBlackoutState` registry. Entry-signals
+reads that registry via `state.whale_blackout` — fully decoupled from
+the listener's lifecycle.
 
-Arkham v1 WS protocol (per https://intel.arkm.com/api/docs):
-  1. `POST /ws/sessions` with `{}` → returns `session_id` (via
-     ArkhamClient.create_ws_session).
-  2. Connect `wss://api.arkm.com/ws/transfers?session_id=<sid>` with
-     `API-Key` header.
-  3. Send `{"id":"1","type":"subscribe","payload":{"filters":{...}}}`.
-  4. Server emits `{"type":"transfer","payload":{"transfer":{...}}}`
-     per matching transfer. Also `ack` / `error` types.
+**Why v2 (2026-04-21 migration):** the v1 `/ws/sessions` endpoint
+charges 500 credits per session creation (operator-observed on the
+Arkham dashboard). Every bot restart and every reconnect after a WS
+drop burned 500 credits. With a 10,000-credit trial budget, that
+capped the bot at ~20 restarts / reconnects per billing period.
 
-Failure policy (mirrors `src.data.liquidation_stream.LiquidationStream`):
-  * Missing session token → log + disable listener (3-strike).
-  * WS disconnect → exponential backoff reconnect.
+v2 flips the model: a stream is a PERSISTENT filter object owned by
+the API key. Create once with `POST /ws/v2/streams`, reuse across
+unlimited reconnects + bot restarts. Stream creation itself has no
+credit fee per docs. The stream_id is persisted to
+`data/arkham_stream_id.txt` so subsequent bot runs skip the REST call.
+
+v2 WS protocol:
+  1. `POST /ws/v2/streams` with `{"from":["type:cex"],"usdGte":"100000000"}`
+     → returns `{streamId, id, createdAt}`. Filter is baked in.
+  2. Connect `wss://api.arkm.com/ws/v2/transfers?stream_id=<sid>` with
+     `API-Key` header. No subscribe message — transfers start flowing
+     as soon as the socket opens.
+  3. Server emits `{"type":"transfer","payload":{"transfer":{...}}}`
+     per matching transfer.
+
+Failure policy (unchanged from v1):
+  * Stream create fails 3x → listener self-disables; gate fails open.
+  * WS disconnect → reconnect with exponential backoff.
   * Parser exception → warn + skip that message.
-  * `stop()` unblocks the reconnect-wait and tears down the socket.
 """
 
 from __future__ import annotations
@@ -30,6 +39,7 @@ import asyncio
 import json
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
 import websockets
@@ -37,47 +47,40 @@ from loguru import logger
 
 from src.data.on_chain_types import WhaleBlackoutState, affected_symbols_for
 
-# Base host for the WS endpoint. The full URL is built with
-# `?session_id=<sid>` per the v1 API.
-ARKHAM_WS_BASE = "wss://api.arkm.com/ws/transfers"
+# Base host for the v2 WS endpoint. The full URL is built with
+# `?stream_id=<sid>` at connect time.
+ARKHAM_WS_BASE = "wss://api.arkm.com/ws/v2/transfers"
+
+# Default stream_id cache location. Gitignored (via `data/` wildcard
+# in .gitignore). Relative to project root.
+DEFAULT_STREAM_ID_PATH = Path("data") / "arkham_stream_id.txt"
 
 
-def build_ws_url(session_id: str, base: str = ARKHAM_WS_BASE) -> str:
-    """Full WebSocket URL carrying the session id as a query param.
-
-    Extracted so tests can assert the shape without opening a socket.
-    """
-    return f"{base}?session_id={session_id}"
+def build_ws_url(stream_id: str, base: str = ARKHAM_WS_BASE) -> str:
+    """Full WebSocket URL carrying the stream id as a query param."""
+    return f"{base}?stream_id={stream_id}"
 
 
-def build_subscribe_message(
+def build_stream_filters(
     tokens: list[str],
     usd_gte: float,
-    *,
-    message_id: str = "1",
-) -> str:
-    """Serialise the subscribe envelope for Arkham's whale stream (v1).
+) -> dict:
+    """Filter dict passed to `POST /ws/v2/streams`.
 
-    Format per the public docs:
-      {"id": "<id>", "type": "subscribe",
-       "payload": {"filters": {"usdGte": <int>, "tokens": [...]}}}
-
-    `usdGte` must be an integer per Arkham (docs example shows `10000`
-    bare, not a string). The `tokens` filter narrows the stream to the
-    configured watchlist; `usdGte` must individually be ≥ 250k when
-    no other filter is set, but we always pair with `tokens`.
+    `base=type:cex` anchors the stream on transfers touching CEXes.
+    `usdGte` is sent as a STRING per Arkham's spec (verified via
+    probe). `tokens` restricts to a subset when non-empty; omitted
+    when empty to keep the filter minimal (usdGte alone satisfies
+    Arkham's "at least one filter" rule at our 100M threshold).
     """
-    payload = {
-        "id": str(message_id),
-        "type": "subscribe",
-        "payload": {
-            "filters": {
-                "tokens": list(tokens),
-                "usdGte": int(usd_gte),
-            },
-        },
+    filters: dict = {
+        "from": ["type:cex"],
+        "to": ["type:cex"],
+        "usdGte": str(int(usd_gte)),
     }
-    return json.dumps(payload)
+    if tokens:
+        filters["tokens"] = list(tokens)
+    return filters
 
 
 def _parse_iso_to_ms(value: Any) -> Optional[int]:
@@ -104,12 +107,12 @@ def parse_transfer_message(
 ) -> Optional[tuple[str, float, int]]:
     """Parse one WS message into (token_id, usd_value, timestamp_ms).
 
-    Expected shape (Arkham v1):
+    Accepts v1/v2 shared shape:
       {"type":"transfer","payload":{"transfer":{
           "tokenSymbol":"USDT","historicalUSD":503.9,
-          "chain":"ethereum","blockTimestamp":"2025-08-28T11:01:35Z", ...}}}
+          "chain":"ethereum","blockTimestamp":"2025-08-28T11:01:35Z"}}}
 
-    Returns None for heartbeats / acks / errors / malformed payloads /
+    Returns None for heartbeats / errors / malformed payloads /
     under-threshold events. Callers consult `affected_symbols_for()`
     for the blast radius.
     """
@@ -127,7 +130,6 @@ def parse_transfer_message(
     transfer = payload.get("transfer")
     if not isinstance(transfer, dict):
         return None
-    # Token identifier — prefer tokenSymbol, fall back to tokenId / asset.
     token = (
         transfer.get("tokenSymbol")
         or transfer.get("tokenId")
@@ -136,7 +138,6 @@ def parse_transfer_message(
     )
     if not token:
         return None
-    # USD value — prefer `historicalUSD` per v1 docs.
     raw_usd = (
         transfer.get("historicalUSD")
         or transfer.get("usdValue")
@@ -148,8 +149,6 @@ def parse_transfer_message(
         return None
     if usd_value < float(threshold_usd):
         return None
-    # Timestamp — ISO string preferred, falls back to ms integer if
-    # newer API variant, else `time.time()`.
     ts_ms = _parse_iso_to_ms(transfer.get("blockTimestamp"))
     if ts_ms is None:
         ts_ms = _parse_iso_to_ms(transfer.get("timestamp"))
@@ -164,9 +163,39 @@ def parse_transfer_message(
     return (str(token), usd_value, ts_ms)
 
 
+def _read_cached_stream_id(path: Path) -> Optional[str]:
+    """Read the last-known stream_id from disk. None on missing / empty
+    / read error."""
+    try:
+        if not path.exists():
+            return None
+        content = path.read_text(encoding="utf-8").strip()
+        return content or None
+    except Exception:
+        return None
+
+
+def _write_cached_stream_id(path: Path, stream_id: str) -> None:
+    """Persist stream_id to disk. Best-effort — a failure to write is a
+    one-tick regression (next restart re-creates), not fatal."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(stream_id, encoding="utf-8")
+    except Exception as e:
+        logger.warning("arkham_stream_id_write_failed err={!r}", e)
+
+
+def _clear_cached_stream_id(path: Path) -> None:
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
+
 class ArkhamWebSocketListener:
     """Background task that mirrors Arkham whale transfers into
-    `WhaleBlackoutState`."""
+    `WhaleBlackoutState` (v2 streams API)."""
 
     def __init__(
         self,
@@ -177,6 +206,7 @@ class ArkhamWebSocketListener:
         blackout_duration_s: int,
         tokens: Optional[list[str]] = None,
         ws_base: str = ARKHAM_WS_BASE,
+        stream_id_path: Path = DEFAULT_STREAM_ID_PATH,
         reconnect_min_s: float = 1.0,
         reconnect_max_s: float = 60.0,
         max_consecutive_failures: int = 3,
@@ -185,25 +215,24 @@ class ArkhamWebSocketListener:
         self._state = blackout_state
         self._usd_gte = float(usd_gte)
         self._duration_s = int(blackout_duration_s)
-        # Token filter — NONE means only usdGte applies (bandwidth +
-        # credit cost slightly higher but we keep the filter minimal
-        # until the operator confirms Arkham's accepted token id format
-        # for the `tokens` filter field). Our usd_gte default (100M)
-        # is well above Arkham's 250k minimum so the subscribe is legal
-        # without a tokens filter.
         self._tokens = tokens or []
         self._ws_base = ws_base
+        self._stream_id_path = Path(stream_id_path)
         self._reconnect_min_s = reconnect_min_s
         self._reconnect_max_s = reconnect_max_s
         self._max_consecutive_failures = max_consecutive_failures
         self._stop = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
         self._disabled = False
-        self._session_id: Optional[str] = None
+        self._stream_id: Optional[str] = None
 
     @property
     def disabled(self) -> bool:
         return self._disabled
+
+    @property
+    def stream_id(self) -> Optional[str]:
+        return self._stream_id
 
     async def start(self) -> None:
         if self._task is not None:
@@ -213,12 +242,12 @@ class ArkhamWebSocketListener:
 
     async def stop(self) -> None:
         self._stop.set()
-        if self._session_id is not None and self._client is not None:
-            try:
-                await self._client.delete_ws_session(self._session_id)
-            except Exception:
-                pass
-            self._session_id = None
+        # IMPORTANT: v2 streams are PERSISTENT and reused across
+        # restarts — we do NOT delete the stream on stop(). Deleting
+        # would force a new `POST /ws/v2/streams` on every bot cycle,
+        # negating the credit-saving design. Streams are released
+        # only via explicit operator action (or if the filter config
+        # changes, handled at startup reuse-or-create).
         if self._task is not None:
             try:
                 await asyncio.wait_for(self._task, timeout=5.0)
@@ -228,22 +257,76 @@ class ArkhamWebSocketListener:
                 pass
             self._task = None
 
+    async def _obtain_stream_id(self) -> Optional[str]:
+        """Return a usable stream_id — reusing the cached one if valid,
+        creating a new one otherwise.
+
+        Reuse logic:
+          1. Read cached id from disk.
+          2. Call GET /ws/v2/streams; if cached id is in the list,
+             reuse it.
+          3. Otherwise create a new stream, persist its id, return it.
+
+        Any failure falls through to creation; creation failure is
+        escalated to the caller's 3-strike disable loop.
+        """
+        cached = _read_cached_stream_id(self._stream_id_path)
+        if cached:
+            try:
+                streams = await self._client.list_ws_streams()
+            except Exception:
+                streams = None
+            if isinstance(streams, list):
+                ids = {
+                    str(s.get("streamId"))
+                    for s in streams if isinstance(s, dict)
+                }
+                if cached in ids:
+                    logger.info(
+                        "arkham_ws_stream_reused stream_id={} (no creation fee)",
+                        cached,
+                    )
+                    return cached
+                # Cached id is stale (deleted, expired, or belongs to
+                # a different key). Clear it so we don't keep checking.
+                logger.info(
+                    "arkham_ws_stream_cache_stale cached={} — creating new",
+                    cached,
+                )
+                _clear_cached_stream_id(self._stream_id_path)
+        # Create fresh.
+        filters = build_stream_filters(self._tokens, self._usd_gte)
+        result = None
+        try:
+            result = await self._client.create_ws_stream(filters)
+        except Exception as e:
+            logger.warning("arkham_ws_stream_create_failed err={!r}", e)
+            return None
+        if not isinstance(result, dict):
+            return None
+        sid = result.get("streamId") or result.get("stream_id")
+        if not sid:
+            return None
+        sid = str(sid)
+        _write_cached_stream_id(self._stream_id_path, sid)
+        logger.info(
+            "arkham_ws_stream_created stream_id={} filters={}",
+            sid, filters,
+        )
+        return sid
+
     async def _run(self) -> None:
         backoff = self._reconnect_min_s
         consecutive_failures = 0
         while not self._stop.is_set():
             if self._disabled:
                 return
-            # Fresh session token per reconnect — short-lived by Arkham's
-            # design, avoids stale-token replay on long outages.
-            try:
-                sid = await self._client.create_ws_session()
-            except Exception:
-                sid = None
+
+            sid = await self._obtain_stream_id()
             if sid is None:
                 consecutive_failures += 1
                 logger.warning(
-                    "arkham_ws_session_create_failed attempt={} backoff={}s",
+                    "arkham_ws_stream_obtain_failed attempt={} backoff={}s",
                     consecutive_failures, backoff,
                 )
                 if consecutive_failures >= self._max_consecutive_failures:
@@ -261,11 +344,9 @@ class ArkhamWebSocketListener:
                     pass
                 backoff = min(backoff * 2, self._reconnect_max_s)
                 continue
-            self._session_id = sid
+            self._stream_id = sid
 
             try:
-                # Per v1 API: API-Key rides as a header on the initial
-                # handshake; session id goes in the URL query string.
                 api_key = getattr(self._client, "api_key", None) or ""
                 headers = {"API-Key": api_key} if api_key else {}
                 ws_url = build_ws_url(sid, base=self._ws_base)
@@ -276,15 +357,12 @@ class ArkhamWebSocketListener:
                     ping_timeout=30,
                 ) as ws:
                     logger.info(
-                        "arkham_whale_ws_connected url={} session={} "
+                        "arkham_whale_ws_connected url={} stream_id={} "
                         "usd_gte={:.0f}",
                         ws_url, sid, self._usd_gte,
                     )
-                    # Subscribe message carries filters; session is in
-                    # the URL, not the payload.
-                    await ws.send(build_subscribe_message(
-                        self._tokens, self._usd_gte,
-                    ))
+                    # v2 streams carry the filter from creation — no
+                    # subscribe message required.
                     backoff = self._reconnect_min_s
                     consecutive_failures = 0
                     async for raw in ws:
@@ -320,13 +398,7 @@ class ArkhamWebSocketListener:
                 backoff = min(backoff * 2, self._reconnect_max_s)
 
     def _handle(self, raw: str) -> None:
-        """Route one WS message into the blackout registry.
-
-        Ignores heartbeats / acks / under-threshold events silently
-        (parse_transfer_message returns None). Applies the blackout to
-        every symbol in `affected_symbols_for(token)` — stablecoin
-        events fan out, chain-native events collapse to one symbol.
-        """
+        """Route one WS message into the blackout registry."""
         parsed = parse_transfer_message(raw, self._usd_gte)
         if parsed is None:
             return

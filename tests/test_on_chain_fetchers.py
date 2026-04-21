@@ -71,35 +71,30 @@ def _build_client_with_response(body: dict) -> ArkhamClient:
     return client
 
 
-def _balance_body(stable_total_usd: float, btc_netflow_usd: float,
-                  eth_netflow_usd: float = 0.0) -> list:
-    """Build a response mirroring Arkham's real v1.1 shape (verified
-    via live probe 2026-04-21):
-      [{entityId, tokenBalances: [{tokenId, balanceUsd, prevBalanceUsd}]}]
-    Balance change = balanceUsd − prevBalanceUsd.
+def _hist(usd: float) -> list:
+    """Single-bucket histogram response shape: `[{time, count, usd}]`."""
+    return [{"time": "2026-04-21T00:00:00Z", "count": 1, "usd": usd}]
+
+
+def _queue_f3_responses(
+    stable_net_usd: float,
+    btc_net_usd: float,
+) -> list:
+    """Build the 4-response queue the F3 fetch_daily_snapshot needs:
+    stable_in, stable_out, btc_in, btc_out (in that order).
+
+    Net = in_sum - out_sum. Tests pass a single net number per token;
+    we express it as in=net, out=0 for simplicity.
     """
-    half_stable = stable_total_usd / 2.0
-    # Convert deltas to a (now, prev) pair. Using (delta, 0) keeps
-    # tests simple; fetcher subtracts prev from now.
-    return [
-        {
-            "entityId": "binance",
-            "entityName": "Binance",
-            "entityType": "cex",
-            "balanceUsd": 1.0e11,
-            "prevBalanceUsd": 0.99e11,
-            "tokenBalances": [
-                {"tokenId": "tether", "tokenSymbol": "usdt",
-                 "balanceUsd": half_stable, "prevBalanceUsd": 0.0},
-                {"tokenId": "usd-coin", "tokenSymbol": "usdc",
-                 "balanceUsd": half_stable, "prevBalanceUsd": 0.0},
-                {"tokenId": "bitcoin", "tokenSymbol": "btc",
-                 "balanceUsd": btc_netflow_usd, "prevBalanceUsd": 0.0},
-                {"tokenId": "ethereum", "tokenSymbol": "eth",
-                 "balanceUsd": eth_netflow_usd, "prevBalanceUsd": 0.0},
-            ],
-        },
+    pairs = [
+        (max(stable_net_usd, 0.0), max(-stable_net_usd, 0.0)),
+        (max(btc_net_usd, 0.0), max(-btc_net_usd, 0.0)),
     ]
+    queue = []
+    for in_usd, out_usd in pairs:
+        queue.append(_FakeResponse(json_body=_hist(in_usd)))
+        queue.append(_FakeResponse(json_body=_hist(out_usd)))
+    return queue
 
 
 # ── fetch_daily_snapshot — classification rules ────────────────────────────
@@ -107,9 +102,10 @@ def _balance_body(stable_total_usd: float, btc_netflow_usd: float,
 
 @pytest.mark.asyncio
 async def test_daily_snapshot_bullish_when_stables_in_and_btc_out():
-    body = _balance_body(stable_total_usd=80_000_000.0,
-                         btc_netflow_usd=-150_000_000.0)
-    client = _build_client_with_response(body)
+    client = ArkhamClient(api_key="test-key")
+    client._client = _FakeClient(queued=_queue_f3_responses(  # type: ignore
+        stable_net_usd=80_000_000.0, btc_net_usd=-150_000_000.0,
+    ))
     snap = await fetch_daily_snapshot(
         client,
         stablecoin_threshold_usd=50_000_000.0,
@@ -125,9 +121,10 @@ async def test_daily_snapshot_bullish_when_stables_in_and_btc_out():
 
 @pytest.mark.asyncio
 async def test_daily_snapshot_bearish_when_stables_out_and_btc_in():
-    body = _balance_body(stable_total_usd=-80_000_000.0,
-                         btc_netflow_usd=150_000_000.0)
-    client = _build_client_with_response(body)
+    client = ArkhamClient(api_key="test-key")
+    client._client = _FakeClient(queued=_queue_f3_responses(  # type: ignore
+        stable_net_usd=-80_000_000.0, btc_net_usd=150_000_000.0,
+    ))
     snap = await fetch_daily_snapshot(
         client,
         stablecoin_threshold_usd=50_000_000.0,
@@ -141,11 +138,10 @@ async def test_daily_snapshot_bearish_when_stables_out_and_btc_in():
 
 @pytest.mark.asyncio
 async def test_daily_snapshot_neutral_when_stables_in_but_btc_also_in():
-    # Mixed signal — stablecoins arriving but BTC also arriving. Not a
-    # clean bullish (BTC leaving) nor clean bearish. Neutral.
-    body = _balance_body(stable_total_usd=80_000_000.0,
-                         btc_netflow_usd=100_000_000.0)
-    client = _build_client_with_response(body)
+    client = ArkhamClient(api_key="test-key")
+    client._client = _FakeClient(queued=_queue_f3_responses(  # type: ignore
+        stable_net_usd=80_000_000.0, btc_net_usd=100_000_000.0,
+    ))
     snap = await fetch_daily_snapshot(
         client,
         stablecoin_threshold_usd=50_000_000.0,
@@ -158,9 +154,10 @@ async def test_daily_snapshot_neutral_when_stables_in_but_btc_also_in():
 
 @pytest.mark.asyncio
 async def test_daily_snapshot_neutral_when_stable_delta_below_threshold():
-    body = _balance_body(stable_total_usd=20_000_000.0,  # below 50M
-                         btc_netflow_usd=-150_000_000.0)
-    client = _build_client_with_response(body)
+    client = ArkhamClient(api_key="test-key")
+    client._client = _FakeClient(queued=_queue_f3_responses(  # type: ignore
+        stable_net_usd=20_000_000.0, btc_net_usd=-150_000_000.0,
+    ))
     snap = await fetch_daily_snapshot(
         client,
         stablecoin_threshold_usd=50_000_000.0,
@@ -172,12 +169,12 @@ async def test_daily_snapshot_neutral_when_stable_delta_below_threshold():
 
 
 @pytest.mark.asyncio
-async def test_daily_snapshot_returns_none_on_http_failure():
-    client = ArkhamClient(api_key="test-key")
+async def test_daily_snapshot_returns_none_when_both_legs_fail():
+    """All 8 attempts (4 calls × max_retries=2 in test) return 500.
+    Both stablecoin + BTC legs report None → whole snapshot is None."""
+    client = ArkhamClient(api_key="test-key", max_retries=1)
     client._client = _FakeClient(queued=[  # type: ignore
-        _FakeResponse(status_code=500),
-        _FakeResponse(status_code=500),
-        _FakeResponse(status_code=500),
+        _FakeResponse(status_code=500) for _ in range(8)
     ])
     snap = await fetch_daily_snapshot(
         client,
@@ -189,23 +186,11 @@ async def test_daily_snapshot_returns_none_on_http_failure():
 
 
 @pytest.mark.asyncio
-async def test_daily_snapshot_returns_none_when_entities_missing():
-    # A 200 response but without an `entities` key — defensive against
-    # Arkham API shape changes. Degrade rather than crash.
-    client = _build_client_with_response({"unexpected": "shape"})
-    snap = await fetch_daily_snapshot(
-        client,
-        stablecoin_threshold_usd=50_000_000.0,
-        btc_netflow_threshold_usd=50_000_000.0,
-        stale_threshold_s=7200,
-    )
-    assert snap is None
-
-
-@pytest.mark.asyncio
 async def test_daily_snapshot_stale_threshold_propagates():
-    body = _balance_body(stable_total_usd=0.0, btc_netflow_usd=0.0)
-    client = _build_client_with_response(body)
+    client = ArkhamClient(api_key="test-key")
+    client._client = _FakeClient(queued=_queue_f3_responses(  # type: ignore
+        stable_net_usd=0.0, btc_net_usd=0.0,
+    ))
     snap = await fetch_daily_snapshot(
         client,
         stablecoin_threshold_usd=50_000_000.0,

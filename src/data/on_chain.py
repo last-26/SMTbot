@@ -251,12 +251,11 @@ class ArkhamClient:
         )
 
     async def create_ws_session(self) -> Optional[str]:
-        """Create a WebSocket session for the whale-transfer stream.
-
-        Calls `POST /ws/sessions` with an empty body. Arkham returns a
-        session id that must ride as `?session_id=<sid>` on the
-        subsequent `wss://api.arkm.com/ws/transfers` connection.
-        Returns None on any failure.
+        """**DEPRECATED v1 endpoint — 500 credits per call.** Kept for
+        back-compat with older listener code; new code should call
+        `create_ws_stream(filters)` instead. The v2 stream endpoint
+        has zero session-creation fee per Arkham's docs; operator
+        observed v1 burning 500 credits / call on the dashboard.
         """
         data = await self._request(
             "/ws/sessions", method="POST", json_body={})
@@ -274,10 +273,8 @@ class ArkhamClient:
         return str(sid)
 
     async def delete_ws_session(self, session_id: str) -> bool:
-        """Best-effort release of a WS session.
-
-        Calls `DELETE /ws/sessions/{id}`. Returns True on 2xx, False
-        otherwise. Failure-isolated (never raises).
+        """**DEPRECATED v1 endpoint.** Best-effort release of a v1
+        session. New code uses `delete_ws_stream(stream_id)`.
         """
         if not self.api_key or self._hard_disabled:
             return False
@@ -289,6 +286,73 @@ class ArkhamClient:
             return 200 <= resp.status_code < 300
         except Exception as e:
             logger.warning("arkham_ws_session_delete_failed err={!r}", e)
+            return False
+
+    # ── WebSocket v2 streams (2026-04-21) ──────────────────────────────────
+    #
+    # v2 replaces v1's ephemeral sessions with persistent streams.
+    # Trade-offs:
+    #   * Stream creation has NO session-creation fee (v1 burned 500
+    #     credits / call → operator dashboard confirmed).
+    #   * Filter (usdGte / tokens / from / to) is baked into the stream
+    #     at creation time. The WS connection carries no subscribe
+    #     message — just connect and receive matching transfers.
+    #   * Streams persist across bot restarts. Persisting stream_id to
+    #     disk lets subsequent restarts reuse instead of re-create.
+
+    async def create_ws_stream(
+        self,
+        filters: dict,
+    ) -> Optional[dict]:
+        """Create a new v2 WebSocket stream with the given filter.
+
+        `filters` follows Arkham's spec (verified via live probe):
+          `{"from": ["type:cex"], "usdGte": "100000000"}` — at least one
+          of base / from / to / tokens / usdGte (≥ 250_000) required.
+
+        Returns the full response dict `{streamId, id, createdAt}` or
+        None on any failure. Callers should persist `streamId` to disk
+        and reuse across restarts.
+        """
+        data = await self._request(
+            "/ws/v2/streams", method="POST", json_body=dict(filters))
+        if not isinstance(data, dict):
+            return None
+        return data
+
+    async def list_ws_streams(self) -> Optional[list]:
+        """List the user's current v2 streams.
+
+        Returned shape (verified via live probe):
+          `[{"streamId": ..., "id": ..., "createdAt": ISO,
+             "isConnected": bool, "lastActive": ISO, "transfersUsed": int}]`
+
+        Used on bot startup to check whether a previous run's stream is
+        still alive (→ reuse, avoid recreation).
+        """
+        data = await self._request("/ws/v2/streams", method="GET")
+        if isinstance(data, list):
+            return data
+        return None
+
+    async def delete_ws_stream(self, stream_id: str) -> bool:
+        """Delete a v2 stream by its `streamId`. Best-effort, never raises.
+
+        Used for cleanup of orphan streams at startup (streams that
+        don't match the current filter config) or at shutdown when the
+        operator wants a clean slate.
+        """
+        if not self.api_key or self._hard_disabled:
+            return False
+        if not stream_id:
+            return False
+        try:
+            resp = await self._client.delete(
+                f"/ws/v2/streams/{stream_id}")
+            self._absorb_usage_headers(resp)
+            return 200 <= resp.status_code < 300
+        except Exception as e:
+            logger.warning("arkham_ws_stream_delete_failed err={!r}", e)
             return False
 
     async def get_subscription_usage(self) -> Optional[dict]:
@@ -574,6 +638,37 @@ def _extract_net_change_usd(
         return None
 
 
+async def _net_flow_via_histogram(
+    client: "ArkhamClient",
+    *,
+    tokens: list[str],
+    time_last: str,
+    rate_pause_s: float = 1.1,
+) -> Optional[float]:
+    """Return net CEX flow (inflow − outflow) for `tokens` over the
+    given window. Two `/transfers/histogram` calls with 1s rate-limit
+    cushion between them.
+
+    Returns None if either leg fails; 0.0 when both return empty.
+    """
+    inflow = await client.get_transfers_histogram(
+        base="type:cex", tokens=tokens, flow="in",
+        time_last=time_last, granularity="1d",
+    )
+    await asyncio.sleep(rate_pause_s)
+    outflow = await client.get_transfers_histogram(
+        base="type:cex", tokens=tokens, flow="out",
+        time_last=time_last, granularity="1d",
+    )
+    if inflow is None or outflow is None:
+        return None
+    total_in = sum(float(b.get("usd") or 0) for b in inflow
+                   if isinstance(b, dict))
+    total_out = sum(float(b.get("usd") or 0) for b in outflow
+                    if isinstance(b, dict))
+    return total_in - total_out
+
+
 async def fetch_daily_snapshot(
     client: "ArkhamClient",
     *,
@@ -582,59 +677,60 @@ async def fetch_daily_snapshot(
     stale_threshold_s: int,
     snapshot_age_s: int = 0,
     entity_ids: Optional[list[str]] = None,
-    interval: str = "7d",
+    time_last: str = "24h",
+    interval: str = "",  # kept for backwards compat; ignored
 ) -> Optional[OnChainSnapshot]:
-    """Build the macro-bias snapshot over a 7d / 14d / 30d window.
+    """Build the macro-bias snapshot over `time_last` (default 24h).
 
-    **Window constraint (server-enforced):** Arkham's
-    `entity_balance_changes` endpoint only accepts `7d`, `14d`, `30d`.
-    The "24h daily" framing in earlier Phase A/B design notes was
-    aspirational — this endpoint can't serve it. Slower signal, still
-    directional. Operator can bump `interval` to `14d` / `30d` for an
-    even slower / smoother signal.
+    **2026-04-21 rebuild (Phase F3):** rebuilt on `/transfers/histogram`
+    with `granularity=1d` which supports arbitrary `timeLast` windows
+    (24h / 48h / 7d / ...). Prior version was locked to Arkham's
+    `/intelligence/entity_balance_changes` 7d minimum, making the
+    "daily" signal actually a 7-day rolling average. Histogram path is
+    more reactive and matches the original plan's 24h intent.
 
-    Rule (Phase C classifier):
-      * bullish  when stablecoin CEX balance Δ ≥ `stablecoin_threshold`
-                 AND BTC netflow ≤ `-btc_netflow_threshold` (BTC leaving CEX)
+    Rule (Phase C classifier, unchanged):
+      * bullish  stablecoin CEX net ≥ `stablecoin_threshold` AND
+                 BTC net ≤ `-btc_netflow_threshold` (BTC leaving CEX)
       * bearish  mirror
       * neutral  otherwise or any component missing
 
-    Returns None when the underlying HTTP call fails.
+    Cost: 4 `/transfers/histogram` calls per invocation (in+out × 2
+    tokens sets). At 4 credits/call × 1 call/day = 16 credits/day =
+    ~480 credits/month. Well inside budget for a once-daily refresh.
+
+    `entity_ids` and `interval` kwargs are preserved for backwards
+    compat but ignored by the histogram path. Returns None when both
+    stablecoin + BTC legs fail; partial failure degrades to neutral.
     """
-    # `entity_types=cex` is safer than an explicit entity_ids list:
-    # operator doesn't need to know Arkham's exact entity names, and
-    # new CEXes Arkham tracks automatically flow in.
-    data = await client.get_entity_balance_changes(
-        entity_ids=entity_ids,
-        pricing_ids=DEFAULT_DAILY_PRICING_IDS,
-        interval=interval,
-        order_by="balanceUsd",
-        order_dir="desc",
-        limit=50,  # cap to avoid over-fetching long tail of CEXes
-        entity_types=None if entity_ids else ["cex"],
+    _ = entity_ids, interval  # ignored; kept for call-site back-compat
+
+    # Stablecoins (USDT + USDC) in a single call by passing both tokens.
+    stablecoin_change = await _net_flow_via_histogram(
+        client,
+        tokens=list(DEFAULT_STABLECOIN_PRICING_IDS),
+        time_last=time_last,
     )
-    if data is None:
-        return None
-    stablecoin_change = 0.0
-    saw_any_stable = False
-    for sid in DEFAULT_STABLECOIN_PRICING_IDS:
-        v = _extract_net_change_usd(data, sid)
-        if v is not None:
-            stablecoin_change += v
-            saw_any_stable = True
-    btc_netflow = _extract_net_change_usd(data, "bitcoin")
-    eth_netflow = _extract_net_change_usd(data, "ethereum")
-    if not saw_any_stable and btc_netflow is None:
+    await asyncio.sleep(1.1)
+    btc_netflow = await _net_flow_via_histogram(
+        client, tokens=["bitcoin"], time_last=time_last,
+    )
+    # ETH netflow is informational (journal context) — not part of the
+    # bias rule. Skipped here to save 2 histogram calls per refresh;
+    # schedule it separately if operator wants it stamped on every row.
+    eth_netflow: Optional[float] = None
+
+    if stablecoin_change is None and btc_netflow is None:
         return None
     bias: str = "neutral"
-    if (saw_any_stable
-            and stablecoin_change >= stablecoin_threshold_usd
+    if (stablecoin_change is not None
             and btc_netflow is not None
+            and stablecoin_change >= stablecoin_threshold_usd
             and btc_netflow <= -btc_netflow_threshold_usd):
         bias = "bullish"
-    elif (saw_any_stable
-            and stablecoin_change <= -stablecoin_threshold_usd
+    elif (stablecoin_change is not None
             and btc_netflow is not None
+            and stablecoin_change <= -stablecoin_threshold_usd
             and btc_netflow >= btc_netflow_threshold_usd):
         bias = "bearish"
     return OnChainSnapshot(

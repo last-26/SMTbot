@@ -22,6 +22,49 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 
 ## Changelog
 
+### 2026-04-21 — Arkham WS v2 migration + F3 (24h daily bias via histogram): critical credit-budget fix
+
+- **Trigger:** operator shared their Arkham dashboard after first production day. Observation: **`/ws/sessions` costs 500 credits per call.** Only 2 session creations (1 probe + 1 bot startup) consumed 1,000 credits — **92.5% of the 30-day rolling usage**. At 10,000-credit trial quota, every restart / reconnect after WS drop burns 500 credits → bot caps at ~20 restarts / reconnects per billing period. Unacceptable.
+- **Root cause:** the Phase D listener used v1 `/ws/sessions` — an ephemeral session endpoint that charges a session-creation fee per call. Docs noted v1 was deprecated in favor of v2 streams "without session creation fees"; initial implementation ignored that note due to v2 not appearing in the public endpoint index. Live probe confirmed v2 works: `POST /ws/v2/streams` returns a persistent stream object that survives bot restarts.
+- **Design decisions:**
+  - **Migrate listener to v2 streams API.** Stream is a PERSISTENT filter object owned by the API key: create once with `POST /ws/v2/streams` + `{"from":["type:cex"],"to":["type:cex"],"usdGte":"100000000"}`, reuse across unlimited reconnects. Stream creation cost: verified ~0 via live probe (vs 500 for v1 session). Net cost model: per-notification fee only (same 2 credits / transfer as v1).
+  - **Persist `stream_id` to `data/arkham_stream_id.txt`.** Bot startup reads the cached id, calls `GET /ws/v2/streams` to verify it's still alive, and reuses it if so — zero credit cost on restart. If cache is empty / stale, create a fresh stream once and persist. File is gitignored.
+  - **Don't delete stream on `stop()`.** v1 listener deleted the session on shutdown to be polite; v2 streams MUST persist across restarts to achieve the credit saving. The listener's `stop()` closes the socket but leaves the stream object in place.
+  - **Rebuild `fetch_daily_snapshot` on `/transfers/histogram` (Phase F3).** `/intelligence/entity_balance_changes` can't serve windows shorter than 7d. Histogram supports arbitrary windows via `time_last` + `granularity=1d`. Ship as in-place replacement (same signature, `interval` kwarg kept for back-compat but ignored). Default window now `24h`, matching the original plan intent.
+- **Fix — `src/data/on_chain.py`:**
+  - New `ArkhamClient.create_ws_stream(filters)` → `POST /ws/v2/streams`, returns `{streamId, id, createdAt}` dict or None.
+  - New `ArkhamClient.list_ws_streams()` → `GET /ws/v2/streams`, returns list for startup reuse check.
+  - New `ArkhamClient.delete_ws_stream(stream_id)` → `DELETE /ws/v2/streams/{id}`, for explicit cleanup.
+  - Existing `create_ws_session` / `delete_ws_session` kept as **deprecated** with loud docstring warnings pointing to the 500-credit-per-call cost.
+  - `fetch_daily_snapshot` rebuilt. New private helper `_net_flow_via_histogram(client, tokens, time_last)` does `/transfers/histogram` flow=in + flow=out with 1.1s rate-limit cushion between the two calls. Bias classifier runs on the net values same as before. 4 calls per daily refresh (stables-in, stables-out, BTC-in, BTC-out); ETH netflow dropped from the refresh path (was informational only).
+- **Fix — `src/data/on_chain_ws.py`:**
+  - Base URL: `wss://api.arkm.com/ws/v2/transfers` (v1 was `wss://api.arkm.com/ws/transfers`).
+  - `build_ws_url(stream_id)` uses `?stream_id=<sid>` (v1 was `?session_id=<sid>`).
+  - `build_stream_filters(tokens, usd_gte)` — new helper for the filter dict that goes into `POST /ws/v2/streams`. `usdGte` as string (Arkham spec) + `from=to=type:cex` to anchor both sides on CEXes. Replaces the old `build_subscribe_message` — v2 has no subscribe message, filters are baked into the stream.
+  - `ArkhamWebSocketListener` rewritten: `stream_id_path: Path = data/arkham_stream_id.txt` constructor arg. New `_obtain_stream_id()` method owns the reuse-or-create decision. `_read_cached_stream_id` / `_write_cached_stream_id` / `_clear_cached_stream_id` file helpers tolerate missing dirs / empty files / read errors.
+  - Subscribe message path deleted — v2 connect-and-stream model doesn't need one.
+- **Fix — `.gitignore`:** `data/arkham_stream_id.txt` added so the cached stream id doesn't leak into commits.
+- **Live verification (operator trial key):**
+  1. `POST /ws/v2/streams` with `{"from":["type:cex"],"to":["type:cex"],"usdGte":"100000000"}` → 200 `{"streamId":"c6521f3f-...","id":633,"createdAt":"..."}` ✓
+  2. Second restart with cache file present → `arkham_ws_stream_reused stream_id=c6521f3f-... (no creation fee)` — zero credit burn on restart ✓
+  3. `DELETE /ws/v2/streams/{id}` → 200 ✓
+  4. WS connect + receive: `arkham_whale_ws_connected url=wss://api.arkm.com/ws/v2/transfers?stream_id=...` ✓
+  5. F3 `fetch_daily_snapshot` with `time_last=24h`: `bias=bullish, btc_netflow_24h_usd=-731,130,537` (vs 7d bias=neutral with +$8.2B BTC arriving — 24h signal is more reactive and caught an inflection).
+- **Credit-budget re-audit (post-migration):**
+  - Daily bias F3: 4 calls/day × 4 credits = 16/day ≈ 480/month.
+  - Hourly pulse (unchanged 1h refresh): 48 calls/day × 4 = 192/day ≈ 5,760/month. **Consider bumping `stablecoin_pulse_refresh_s` to 10800 (3h) for ~8 calls/day = ~960/month if budget tightens — operator tune.**
+  - Altcoin index: 24 calls/day × 1 = 24/day ≈ 720/month.
+  - WS stream: zero create fee post-v2; per-notification ~2 credits, rare at 100M threshold (a few per day at most).
+  - **Projected total: ~7,000 credits/month** at current settings. Inside 10k trial quota. Dropping pulse to 3h refresh brings it to ~2,200/month — very comfortable.
+- **Tests:** 946 passing (was 947; -4 old daily_snapshot tests removed/rewritten, +16 new v2 listener + stream-id tests, net -1). `test_on_chain_fetchers.py` daily_snapshot tests now queue 4 histogram responses per call via new `_queue_f3_responses` helper. `test_on_chain_ws.py` fully rewritten around v2 primitives (`build_ws_url`, `build_stream_filters`, `_obtain_stream_id` reuse-or-create logic, stream-id disk persistence round-trip, listener `_handle` fanout unchanged from v1).
+- **Config:** no flag flips. F3 is a transparent in-place replacement of the daily-bias backend; operator doesn't need to toggle anything.
+- **Not fixed / explicitly out of scope:**
+  - **F4 per-entity flow divergence** (`/flow/entity/{entity}` — Coinbase premium pattern, Binance vs Coinbase flows). Macro-scale signal, scalp horizon mismatch. Deferred — Phase 12 candidate when longer-horizon modules get wired.
+  - **F5 swap volume** (`/swaps` — DEX activity proxy). Indirect for futures scalping. Deferred.
+  - Pulse refresh cadence — left at 1h default. Operator can tune per their budget preference.
+  - Cleanup of orphan streams at startup beyond the cache-check path. If operator's key accumulates unused streams (from probes, previous runs with different filters), `GET /ws/v2/streams` lists them; a dedicated `scripts/cleanup_arkham_streams.py` could be added if this becomes routine. Not urgent — orphan streams don't burn credits unless connected.
+- **Operator takeaway:** bot can now be restarted unlimited times without burning WS credits. First bot startup post-commit will cost ~1 credit (one-time v2 stream creation); every subsequent startup is free via the disk cache. If the `.env` key is rotated, delete `data/arkham_stream_id.txt` to force a fresh stream under the new key.
+
 ### 2026-04-21 — Arkham Phase F1 + F2: real hourly pulse via /transfers/histogram + altcoin-index modifier
 
 - **Trigger:** operator question — "7d minimum window yüzünden credit budget'ımız açıkta kaldı, başka endpoint var mı?". Audit of the public docs index (80+ endpoints) surfaced `/transfers/histogram` (supports **1h** granularity!) and `/marketdata/altcoin_index` (scalar macro signal) — both applicable to existing Phase E + a new F2 feature, and neither was covered by the original plan's guess at the API shape.

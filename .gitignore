@@ -57,6 +57,10 @@ data/*.csv
 data/*.parquet
 data/exports/
 
+# Arkham on-chain WS stream id cache (gitignored — reused across restarts
+# to avoid the v1 session-creation fee; contents are an API-key-scoped id)
+data/arkham_stream_id.txt
+
 # IDE
 .vscode/
 .idea/
