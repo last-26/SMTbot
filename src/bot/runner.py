@@ -408,6 +408,9 @@ class BotContext:
     # timestamp of the last pulse fetch. Zero / None means "never fetched".
     last_on_chain_daily_date: Any = None              # datetime.date
     last_on_chain_pulse_ts: float = 0.0
+    # Phase F2 — Arkham altcoin index scalar + last-fetch monotonic ts.
+    altcoin_index_value: Optional[int] = None
+    last_altcoin_index_ts: float = 0.0
     # 2026-04-21 — Arkham whale-transfer WS listener (Phase D). Only
     # instantiated + started when `on_chain.enabled AND
     # whale_blackout_enabled`. Writes to `whale_blackout_state`; the
@@ -1603,6 +1606,18 @@ class BotRunner:
                     cfg.on_chain.stablecoin_pulse_threshold_usd),
                 stablecoin_pulse_penalty=(
                     cfg.on_chain.stablecoin_pulse_penalty),
+                altcoin_index_enabled=(
+                    cfg.on_chain.enabled
+                    and cfg.on_chain.altcoin_index_enabled
+                ),
+                altcoin_index_value=self.ctx.altcoin_index_value,
+                altcoin_index_is_altcoin=(symbol not in _PILLAR_SYMBOLS),
+                altcoin_index_bearish_threshold=(
+                    cfg.on_chain.altcoin_index_bearish_threshold),
+                altcoin_index_bullish_threshold=(
+                    cfg.on_chain.altcoin_index_bullish_threshold),
+                altcoin_index_penalty=(
+                    cfg.on_chain.altcoin_index_modifier_delta),
             )
         except Exception:
             logger.exception("plan_build_failed symbol={}", symbol)
@@ -1964,6 +1979,24 @@ class BotRunner:
                 )
             # else: leave last-known snapshot in place; caller sees
             # stale snapshot flagged via `.fresh`.
+
+        # Altcoin index — hourly scalar refresh (Phase F2). Fires on
+        # its own cadence so a pulse failure doesn't starve the index
+        # update and vice versa.
+        now_mono_aci = time.monotonic()
+        if cfg.on_chain.altcoin_index_enabled:
+            aci_refresh_s = float(cfg.on_chain.altcoin_index_refresh_s)
+            aci_elapsed = now_mono_aci - self.ctx.last_altcoin_index_ts
+            if aci_elapsed >= aci_refresh_s:
+                try:
+                    aci = await client.get_altcoin_index()
+                except Exception:
+                    logger.exception("arkham_altcoin_index_fetch_failed")
+                    aci = None
+                if aci is not None:
+                    self.ctx.altcoin_index_value = aci
+                    self.ctx.last_altcoin_index_ts = now_mono_aci
+                    logger.info("arkham_altcoin_index_refreshed value={}", aci)
 
         # Hourly stablecoin pulse — `refresh_s` cadence.
         now_mono = time.monotonic()

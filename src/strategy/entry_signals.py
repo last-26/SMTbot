@@ -389,6 +389,45 @@ def _stablecoin_pulse_penalty(
     return penalty if misaligned else 0.0
 
 
+def _altcoin_index_penalty(
+    *,
+    direction: Direction,
+    index_value: Optional[int],
+    is_altcoin: bool,
+    bearish_threshold: int,
+    bullish_threshold: int,
+    penalty: float,
+) -> float:
+    """Return the additive confluence-threshold penalty for altcoin
+    trades that oppose the prevailing Arkham altcoin index regime.
+
+    The index is a scalar 0–100 (low → altcoins underperforming BTC,
+    high → altcoins outperforming). This penalty only bites on altcoin
+    symbols — majors (BTC / ETH) never pay it.
+
+    Rule:
+      * altcoin LONG + index <= bearish_threshold → misaligned
+        (trading an alt long in BTC-dominance season), +penalty.
+      * altcoin SHORT + index >= bullish_threshold → misaligned
+        (fading alts during altseason), +penalty.
+      * `is_altcoin=False` → never applies.
+      * Index in the neutral band (bearish < v < bullish) → no penalty.
+      * `index_value=None` → no signal, no penalty.
+    """
+    if penalty <= 0.0:
+        return 0.0
+    if not is_altcoin:
+        return 0.0
+    if index_value is None:
+        return 0.0
+    is_long = direction == Direction.BULLISH
+    if is_long and index_value <= int(bearish_threshold):
+        return penalty
+    if (not is_long) and index_value >= int(bullish_threshold):
+        return penalty
+    return 0.0
+
+
 def generate_entry_intent(
     state: MarketState,
     candles: Optional[list[Candle]] = None,
@@ -417,6 +456,12 @@ def generate_entry_intent(
     stablecoin_pulse_usd: Optional[float] = None,
     stablecoin_pulse_threshold_usd: float = 50_000_000.0,
     stablecoin_pulse_penalty: float = 0.5,
+    altcoin_index_enabled: bool = False,
+    altcoin_index_value: Optional[int] = None,
+    altcoin_index_is_altcoin: bool = False,
+    altcoin_index_bearish_threshold: int = 25,
+    altcoin_index_bullish_threshold: int = 75,
+    altcoin_index_penalty: float = 0.5,
 ) -> Optional[EntryIntent]:
     """Compute confluence + pick an SL. Returns None when not tradable."""
     if state.current_price <= 0:
@@ -443,14 +488,12 @@ def generate_entry_intent(
         daily_bias_enabled=daily_bias_enabled,
         daily_bias_delta=daily_bias_delta,
     )
-    # 2026-04-21 — Arkham stablecoin-pulse cross-asset penalty (Phase E).
-    # When the hourly stablecoin pulse opposes the winning direction
-    # (long + stablecoins leaving CEX, or short + stablecoins arriving),
-    # bump the effective confluence threshold by `penalty`. Aligned /
-    # below-threshold / None → no penalty. Applied AFTER calculate_confluence
-    # so direction is already resolved. Uses the SAME threshold as the
-    # baseline rejection — below-threshold setups still reject under
-    # `below_confluence` but via an adjusted bar.
+    # 2026-04-21 — Arkham confluence-threshold penalties (Phase E + F2).
+    # Both are additive bumps to the effective `min_confluence_score`
+    # applied AFTER calculate_confluence so direction is resolved.
+    # Below-threshold setups reject under `below_confluence` (no new
+    # reject string) but via an adjusted bar. Aligned / missing-signal
+    # → no penalty.
     effective_min_conf = float(min_confluence_score)
     if stablecoin_pulse_enabled:
         effective_min_conf += _stablecoin_pulse_penalty(
@@ -458,6 +501,15 @@ def generate_entry_intent(
             pulse_usd=stablecoin_pulse_usd,
             threshold_usd=stablecoin_pulse_threshold_usd,
             penalty=stablecoin_pulse_penalty,
+        )
+    if altcoin_index_enabled:
+        effective_min_conf += _altcoin_index_penalty(
+            direction=confluence.direction,
+            index_value=altcoin_index_value,
+            is_altcoin=altcoin_index_is_altcoin,
+            bearish_threshold=altcoin_index_bearish_threshold,
+            bullish_threshold=altcoin_index_bullish_threshold,
+            penalty=altcoin_index_penalty,
         )
     if not confluence.is_tradable(effective_min_conf):
         return None
@@ -679,6 +731,12 @@ def build_trade_plan_with_reason(
     stablecoin_pulse_usd: Optional[float] = None,
     stablecoin_pulse_threshold_usd: float = 50_000_000.0,
     stablecoin_pulse_penalty: float = 0.5,
+    altcoin_index_enabled: bool = False,
+    altcoin_index_value: Optional[int] = None,
+    altcoin_index_is_altcoin: bool = False,
+    altcoin_index_bearish_threshold: int = 25,
+    altcoin_index_bullish_threshold: int = 75,
+    altcoin_index_penalty: float = 0.5,
 ) -> tuple[Optional[TradePlan], str]:
     """Same as `build_trade_plan_from_state` but returns `(plan, reason)`.
 
@@ -738,6 +796,12 @@ def build_trade_plan_with_reason(
         stablecoin_pulse_usd=stablecoin_pulse_usd,
         stablecoin_pulse_threshold_usd=stablecoin_pulse_threshold_usd,
         stablecoin_pulse_penalty=stablecoin_pulse_penalty,
+        altcoin_index_enabled=altcoin_index_enabled,
+        altcoin_index_value=altcoin_index_value,
+        altcoin_index_is_altcoin=altcoin_index_is_altcoin,
+        altcoin_index_bearish_threshold=altcoin_index_bearish_threshold,
+        altcoin_index_bullish_threshold=altcoin_index_bullish_threshold,
+        altcoin_index_penalty=altcoin_index_penalty,
     )
     if intent is None:
         # Distinguish the three upstream `generate_entry_intent` None paths.
@@ -758,7 +822,7 @@ def build_trade_plan_with_reason(
             daily_bias_enabled=daily_bias_enabled,
             daily_bias_delta=daily_bias_delta,
         )
-        # Apply the same stablecoin-pulse penalty to the diagnostic
+        # Apply the same penalties (Phase E + F2) to the diagnostic
         # check so reject reasons stay consistent with the primary path.
         effective_min_conf = float(min_confluence_score)
         if stablecoin_pulse_enabled:
@@ -767,6 +831,15 @@ def build_trade_plan_with_reason(
                 pulse_usd=stablecoin_pulse_usd,
                 threshold_usd=stablecoin_pulse_threshold_usd,
                 penalty=stablecoin_pulse_penalty,
+            )
+        if altcoin_index_enabled:
+            effective_min_conf += _altcoin_index_penalty(
+                direction=conf.direction,
+                index_value=altcoin_index_value,
+                is_altcoin=altcoin_index_is_altcoin,
+                bearish_threshold=altcoin_index_bearish_threshold,
+                bullish_threshold=altcoin_index_bullish_threshold,
+                penalty=altcoin_index_penalty,
             )
         if not conf.is_tradable(effective_min_conf):
             return None, "below_confluence"

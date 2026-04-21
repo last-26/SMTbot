@@ -222,29 +222,112 @@ async def test_daily_snapshot_stale_threshold_propagates():
 # ── fetch_hourly_stablecoin_pulse ──────────────────────────────────────────
 
 
-@pytest.mark.asyncio
-async def test_hourly_pulse_returns_none_stub():
-    """fetch_hourly_stablecoin_pulse is a deliberate stub since the
-    real Arkham endpoint only supports 7d+ windows. Returns None so
-    Phase E penalty stays inert until a real hourly source lands
-    (likely /transfers/histogram or WS aggregation)."""
-    body = [
-        {"entityId": "binance", "tokenBalances": [
-            {"tokenId": "tether",
-             "balanceUsd": 40_000_000.0, "prevBalanceUsd": 0.0},
-        ]},
+def _histogram_body(buckets: list[tuple[str, float]]) -> list:
+    """Build a histogram response matching Arkham v1.1 /transfers/histogram shape:
+    `[{"time": ISO, "count": int, "usd": float}]`."""
+    return [
+        {"time": t, "count": 1, "usd": usd}
+        for t, usd in buckets
     ]
-    client = _build_client_with_response(body)
+
+
+@pytest.mark.asyncio
+async def test_hourly_pulse_computes_net_inflow_minus_outflow():
+    """Two /transfers/histogram calls (flow=in then flow=out) → net
+    pulse = inflow total − outflow total."""
+    inflow_body = _histogram_body([
+        ("2026-04-21T20:00:00Z", 400_000_000.0),
+        ("2026-04-21T21:00:00Z", 200_000_000.0),
+    ])
+    outflow_body = _histogram_body([
+        ("2026-04-21T20:00:00Z", 150_000_000.0),
+        ("2026-04-21T21:00:00Z", 100_000_000.0),
+    ])
+    client = ArkhamClient(api_key="test-key")
+    client._client = _FakeClient(queued=[  # type: ignore
+        _FakeResponse(json_body=inflow_body),
+        _FakeResponse(json_body=outflow_body),
+    ])
+    pulse = await fetch_hourly_stablecoin_pulse(client)
+    # (400M + 200M) - (150M + 100M) = 350M
+    assert pulse == 350_000_000.0
+
+
+@pytest.mark.asyncio
+async def test_hourly_pulse_returns_none_when_either_leg_fails():
+    # First call 200, second call 500 → one retry per attempt, eventually None.
+    client = ArkhamClient(api_key="test-key", max_retries=1)
+    client._client = _FakeClient(queued=[  # type: ignore
+        _FakeResponse(json_body=_histogram_body([("2026-04-21T20:00:00Z", 10.0)])),
+        _FakeResponse(status_code=500),
+    ])
     pulse = await fetch_hourly_stablecoin_pulse(client)
     assert pulse is None
 
 
 @pytest.mark.asyncio
-async def test_hourly_pulse_stub_does_not_hit_api():
+async def test_hourly_pulse_empty_buckets_yields_zero():
+    """Both legs return empty lists → net pulse is exactly 0.0 (not None).
+    Distinguishes "no flow in the window" (0) from "API failed" (None)."""
     client = ArkhamClient(api_key="test-key")
-    fake = _FakeClient(queued=[])
-    client._client = fake  # type: ignore
+    client._client = _FakeClient(queued=[  # type: ignore
+        _FakeResponse(json_body=[]),
+        _FakeResponse(json_body=[]),
+    ])
     pulse = await fetch_hourly_stablecoin_pulse(client)
-    assert pulse is None
-    # Stub must not make any HTTP calls.
-    assert fake.calls == []
+    assert pulse == 0.0
+
+
+@pytest.mark.asyncio
+async def test_hourly_pulse_hits_histogram_endpoint_with_cex_filter():
+    body = _histogram_body([("2026-04-21T20:00:00Z", 50_000_000.0)])
+    client = ArkhamClient(api_key="test-key")
+    fake = _FakeClient(queued=[  # type: ignore
+        _FakeResponse(json_body=body),
+        _FakeResponse(json_body=body),
+    ])
+    client._client = fake  # type: ignore
+    await fetch_hourly_stablecoin_pulse(client)
+    assert len(fake.calls) == 2
+    # Both calls hit /transfers/histogram.
+    for path, params in fake.calls:
+        assert path == "/transfers/histogram"
+        assert params["base"] == "type:cex"
+        assert params["granularity"] == "1h"
+        assert params["tokens"] == "tether,usd-coin"
+    # First call is inflow, second is outflow.
+    assert fake.calls[0][1]["flow"] == "in"
+    assert fake.calls[1][1]["flow"] == "out"
+
+
+# ── get_altcoin_index ──────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_altcoin_index_returns_int():
+    client = ArkhamClient(api_key="test-key")
+    client._client = _FakeClient(queued=[  # type: ignore
+        _FakeResponse(json_body={"altcoinIndex": 42}),
+    ])
+    aci = await client.get_altcoin_index()
+    assert aci == 42
+
+
+@pytest.mark.asyncio
+async def test_get_altcoin_index_none_on_failure():
+    client = ArkhamClient(api_key="test-key", max_retries=1)
+    client._client = _FakeClient(queued=[  # type: ignore
+        _FakeResponse(status_code=500),
+    ])
+    aci = await client.get_altcoin_index()
+    assert aci is None
+
+
+@pytest.mark.asyncio
+async def test_get_altcoin_index_none_on_unexpected_shape():
+    client = ArkhamClient(api_key="test-key")
+    client._client = _FakeClient(queued=[  # type: ignore
+        _FakeResponse(json_body=[1, 2, 3]),  # wrong shape
+    ])
+    aci = await client.get_altcoin_index()
+    assert aci is None

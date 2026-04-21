@@ -303,6 +303,77 @@ class ArkhamClient:
             "/user/usage", method="GET",
         )
 
+    async def get_transfers_histogram(
+        self,
+        *,
+        base: Optional[str] = None,
+        tokens: Optional[list[str]] = None,
+        flow: Optional[str] = None,       # "in" | "out" | "self" | "all"
+        time_last: str = "24h",
+        granularity: str = "1h",          # "1h" | "1d"
+        usd_gte: Optional[float] = None,
+        chains: Optional[list[str]] = None,
+        limit: int = 100,
+    ) -> Optional[list]:
+        """Aggregated histogram of transfers over time (count + USD).
+
+        Calls `GET /transfers/histogram`. Returns a list of per-bucket
+        dicts `[{"time": ISO, "count": int, "usd": float}]`.
+
+        Key Arkham syntax (verified via live probe):
+          * `base="type:cex"` → any CEX entity; `base="binance"` → one.
+          * `flow="in"` → into the base entity; `"out"` → out of it.
+          * `tokens="tether,usd-coin"` comma-joined pricing IDs.
+          * `time_last="24h"` + `granularity="1h"` → 25 buckets (24 hours
+            + boundary). `granularity="1d"` for daily buckets.
+          * Rate limit is stricter: 1 req/s. Callers should pace.
+
+        None on any failure; empty list when no matching transfers.
+        """
+        params: dict = {
+            "timeLast": time_last,
+            "granularity": granularity,
+            "limit": int(limit),
+        }
+        if base is not None:
+            params["base"] = base
+        if tokens:
+            # Arkham's `tokens` param on /transfers/histogram accepts
+            # a comma-joined string (unlike `entityIds` which takes a
+            # list-of-repeated). Verified via probe.
+            params["tokens"] = ",".join(tokens)
+        if flow:
+            params["flow"] = flow
+        if chains:
+            params["chains"] = ",".join(chains)
+        if usd_gte is not None:
+            params["usdGte"] = float(usd_gte)
+        return await self._request(
+            "/transfers/histogram",
+            method="GET", params=params,
+        )
+
+    async def get_altcoin_index(self) -> Optional[int]:
+        """Current Altcoin Index (scalar 0-100).
+
+        Low values → altcoins underperforming BTC (BTC dominance
+        season). High values → altcoins outperforming. Single-call
+        endpoint, cheap. Docs don't specify update cadence; treat as
+        an hourly-refresh signal.
+
+        Returns None on HTTP failure or unexpected response shape.
+        """
+        data = await self._request(
+            "/marketdata/altcoin_index", method="GET",
+        )
+        if not isinstance(data, dict):
+            return None
+        raw = data.get("altcoinIndex")
+        try:
+            return int(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
+
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
     async def close(self) -> None:
@@ -582,18 +653,55 @@ async def fetch_hourly_stablecoin_pulse(
     client: "ArkhamClient",
     *,
     entity_ids: Optional[list[str]] = None,
+    time_last: str = "1h",
 ) -> Optional[float]:
-    """**Disabled / stub (2026-04-21).** Arkham's
-    `entity_balance_changes` endpoint doesn't support sub-7d windows —
-    the original 1h pulse design was based on a misread of the API. A
-    proper hourly flow signal would come from `/transfers/histogram`
-    (or aggregating the WS transfers stream in-process); neither is
-    wired yet.
+    """Net hourly stablecoin flow into / out of centralised exchanges.
 
-    Returns None unconditionally so the Phase E penalty in
-    `entry_signals.py` stays inert. Keeping the function signature
-    + name so the runner scheduler + wiring don't need to change when
-    a real hourly source lands.
+    Uses `/transfers/histogram` with `base=type:cex, tokens=USDT+USDC,
+    flow=in` and `flow=out` over the last `time_last` window, summing
+    the USD buckets. Returns a **signed** number:
+      * positive → stablecoins flowing INTO CEXes (buying ammo, risk-on).
+      * negative → stablecoins flowing OUT of CEXes (cashing out, risk-off).
+      * None     → one or both calls failed; caller treats as "no signal".
+
+    Cost: 2 `/transfers/histogram` calls per invocation. Rate-limit: the
+    endpoint is capped at 1 req/s; this function pauses ~1.1s between
+    its two calls so back-to-back scheduler ticks don't 429.
+
+    `entity_ids` is ignored (the `type:cex` meta filter already covers
+    every Arkham-tracked CEX). Kept in the signature for backwards
+    compat with the Phase B scheduler's call site.
     """
-    _ = client, entity_ids  # unused; kept for future real implementation
-    return None
+    _ = entity_ids
+    tokens = list(DEFAULT_STABLECOIN_PRICING_IDS)
+    inflow = await client.get_transfers_histogram(
+        base="type:cex",
+        tokens=tokens,
+        flow="in",
+        time_last=time_last,
+        granularity="1h",
+    )
+    # Best-effort rate-limit cushion between back-to-back histogram calls.
+    await asyncio.sleep(1.1)
+    outflow = await client.get_transfers_histogram(
+        base="type:cex",
+        tokens=tokens,
+        flow="out",
+        time_last=time_last,
+        granularity="1h",
+    )
+    if inflow is None or outflow is None:
+        return None
+
+    def _sum_usd(buckets: list) -> float:
+        total = 0.0
+        for b in buckets or []:
+            if not isinstance(b, dict):
+                continue
+            try:
+                total += float(b.get("usd") or 0)
+            except (TypeError, ValueError):
+                continue
+        return total
+
+    return _sum_usd(inflow) - _sum_usd(outflow)

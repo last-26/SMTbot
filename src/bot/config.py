@@ -554,6 +554,19 @@ class OnChainConfig(BaseModel):
     whale_threshold_usd: float = 100_000_000.0
     whale_blackout_duration_s: int = 600  # 10 minutes
 
+    # Phase F2 (2026-04-21 post-integration) — Arkham altcoin index
+    # modifier. Index is a scalar 0-100 from `/marketdata/altcoin_index`
+    # (low = altcoins underperforming BTC, high = altcoins outperforming).
+    # Applies only to altcoin symbols (not BTC / ETH). Misaligned direction
+    # (long alt in BTC-dominance season, or short alt in altseason) takes
+    # a penalty bump on the effective `min_confluence_score`.
+    altcoin_index_enabled: bool = False
+    altcoin_index_bearish_threshold: int = 25
+    altcoin_index_bullish_threshold: int = 75
+    altcoin_index_modifier_delta: float = 0.5
+    # Refresh cadence (seconds) — index is macro-scale, hourly is plenty.
+    altcoin_index_refresh_s: int = 3600
+
     # Safety / budget controls.
     # Auto-disable the master when the reported label-usage fraction
     # crosses this percent. Prevents the trial key from being exhausted
@@ -598,7 +611,8 @@ class OnChainConfig(BaseModel):
         return v
 
     @field_validator("whale_blackout_duration_s", "stablecoin_pulse_refresh_s",
-                     "snapshot_staleness_threshold_s")
+                     "snapshot_staleness_threshold_s",
+                     "altcoin_index_refresh_s")
     @classmethod
     def _positive_duration(cls, v: int) -> int:
         if v <= 0:
@@ -606,6 +620,30 @@ class OnChainConfig(BaseModel):
                 f"on_chain duration fields must be > 0 seconds; got {v}"
             )
         return v
+
+    @field_validator("altcoin_index_bearish_threshold",
+                     "altcoin_index_bullish_threshold")
+    @classmethod
+    def _altcoin_thresholds_in_range(cls, v: int) -> int:
+        if not (0 <= v <= 100):
+            raise ValueError(
+                f"on_chain.altcoin_index_* thresholds must be in [0, 100]; "
+                f"got {v}"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _altcoin_thresholds_ordered(self) -> "OnChainConfig":
+        if (self.altcoin_index_bearish_threshold
+                >= self.altcoin_index_bullish_threshold):
+            raise ValueError(
+                f"on_chain.altcoin_index_bearish_threshold "
+                f"({self.altcoin_index_bearish_threshold}) must be strictly "
+                f"less than altcoin_index_bullish_threshold "
+                f"({self.altcoin_index_bullish_threshold}); otherwise the "
+                f"neutral band collapses and every value triggers a penalty."
+            )
+        return self
 
     @field_validator("api_usage_auto_disable_pct")
     @classmethod

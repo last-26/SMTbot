@@ -593,6 +593,17 @@ on_chain:
   whale_threshold_usd: 100000000.0                 # WS filter (usdGte); ≥10M minimum
   whale_blackout_duration_s: 600                   # 10 min after event
 
+  # Phase F2 (2026-04-21) — Arkham altcoin index modifier.
+  # `/marketdata/altcoin_index` scalar 0-100. Low → altcoins underperforming
+  # BTC (BTC-dominance regime). Applies ONLY to altcoin symbols (SOL/DOGE/BNB,
+  # not BTC/ETH). Misaligned direction (altcoin long in BTC-dominance OR
+  # altcoin short in altseason) bumps the `below_confluence` threshold.
+  altcoin_index_enabled: true
+  altcoin_index_bearish_threshold: 25              # index ≤ this → altcoin longs penalised
+  altcoin_index_bullish_threshold: 75              # index ≥ this → altcoin shorts penalised
+  altcoin_index_modifier_delta: 0.5                # threshold bump when misaligned
+  altcoin_index_refresh_s: 3600                    # 1h — macro, no need to poll faster
+
   # Safety / budget controls.
   api_usage_auto_disable_pct: 95.0
   api_client_timeout_s: 10.0

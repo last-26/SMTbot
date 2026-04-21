@@ -22,6 +22,54 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 
 ## Changelog
 
+### 2026-04-21 — Arkham Phase F1 + F2: real hourly pulse via /transfers/histogram + altcoin-index modifier
+
+- **Trigger:** operator question — "7d minimum window yüzünden credit budget'ımız açıkta kaldı, başka endpoint var mı?". Audit of the public docs index (80+ endpoints) surfaced `/transfers/histogram` (supports **1h** granularity!) and `/marketdata/altcoin_index` (scalar macro signal) — both applicable to existing Phase E + a new F2 feature, and neither was covered by the original plan's guess at the API shape.
+- **Findings (verified via live probes):**
+  - `/transfers/histogram` supports `granularity=1h` with `timeLast=24h`, `flow=in/out`, `base=type:cex` meta filter, `tokens=` comma-joined list, `usdGte` threshold. Response: `[{time: ISO, count: int, usd: float}]` per bucket. Rate limit: 1 req/s.
+  - Live probe result (last 24h): USDT CEX inflow $6.87B vs outflow $6.64B → net pulse **+$233M**. Per-hour granularity works as documented.
+  - `/marketdata/altcoin_index` returns `{"altcoinIndex": int}` scalar 0-100. Current: **19** (BTC dominance season — altcoins underperforming). Single-call endpoint.
+- **Design decisions:**
+  - **Rebuild Phase E hourly pulse on `/transfers/histogram`.** Two calls per refresh (`flow=in` + `flow=out`), net = inflow.usd.sum() − outflow.usd.sum(). 1.1s sleep between the two calls to respect the 1/s rate limit without adding a dedicated limiter. `base=type:cex` meta filter covers every Arkham-tracked CEX in one query — no need to iterate Binance / Coinbase / etc. individually. Returns None if either leg fails (strict: partial data would mislead); returns 0.0 if both legs return empty buckets ("no flow" vs "API down" distinguishable).
+  - **New Phase F2 — altcoin-index confluence-threshold penalty.** Different character from Phase C/E: macro scalar, not flow data, direction-dependent only for *altcoin* symbols. Pattern copied from Phase E: bump `effective_min_conf` when misaligned, reject under existing `below_confluence` (no new reject string).
+  - **Altcoin-only gating.** The runner passes `altcoin_index_is_altcoin = (symbol not in _PILLAR_SYMBOLS)`. BTC / ETH trades never pay the penalty regardless of index — the signal is specifically about *relative* altcoin performance, doesn't apply to majors by definition.
+  - **Asymmetric misalignment.** `index ≤ bearish_threshold` penalises altcoin LONGs (BTC-dominance — don't fight the regime). `index ≥ bullish_threshold` penalises altcoin SHORTs (altseason — don't short into strength). Neutral band between thresholds → no penalty. Inclusive at boundaries (`<=` / `>=`) to avoid ambiguity at exact threshold values.
+  - **Config ordering validator.** `bearish_threshold >= bullish_threshold` would collapse the neutral band and fire penalty for every index value. Pydantic `@model_validator(mode="after")` rejects at config load.
+  - **Independent refresh cadence.** Altcoin index refresh runs on its own monotonic clock (`last_altcoin_index_ts`) separate from stablecoin pulse refresh. A pulse failure doesn't starve the index update and vice versa. Both default 1h refresh.
+- **Fix — `src/data/on_chain.py`:**
+  - `ArkhamClient.get_transfers_histogram(base, tokens, flow, time_last, granularity, usd_gte, chains, limit)` — new method calling `GET /transfers/histogram`. Tokens param accepts a list, serialised as comma-joined string (endpoint's expected format, verified via probe; differs from `entity_balance_changes` which wants repeated query params).
+  - `ArkhamClient.get_altcoin_index()` — new method, returns int or None. Defensive parse of `altcoinIndex` field.
+  - `fetch_hourly_stablecoin_pulse()` — rewritten. No longer a stub. Calls histogram twice (in + out) with `base=type:cex, tokens=[tether, usd-coin], granularity=1h`. Sleeps 1.1s between calls. Returns signed USD net.
+- **Fix — `src/strategy/entry_signals.py`:**
+  - `_altcoin_index_penalty(direction, index_value, is_altcoin, bearish_threshold, bullish_threshold, penalty) -> float` — pure helper mirroring `_stablecoin_pulse_penalty`. Returns penalty when altcoin + misaligned, 0 otherwise.
+  - `generate_entry_intent` + `build_trade_plan_with_reason` gain 6 new kwargs (`altcoin_index_enabled`, `altcoin_index_value`, `altcoin_index_is_altcoin`, `altcoin_index_bearish_threshold`, `altcoin_index_bullish_threshold`, `altcoin_index_penalty`). Applied after `calculate_confluence` in the same block as the stablecoin-pulse penalty; both stack additively on the effective threshold. Mirror in the diagnostic `below_confluence` path for consistent reject reasons.
+- **Fix — `src/bot/config.py`:**
+  - `OnChainConfig` gains `altcoin_index_enabled`, `altcoin_index_bearish_threshold=25`, `altcoin_index_bullish_threshold=75`, `altcoin_index_modifier_delta=0.5`, `altcoin_index_refresh_s=3600`. Field-level validators enforce `[0, 100]` threshold range + positive duration. Model-level validator enforces strict `bearish < bullish` ordering.
+- **Fix — `src/bot/runner.py`:**
+  - `BotContext` gains `altcoin_index_value: Optional[int]` + `last_altcoin_index_ts: float`.
+  - `_refresh_on_chain_snapshots` calls `get_altcoin_index()` on its own monotonic cadence, logs `arkham_altcoin_index_refreshed value=...`.
+  - `build_trade_plan_with_reason` call site threads the 6 new altcoin-index kwargs. `is_altcoin` computed inline as `symbol not in _PILLAR_SYMBOLS`.
+- **Config flip (`config/default.yaml`):**
+  - `on_chain.altcoin_index_enabled: true` — default ON (same as other sub-features). Rollback: flip `enabled: false` on master or the sub-feature.
+- **Live verification after this commit:**
+  1. `arkham_daily_snapshot_refreshed bias=neutral btc_netflow=8.2B eth_netflow=1.2B` — Phase C 7d signal.
+  2. `arkham_altcoin_index_refreshed value=19` — F2 hourly scalar. At 19 < 25 bearish threshold → altcoin longs (SOL / DOGE / BNB) get +0.5 threshold bump.
+  3. `arkham_stablecoin_pulse_refreshed pulse_usd=464886856.28` — F1 hourly pulse. +$464M net into CEXes; > 50M threshold, so shorts are misaligned (pulse aligned with longs) and get +0.5 bump.
+- **Credit-budget math post-F1+F2:**
+  - Phase C daily snapshot: 1 call / day (`entity_balance_changes`, interval=7d).
+  - Phase F1 hourly pulse: 2 calls / hour × 24 = 48 calls / day (`transfers/histogram` in + out).
+  - Phase F2 altcoin index: 1 call / hour × 24 = 24 calls / day (`marketdata/altcoin_index`).
+  - WS transfers: per-notification only; at usdGte=100M, rare (≤ a few per day).
+  - **Total: ~75 calls / day** for the full on-chain stack. Well under any reasonable trial quota.
+- **Tests:** 14 new (929 → 943 total, all green):
+  - `tests/test_on_chain_fetchers.py` (5 new): `fetch_hourly_stablecoin_pulse` net math (inflow − outflow), both-legs-fail → None, empty buckets → 0.0, endpoint+params shape check. `get_altcoin_index` success / HTTP failure / unexpected shape.
+  - `tests/test_altcoin_index_penalty.py` (14 new): helper unit coverage (9 cases — penalty=0, None index, not altcoin, both misaligned directions, both aligned, neutral band, exact thresholds) + OnChainConfig validators (defaults, `[0, 100]` threshold range, `bearish < bullish` ordering, equal rejected, positive refresh).
+- **Not fixed / explicit out-of-scope:**
+  - `fetch_daily_snapshot` still uses `/intelligence/entity_balance_changes` with 7d window. Candidate F3 would rebuild it on `/transfers/histogram` with `granularity=1d, timeLast=24h` for a true 24h signal (original plan intent). Deferred until we have ≥10 post-F1+F2 trades + factor-audit confirms the current 7d signal is the performance bottleneck.
+  - Altcoin-index modifier is a penalty-bump only (doesn't BOOST aligned trades the way the daily_bias multiplier does). Asymmetric by design — preserves the "conservative default" property (never *lower* the bar).
+  - No per-symbol altcoin-index override (SOL vs DOGE respond differently to BTC dominance). Phase 12 candidate once GBT data confirms symbol-level variance.
+- **Dataset:** `rl.clean_since` unchanged. New `on_chain_context` fields are added on the journal side in the normal runner write path; Phase 9 GBT will find them. Activation of F1 + F2 is a behavioural change but same vintage as the rest of the on-chain integration (same day); the `arkham_active=true` categorical segmentation covers it without a cut.
+
 ### 2026-04-21 — Arkham client patched against real v1.1 API shape (post-rollback recovery)
 
 - **Trigger:** rollback commit `27e5c8b` turned master off after 405 spam. Operator then shared the real docs URL (`https://intel.arkm.com/api/docs`) and the machine-readable variant at `intel.arkm.com/llms-full.txt` — which revealed every assumption in the original integration plan was wrong on shape details (paths, methods, params, response fields, WS URL, subscribe envelope). This commit rewrites the client against the real API and verifies end-to-end with live probes.
