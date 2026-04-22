@@ -750,4 +750,11 @@ rl:
   # the scalp-native rewire baseline commit; earlier Pine overlay regimes
   # had different confluence row layout and are excluded from the clean
   # window.
-  clean_since: "2026-04-19T03:21:48Z"
+  # 2026-04-22 (gece, late) — Pass 2 restart cut. Pre-restart DB
+  # (42 closed trades, Pass 1 baseline) archived as
+  # `data/trades.db.pass1_backup_2026-04-22T203324Z`. Fresh DB starts
+  # empty; every new row carries uniform feature coverage (all Arkham
+  # soft signals live, confluence_pillar_scores + oscillator_raw_values
+  # 1m/3m/15m populated from first tick). Pass 2 reporter / GBT /
+  # Optuna use this cut as the clean-window start.
+  clean_since: "2026-04-22T20:33:24Z"

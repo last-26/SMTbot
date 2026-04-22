@@ -18,7 +18,7 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 - **On-chain (Arkham):** runtime soft signals only — daily bias ±15%, hourly stablecoin pulse +0.75 threshold penalty, altcoin-index +0.5 penalty on misaligned altcoin trades, **flow_alignment** 6-input directional score (stablecoin + BTC/ETH + Coinbase/Binance/Bybit 24h netflow; weights 0.25/0.25/0.15/0.15/0.10/0.10; default penalty 0.25), **per_symbol_cex_flow** binary penalty on misaligned symbol 1h volume (default 0.25, $5M floor). Whale HARD GATE removed 2026-04-22 — WS listener feeds `whale_transfers` journal for Pass 3 directional classification. Credit-safe via v2 persistent WS streams + filter-fingerprint cache. All Arkham weights tuned in Pass 3.
 - **Pass 2 instrumentation:** every trade row now captures `confluence_pillar_scores` (factor name → weight dict) and `oscillator_raw_values` (per-TF dict with 1m/3m/15m OscillatorTableData numerics: wt1/wt2/rsi/rsi_mfi/stoch_k/d/momentum/divergence flags). Both sourced from existing runner TF-switch cache — zero extra TV latency.
 - **Tests:** 1028, all green. Demo-runnable end-to-end.
-- **Data cutoff (`rl.clean_since`):** `2026-04-19T19:55:00Z` through Pass 1; operator bumps to restart-timestamp for Pass 2 with fresh DB + uniform feature coverage.
+- **Data cutoff (`rl.clean_since`):** `2026-04-22T20:33:24Z` — Pass 2 restart cut. Pre-restart DB (42 Pass 1 trades) archived as `data/trades.db.pass1_backup_2026-04-22T203324Z`. Fresh DB created on first bot startup; every new row post-restart carries uniform feature coverage.
 
 ---
 
