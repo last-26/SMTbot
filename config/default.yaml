@@ -115,7 +115,14 @@ analysis:
   # the floor from 2 → 3 drops the worst bucket while keeping the sweet
   # spot (4+) intact. If reject flow cratered, drop back to 2 and instead
   # gate on analysis.require_structural_factor (not yet implemented).
-  min_confluence_score: 3
+  #
+  # 2026-04-22 (gece) Pass 1 tuning: operator bump 3 → 3.75 after 42-trade
+  # threshold sweep. Sweep showed 3.5/3.75 both lift net_R (+13.46 → +16.08)
+  # while 4.0+ over-filters. Raising to 3.75 cuts 5 trades from the window
+  # (4 of them losses), WR shifts 47.6% → 51.4% on the historical sample.
+  # Re-eval after 30 new closed trades post-restart — if accept rate drops
+  # below 0.5/day sustained, retreat to 3.5.
+  min_confluence_score: 3.75
   candle_buffer_size: 500
   swing_lookback: 20
   sr_min_touches: 3
