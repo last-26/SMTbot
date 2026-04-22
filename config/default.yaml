@@ -662,17 +662,34 @@ on_chain:
   altcoin_index_refresh_s: 3600                    # 1h — macro, no need to poll faster
 
   # 2026-04-22 (gece) — flow_alignment soft directional signal.
-  # Combines stablecoin pulse + BTC/ETH netflow into a [-1, +1] score:
-  #   +1 = bullish aligned (stables FLOW IN + BTC/ETH FLOW OUT of CEX)
-  #   -1 = bearish aligned (stables FLOW OUT + BTC/ETH FLOW IN to CEX)
-  # Misaligned direction pays additive penalty on min_confluence_score.
-  # Replaces the whale blackout's directional intuition now that the hard
-  # gate is gone. Ships with DEFAULT weight (Pass 1): 41-trade dataset has
-  # inconsistent Arkham coverage, so penalty magnitude is not tuned until
-  # Pass 2 when coverage is uniform.
+  # Combines SIX Arkham inputs into a [-1, +1] directional score:
+  #   stablecoin pulse (0.25)  natural sign (IN=bullish)
+  #   BTC netflow      (0.25)  inverted (OUT=bullish)
+  #   ETH netflow      (0.15)  inverted
+  #   Coinbase netflow (0.15)  inverted — "Coinbase premium" pattern
+  #   Binance netflow  (0.10)  inverted — Asia retail flow
+  #   Bybit netflow    (0.10)  inverted — leverage/derivatives flow
+  # Per-entity inputs added 2026-04-22 (gece, late) when the journal-only
+  # FAZ 2 columns were promoted to runtime ahead of the Pass 1 clean
+  # restart. Misaligned direction pays additive penalty on
+  # min_confluence_score, scaled linearly by |score|. Replaces the whale
+  # blackout's directional intuition now that the hard gate is gone.
+  # Ships with DEFAULT weight (Pass 1); Pass 2 tunes penalty + noise_floor
+  # + individual input weights against uniform-coverage dataset.
   flow_alignment_enabled: true
   flow_alignment_penalty: 0.25                     # additive threshold bump on misalignment (full magnitude at |score|=1.0)
   flow_alignment_noise_floor_usd: 1000000.0        # sub-$1M signals treated as zero to filter noise
+
+  # 2026-04-22 (gece, late) — per-symbol 1h CEX volume penalty.
+  # Unlike stablecoins, token flowing INTO exchange is BEARISH for that
+  # symbol (selling setup), OUT is BULLISH (cold wallet / DEX accumulation).
+  # Misaligned direction on the traded symbol pays additive threshold bump.
+  # Data source: Arkham `/token/volume/{id}?granularity=1h` most-recent
+  # bucket's `inUSD - outUSD` per watched OKX perp. Promoted to runtime
+  # alongside per-entity netflow expansion.
+  per_symbol_cex_flow_enabled: true
+  per_symbol_cex_flow_penalty: 0.25                # same conservative default as flow_alignment
+  per_symbol_cex_flow_noise_floor_usd: 5000000.0   # $5M — token volume on 1h bucket noisier than macro stablecoin pulse
 
   # Safety / budget controls.
   api_usage_auto_disable_pct: 95.0

@@ -15,13 +15,58 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 - **Execution:** post-only limit → regular limit → market-at-edge fallback. Single-leg OCO SL/TP at hard **1:2 RR** (tightened 1:3→1:2 on 2026-04-21 eve; partial TP disabled 2026-04-19 late-night — see changelog; `move_sl_to_be_after_tp1` flag kept but inert while partial off). Dynamic TP revision re-anchors the runner OCO to `entry ± 2 × sl_distance` every cycle, floor at 1.0R. **MFE-triggered SL lock (Option A, 2026-04-20)**: once MFE ≥ 1.3R (scaled from 2R when RR cap tightened), the runner OCO's SL is pulled to entry (+fee buffer) so the remaining 0.7R of target is risk-free. One-shot per position. **Maker-TP resting limit (2026-04-20)**: post-only reduce-only limit sits at TP price alongside the OCO — captures wicks as maker, avoids market-trigger latency.
 - **Sizing:** fee-aware ceil on per-contract total cost so total realized SL loss (price + fee reserve) ≥ target_risk across every symbol (2026-04-19 late-night-2). Overshoot bounded by one per-contract step (< $3 per position). Operator override via `RISK_AMOUNT_USDT` env (2026-04-20) bypasses percent-mode sizing; 10%-of-balance safety ceiling.
 - **Journal:** async SQLite, schema v3 (+ `on_chain_context`, `demo_artifact`). `rejected_signals` table with counter-factual outcome pegging. Separate `on_chain_snapshots` time-series table captures every Arkham state mutation for Phase 9 trade-lifetime joins.
-- **On-chain (Arkham):** runtime soft signals only — daily bias ±15%, hourly stablecoin pulse +0.75 threshold penalty, altcoin-index +0.5 penalty on misaligned altcoin trades, **flow_alignment** soft directional signal combining stablecoin + BTC/ETH netflow (default penalty 0.25, Pass 2'de tune). **Whale hard gate removed 2026-04-22 (gece)**; WS listener now streams events to `whale_transfers` journal table for Phase 9 GBT directional learning. Credit-safe via v2 persistent WS streams + filter-fingerprint cache. Journal-only enrichment: per-entity 24h netflow (Coinbase/Binance/Bybit) + per-symbol 1h CEX volume. See changelog for re-eval triggers.
-- **Tests:** 967, all green. Demo-runnable end-to-end.
+- **On-chain (Arkham):** runtime soft signals — daily bias ±15%, hourly stablecoin pulse +0.75 threshold penalty, altcoin-index +0.5 penalty on misaligned altcoin trades, **flow_alignment** soft directional signal combining stablecoin + BTC/ETH + Coinbase/Binance/Bybit 24h netflow (weights 0.25/0.25/0.15/0.15/0.10/0.10, default penalty 0.25), **per_symbol_cex_flow** soft penalty on misaligned token flow (default penalty 0.25, $5M noise floor). **Whale hard gate removed 2026-04-22 (gece)**; WS listener streams events to `whale_transfers` journal table for Phase 9 GBT directional learning. Credit-safe via v2 persistent WS streams + filter-fingerprint cache. Per-entity netflow + per-symbol 1h volume promoted from journal-only to runtime 2026-04-22 (gece, late). All Arkham weights Pass 2'de tune. See changelog for re-eval triggers.
+- **Tests:** 1011, all green. Demo-runnable end-to-end.
 - **Data cutoff (`rl.clean_since`):** `2026-04-19T19:55:00Z` (bumped after ceil sizing flipped — realized-R distribution shifts from clustered-below-target to clustered-at-or-above-target). Arkham activation did NOT bump — dataset segments by `arkham_active` categorical.
 
 ---
 
 ## Changelog
+
+### 2026-04-22 (gece, late) — Arkham journal-only → runtime promotion (per-entity netflow + per-symbol CEX volume) + confluence threshold 3 → 3.75
+
+**Trigger:** operator wants a CLEAN restart where every new data row has every Arkham feature populated uniformly, so that Pass 2 tuning isn't hamstrung by mixed-feature coverage like Pass 1 was. The FAZ 2 (per-entity 24h netflow Coinbase/Binance/Bybit) and FAZ 3 (per-symbol 1h CEX volume) additions from 2026-04-22 afternoon were shipped journal-only pending Phase 9 GBT validation; promoting them now means the restart kicks off with ALL Arkham signals active and journalled, so Pass 2 GBT has one uniform dataset to learn from.
+
+**flow_alignment extended 3 → 6 inputs.** [src/strategy/entry_signals.py:_flow_alignment_score](src/strategy/entry_signals.py)
+- Previous 3-input weights (stables 0.4, BTC 0.4, ETH 0.2) rebalanced to six:
+  - stablecoin pulse **0.25** (hourly, natural sign: IN=bullish)
+  - BTC netflow **0.25** (daily, inverted: OUT=bullish)
+  - ETH netflow **0.15** (daily, inverted)
+  - Coinbase netflow **0.15** (daily, inverted; highest per-entity weight — "Coinbase premium" institutional pattern is well-established in crypto regime analysis)
+  - Binance netflow **0.10** (daily, inverted; ~Asia retail, noisier)
+  - Bybit netflow **0.10** (daily, inverted; leverage/derivatives flow)
+- Sum still 1.0; score still [-1, +1]; penalty pattern unchanged (`penalty × |score|` additive bump when misaligned).
+- Runner (`src/bot/runner.py`) now pulls all 3 per-entity values from `ctx.on_chain_snapshot.cex_{coinbase,binance,bybit}_netflow_24h_usd` and forwards via 3 new kwargs on `build_trade_plan_with_reason`.
+
+**`per_symbol_cex_flow_penalty` — NEW soft signal.** [src/strategy/entry_signals.py:_per_symbol_cex_flow_penalty](src/strategy/entry_signals.py)
+- Uses the traded symbol's OWN 1h token flow (`on_chain_snapshots.token_volume_1h_net_usd_json[symbol]`) as a directional check.
+- Semantic INVERSION from stablecoins: token flowing INTO CEX = BEARISH for symbol (selling setup); OUT = BULLISH (cold/DEX accumulation). Binary penalty (not magnitude-scaled, mirrors `_stablecoin_pulse_penalty` pattern) when misaligned above the noise floor.
+- Config: `per_symbol_cex_flow_enabled=true`, `per_symbol_cex_flow_penalty=0.25`, `per_symbol_cex_flow_noise_floor_usd=5_000_000.0`. Higher floor than flow_alignment because single-token 1h buckets see routine $1M moves.
+- Runner helper `_per_symbol_cex_flow_for(symbol)` parses the JSON dict per-cycle, returns None on missing key / bad JSON / absent snapshot.
+
+**Confluence threshold 3 → 3.75 (Pass 1 tune applied).** [config/default.yaml:min_confluence_score](config/default.yaml)
+- 42-trade threshold sweep from `scripts/tune_confluence.py` (Optuna, 300 trials):
+  - thr=3.00: n=42 WR=47.6% net=+13.46R
+  - thr=3.50: n=40 WR=50.0% net=+15.67R
+  - thr=3.75: n=37 WR=51.4% net=+16.08R ← operator pick
+  - thr=4.00: n=31 WR=48.4% net= +7.35R (over-filter)
+- Cuts 5 trades (4 losses, 1 win) from the historical window; +3.8pp WR shift on the dataset.
+- Re-eval trigger: after 30 new closed trades post-restart — if accept rate drops below 0.5/day sustained, retreat to 3.5. Pass 2 tunes per-symbol thresholds once uniform Arkham coverage gives enough stratification.
+
+**Pass 2 surface expanded.** Now Pass 2 Optuna knob set will cover:
+- All 6 flow_alignment input weights (currently hardcoded ratios)
+- `flow_alignment_penalty` + `flow_alignment_noise_floor_usd`
+- `per_symbol_cex_flow_penalty` + `per_symbol_cex_flow_noise_floor_usd`
+- All previously planned: Arkham modifier deltas + per-pillar weights (via `confluence_pillar_scores` journaling)
+
+**Dataset contract — `rl.clean_since` still UNCHANGED.** Will bump to restart-timestamp in Phase G (operator restart). Post-restart: uniform Arkham coverage on every row, flow_alignment scores computed per-cycle, per-symbol flow penalty active, per-pillar scores captured. Exactly the uniform-feature dataset Pass 2 needs.
+
+**Re-eval triggers (added):**
+1. **Per-symbol flow hit rate** — fraction of entries where `|per_symbol_netflow|` ≥ $5M. <10% → floor too high, tighten to $3M. >90% → floor too low, raise to $10M. Target: 30-60%.
+2. **Per-entity non-zero fraction on snapshot rows** — Coinbase/Binance/Bybit netflow column NULL fraction should be < 5% on post-restart rows. Higher = Arkham fetch failures; investigate `arkham_entity_flow_refresh_failed` log pattern.
+3. **flow_alignment score distribution** — median |score| should land 0.15-0.50 with full 6 inputs. If < 0.10 signals are cancelling (balanced market, harmless); if > 0.70 most trades penalty-hit (over-weighted, revisit `flow_alignment_penalty`).
+
+**Tests:** 1000 → **1011** (+11: 5 extended flow_alignment tests for new inputs, 9 new per_symbol_cex_flow tests; 3 prior flow_alignment tests removed because magnitude-specific). All pass.
 
 ### 2026-04-22 (gece) — Whale hard gate removed · flow_alignment soft signal · per-pillar journaling · Pass 1 tooling
 

@@ -1274,6 +1274,41 @@ class BotRunner:
             return None
         return bias.value
 
+    def _per_symbol_cex_flow_for(self, symbol: str) -> Optional[float]:
+        """Extract the per-symbol 1h CEX net flow (USD) from the Arkham
+        snapshot's JSON dict.
+
+        Snapshot stores `token_volume_1h_net_usd_json` as a JSON string
+        keyed by OKX perp symbol (e.g. "BTC-USDT-SWAP") with the most-recent-
+        hour `inUSD - outUSD` as float value. Returns None when:
+          * on_chain snapshot is absent (master off, or pre-first-refresh)
+          * JSON column missing / unparseable (legacy row or fetch failure)
+          * symbol not in the dict (Arkham coverage gap for that token)
+
+        Positive value = token flowing INTO CEX (bearish for symbol);
+        negative = flowing OUT (bullish). Downstream
+        `_per_symbol_cex_flow_penalty` applies the misalignment bump.
+        """
+        snap = self.ctx.on_chain_snapshot
+        if snap is None:
+            return None
+        raw = getattr(snap, "token_volume_1h_net_usd_json", None)
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        val = parsed.get(symbol)
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
+
     async def _record_reject(
         self,
         *,
@@ -1804,6 +1839,29 @@ class BotRunner:
                     self.ctx.on_chain_snapshot.cex_eth_netflow_24h_usd
                     if self.ctx.on_chain_snapshot is not None else None
                 ),
+                flow_alignment_coinbase_netflow_24h_usd=(
+                    self.ctx.on_chain_snapshot.cex_coinbase_netflow_24h_usd
+                    if self.ctx.on_chain_snapshot is not None else None
+                ),
+                flow_alignment_binance_netflow_24h_usd=(
+                    self.ctx.on_chain_snapshot.cex_binance_netflow_24h_usd
+                    if self.ctx.on_chain_snapshot is not None else None
+                ),
+                flow_alignment_bybit_netflow_24h_usd=(
+                    self.ctx.on_chain_snapshot.cex_bybit_netflow_24h_usd
+                    if self.ctx.on_chain_snapshot is not None else None
+                ),
+                # 2026-04-22 (gece, late) — per-symbol 1h CEX volume penalty.
+                # Looked up per-symbol from the snapshot's JSON dict.
+                per_symbol_cex_flow_enabled=(
+                    cfg.on_chain.enabled
+                    and cfg.on_chain.per_symbol_cex_flow_enabled
+                ),
+                per_symbol_cex_flow_usd=self._per_symbol_cex_flow_for(symbol),
+                per_symbol_cex_flow_noise_floor_usd=(
+                    cfg.on_chain.per_symbol_cex_flow_noise_floor_usd),
+                per_symbol_cex_flow_penalty=(
+                    cfg.on_chain.per_symbol_cex_flow_penalty),
             )
         except Exception:
             logger.exception("plan_build_failed symbol={}", symbol)

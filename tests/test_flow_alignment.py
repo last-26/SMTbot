@@ -1,16 +1,21 @@
-"""Tests for the Arkham flow-alignment soft directional signal (2026-04-22).
+"""Tests for the Arkham flow-alignment soft directional signal.
+
+Shipped 2026-04-22 (gece) as whale-hard-gate replacement; extended
+2026-04-22 (gece, late) with per-entity Coinbase/Binance/Bybit inputs
+when those journal-only columns were promoted to runtime.
 
 Covers the two pure helpers in `src.strategy.entry_signals`:
 
-  * `_flow_alignment_score` — combines stablecoin pulse + BTC + ETH 24h
-    netflow into a single [-1, +1] directional score.
+  * `_flow_alignment_score` — combines six inputs (stablecoin pulse +
+    BTC/ETH + Coinbase/Binance/Bybit 24h netflow) into [-1, +1].
+    Weights: stables 0.25, BTC 0.25, ETH 0.15, Coinbase 0.15, Binance 0.10,
+    Bybit 0.10 (sum = 1.0). BTC/ETH and all per-entity netflows use
+    INVERTED sign (OUT=bullish); stablecoin pulse uses natural (IN=bullish).
   * `_flow_alignment_penalty` — additive confluence-threshold bump when
     the score opposes the proposed direction.
 
 Plus one integration test that exercises the penalty via
-`generate_entry_intent` — a setup that would normally clear the confluence
-threshold should reject once the bump pushes the effective threshold above
-the raw score.
+`generate_entry_intent`.
 """
 
 from __future__ import annotations
@@ -49,71 +54,113 @@ def test_score_all_below_noise_floor():
 
 
 def test_score_strong_bullish():
-    """Stables in (+), BTC out (-), ETH out (-) → full +1.0.
+    """All six signals bullish-aligned → full +1.0.
 
-    All three signals contribute to the bullish side: sum of weights
-    is 0.4 + 0.4 + 0.2 = 1.0 exactly.
+    Weights sum to exactly 1.0 (0.25 + 0.25 + 0.15 + 0.15 + 0.10 + 0.10).
+    Stables IN (+), everything else OUT (-) → each direction input = +1.
     """
     score = _flow_alignment_score(
         stablecoin_pulse_1h_usd=+50_000_000.0,
         btc_netflow_24h_usd=-100_000_000.0,
         eth_netflow_24h_usd=-30_000_000.0,
+        coinbase_netflow_24h_usd=-20_000_000.0,
+        binance_netflow_24h_usd=-40_000_000.0,
+        bybit_netflow_24h_usd=-10_000_000.0,
     )
     assert score == pytest.approx(1.0)
 
 
 def test_score_strong_bearish():
-    """Stables out (-), BTC in (+), ETH in (+) → full -1.0."""
+    """All six signals bearish-aligned → full -1.0."""
     score = _flow_alignment_score(
         stablecoin_pulse_1h_usd=-50_000_000.0,
         btc_netflow_24h_usd=+100_000_000.0,
         eth_netflow_24h_usd=+30_000_000.0,
+        coinbase_netflow_24h_usd=+20_000_000.0,
+        binance_netflow_24h_usd=+40_000_000.0,
+        bybit_netflow_24h_usd=+10_000_000.0,
     )
     assert score == pytest.approx(-1.0)
 
 
-def test_score_mixed_neutral():
-    """Stables bullish (+0.4), BTC inflow bearish (-0.4), ETH inflow
-    bearish (-0.2). Net = -0.2.
+def test_score_only_three_old_inputs():
+    """Legacy 3-input call (stables + BTC + ETH, per-entity = None).
 
-    Reminder: BTC/ETH signs are INVERTED (inflow = bearish, outflow = bullish).
+    Sum of these three weights is 0.25 + 0.25 + 0.15 = 0.65. All three
+    bullish → 0.65 (not 1.0 anymore). Bearish → -0.65.
+    """
+    bullish = _flow_alignment_score(
+        +50_000_000.0, -100_000_000.0, -30_000_000.0,
+    )
+    assert bullish == pytest.approx(0.65)
+    bearish = _flow_alignment_score(
+        -50_000_000.0, +100_000_000.0, +30_000_000.0,
+    )
+    assert bearish == pytest.approx(-0.65)
+
+
+def test_score_mixed_neutral():
+    """Stables bullish (+0.25), BTC inflow bearish (-0.25), ETH inflow
+    bearish (-0.15). Net = -0.15.
+
+    Reminder: BTC/ETH/entity signs INVERTED; stablecoin natural.
     """
     score = _flow_alignment_score(
-        stablecoin_pulse_1h_usd=+10_000_000.0,  # bullish (+0.4)
-        btc_netflow_24h_usd=+10_000_000.0,      # inverted → bearish (-0.4)
-        eth_netflow_24h_usd=+10_000_000.0,      # inverted → bearish (-0.2)
+        stablecoin_pulse_1h_usd=+10_000_000.0,  # bullish (+0.25)
+        btc_netflow_24h_usd=+10_000_000.0,      # inverted → bearish (-0.25)
+        eth_netflow_24h_usd=+10_000_000.0,      # inverted → bearish (-0.15)
     )
-    assert score == pytest.approx(-0.2)
+    assert score == pytest.approx(-0.15)
+
+
+def test_score_per_entity_contribution():
+    """Only per-entity inputs fire — verify their weight sums to 0.35."""
+    # All three entities bullish (outflow) → 0.15 + 0.10 + 0.10 = 0.35.
+    all_entities = _flow_alignment_score(
+        None, None, None,
+        coinbase_netflow_24h_usd=-20_000_000.0,
+        binance_netflow_24h_usd=-40_000_000.0,
+        bybit_netflow_24h_usd=-10_000_000.0,
+    )
+    assert all_entities == pytest.approx(0.35)
+    # Coinbase alone bullish → 0.15.
+    only_coinbase = _flow_alignment_score(
+        None, None, None,
+        coinbase_netflow_24h_usd=-20_000_000.0,
+    )
+    assert only_coinbase == pytest.approx(0.15)
 
 
 def test_score_clamps_to_unit_range():
-    """Score always in [-1, +1].
+    """Score always in [-1, +1] regardless of sign combo.
 
-    With each `_sign()` contributing -1, 0, or +1 and weights summing to
-    exactly 1.0, the raw arithmetic already lives in [-1, +1], but the
-    helper wraps `max(-1.0, min(1.0, score))` as a safety belt. Exercise
-    every sign combination and assert it stays in-range.
+    With weights summing to 1.0, raw arithmetic is already in-range,
+    but the helper wraps `max(-1.0, min(1.0, ...))` as a safety belt.
+    Exhaustively cover 3^6 = 729 sign combinations. With 6 inputs this
+    is still tractable for a unit test.
     """
     signed_magnitudes = (+10_000_000.0, 0.0, -10_000_000.0)
-    # None is treated as 0 too — covered by test_score_all_zero_on_none_inputs.
     for stables in signed_magnitudes:
         for btc in signed_magnitudes:
             for eth in signed_magnitudes:
-                score = _flow_alignment_score(stables, btc, eth)
-                assert -1.0 <= score <= 1.0, (stables, btc, eth, score)
-    # Extremes still clamp.
-    assert _flow_alignment_score(
-        +50_000_000.0, -100_000_000.0, -30_000_000.0) == pytest.approx(1.0)
-    assert _flow_alignment_score(
-        -50_000_000.0, +100_000_000.0, +30_000_000.0) == pytest.approx(-1.0)
+                for coinbase in signed_magnitudes:
+                    for binance in signed_magnitudes:
+                        for bybit in signed_magnitudes:
+                            score = _flow_alignment_score(
+                                stables, btc, eth,
+                                coinbase_netflow_24h_usd=coinbase,
+                                binance_netflow_24h_usd=binance,
+                                bybit_netflow_24h_usd=bybit,
+                            )
+                            assert -1.0 <= score <= 1.0
 
 
 def test_score_custom_noise_floor():
     """A larger `noise_floor_usd` swallows otherwise-signed inputs."""
-    # Default floor 1M → $5M would ordinarily be a bullish signal.
+    # Default floor 1M → stables $5M at weight 0.25 → +0.25.
     baseline = _flow_alignment_score(+5_000_000.0, None, None)
-    assert baseline == pytest.approx(0.4)  # stables bullish (+0.4 weight)
-    # Raise the floor above $5M → input drops out → score 0.
+    assert baseline == pytest.approx(0.25)
+    # Raise the floor above $5M → input drops out → 0.
     muted = _flow_alignment_score(
         +5_000_000.0, None, None,
         noise_floor_usd=10_000_000.0,

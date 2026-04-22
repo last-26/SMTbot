@@ -394,26 +394,41 @@ def _flow_alignment_score(
     btc_netflow_24h_usd: Optional[float],
     eth_netflow_24h_usd: Optional[float],
     noise_floor_usd: float = 1_000_000.0,
+    coinbase_netflow_24h_usd: Optional[float] = None,
+    binance_netflow_24h_usd: Optional[float] = None,
+    bybit_netflow_24h_usd: Optional[float] = None,
 ) -> float:
     """Return a directional alignment score in [-1, +1].
 
-    Combines three Arkham signals into a single directional bias:
-      * +1 → strong bullish alignment (stablecoin inflow + BTC/ETH outflow
-        from CEX; cash arriving, supply leaving)
-      * -1 → strong bearish alignment (stables leaving + BTC/ETH arriving;
-        profit taking pattern)
+    Combines up to six Arkham signals into a single directional bias:
+      * +1 → strong bullish alignment (stablecoin inflow + BTC/ETH/entity
+        outflow from CEX; cash arriving, supply leaving)
+      * -1 → strong bearish alignment (stables leaving + BTC/ETH/entity
+        arriving; profit taking pattern)
       *  0 → neutral / conflicting / insufficient data
 
-    Weights: stables 0.4, BTC 0.4, ETH 0.2 (BTC is market leader; stables
-    are timeliest because refreshed hourly vs 24h for BTC/ETH).
+    Weights (sum = 1.0):
+      * stablecoin_pulse    0.25  — hourly, timeliest signal
+      * BTC netflow         0.25  — market leader, daily cadence
+      * ETH netflow         0.15  — secondary leader
+      * Coinbase netflow    0.15  — "Coinbase premium" institutional pattern
+      * Binance netflow     0.10  — primarily Asia retail, noisier
+      * Bybit netflow       0.10  — leverage/derivatives flow
+
+    BTC/ETH and all per-entity netflows use INVERTED sign semantics: a
+    negative (OUT of CEX) value is bullish, because supply is being
+    withdrawn. Stablecoin pulse uses natural sign: positive (IN to CEX)
+    is bullish, because buying power is arriving.
 
     Each input below `noise_floor_usd` contributes 0 (not ±1), so low-
     magnitude flow ticks don't drag the score around. None inputs also
     contribute 0 — fail-open when Arkham data is missing.
 
-    2026-04-22: new signal replacing the whale-transfer hard gate's
-    directional intuition. Ships with default weight in Pass 1; tuned
-    in Pass 2 against uniform-coverage dataset.
+    2026-04-22 (gece): initial 3-input version (stable + BTC + ETH) shipped
+    with whale hard-gate removal. 2026-04-22 (gece, late): extended with
+    Coinbase + Binance + Bybit per-entity netflow when those journal-only
+    columns were promoted to runtime ahead of the Pass 1 clean-restart.
+    Pass 2 re-tunes all weights on uniform-coverage data.
     """
     def _sign(x: Optional[float]) -> int:
         if x is None:
@@ -423,10 +438,20 @@ def _flow_alignment_score(
         return 1 if x > 0 else -1
 
     stable_dir = _sign(stablecoin_pulse_1h_usd)
-    # BTC/ETH flowing OUT of CEX (negative netflow) is bullish → invert.
+    # BTC/ETH + per-entity netflows: OUT of CEX (negative) is bullish → invert.
     btc_dir = -_sign(btc_netflow_24h_usd)
     eth_dir = -_sign(eth_netflow_24h_usd)
-    score = 0.4 * stable_dir + 0.4 * btc_dir + 0.2 * eth_dir
+    coinbase_dir = -_sign(coinbase_netflow_24h_usd)
+    binance_dir = -_sign(binance_netflow_24h_usd)
+    bybit_dir = -_sign(bybit_netflow_24h_usd)
+    score = (
+        0.25 * stable_dir
+        + 0.25 * btc_dir
+        + 0.15 * eth_dir
+        + 0.15 * coinbase_dir
+        + 0.10 * binance_dir
+        + 0.10 * bybit_dir
+    )
     return max(-1.0, min(1.0, score))
 
 
@@ -455,6 +480,49 @@ def _flow_alignment_penalty(
     if dir_sign * score >= 0.0:
         return 0.0
     return float(penalty) * abs(float(score))
+
+
+def _per_symbol_cex_flow_penalty(
+    *,
+    direction: Direction,
+    symbol_netflow_1h_usd: Optional[float],
+    noise_floor_usd: float,
+    penalty: float,
+) -> float:
+    """Additive confluence-threshold bump when the traded symbol's own
+    1h CEX volume opposes the proposed direction.
+
+    Semantics (tokens behave OPPOSITE to stablecoins here):
+      * Token flowing INTO exchange (positive netflow) → preparing to
+        sell → BEARISH for that symbol.
+      * Token flowing OUT (negative netflow) → moving to cold / DEX →
+        BULLISH for that symbol.
+    So:
+      * Long + netflow ≥ +floor  → misaligned, +penalty
+      * Short + netflow ≤ -floor → misaligned, +penalty
+      * Aligned / below floor / None → 0
+
+    Data source: `on_chain_snapshots.token_volume_1h_net_usd_json[symbol]`
+    from Arkham `/token/volume/{id}?granularity=1h`. Journal-only until
+    2026-04-22 (gece, late) when promoted to runtime ahead of the
+    Pass 1 clean restart.
+
+    `noise_floor_usd` defaults to $5M in YAML (token volume is noisier
+    than stablecoin pulse — token prints in $1M range are routine).
+    """
+    if penalty <= 0.0:
+        return 0.0
+    if symbol_netflow_1h_usd is None:
+        return 0.0
+    magnitude = abs(symbol_netflow_1h_usd)
+    if magnitude < float(noise_floor_usd):
+        return 0.0
+    is_long = direction == Direction.BULLISH
+    misaligned = (
+        (is_long and symbol_netflow_1h_usd >= float(noise_floor_usd))
+        or (not is_long and symbol_netflow_1h_usd <= -float(noise_floor_usd))
+    )
+    return float(penalty) if misaligned else 0.0
 
 
 def _altcoin_index_penalty(
@@ -535,6 +603,13 @@ def generate_entry_intent(
     flow_alignment_noise_floor_usd: float = 1_000_000.0,
     flow_alignment_btc_netflow_24h_usd: Optional[float] = None,
     flow_alignment_eth_netflow_24h_usd: Optional[float] = None,
+    flow_alignment_coinbase_netflow_24h_usd: Optional[float] = None,
+    flow_alignment_binance_netflow_24h_usd: Optional[float] = None,
+    flow_alignment_bybit_netflow_24h_usd: Optional[float] = None,
+    per_symbol_cex_flow_enabled: bool = False,
+    per_symbol_cex_flow_usd: Optional[float] = None,
+    per_symbol_cex_flow_noise_floor_usd: float = 5_000_000.0,
+    per_symbol_cex_flow_penalty: float = 0.0,
 ) -> Optional[EntryIntent]:
     """Compute confluence + pick an SL. Returns None when not tradable."""
     if state.current_price <= 0:
@@ -590,11 +665,21 @@ def generate_entry_intent(
             btc_netflow_24h_usd=flow_alignment_btc_netflow_24h_usd,
             eth_netflow_24h_usd=flow_alignment_eth_netflow_24h_usd,
             noise_floor_usd=flow_alignment_noise_floor_usd,
+            coinbase_netflow_24h_usd=flow_alignment_coinbase_netflow_24h_usd,
+            binance_netflow_24h_usd=flow_alignment_binance_netflow_24h_usd,
+            bybit_netflow_24h_usd=flow_alignment_bybit_netflow_24h_usd,
         )
         effective_min_conf += _flow_alignment_penalty(
             direction=confluence.direction,
             score=alignment,
             penalty=flow_alignment_penalty,
+        )
+    if per_symbol_cex_flow_enabled:
+        effective_min_conf += _per_symbol_cex_flow_penalty(
+            direction=confluence.direction,
+            symbol_netflow_1h_usd=per_symbol_cex_flow_usd,
+            noise_floor_usd=per_symbol_cex_flow_noise_floor_usd,
+            penalty=per_symbol_cex_flow_penalty,
         )
     if not confluence.is_tradable(effective_min_conf):
         return None
@@ -822,13 +907,27 @@ def build_trade_plan_with_reason(
     # 2026-04-22 — flow_alignment soft signal. Replaces whale-blackout
     # directional intuition. Misaligned direction pays additive threshold
     # penalty scaled by |score|. Stablecoin input reuses
-    # `stablecoin_pulse_usd`; BTC/ETH netflow come from the Arkham
-    # daily snapshot (UTC-day completed series).
+    # `stablecoin_pulse_usd`; BTC/ETH netflow + per-entity (Coinbase/
+    # Binance/Bybit) netflow come from the Arkham daily snapshot
+    # (UTC-day completed series). Per-entity inputs added 2026-04-22
+    # (gece, late) when those journal-only columns were promoted to
+    # runtime ahead of the Pass 1 clean restart.
     flow_alignment_enabled: bool = False,
     flow_alignment_penalty: float = 0.0,
     flow_alignment_noise_floor_usd: float = 1_000_000.0,
     flow_alignment_btc_netflow_24h_usd: Optional[float] = None,
     flow_alignment_eth_netflow_24h_usd: Optional[float] = None,
+    flow_alignment_coinbase_netflow_24h_usd: Optional[float] = None,
+    flow_alignment_binance_netflow_24h_usd: Optional[float] = None,
+    flow_alignment_bybit_netflow_24h_usd: Optional[float] = None,
+    # 2026-04-22 (gece, late) — per-symbol 1h CEX volume penalty.
+    # Symbol's own token flow: INTO CEX = bearish for that symbol, OUT = bullish.
+    # Misaligned direction pays additive threshold bump. Source: Arkham
+    # `/token/volume/{id}?granularity=1h` most-recent-bucket `inUSD - outUSD`.
+    per_symbol_cex_flow_enabled: bool = False,
+    per_symbol_cex_flow_usd: Optional[float] = None,
+    per_symbol_cex_flow_noise_floor_usd: float = 5_000_000.0,
+    per_symbol_cex_flow_penalty: float = 0.0,
 ) -> tuple[Optional[TradePlan], str]:
     """Same as `build_trade_plan_from_state` but returns `(plan, reason)`.
 
@@ -899,6 +998,13 @@ def build_trade_plan_with_reason(
         flow_alignment_noise_floor_usd=flow_alignment_noise_floor_usd,
         flow_alignment_btc_netflow_24h_usd=flow_alignment_btc_netflow_24h_usd,
         flow_alignment_eth_netflow_24h_usd=flow_alignment_eth_netflow_24h_usd,
+        flow_alignment_coinbase_netflow_24h_usd=flow_alignment_coinbase_netflow_24h_usd,
+        flow_alignment_binance_netflow_24h_usd=flow_alignment_binance_netflow_24h_usd,
+        flow_alignment_bybit_netflow_24h_usd=flow_alignment_bybit_netflow_24h_usd,
+        per_symbol_cex_flow_enabled=per_symbol_cex_flow_enabled,
+        per_symbol_cex_flow_usd=per_symbol_cex_flow_usd,
+        per_symbol_cex_flow_noise_floor_usd=per_symbol_cex_flow_noise_floor_usd,
+        per_symbol_cex_flow_penalty=per_symbol_cex_flow_penalty,
     )
     if intent is None:
         # Distinguish the three upstream `generate_entry_intent` None paths.
@@ -944,11 +1050,21 @@ def build_trade_plan_with_reason(
                 btc_netflow_24h_usd=flow_alignment_btc_netflow_24h_usd,
                 eth_netflow_24h_usd=flow_alignment_eth_netflow_24h_usd,
                 noise_floor_usd=flow_alignment_noise_floor_usd,
+                coinbase_netflow_24h_usd=flow_alignment_coinbase_netflow_24h_usd,
+                binance_netflow_24h_usd=flow_alignment_binance_netflow_24h_usd,
+                bybit_netflow_24h_usd=flow_alignment_bybit_netflow_24h_usd,
             )
             effective_min_conf += _flow_alignment_penalty(
                 direction=conf.direction,
                 score=alignment,
                 penalty=flow_alignment_penalty,
+            )
+        if per_symbol_cex_flow_enabled:
+            effective_min_conf += _per_symbol_cex_flow_penalty(
+                direction=conf.direction,
+                symbol_netflow_1h_usd=per_symbol_cex_flow_usd,
+                noise_floor_usd=per_symbol_cex_flow_noise_floor_usd,
+                penalty=per_symbol_cex_flow_penalty,
             )
         if not conf.is_tradable(effective_min_conf):
             return None, "below_confluence"

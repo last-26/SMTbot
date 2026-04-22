@@ -538,10 +538,15 @@ class OnChainConfig(BaseModel):
         Legacy name preserved to avoid YAML migration; rename tracked as
         Pass 2 cleanup.
       * flow_alignment_enabled     — 2026-04-22: soft directional signal.
-        Combines stablecoin pulse + BTC/ETH netflow into a score [-1, +1];
-        misaligned direction pays additive penalty on min_confluence.
-        Default-weighted (no tuning in Pass 1). Tuned in Pass 2 once
-        Arkham coverage is uniform across the dataset.
+        Combines stablecoin pulse + BTC/ETH + Coinbase/Binance/Bybit
+        netflow into a score [-1, +1]; misaligned direction pays additive
+        penalty on min_confluence. Per-entity inputs added late-gece as
+        journal-only promotion. Default-weighted (no tuning in Pass 1).
+        Tuned in Pass 2 once Arkham coverage is uniform across dataset.
+      * per_symbol_cex_flow_enabled — 2026-04-22 (gece, late): per-symbol
+        1h CEX volume penalty. Symbol's own token INTO CEX = bearish /
+        OUT = bullish; misaligned direction pays additive threshold bump.
+        Default-weighted; tuned in Pass 2.
     Phase B (journal enrichment) is always-on when `enabled=true` — no
     separate flag, the `on_chain_context` JSON column just stays NULL
     whenever the snapshot is unavailable.
@@ -610,20 +615,40 @@ class OnChainConfig(BaseModel):
     altcoin_index_refresh_s: int = 3600
 
     # 2026-04-22 (gece) — flow_alignment soft directional signal.
-    # Combines `stablecoin_pulse_1h_usd` + `cex_btc_netflow_24h_usd` +
-    # `cex_eth_netflow_24h_usd` into a [-1, +1] score: +1 = bullish
-    # aligned (stables INflow + BTC/ETH OUTflow from CEX), -1 = bearish
-    # aligned. Misaligned direction (long on bearish score OR short on
-    # bullish score) pays additive penalty on `min_confluence_score`.
-    # Default-weighted for Pass 1 (no tuning on current 41 trades, where
-    # Arkham coverage is inconsistent). Pass 2 will tune penalty +
-    # noise_floor against a uniform Arkham-coverage dataset.
+    # Combines six Arkham inputs into a [-1, +1] directional score:
+    #   stablecoin pulse (0.25)  — hourly, natural sign (IN=bullish)
+    #   BTC netflow      (0.25)  — daily, inverted (OUT=bullish)
+    #   ETH netflow      (0.15)  — daily, inverted
+    #   Coinbase netflow (0.15)  — daily, inverted ("Coinbase premium" pattern)
+    #   Binance netflow  (0.10)  — daily, inverted
+    #   Bybit netflow    (0.10)  — daily, inverted
+    # Per-entity inputs (Coinbase/Binance/Bybit) added 2026-04-22 (gece,
+    # late) when their journal-only columns were promoted to runtime ahead
+    # of the Pass 1 clean restart. Misaligned direction (long on bearish
+    # score OR short on bullish score) pays additive penalty on
+    # `min_confluence_score`, scaled linearly by `|score|`. Default-
+    # weighted for Pass 1 (no tuning on current 42 trades where Arkham
+    # coverage is inconsistent). Pass 2 tunes penalty + noise_floor +
+    # individual weights against uniform-coverage dataset.
     flow_alignment_enabled: bool = True
     flow_alignment_penalty: float = 0.25
     # Signals below this USD magnitude treated as noise → contribute 0
     # (not +1 / -1) to the score, regardless of sign. Prevents random
     # sub-$1M flow ticks from dragging the signal around.
     flow_alignment_noise_floor_usd: float = 1_000_000.0
+
+    # 2026-04-22 (gece, late) — per-symbol 1h CEX volume penalty.
+    # Unlike stablecoins, token flowing INTO exchange is BEARISH for that
+    # symbol (selling setup), OUT is BULLISH (cold/DEX accumulation).
+    # Misaligned direction on the traded symbol pays additive threshold
+    # bump. Source: Arkham `/token/volume/{id}?granularity=1h`
+    # most-recent bucket's `inUSD - outUSD` (positive = net inflow).
+    # Promoted to runtime alongside per-entity netflow expansion.
+    per_symbol_cex_flow_enabled: bool = True
+    per_symbol_cex_flow_penalty: float = 0.25
+    # Higher floor than flow_alignment: token volume on a 1h bucket is
+    # noisier than macro stablecoin pulse ($1M moves are routine).
+    per_symbol_cex_flow_noise_floor_usd: float = 5_000_000.0
 
     # 2026-04-22 — per-entity (Coinbase + Binance + Bybit) 24h netflow.
     # Refreshes on the same UTC-day cadence as `daily_macro_bias`.
@@ -664,7 +689,9 @@ class OnChainConfig(BaseModel):
                      "stablecoin_pulse_threshold_usd",
                      "stablecoin_pulse_penalty",
                      "flow_alignment_penalty",
-                     "flow_alignment_noise_floor_usd")
+                     "flow_alignment_noise_floor_usd",
+                     "per_symbol_cex_flow_penalty",
+                     "per_symbol_cex_flow_noise_floor_usd")
     @classmethod
     def _non_negative(cls, v: float) -> float:
         if v < 0:

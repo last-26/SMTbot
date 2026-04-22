@@ -46,15 +46,20 @@ class OnChainSnapshot:
     coinbase_asia_skew_usd: Optional[float] = None  # legacy / unused
     bnb_self_flow_24h_usd: Optional[float] = None  # legacy / unused
     # 2026-04-22 — per-entity 24h netflow (last completed UTC day) via
-    # `/flow/entity/{entity}`. Journal-only; does NOT participate in any
-    # gate or modifier. Phase 9 GBT will test predictive value before any
-    # runtime wiring.
+    # `/flow/entity/{entity}`. Initially journal-only; promoted to runtime
+    # 2026-04-22 (gece, late) as additional inputs to the flow_alignment
+    # soft signal ahead of the Pass 1 clean restart. Coinbase/Binance/Bybit
+    # weights: 0.15 / 0.10 / 0.10 in `_flow_alignment_score` (vs 0.25
+    # each for BTC and stablecoin pulse).
     cex_coinbase_netflow_24h_usd: Optional[float] = None
     cex_binance_netflow_24h_usd: Optional[float] = None
     cex_bybit_netflow_24h_usd: Optional[float] = None
     # 2026-04-22 — per-symbol most-recent-hour net CEX flow (USD) via
     # `/token/volume/{id}?granularity=1h`. JSON dict keyed by OKX symbol;
-    # adding a 6th symbol won't require schema migration. Journal-only.
+    # adding a 6th symbol won't require schema migration. Initially
+    # journal-only; promoted to runtime 2026-04-22 (gece, late) as the
+    # `per_symbol_cex_flow_penalty` soft signal (per-symbol directional
+    # bias: IN=bearish, OUT=bullish for the traded token).
     token_volume_1h_net_usd_json: Optional[str] = None
     snapshot_age_s: int = 0
     stale_threshold_s: int = 7200
