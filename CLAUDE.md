@@ -23,6 +23,20 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 
 ## Changelog
 
+### 2026-04-22 (eve) — Pending limit hard-gate early-cancel
+
+- **Trigger:** operator observation that limit entries sit pending for up to 7 bars (21 min on 3m) without ANY mid-flight checks. When market sharply turns mid-pending (whale event, BTC+ETH consensus flip, momentum reversal, VWAP cross), the limit fills at a no-longer-favorable level and trade goes straight to stop. Five overnight wins were ALSO accompanied by losers that filled into reversed conditions.
+- **Fix — pure consistency, no new strategy:** the same HARD veto gates that reject a NEW entry now also invalidate WAITING entries. New helper `evaluate_pending_invalidation_gates` in [src/strategy/entry_signals.py](src/strategy/entry_signals.py) re-runs `vwap_misaligned → ema_momentum_contra → cross_asset_opposition → whale_transfer_blackout` against current state for any pending limit. First failing gate triggers cancel.
+- **Runner integration — `_maybe_invalidate_pending_for`** ([src/bot/runner.py](src/bot/runner.py)): called from `_run_one_symbol` BEFORE the existing pending-skip dedup. Cancel reason carries the specific gate (`hard_gate:vwap_misaligned`); `_handle_pending_canceled` maps all `hard_gate:*` reasons to the new `pending_hard_gate_invalidated` rejected_signals reason for Phase 9 segment-by-cause analysis.
+- **Deliberately NOT included:** confluence rescore (pullback strategy expects natural confluence fluctuation during the wait), price-drift cancel (price moving away IS the pullback by design), HTF S/R ceiling check (relevant only at entry plan time). Only "would now reject a NEW entry of the same direction" cases trigger cancel.
+- **Failure isolation:** helper exceptions log + swallow; cancel-call exceptions log + swallow. Worst case: pending sits one extra cycle. Never blocks the symbol's normal entry/exit flow.
+- **New reject reason:** `pending_hard_gate_invalidated` added to the unified vocabulary. Distinct from existing `pending_invalidated` (catches OKX-side cancellations) and `zone_timeout_cancel` (7-bar timeout).
+- **Re-eval triggers:**
+  1. Frequency check after ≥30 trades — `pending_hard_gate_invalidated` count vs `zone_timeout_cancel` count. If hard-gate fires more than 25% as often as timeout, the gates may be too aggressive (fail-positive on winners). If <5%, mid-pending market shifts may not be the real loss source — re-investigate.
+  2. Counter-factual outcome via `peg_rejected_outcomes.py`: would these cancels have been winners? If the cancelled-pending counterfactual WR is materially better than the open-trade WR for the symbol, the gate is over-blocking. Targeted gate disable is then the right call.
+  3. Per-gate breakdown — log line `pending_hard_gate_invalidated symbol=... gate=...` carries the specific gate. If one gate dominates (e.g. 90% are `vwap_misaligned`), that gate's threshold may be too tight.
+- **Tests:** 978 passing (+10: 7 helper unit tests + 2 runner-cycle integration + 1 cancel/event-dispatch round-trip).
+
 ### 2026-04-22 (afternoon) — Arkham FAZ 2 expansion (WS budget + entity netflow + token volume)
 
 Three-part Arkham capability bump driven by trial-quota analysis (only 558/10k labels burned over 22 days; credits effectively unmetered on trial). Endpoint inventory + cost matrix probed via `scripts/probe_arkham.py`. **All shipped as journal-only data layers; zero runtime decision impact.** Phase 9 GBT decides predictive value before any wiring.
@@ -368,7 +382,7 @@ All config in `config/default.yaml` (self-documenting). Top-level sections: `bot
 
 **`.env` keys:** `OKX_API_KEY`, `OKX_API_SECRET`, `OKX_PASSPHRASE`, `OKX_DEMO_FLAG`, `COINALYZE_API_KEY`, `FINNHUB_API_KEY`, `ARKHAM_API_KEY`, `RISK_AMOUNT_USDT` (optional flat-$ override), `TV_MCP_PORT`, `LOG_LEVEL`.
 
-**Reject reasons (unified):** `below_confluence`, `no_setup_zone`, `wrong_side_of_premium_discount`, `vwap_misaligned`, `ema_momentum_contra`, `cross_asset_opposition`, `whale_transfer_blackout`, `session_filter`, `macro_event_blackout`, `crowded_skip`, `no_sl_source`, `zero_contracts`, `htf_tp_ceiling`, `tp_too_tight`, `insufficient_contracts_for_split`, `zone_timeout_cancel`, `pending_invalidated`. Sub-floor SL distances are **widened**, not rejected. Every reject writes to `rejected_signals` with `on_chain_context` JSON (when Arkham master on).
+**Reject reasons (unified):** `below_confluence`, `no_setup_zone`, `wrong_side_of_premium_discount`, `vwap_misaligned`, `ema_momentum_contra`, `cross_asset_opposition`, `whale_transfer_blackout`, `session_filter`, `macro_event_blackout`, `crowded_skip`, `no_sl_source`, `zero_contracts`, `htf_tp_ceiling`, `tp_too_tight`, `insufficient_contracts_for_split`, `zone_timeout_cancel`, `pending_invalidated`, `pending_hard_gate_invalidated` (2026-04-22 — mid-pending hard-gate flip). Sub-floor SL distances are **widened**, not rejected. Every reject writes to `rejected_signals` with `on_chain_context` JSON (when Arkham master on).
 
 **Circuit breakers (currently loosened for data collection):** `max_consecutive_losses=9999`, `max_daily_loss_pct=40`, `max_drawdown_pct=40`, `min_rr_ratio=1.5`. Restore to `5 / 15 / 25 / 2.0` after 20+ post-pivot closed trades.
 

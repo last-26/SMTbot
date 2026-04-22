@@ -90,6 +90,7 @@ from src.journal.database import TradeJournal
 from src.journal.derivatives_journal import DerivativesJournal
 from src.strategy.entry_signals import (
     build_trade_plan_with_reason,
+    evaluate_pending_invalidation_gates,
 )
 from src.strategy.risk_manager import RiskManager, TradeResult
 from src.strategy.setup_planner import (
@@ -955,6 +956,97 @@ class BotRunner:
                 return side
         return None
 
+    async def _maybe_invalidate_pending_for(
+        self, symbol: str, state: MarketState, candles: list,
+    ) -> None:
+        """2026-04-22 — Pending limit early-cancel on hard-gate flip.
+
+        For any pending limit waiting on `symbol`, re-run the same HARD veto
+        gates that decide a NEW entry. If a gate would now reject (sharp
+        market turn, whale event, momentum flip, VWAP cross during the
+        21-min wait), cancel the pending so we don't fill at a no-longer-
+        favorable level.
+
+        Pure consistency fix — same gates that reject NEW entries now also
+        invalidate WAITING entries. Confluence is NOT rescored (pullback
+        strategy expects natural confluence fluctuation while waiting). On
+        cancel, the journal records `pending_hard_gate_invalidated` with
+        the specific gate name carried via the cancel reason.
+
+        Failures here log + swallow so a hiccup never blocks the symbol's
+        normal cycle (worst case: pending sits one extra cycle).
+        """
+        cfg = self.ctx.config
+        # Find the pending for this symbol (at most one per side; usually one).
+        meta_keys = [k for k in self.ctx.pending_setups if k[0] == symbol]
+        if not meta_keys:
+            return
+        for key in meta_keys:
+            symbol_, pos_side = key
+            meta = self.ctx.pending_setups.get(key)
+            if meta is None:
+                continue
+            try:
+                gate_reason = evaluate_pending_invalidation_gates(
+                    state=state,
+                    candles=candles,
+                    direction=meta.plan.direction,
+                    entry_price=float(meta.plan.entry_price),
+                    pillar_opposition=self._pillar_opposition_for(symbol_),
+                    vwap_hard_veto_enabled=cfg.analysis.vwap_hard_veto_enabled,
+                    ema_veto_enabled=cfg.analysis.ema_veto_enabled,
+                    ema_veto_fast_period=cfg.analysis.ema_veto_fast_period,
+                    ema_veto_slow_period=cfg.analysis.ema_veto_slow_period,
+                    whale_blackout_enabled=(
+                        cfg.on_chain.enabled
+                        and cfg.on_chain.whale_blackout_enabled
+                    ),
+                    whale_blackout=self.ctx.whale_blackout_state,
+                    whale_blackout_symbol=symbol_,
+                )
+            except Exception:
+                logger.exception(
+                    "pending_gate_eval_failed symbol={} side={}",
+                    symbol_, pos_side,
+                )
+                continue
+            if gate_reason is None:
+                continue
+            # Hard gate flipped — cancel the pending. Pass gate_reason as
+            # cancel reason; `_handle_pending_canceled` maps it to a
+            # journal `pending_hard_gate_invalidated` reject reason.
+            logger.info(
+                "pending_hard_gate_invalidated symbol={} side={} order_id={} "
+                "gate={} entry_px={}",
+                symbol_, pos_side, meta.order_id, gate_reason,
+                meta.plan.entry_price,
+            )
+            try:
+                ev = await asyncio.to_thread(
+                    self.ctx.monitor.cancel_pending,
+                    symbol_, pos_side,
+                    reason=f"hard_gate:{gate_reason}",
+                )
+            except Exception:
+                logger.exception(
+                    "pending_hard_gate_cancel_failed symbol={} side={}",
+                    symbol_, pos_side,
+                )
+                continue
+            # `cancel_pending` returns the CANCELED event but does NOT
+            # queue it — only `poll_pending` events flow through
+            # `_process_pending`. We must dispatch the handler ourselves
+            # so the journal records a `pending_hard_gate_invalidated`
+            # rejected_signals row + the pending_setups slot is cleared.
+            if ev is not None:
+                try:
+                    await self._handle_pending_canceled(ev)
+                except Exception:
+                    logger.exception(
+                        "pending_hard_gate_handler_failed symbol={} side={}",
+                        symbol_, pos_side,
+                    )
+
     async def _maybe_revise_tp_dynamic(
         self, symbol: str, pos_side: str, state: MarketState,
     ) -> None:
@@ -1523,6 +1615,15 @@ class BotRunner:
         # already have a pending limit entry waiting for fill (Phase 7.C4).
         if any(k[0] == symbol for k in self.ctx.open_trade_ids):
             return
+        # 2026-04-22 — pending limit re-evaluation. Before short-circuiting,
+        # re-run the HARD veto gates against current state for any pending
+        # limit on this symbol. If the SAME setup wouldn't pass NOW
+        # (cross-asset flipped, whale event, momentum reversed, VWAP cross),
+        # cancel the pending so a fill at a no-longer-favorable level is
+        # avoided. Pure consistency fix — same gates that reject NEW
+        # entries now also invalidate WAITING entries. Confluence is NOT
+        # rescored (pullback strategy expects natural fluctuation).
+        await self._maybe_invalidate_pending_for(symbol, state, candles)
         if any(k[0] == symbol for k in self.ctx.pending_setups):
             return
 
@@ -2606,7 +2707,15 @@ class BotRunner:
             "manual": "pending_invalidated",
             "invalidated": "pending_invalidated",
         }
-        reject_reason = reason_map.get(ev.reason, "pending_invalidated")
+        # 2026-04-22 — hard-gate-driven cancels carry the specific gate
+        # name in `reason` as `hard_gate:<gate_name>`. Map all such
+        # variants to `pending_hard_gate_invalidated` so Phase 9 GBT can
+        # filter by this category specifically. The original gate name
+        # is preserved in the bot's log line at cancel time.
+        if ev.reason and ev.reason.startswith("hard_gate:"):
+            reject_reason = "pending_hard_gate_invalidated"
+        else:
+            reject_reason = reason_map.get(ev.reason, "pending_invalidated")
         logger.info(
             "pending_canceled inst={} side={} order_id={} reason={}",
             ev.inst_id, ev.pos_side, ev.order_id, ev.reason,

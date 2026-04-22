@@ -83,6 +83,7 @@ class ZoneFakeMonitor(FakeMonitor):
         super().__init__()
         self.pending_registered: list[tuple] = []
         self.pending_events: list[PendingEvent] = []
+        self.cancel_pending_calls: list[tuple] = []
 
     def register_pending(self, *, inst_id, pos_side, order_id,
                          num_contracts, entry_px, max_wait_s, placed_at=None):
@@ -94,6 +95,14 @@ class ZoneFakeMonitor(FakeMonitor):
         out = self.pending_events
         self.pending_events = []
         return out
+
+    def cancel_pending(self, inst_id, pos_side, *, reason="manual"):
+        """Mirror PositionMonitor.cancel_pending: returns CANCELED PendingEvent."""
+        self.cancel_pending_calls.append((inst_id, pos_side, reason))
+        return PendingEvent(
+            inst_id=inst_id, pos_side=pos_side, order_id="LIM-X",
+            event_type="CANCELED", reason=reason,
+        )
 
 
 _ZONE = ZoneSetup(
@@ -379,6 +388,96 @@ async def test_process_pending_external_cancel_marks_invalidated(
 
     reasons = [r.reject_reason for r in rows]
     assert "pending_invalidated" in reasons
+
+
+# ── 2026-04-22: pending hard-gate invalidation (early-cancel) ──────────────
+
+
+async def test_pending_hard_gate_invalidation_cancels_and_journals(
+    monkeypatch, make_ctx,
+):
+    """When the runner's per-symbol cycle detects a pending limit AND a
+    hard gate would now reject a NEW entry of the same direction, the
+    pending must be cancelled + the journal must record a
+    `pending_hard_gate_invalidated` rejected_signals row."""
+    # Stub plan_builder to None so the cancel path is observed in isolation
+    # (otherwise the symbol would immediately try to PLACE a new pending
+    # after the cancel, occupying the same slot key).
+    _patch_plan_builder(monkeypatch, None)
+    _patch_zone_builder(monkeypatch, _ZONE)
+    cfg = make_config(contract_size=0.01)
+    _enable_zone(cfg)
+    monitor = ZoneFakeMonitor()
+    router = ZoneFakeRouter()
+    ctx, fakes = make_ctx(config=cfg, monitor=monitor, router=router)
+    ctx.contract_sizes = {"BTC-USDT-SWAP": 0.01}
+
+    # Seed a pending long limit.
+    pending_plan = make_plan()
+    ctx.pending_setups[("BTC-USDT-SWAP", "long")] = PendingSetupMeta(
+        plan=pending_plan, zone=_ZONE, order_id="LIM-OLD",
+        signal_state=fakes.reader.state, placed_at=datetime.now(UTC),
+    )
+
+    # Force the helper to flag invalidation regardless of state details.
+    def _stub_eval(**_kw):
+        return "vwap_misaligned"
+    monkeypatch.setattr(
+        "src.bot.runner.evaluate_pending_invalidation_gates", _stub_eval,
+    )
+
+    runner = BotRunner(ctx)
+    async with ctx.journal:
+        await runner.run_once()
+        rows = await ctx.journal.list_rejected_signals()
+
+    # Cancel call dispatched to monitor with our prefixed reason.
+    assert len(monitor.cancel_pending_calls) == 1
+    inst_id, pos_side, reason = monitor.cancel_pending_calls[0]
+    assert inst_id == "BTC-USDT-SWAP"
+    assert pos_side == "long"
+    assert reason.startswith("hard_gate:")
+    assert "vwap_misaligned" in reason
+    # Pending slot cleared (handler ran).
+    assert ("BTC-USDT-SWAP", "long") not in ctx.pending_setups
+    # Journal row written with the new specific reject reason.
+    reasons = [r.reject_reason for r in rows]
+    assert "pending_hard_gate_invalidated" in reasons
+
+
+async def test_pending_kept_alive_when_no_hard_gate_fires(monkeypatch, make_ctx):
+    """When the helper returns None (all gates pass), the pending must be
+    left untouched and the runner short-circuits as before — no cancel,
+    no rejected_signals row from this path."""
+    _patch_plan_builder(monkeypatch, make_plan())
+    _patch_zone_builder(monkeypatch, _ZONE)
+    cfg = make_config(contract_size=0.01)
+    _enable_zone(cfg)
+    monitor = ZoneFakeMonitor()
+    router = ZoneFakeRouter()
+    ctx, fakes = make_ctx(config=cfg, monitor=monitor, router=router)
+    ctx.contract_sizes = {"BTC-USDT-SWAP": 0.01}
+
+    ctx.pending_setups[("BTC-USDT-SWAP", "long")] = PendingSetupMeta(
+        plan=make_plan(), zone=_ZONE, order_id="LIM-OLD",
+        signal_state=fakes.reader.state, placed_at=datetime.now(UTC),
+    )
+    monkeypatch.setattr(
+        "src.bot.runner.evaluate_pending_invalidation_gates",
+        lambda **_kw: None,
+    )
+
+    runner = BotRunner(ctx)
+    async with ctx.journal:
+        await runner.run_once()
+        rows = await ctx.journal.list_rejected_signals()
+
+    # No cancel attempted.
+    assert monitor.cancel_pending_calls == []
+    # Pending slot still occupied — short-circuited normally.
+    assert ("BTC-USDT-SWAP", "long") in ctx.pending_setups
+    # No `pending_hard_gate_invalidated` row written.
+    assert "pending_hard_gate_invalidated" not in [r.reject_reason for r in rows]
 
 
 # ── Multi-cycle integration (7.C5) ─────────────────────────────────────────

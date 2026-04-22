@@ -18,6 +18,7 @@ from src.data.models import (
 from src.strategy.entry_signals import (
     build_trade_plan_from_state,
     build_trade_plan_with_reason,
+    evaluate_pending_invalidation_gates,
     generate_entry_intent,
     select_sl_price,
 )
@@ -695,3 +696,169 @@ def test_vwap_hard_veto_fail_open_when_all_vwaps_missing():
     )
     assert plan is not None
     assert reason == ""
+
+
+# ── 2026-04-22: evaluate_pending_invalidation_gates ────────────────────────
+
+
+def _bear_ema_candles() -> list[Candle]:
+    """50 closing candles in a strict downtrend so EMA9 < EMA21 (bear stack)."""
+    base = 100.0
+    candles: list[Candle] = []
+    for i in range(50):
+        c = base - i * 0.5
+        candles.append(Candle(open=c + 0.1, high=c + 0.2, low=c - 0.2, close=c))
+    return candles
+
+
+def _bull_ema_candles() -> list[Candle]:
+    """50 closing candles in a strict uptrend so EMA9 > EMA21 (bull stack)."""
+    base = 100.0
+    candles: list[Candle] = []
+    for i in range(50):
+        c = base + i * 0.5
+        candles.append(Candle(open=c - 0.1, high=c + 0.2, low=c - 0.2, close=c))
+    return candles
+
+
+def test_pending_eval_returns_none_when_all_gates_pass():
+    state = _state_with_vwaps(
+        direction=Direction.BULLISH, price=100.0, vwaps=(99.0, 99.5, 99.0),
+    )
+    candles = _bull_ema_candles()
+    result = evaluate_pending_invalidation_gates(
+        state=state,
+        candles=candles,
+        direction=Direction.BULLISH,
+        entry_price=100.0,
+    )
+    assert result is None
+
+
+def test_pending_eval_catches_vwap_misaligned_mid_pending():
+    """Long pending at 99.5; price now sits BELOW all VWAPs → vwap_misaligned."""
+    state = _state_with_vwaps(
+        direction=Direction.BULLISH, price=99.5, vwaps=(100.0, 101.0, 102.0),
+    )
+    result = evaluate_pending_invalidation_gates(
+        state=state,
+        candles=_bull_ema_candles(),
+        direction=Direction.BULLISH,
+        entry_price=99.5,
+        vwap_hard_veto_enabled=True,
+    )
+    assert result == "vwap_misaligned"
+
+
+def test_pending_eval_catches_ema_momentum_contra_mid_pending():
+    """Long pending but EMA stack now bearish → ema_momentum_contra.
+
+    The veto fires when `price < ema_fast < ema_slow`. Bear candles (50-bar
+    downtrend) push EMA21 above EMA55 (faster catches new lows first), and
+    if our entry sits BELOW both EMAs, the long is wrong-side of momentum.
+    """
+    state = _state_with_vwaps(
+        direction=Direction.BULLISH, price=70.0, vwaps=(60.0, 60.0, 60.0),
+    )
+    result = evaluate_pending_invalidation_gates(
+        state=state,
+        candles=_bear_ema_candles(),  # closes 100 → 75.5; EMA fast catches faster
+        direction=Direction.BULLISH,
+        entry_price=70.0,  # below both EMAs → bear stack confirmed
+        ema_veto_enabled=True,
+    )
+    assert result == "ema_momentum_contra"
+
+
+def test_pending_eval_catches_cross_asset_opposition():
+    """Bullish alt long pending; BTC+ETH both bearish → cross_asset_opposition."""
+    state = _state_with_vwaps(
+        direction=Direction.BULLISH, price=100.0, vwaps=(99.0, 99.0, 99.0),
+    )
+    result = evaluate_pending_invalidation_gates(
+        state=state,
+        candles=_bull_ema_candles(),
+        direction=Direction.BULLISH,
+        entry_price=100.0,
+        # Pillars say the alt's direction is opposed.
+        pillar_opposition=Direction.BEARISH,  # BTC+ETH bearish blocks long
+    )
+    assert result == "cross_asset_opposition"
+
+
+def test_pending_eval_catches_whale_blackout():
+    """Whale event fires mid-pending → whale_transfer_blackout."""
+    class _StubBlackout:
+        def is_active(self, sym, now_ms):
+            return True
+
+    state = _state_with_vwaps(
+        direction=Direction.BULLISH, price=100.0, vwaps=(99.0, 99.0, 99.0),
+    )
+    result = evaluate_pending_invalidation_gates(
+        state=state,
+        candles=_bull_ema_candles(),
+        direction=Direction.BULLISH,
+        entry_price=100.0,
+        whale_blackout_enabled=True,
+        whale_blackout=_StubBlackout(),
+        whale_blackout_symbol="BTC-USDT-SWAP",
+    )
+    assert result == "whale_transfer_blackout"
+
+
+def test_pending_eval_disabled_gates_do_not_fire():
+    """Even with bearish EMA stack, ema_veto_enabled=False → no cancel."""
+    state = _state_with_vwaps(
+        direction=Direction.BULLISH, price=99.5, vwaps=(100.0, 101.0, 102.0),
+    )
+    result = evaluate_pending_invalidation_gates(
+        state=state,
+        candles=_bear_ema_candles(),
+        direction=Direction.BULLISH,
+        entry_price=99.5,
+        vwap_hard_veto_enabled=False,  # disabled
+        ema_veto_enabled=False,        # disabled
+    )
+    assert result is None
+
+
+def test_pending_eval_check_order_vwap_first():
+    """When multiple gates would fail, vwap_misaligned wins (matches the
+    live entry path's check ordering)."""
+    state = _state_with_vwaps(
+        direction=Direction.BULLISH, price=99.5, vwaps=(100.0, 101.0, 102.0),
+    )
+    result = evaluate_pending_invalidation_gates(
+        state=state,
+        candles=_bear_ema_candles(),  # EMA also fails
+        direction=Direction.BULLISH,
+        entry_price=99.5,
+        vwap_hard_veto_enabled=True,
+        ema_veto_enabled=True,
+        pillar_opposition=Direction.BEARISH,
+    )
+    # First failure wins — vwap_misaligned per check order.
+    assert result == "vwap_misaligned"
+
+
+def test_pending_eval_whale_blackout_exception_swallowed():
+    """A corrupt blackout state must not propagate."""
+    class _BoomBlackout:
+        def is_active(self, sym, now_ms):
+            raise RuntimeError("corrupt")
+
+    state = _state_with_vwaps(
+        direction=Direction.BULLISH, price=100.0, vwaps=(99.0, 99.0, 99.0),
+    )
+    # Should silently treat the gate as fail-open (return None).
+    result = evaluate_pending_invalidation_gates(
+        state=state,
+        candles=_bull_ema_candles(),
+        direction=Direction.BULLISH,
+        entry_price=100.0,
+        whale_blackout_enabled=True,
+        whale_blackout=_BoomBlackout(),
+        whale_blackout_symbol="BTC-USDT-SWAP",
+    )
+    assert result is None

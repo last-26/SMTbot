@@ -986,6 +986,73 @@ def build_trade_plan_with_reason(
     return plan, ""
 
 
+def evaluate_pending_invalidation_gates(
+    *,
+    state: MarketState,
+    candles: list[Candle],
+    direction: Direction,
+    entry_price: float,
+    pillar_opposition: bool = False,
+    vwap_hard_veto_enabled: bool = True,
+    ema_veto_enabled: bool = True,
+    ema_veto_fast_period: int = 9,
+    ema_veto_slow_period: int = 21,
+    whale_blackout_enabled: bool = False,
+    whale_blackout: Optional[Any] = None,
+    whale_blackout_symbol: Optional[str] = None,
+) -> Optional[str]:
+    """Re-evaluate the HARD veto gates against current state for a pending limit.
+
+    Used by the runner's pending-poll cycle (2026-04-22) to detect mid-pending
+    invalidation: a sharp market turn or new whale event between limit
+    placement and the 7-bar (21-min) timeout. If any gate would now reject
+    a NEW entry of the same direction, the pending limit is canceled before
+    a fill at a no-longer-favorable level.
+
+    Returns the first failing gate's reject_reason string, or None if all
+    pass (pending should remain active).
+
+    Deliberately limited to HARD vetoes — confluence rescore is NOT done
+    because the strategy is pullback-based and confluence naturally
+    fluctuates during the wait window. Only "would now reject a NEW entry
+    of the same direction" cases trigger cancel; price drifting away from
+    the limit (which IS the pullback by design) does not.
+
+    Order matches the live entry path in `build_trade_plan_with_reason` so
+    rejected_signals reasons are consistent with the new-entry vocabulary:
+      vwap_misaligned → ema_momentum_contra → cross_asset_opposition
+      → whale_transfer_blackout
+    """
+    if vwap_hard_veto_enabled and _vwap_hard_veto(state, direction, entry_price):
+        return "vwap_misaligned"
+
+    if ema_veto_enabled and _ema_momentum_veto(
+        candles, direction, entry_price,
+        fast_period=ema_veto_fast_period,
+        slow_period=ema_veto_slow_period,
+    ):
+        return "ema_momentum_contra"
+
+    if _cross_asset_opposes(pillar_opposition, direction):
+        return "cross_asset_opposition"
+
+    if (
+        whale_blackout_enabled
+        and whale_blackout is not None
+        and whale_blackout_symbol is not None
+    ):
+        try:
+            import time as _time
+            now_ms = int(_time.time() * 1000)
+            if whale_blackout.is_active(whale_blackout_symbol, now_ms):
+                return "whale_transfer_blackout"
+        except Exception:
+            # Same defensive contract as the live entry path.
+            pass
+
+    return None
+
+
 def _replace_tp(plan: TradePlan, *, new_tp: float, new_rr: float) -> TradePlan:
     """Return a new TradePlan with tp_price/rr_ratio swapped (dataclass copy)."""
     from dataclasses import replace
