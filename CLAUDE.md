@@ -13,11 +13,11 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 - **Entry TF:** 3m. HTF context 15m, LTF confirmation 1m.
 - **Scoring:** 5 pillars (Market Structure, Liquidity, Money Flow, VWAP, Divergence) + hard gates (displacement, EMA momentum, VWAP, cross-asset opposition) + ADX regime-conditional weights. Confluence threshold `min_confluence_score=3.75` (Pass 1 Optuna tune, 2026-04-22). *Premium/discount gate and HTF TP/SR ceiling temporarily disabled 2026-04-19 — see changelog; re-evaluated as Pass 3 candidates.*
 - **Execution:** post-only limit → regular limit → market-at-edge fallback. Single-leg OCO SL/TP at hard **1:2 RR** (tightened 1:3→1:2 on 2026-04-21 eve; partial TP disabled 2026-04-19 late-night — see changelog; `move_sl_to_be_after_tp1` flag kept but inert while partial off). Dynamic TP revision re-anchors the runner OCO to `entry ± 2 × sl_distance` every cycle, floor at 1.0R. **MFE-triggered SL lock (Option A, 2026-04-20)**: once MFE ≥ 1.3R (scaled from 2R when RR cap tightened), the runner OCO's SL is pulled to entry (+fee buffer) so the remaining 0.7R of target is risk-free. One-shot per position. **Maker-TP resting limit (2026-04-20)**: post-only reduce-only limit sits at TP price alongside the OCO — captures wicks as maker, avoids market-trigger latency.
-- **Sizing:** fee-aware ceil on per-contract total cost so total realized SL loss (price + fee reserve) ≥ target_risk across every symbol (2026-04-19 late-night-2). Overshoot bounded by one per-contract step (< $3 per position). Operator override via `RISK_AMOUNT_USDT` env (2026-04-20) bypasses percent-mode sizing; 10%-of-balance safety ceiling.
+- **Sizing:** fee-aware ceil on per-contract total cost so total realized SL loss (price + fee reserve) ≥ target_risk across every symbol (2026-04-19 late-night-2). Overshoot bounded by one per-contract step (< $3 per position). Operator override via `RISK_AMOUNT_USDT` env (2026-04-20) bypasses percent-mode sizing; 10%-of-balance safety ceiling. Per-symbol `min_sl_distance_pct_per_symbol` floors bumped 25–50% on 2026-04-23 (Pass 2) for R=$100 breathing room: BTC 0.006, ETH 0.010, SOL 0.012, DOGE 0.010, BNB 0.007.
 - **Journal:** async SQLite, schema includes `on_chain_context`, `demo_artifact`, `confluence_pillar_scores`, `oscillator_raw_values` (all JSON). Separate tables: `rejected_signals` (counter-factual outcome pegged), `on_chain_snapshots` (Arkham state mutation time-series), `whale_transfers` (raw WS events for Phase 9 directional learning).
 - **On-chain (Arkham):** runtime soft signals only — daily bias ±15%, hourly stablecoin pulse +0.75 threshold penalty, altcoin-index +0.5 penalty on misaligned altcoin trades, **flow_alignment** 6-input directional score (stablecoin + BTC/ETH + Coinbase/Binance/Bybit 24h netflow; weights 0.25/0.25/0.15/0.15/0.10/0.10; default penalty 0.25), **per_symbol_cex_flow** binary penalty on misaligned symbol 1h volume (default 0.25, $5M floor). Whale HARD GATE removed 2026-04-22 — WS listener feeds `whale_transfers` journal for Pass 3 directional classification. Per-symbol token_volume fallback (2026-04-23): when Arkham `/token/volume/{id}` returns JSON `null` (confirmed for `solana`, `wrapped-solana`), `fetch_token_volume_last_hour` falls back to `/transfers/histogram` (flow=in + flow=out, last bucket) — zero coverage gap for the traded symbol set. Credit-safe via v2 persistent WS streams + filter-fingerprint cache. All Arkham weights tuned in Pass 3.
 - **Pass 2 instrumentation:** every trade row now captures `confluence_pillar_scores` (factor name → weight dict) and `oscillator_raw_values` (per-TF dict with 1m/3m/15m OscillatorTableData numerics: wt1/wt2/rsi/rsi_mfi/stoch_k/d/momentum/divergence flags). Both sourced from existing runner TF-switch cache — zero extra TV latency.
-- **Tests:** 1034, all green. Demo-runnable end-to-end.
+- **Tests:** 1057, all green. Demo-runnable end-to-end.
 - **Data cutoff (`rl.clean_since`):** `2026-04-22T20:33:24Z` — Pass 2 restart cut. Pre-restart DB (42 Pass 1 trades) archived as `data/trades.db.pass1_backup_2026-04-22T203324Z`. Fresh DB created on first bot startup; every new row post-restart carries uniform feature coverage.
 
 ---
@@ -166,6 +166,57 @@ Addendum to the 2026-04-22 Pass 1 entry. First Pass 2 cycle revealed that Arkham
 **Verification (live probe 2026-04-22 21:30Z post-fix):** SOL now yields `+$4,634,107` (6.39M in − 1.75M out) — matching the histogram raw data end-to-end. Post-restart log shows `arkham_token_volume_refreshed symbols=[BTC, ETH, SOL, DOGE, BNB]` (5/5 populated). Every new trades / rejected_signals row's `on_chain_context.token_volume_1h_net_usd_json` now contains SOL alongside the other four.
 
 **Tests:** +6 in `test_on_chain_fetchers.py` locking the primary→fallback state machine (1028 → **1034 passing**).
+
+### 2026-04-23 (evening) — SL floor bump + derivatives journal enrichment (Pass 3 feature prep)
+
+Two paired tunes triggered by early Pass 2 observations. Operator raised `RISK_AMOUNT_USDT` to $100 and flagged that TP/SL levels landed "too tight" — per-symbol `min_sl_distance_pct_per_symbol` floors were the binding constraint on most entries, putting SL well inside 1m–3m noise envelopes. Separately, a journal audit showed that OI + funding + liquidation stats were all computed on `DerivativesState` at cycle time but only a subset (4 of 13 numeric fields) reached the journal — leaving Pass 3 Optuna/GBT without the OI × price combinatorial signal that traders use to infer long pile-in vs short covering vs capitulation.
+
+**Per-symbol SL floors — `config/default.yaml::min_sl_distance_pct_per_symbol`:**
+
+| Symbol | Old | New | Δ |
+|---|---:|---:|---:|
+| BTC-USDT-SWAP | 0.004 | **0.006** | +50% |
+| ETH-USDT-SWAP | 0.008 | **0.010** | +25% |
+| SOL-USDT-SWAP | 0.010 | **0.012** | +20% |
+| DOGE-USDT-SWAP | 0.008 | **0.010** | +25% |
+| BNB-USDT-SWAP | 0.005 | **0.007** | +40% (also made explicit; previously inherited 0.005 global) |
+| XRP / ADA | 0.008 | 0.010 | parallel; symbols not currently watched |
+
+R stays $100 flat — fee-aware ceil sizer auto-shrinks notional: `risk_amount / sl_pct = notional`. Example BNB: old 0.5% × $20k = $100 R → new 0.7% × $14.3k = $100 R. 40% less leverage exposure, 40% more wick protection. Applies to NEW entries from next restart; existing live position (BNB LONG) keeps its old 0.5% SL (operator-controlled cancel+replace if retroactive widening desired).
+
+**Derivatives journal enrichment — 9 REAL columns + 1 TEXT column added to both `trades` and `rejected_signals`:**
+
+| Column | Source | Pass 3 use |
+|---|---|---|
+| `open_interest_usd_at_entry` | `DerivativesState.open_interest_usd` | Absolute OI pairs with change % for crowding context |
+| `oi_change_1h_pct_at_entry` | `oi_change_1h_pct` | Short-window positioning shift — classic OI × price divergence |
+| `funding_rate_current_at_entry` | `funding_rate_current` | Absolute funding (raw decimal); GBT learns "funding > 0.05%/8h danger zone" |
+| `funding_rate_predicted_at_entry` | `funding_rate_predicted` | Next-funding estimate, cost-of-carry forward |
+| `long_liq_notional_1h_at_entry` | `long_liq_notional_1h` | Long-side liquidation flow USD |
+| `short_liq_notional_1h_at_entry` | `short_liq_notional_1h` | Short-side — asymmetric squeeze pressure detection |
+| `ls_ratio_zscore_14d_at_entry` | `ls_ratio_zscore_14d` | Crowded-positioning speed (ratio change z-score) |
+| `price_change_1h_pct_at_entry` | entry-TF candle buffer (20 bars back on 3m) | OI × price combinatorial |
+| `price_change_4h_pct_at_entry` | 80 bars back | Wider context window |
+| `liq_heatmap_top_clusters_json` | `LiquidityHeatmap.clusters_above/below` top-5 each | Magnet / target modelling richer than the single nearest-above/below pair already stored |
+
+Wiring via three new helpers in `src/bot/runner.py`:
+- `_timeframe_to_minutes(tf)` — safe TV-string → int conversion with fallback ('3m'→3, '4H'→240, unknown→3).
+- `_price_change_pct(candles, bars_ago)` — defensive percent-change with guards for empty/short buffer, zero closes, malformed candles.
+- `_top_n_heatmap_clusters(heatmap, current_price, atr, top_n=5)` — JSON-ready extraction with signed toward-price `distance_atr`.
+
+`_derive_enrichment(state)` signature extended to `_derive_enrichment(state, candles=None, entry_tf_minutes=3)` with backward-compat defaults — existing callers that pass only state keep working (new fields default to None / empty dict). Four call sites updated: `_record_reject` takes candles kwarg threaded from the cycle's buffer; market-entry `record_open` passes candles + cfg-derived entry_tf_minutes; pending-fill / pending-cancel paths stay `candles=None` (placement-time candles not stashed in PendingSetupMeta; price_change remains None for those rows — Pass 3 GBT can segment by "has price_change").
+
+**Funding_z_6h + funding_z_24h DEFERRED.** Existing schema placeholder columns from Phase 7.B5 could have been populated this commit but the derivatives cache's `_funding_history` mixes 1h-cadence historical samples (loaded at startup from `fetch_funding_history_series`) with 75s-cadence incremental samples (appended per `refresh_interval_s` refresh). Clean wall-clock windowed z-scores require a timestamp-aware refactor of the history buffer to `list[(ts_ms, rate)]`. Flagged as Phase 12 candidate. The existing `funding_rate_zscore_30d` stays populated via the 720-sample tail.
+
+**Cost impact:** zero extra API calls. Every field was already computed on `DerivativesState` or derivable from the existing candle buffer. Journal writes add ~200 bytes/row (10 extra columns × average). Schema migrations idempotent — restart auto-applies; no manual steps.
+
+**Tests:** +23 in `test_derive_enrichment.py` covering `_timeframe_to_minutes`, `_price_change_pct`, `_top_n_heatmap_clusters`, and the extended `_derive_enrichment` (DerivativesState pull-through, heatmap integration, backward-compat, entry_tf_minutes=0 safety). Full suite 1034 → **1057 passing**.
+
+**Re-eval triggers:**
+1. **Wick-out rate** (SL floor bumps) — % of closed trades where SL hit within 1 ATR of floor-widened SL. Target < 40% post-bump. Higher → loosen further (e.g. BTC 0.006 → 0.008). Lower < 15% → may have over-loosened; consider tightening one step.
+2. **Accept-rate per symbol post-bump** — if per-symbol accepts drop materially (e.g., BNB from ~1/hour to <1/4h) because notional floor hits OKX minimum, one-step tightening justified.
+3. **Enrichment column coverage** — `open_interest_usd_at_entry IS NOT NULL` fraction on post-restart rows should approach 100% for symbols where Coinalyze snapshot stays fresh. Lower = cache freshness regression.
+4. **Price change window hit rate** — `price_change_1h_pct_at_entry IS NOT NULL` on market-entry trades should be ~100%, 0% on pending-fill trades (expected by design). Mismatch = wiring regression.
 
 ### Historical context (pre-Pass-1, 2026-04-19 → 2026-04-21)
 
