@@ -15,13 +15,56 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 - **Execution:** post-only limit → regular limit → market-at-edge fallback. Single-leg OCO SL/TP at hard **1:2 RR** (tightened 1:3→1:2 on 2026-04-21 eve; partial TP disabled 2026-04-19 late-night — see changelog; `move_sl_to_be_after_tp1` flag kept but inert while partial off). Dynamic TP revision re-anchors the runner OCO to `entry ± 2 × sl_distance` every cycle, floor at 1.0R. **MFE-triggered SL lock (Option A, 2026-04-20)**: once MFE ≥ 1.3R (scaled from 2R when RR cap tightened), the runner OCO's SL is pulled to entry (+fee buffer) so the remaining 0.7R of target is risk-free. One-shot per position. **Maker-TP resting limit (2026-04-20)**: post-only reduce-only limit sits at TP price alongside the OCO — captures wicks as maker, avoids market-trigger latency.
 - **Sizing:** fee-aware ceil on per-contract total cost so total realized SL loss (price + fee reserve) ≥ target_risk across every symbol (2026-04-19 late-night-2). Overshoot bounded by one per-contract step (< $3 per position). Operator override via `RISK_AMOUNT_USDT` env (2026-04-20) bypasses percent-mode sizing; 10%-of-balance safety ceiling.
 - **Journal:** async SQLite, schema v3 (+ `on_chain_context`, `demo_artifact`). `rejected_signals` table with counter-factual outcome pegging. Separate `on_chain_snapshots` time-series table captures every Arkham state mutation for Phase 9 trade-lifetime joins.
-- **On-chain (Arkham):** integrated end-to-end (daily bias ±15%, hourly stablecoin pulse +0.75 threshold penalty, altcoin-index +0.5 penalty on misaligned altcoin trades, whale blackout hard gate 100M+ / 10 min). Credit-safe via v2 persistent WS streams. Weights tuned 1.5× 2026-04-21 (eve) for visibility; see changelog for re-eval triggers.
+- **On-chain (Arkham):** integrated end-to-end (daily bias ±15%, hourly stablecoin pulse +0.75 threshold penalty, altcoin-index +0.5 penalty on misaligned altcoin trades, whale blackout hard gate **150M+ / 10 min** with token whitelist). Credit-safe via v2 persistent WS streams + filter-fingerprint cache. Journal-only enrichment (no runtime impact): per-entity 24h netflow (Coinbase + Binance + Bybit) + per-symbol 1h CEX volume — both for Phase 9 GBT analysis. Weights tuned 1.5× 2026-04-21 (eve); FAZ 2 expansion 2026-04-22 (afternoon). See changelog for re-eval triggers.
 - **Tests:** 946, all green. Demo-runnable end-to-end.
 - **Data cutoff (`rl.clean_since`):** `2026-04-19T19:55:00Z` (bumped after ceil sizing flipped — realized-R distribution shifts from clustered-below-target to clustered-at-or-above-target). Arkham activation did NOT bump — dataset segments by `arkham_active` categorical.
 
 ---
 
 ## Changelog
+
+### 2026-04-22 (afternoon) — Arkham FAZ 2 expansion (WS budget + entity netflow + token volume)
+
+Three-part Arkham capability bump driven by trial-quota analysis (only 558/10k labels burned over 22 days; credits effectively unmetered on trial). Endpoint inventory + cost matrix probed via `scripts/probe_arkham.py`. **All shipped as journal-only data layers; zero runtime decision impact.** Phase 9 GBT decides predictive value before any wiring.
+
+**FAZ 0 — WS stream label-budget kurtarma.** [src/data/on_chain_ws.py](src/data/on_chain_ws.py)
+- New `OnChainConfig.whale_tokens` (BTC/ETH/SOL/DOGE/BNB + USDT/USDC) — restricts WS to tokens we trade, drops noise (XRP/ADA/MATIC/LINK transfers were burning labels for blackouts that `affected_symbols_for` discards anyway).
+- `whale_threshold_usd` default bumped 100M → 150M (paired). Probe-confirmed monthly burn was projecting ~17k labels at 100M; combined fix targets ~5k/month.
+- **Filter-fingerprint sidecar** (`*.filter` next to stream_id cache) — Arkham v2 streams immutable post-create, so config changes silently reused old streams. New logic: hash filter dict, compare on startup, delete-old + recreate on mismatch. Legacy installs (no sidecar) recreate once.
+
+**FAZ 1 — Probe script v2.** [scripts/probe_arkham.py](scripts/probe_arkham.py) extended with 4 probes (subscription usage, entity flow, token volume granularity, sub-hourly histogram). Critical findings:
+- `/flow/entity/{entity}` works for `binance`, `coinbase`, **`bybit`** (operator's hunch confirmed). Returns daily series 2021/2022 → present. ~3 credits/call, **0 labels**.
+- `/token/volume/{id}` granularity: `1h` works (24 buckets, USD-denominated), `5m`/`15m`/`30m` return 500. Sub-hourly NOT supported.
+- `/transfers/histogram` with `timeGte`/`timeLte` 15m window returns 500 → custom minute-precision windows not accepted.
+- `/subscription/intel-usage` is the canonical usage endpoint (not `/user/usage` which 405s on trial). Response shape: `{totalCount, totalLimit, chainUsage, periodStart}`.
+- Full probe run consumed **0 labels** — all four endpoints aggregate-only.
+
+**FAZ 2 — Per-entity 24h netflow.** [src/data/on_chain.py:get_entity_flow + fetch_entity_netflow_24h](src/data/on_chain.py)
+- Coinbase + Binance + Bybit netflow (last completed UTC day) via `/flow/entity/{entity}`. Refreshed in the daily-snapshot branch (UTC-day cadence — matches data granularity).
+- 3 new columns on `on_chain_snapshots`: `cex_{coinbase,binance,bybit}_netflow_24h_usd`. Idempotent ALTER TABLE migrations.
+- Per-entity failures isolated; one bad slug leaves others intact.
+
+**FAZ 3 — Per-symbol 1h CEX volume.** [src/data/on_chain.py:get_token_volume + fetch_token_volume_last_hour](src/data/on_chain.py)
+- `/token/volume/{id}?granularity=1h` per watched OKX perp (5 symbols). Returns `{inUSD, outUSD, ...}` per hour; we record the most-recent bucket's `inUSD - outUSD` as USD net flow.
+- New cadence `token_volume_refresh_s` (1h). 5 symbols × 24/day × 3 credits = ~360/day = ~11k credits/month, **0 labels**.
+- `WATCHED_SYMBOL_TO_TOKEN_ID` reverse map in `on_chain_types.py` (OKX symbol → CoinGecko slug). Adding a 6th pair extends both this AND `affected_symbols_for`.
+- Storage: single TEXT column `token_volume_1h_net_usd_json` (JSON dict keyed by OKX symbol) — adding a symbol won't trigger schema migration.
+- Probe run shows partial-success behavior in the wild: SOL returned None on one fetch, other 4 symbols recorded normally.
+
+**FAZ 4 — Cancelled.** Sub-hourly stablecoin pulse delta would have used `/transfers/histogram` with `timeGte`/`timeLte` — probe returned 500. Documented in `scripts/probe_arkham.py` for future re-eval if Arkham adds support.
+
+**Cost analysis (post-ship, all four FAZ together):**
+- WS: 17k → ~5k labels/month (token whitelist + threshold bump)
+- Daily entity flow: +9 credits/day (~270/month), 0 labels
+- Hourly token volume: +360 credits/day (~11k/month), 0 labels
+- Net trial-quota impact: label burn DROPS from ~17k/month projected to ~5k/month observed; credits irrelevant on trial.
+
+**Re-eval triggers:**
+1. Probe row count growth — `on_chain_snapshots` now bumps fingerprint on entity netflow + token volume changes too. Expected cadence 5-10 rows/hour during waking hours (token volume changes hourly).
+2. Phase 9 GBT — segment trades by `cex_bybit_netflow_24h_usd` sign; if no lift over Coinbase/Binance, drop Bybit. Inverse: if Bybit dominates, reweight Phase 12 design.
+3. SOL token volume coverage — observed one None from `/token/volume/solana`. If chronic, Arkham's SOL coverage may be too thin; document and exclude from Phase 9 token-volume features for SOL specifically.
+
+**Tests:** 968 passing (+15 across FAZ 0/2/3). Smoke verified end-to-end with real Arkham data.
 
 ### 2026-04-22 — ETH netflow re-enabled in daily macro snapshot
 
