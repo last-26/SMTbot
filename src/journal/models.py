@@ -187,6 +187,31 @@ class TradeRecord(BaseModel):
     # 15m trending up") that factor names alone can't express.
     oscillator_raw_values: dict[str, dict] = Field(default_factory=dict)
 
+    # 2026-04-23 — extended derivatives enrichment (Pass 3 GBT inputs).
+    # All already populated on `DerivativesState` each cycle; previously
+    # only a subset landed in journal. Captures OI absolute + 1h change
+    # (classic OI×price combinatorial inference), absolute funding +
+    # predicted-next (basis/cost-of-carry), 1h liquidation notional per
+    # side (flow pressure), LS z-score (crowded-positioning speed), and
+    # price changes over 1h/4h from the entry-TF candle buffer
+    # (price-OI divergence patterns). None on rows where the cache was
+    # unavailable (bridge=None tests, early tick before Coinalyze warms).
+    open_interest_usd_at_entry: Optional[float] = None
+    oi_change_1h_pct_at_entry: Optional[float] = None
+    funding_rate_current_at_entry: Optional[float] = None
+    funding_rate_predicted_at_entry: Optional[float] = None
+    long_liq_notional_1h_at_entry: Optional[float] = None
+    short_liq_notional_1h_at_entry: Optional[float] = None
+    ls_ratio_zscore_14d_at_entry: Optional[float] = None
+    price_change_1h_pct_at_entry: Optional[float] = None
+    price_change_4h_pct_at_entry: Optional[float] = None
+    # Top-N liq heatmap clusters (JSON). Shape:
+    #   {"above": [{"price": .., "notional_usd": .., "distance_atr": ..}, ...],
+    #    "below": [{...}, ...]}
+    # Default empty dict; richer target/magnet modelling in Pass 3 vs just
+    # the nearest-above/nearest-below pair.
+    liq_heatmap_top_clusters: dict = Field(default_factory=dict)
+
     @property
     def is_open(self) -> bool:
         return self.outcome == TradeOutcome.OPEN
@@ -287,6 +312,20 @@ class RejectedSignal(BaseModel):
     # Captured at reject time (or pending placement time for mid-pending
     # cancels). Shape identical: {"1m": {...}, "3m": {...}, "15m": {...}}.
     oscillator_raw_values: dict[str, dict] = Field(default_factory=dict)
+
+    # 2026-04-23 — mirrors TradeRecord.* extended derivatives enrichment.
+    # Lets Pass 3 counter-factual analysis test "would trade have opened
+    # at this OI/funding/LS state?" for the reject subset too.
+    open_interest_usd_at_entry: Optional[float] = None
+    oi_change_1h_pct_at_entry: Optional[float] = None
+    funding_rate_current_at_entry: Optional[float] = None
+    funding_rate_predicted_at_entry: Optional[float] = None
+    long_liq_notional_1h_at_entry: Optional[float] = None
+    short_liq_notional_1h_at_entry: Optional[float] = None
+    ls_ratio_zscore_14d_at_entry: Optional[float] = None
+    price_change_1h_pct_at_entry: Optional[float] = None
+    price_change_4h_pct_at_entry: Optional[float] = None
+    liq_heatmap_top_clusters: dict = Field(default_factory=dict)
 
 
 class WhaleTransferRecord(BaseModel):

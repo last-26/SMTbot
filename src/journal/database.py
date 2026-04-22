@@ -125,7 +125,27 @@ CREATE TABLE IF NOT EXISTS trades (
     -- stoch_k, stoch_d, momentum, divergence flags, etc.). Any TF may be
     -- missing when cache was empty (already-open HTF skip, LTF timeout).
     -- Empty dict '{}' on pre-migration rows.
-    oscillator_raw_values TEXT NOT NULL DEFAULT '{}'
+    oscillator_raw_values TEXT NOT NULL DEFAULT '{}',
+
+    -- 2026-04-23 — extended derivatives enrichment (Pass 3 GBT inputs).
+    -- All 9 columns were already available on `DerivativesState` at cycle
+    -- time but previously only 4 fields landed in journal. Unpopulated on
+    -- pre-migration rows; new rows carry every field when the Coinalyze
+    -- cache has fresh data.
+    open_interest_usd_at_entry       REAL,   -- absolute OI $; pairs with oi_change_* for crowding context
+    oi_change_1h_pct_at_entry        REAL,   -- 1h window OI change % (short-term positioning shift)
+    funding_rate_current_at_entry    REAL,   -- current funding rate (raw decimal, e.g. 0.0001 = 0.01%/8h)
+    funding_rate_predicted_at_entry  REAL,   -- next-funding prediction
+    long_liq_notional_1h_at_entry    REAL,   -- long-side liquidation USD past 1h
+    short_liq_notional_1h_at_entry   REAL,   -- short-side liquidation USD past 1h
+    ls_ratio_zscore_14d_at_entry     REAL,   -- LS ratio z-score over 14 days
+    price_change_1h_pct_at_entry     REAL,   -- entry-TF candle buffer derived
+    price_change_4h_pct_at_entry     REAL,   -- wider context window
+    -- Top-N liquidation heatmap clusters (JSON list of dicts):
+    -- `{"above": [{price, notional_usd, distance_atr}, ...],
+    --   "below": [{...}, ...]}`.
+    -- Default '{}' when heatmap missing or already-open HTF skip empties cache.
+    liq_heatmap_top_clusters_json    TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_trades_outcome      ON trades(outcome);
@@ -186,7 +206,22 @@ CREATE TABLE IF NOT EXISTS rejected_signals (
     -- counter-factual analysis has continuous features for the reject
     -- subset too (e.g., "would a lower oscillator_raw_values.3m.rsi
     -- threshold have admitted this reject?").
-    oscillator_raw_values TEXT NOT NULL DEFAULT '{}'
+    oscillator_raw_values TEXT NOT NULL DEFAULT '{}',
+
+    -- 2026-04-23 — mirrors trades.* extended derivatives enrichment.
+    -- Rejected signals carry the same snapshot so Pass 3 counter-factual
+    -- analysis can test "would trade have opened at this OI/funding
+    -- state?" even for the reject subset.
+    open_interest_usd_at_entry       REAL,
+    oi_change_1h_pct_at_entry        REAL,
+    funding_rate_current_at_entry    REAL,
+    funding_rate_predicted_at_entry  REAL,
+    long_liq_notional_1h_at_entry    REAL,
+    short_liq_notional_1h_at_entry   REAL,
+    ls_ratio_zscore_14d_at_entry     REAL,
+    price_change_1h_pct_at_entry     REAL,
+    price_change_4h_pct_at_entry     REAL,
+    liq_heatmap_top_clusters_json    TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_rejected_symbol_ts  ON rejected_signals(symbol, signal_timestamp);
@@ -275,6 +310,16 @@ _COLUMNS = [
     "on_chain_context",
     "confluence_pillar_scores",
     "oscillator_raw_values",
+    "open_interest_usd_at_entry",
+    "oi_change_1h_pct_at_entry",
+    "funding_rate_current_at_entry",
+    "funding_rate_predicted_at_entry",
+    "long_liq_notional_1h_at_entry",
+    "short_liq_notional_1h_at_entry",
+    "ls_ratio_zscore_14d_at_entry",
+    "price_change_1h_pct_at_entry",
+    "price_change_4h_pct_at_entry",
+    "liq_heatmap_top_clusters_json",
 ]
 
 
@@ -293,6 +338,16 @@ _REJECTED_COLUMNS = [
     "on_chain_context",
     "confluence_pillar_scores",
     "oscillator_raw_values",
+    "open_interest_usd_at_entry",
+    "oi_change_1h_pct_at_entry",
+    "funding_rate_current_at_entry",
+    "funding_rate_predicted_at_entry",
+    "long_liq_notional_1h_at_entry",
+    "short_liq_notional_1h_at_entry",
+    "ls_ratio_zscore_14d_at_entry",
+    "price_change_1h_pct_at_entry",
+    "price_change_4h_pct_at_entry",
+    "liq_heatmap_top_clusters_json",
 ]
 
 
@@ -353,6 +408,33 @@ _MIGRATIONS = [
     # rows when upstream caches are unavailable (tests without bridge etc.).
     "ALTER TABLE trades ADD COLUMN oscillator_raw_values TEXT NOT NULL DEFAULT '{}'",
     "ALTER TABLE rejected_signals ADD COLUMN oscillator_raw_values TEXT NOT NULL DEFAULT '{}'",
+    # 2026-04-23 — extended derivatives enrichment (9 REAL + 1 TEXT).
+    # All 9 numeric fields were already on DerivativesState; 4 were being
+    # written (regime / funding_z_30d / ls_ratio / oi_change_24h / liq_imb_1h);
+    # the other 9 joined-later for Pass 3 GBT continuous-feature search.
+    # price_change_1h/4h_pct_at_entry derived from the entry-TF candle
+    # buffer (zero extra API cost). liq_heatmap_top_clusters_json carries
+    # top-5 above + top-5 below JSON for richer magnet / target modelling.
+    "ALTER TABLE trades ADD COLUMN open_interest_usd_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN oi_change_1h_pct_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN funding_rate_current_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN funding_rate_predicted_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN long_liq_notional_1h_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN short_liq_notional_1h_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN ls_ratio_zscore_14d_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN price_change_1h_pct_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN price_change_4h_pct_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN liq_heatmap_top_clusters_json TEXT NOT NULL DEFAULT '{}'",
+    "ALTER TABLE rejected_signals ADD COLUMN open_interest_usd_at_entry REAL",
+    "ALTER TABLE rejected_signals ADD COLUMN oi_change_1h_pct_at_entry REAL",
+    "ALTER TABLE rejected_signals ADD COLUMN funding_rate_current_at_entry REAL",
+    "ALTER TABLE rejected_signals ADD COLUMN funding_rate_predicted_at_entry REAL",
+    "ALTER TABLE rejected_signals ADD COLUMN long_liq_notional_1h_at_entry REAL",
+    "ALTER TABLE rejected_signals ADD COLUMN short_liq_notional_1h_at_entry REAL",
+    "ALTER TABLE rejected_signals ADD COLUMN ls_ratio_zscore_14d_at_entry REAL",
+    "ALTER TABLE rejected_signals ADD COLUMN price_change_1h_pct_at_entry REAL",
+    "ALTER TABLE rejected_signals ADD COLUMN price_change_4h_pct_at_entry REAL",
+    "ALTER TABLE rejected_signals ADD COLUMN liq_heatmap_top_clusters_json TEXT NOT NULL DEFAULT '{}'",
 ]
 
 
@@ -394,6 +476,16 @@ def _record_to_row(rec: TradeRecord) -> tuple:
          if rec.on_chain_context is not None else None),
         json.dumps(rec.confluence_pillar_scores or {}),
         json.dumps(rec.oscillator_raw_values or {}),
+        rec.open_interest_usd_at_entry,
+        rec.oi_change_1h_pct_at_entry,
+        rec.funding_rate_current_at_entry,
+        rec.funding_rate_predicted_at_entry,
+        rec.long_liq_notional_1h_at_entry,
+        rec.short_liq_notional_1h_at_entry,
+        rec.ls_ratio_zscore_14d_at_entry,
+        rec.price_change_1h_pct_at_entry,
+        rec.price_change_4h_pct_at_entry,
+        json.dumps(rec.liq_heatmap_top_clusters or {}),
     )
 
 
@@ -417,6 +509,16 @@ def _rejected_to_row(rec: RejectedSignal) -> tuple:
          if rec.on_chain_context is not None else None),
         json.dumps(rec.confluence_pillar_scores or {}),
         json.dumps(rec.oscillator_raw_values or {}),
+        rec.open_interest_usd_at_entry,
+        rec.oi_change_1h_pct_at_entry,
+        rec.funding_rate_current_at_entry,
+        rec.funding_rate_predicted_at_entry,
+        rec.long_liq_notional_1h_at_entry,
+        rec.short_liq_notional_1h_at_entry,
+        rec.ls_ratio_zscore_14d_at_entry,
+        rec.price_change_1h_pct_at_entry,
+        rec.price_change_4h_pct_at_entry,
+        json.dumps(rec.liq_heatmap_top_clusters or {}),
     )
 
 
@@ -458,7 +560,40 @@ def _row_to_rejected(row: aiosqlite.Row) -> RejectedSignal:
         on_chain_context=_parse_on_chain_context(row),
         confluence_pillar_scores=_parse_pillar_scores(row),
         oscillator_raw_values=_parse_oscillator_raw_values(row),
+        open_interest_usd_at_entry=_safe_col(row, "open_interest_usd_at_entry"),
+        oi_change_1h_pct_at_entry=_safe_col(row, "oi_change_1h_pct_at_entry"),
+        funding_rate_current_at_entry=_safe_col(row, "funding_rate_current_at_entry"),
+        funding_rate_predicted_at_entry=_safe_col(row, "funding_rate_predicted_at_entry"),
+        long_liq_notional_1h_at_entry=_safe_col(row, "long_liq_notional_1h_at_entry"),
+        short_liq_notional_1h_at_entry=_safe_col(row, "short_liq_notional_1h_at_entry"),
+        ls_ratio_zscore_14d_at_entry=_safe_col(row, "ls_ratio_zscore_14d_at_entry"),
+        price_change_1h_pct_at_entry=_safe_col(row, "price_change_1h_pct_at_entry"),
+        price_change_4h_pct_at_entry=_safe_col(row, "price_change_4h_pct_at_entry"),
+        liq_heatmap_top_clusters=_parse_liq_heatmap_clusters(row),
     )
+
+
+def _parse_liq_heatmap_clusters(row: aiosqlite.Row) -> dict:
+    """Decode `liq_heatmap_top_clusters_json`; `{}` on any issue.
+
+    Expected shape: `{"above": [{price, notional_usd, distance_atr}, ...],
+    "below": [...]}`. Missing/malformed → empty dict; non-dict top-level
+    → empty dict; list values with non-dict entries filtered."""
+    raw = _safe_col(row, "liq_heatmap_top_clusters_json")
+    if raw is None:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    out: dict[str, list] = {}
+    for side in ("above", "below"):
+        value = parsed.get(side)
+        if isinstance(value, list):
+            out[side] = [dict(c) for c in value if isinstance(c, dict)]
+    return out
 
 
 def _parse_oscillator_raw_values(row: aiosqlite.Row) -> dict[str, dict]:
@@ -588,6 +723,16 @@ def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
         on_chain_context=_parse_on_chain_context(row),
         confluence_pillar_scores=_parse_pillar_scores(row),
         oscillator_raw_values=_parse_oscillator_raw_values(row),
+        open_interest_usd_at_entry=_safe_col(row, "open_interest_usd_at_entry"),
+        oi_change_1h_pct_at_entry=_safe_col(row, "oi_change_1h_pct_at_entry"),
+        funding_rate_current_at_entry=_safe_col(row, "funding_rate_current_at_entry"),
+        funding_rate_predicted_at_entry=_safe_col(row, "funding_rate_predicted_at_entry"),
+        long_liq_notional_1h_at_entry=_safe_col(row, "long_liq_notional_1h_at_entry"),
+        short_liq_notional_1h_at_entry=_safe_col(row, "short_liq_notional_1h_at_entry"),
+        ls_ratio_zscore_14d_at_entry=_safe_col(row, "ls_ratio_zscore_14d_at_entry"),
+        price_change_1h_pct_at_entry=_safe_col(row, "price_change_1h_pct_at_entry"),
+        price_change_4h_pct_at_entry=_safe_col(row, "price_change_4h_pct_at_entry"),
+        liq_heatmap_top_clusters=_parse_liq_heatmap_clusters(row),
     )
 
 
@@ -699,6 +844,16 @@ class TradeJournal:
         on_chain_context: Optional[dict] = None,
         confluence_pillar_scores: Optional[dict[str, float]] = None,
         oscillator_raw_values: Optional[dict[str, dict]] = None,
+        open_interest_usd_at_entry: Optional[float] = None,
+        oi_change_1h_pct_at_entry: Optional[float] = None,
+        funding_rate_current_at_entry: Optional[float] = None,
+        funding_rate_predicted_at_entry: Optional[float] = None,
+        long_liq_notional_1h_at_entry: Optional[float] = None,
+        short_liq_notional_1h_at_entry: Optional[float] = None,
+        ls_ratio_zscore_14d_at_entry: Optional[float] = None,
+        price_change_1h_pct_at_entry: Optional[float] = None,
+        price_change_4h_pct_at_entry: Optional[float] = None,
+        liq_heatmap_top_clusters: Optional[dict] = None,
     ) -> TradeRecord:
         """Insert an OPEN row describing a freshly-placed trade.
 
@@ -752,6 +907,16 @@ class TradeJournal:
             on_chain_context=on_chain_context,
             confluence_pillar_scores=dict(confluence_pillar_scores or {}),
             oscillator_raw_values=dict(oscillator_raw_values or {}),
+            open_interest_usd_at_entry=open_interest_usd_at_entry,
+            oi_change_1h_pct_at_entry=oi_change_1h_pct_at_entry,
+            funding_rate_current_at_entry=funding_rate_current_at_entry,
+            funding_rate_predicted_at_entry=funding_rate_predicted_at_entry,
+            long_liq_notional_1h_at_entry=long_liq_notional_1h_at_entry,
+            short_liq_notional_1h_at_entry=short_liq_notional_1h_at_entry,
+            ls_ratio_zscore_14d_at_entry=ls_ratio_zscore_14d_at_entry,
+            price_change_1h_pct_at_entry=price_change_1h_pct_at_entry,
+            price_change_4h_pct_at_entry=price_change_4h_pct_at_entry,
+            liq_heatmap_top_clusters=dict(liq_heatmap_top_clusters or {}),
         )
         placeholders = ", ".join("?" * len(_COLUMNS))
         cols = ", ".join(_COLUMNS)
@@ -890,6 +1055,16 @@ class TradeJournal:
         on_chain_context: Optional[dict] = None,
         confluence_pillar_scores: Optional[dict[str, float]] = None,
         oscillator_raw_values: Optional[dict[str, dict]] = None,
+        open_interest_usd_at_entry: Optional[float] = None,
+        oi_change_1h_pct_at_entry: Optional[float] = None,
+        funding_rate_current_at_entry: Optional[float] = None,
+        funding_rate_predicted_at_entry: Optional[float] = None,
+        long_liq_notional_1h_at_entry: Optional[float] = None,
+        short_liq_notional_1h_at_entry: Optional[float] = None,
+        ls_ratio_zscore_14d_at_entry: Optional[float] = None,
+        price_change_1h_pct_at_entry: Optional[float] = None,
+        price_change_4h_pct_at_entry: Optional[float] = None,
+        liq_heatmap_top_clusters: Optional[dict] = None,
     ) -> RejectedSignal:
         """Insert a single row into `rejected_signals`.
 
@@ -933,6 +1108,16 @@ class TradeJournal:
             on_chain_context=on_chain_context,
             confluence_pillar_scores=dict(confluence_pillar_scores or {}),
             oscillator_raw_values=dict(oscillator_raw_values or {}),
+            open_interest_usd_at_entry=open_interest_usd_at_entry,
+            oi_change_1h_pct_at_entry=oi_change_1h_pct_at_entry,
+            funding_rate_current_at_entry=funding_rate_current_at_entry,
+            funding_rate_predicted_at_entry=funding_rate_predicted_at_entry,
+            long_liq_notional_1h_at_entry=long_liq_notional_1h_at_entry,
+            short_liq_notional_1h_at_entry=short_liq_notional_1h_at_entry,
+            ls_ratio_zscore_14d_at_entry=ls_ratio_zscore_14d_at_entry,
+            price_change_1h_pct_at_entry=price_change_1h_pct_at_entry,
+            price_change_4h_pct_at_entry=price_change_4h_pct_at_entry,
+            liq_heatmap_top_clusters=dict(liq_heatmap_top_clusters or {}),
         )
         placeholders = ", ".join("?" * len(_REJECTED_COLUMNS))
         cols = ", ".join(_REJECTED_COLUMNS)
