@@ -122,6 +122,25 @@ def _timeframe_key(tf: str) -> str:
     return raw
 
 
+def _timeframe_to_minutes(tf: str) -> int:
+    """Normalize TV timeframe strings to integer minutes.
+
+    '3m' → 3, '15m' → 15, '1H' → 60, '4H' → 240. Returns 3 (entry TF
+    default) on any parse failure — keeps `_derive_enrichment`'s
+    price_change computation working even if the YAML has an exotic
+    format we don't recognise.
+    """
+    raw = tf.strip()
+    try:
+        if raw.endswith(("m", "M")):
+            return int(raw[:-1])
+        if raw.endswith(("h", "H")):
+            return int(raw[:-1]) * 60
+        return int(raw)
+    except (TypeError, ValueError):
+        return 3
+
+
 def _tf_seconds(tf: str) -> int:
     """Convert a TV timeframe string to seconds (e.g. '3m' → 180, '4H' → 14400)."""
     raw = tf.strip()
@@ -259,10 +278,97 @@ def _cross_asset_opposition(
     return False
 
 
-def _derive_enrichment(state: MarketState) -> dict:
+def _price_change_pct(
+    candles: Optional[list],
+    bars_ago: int,
+) -> Optional[float]:
+    """Percent price change from N bars ago to the latest close.
+
+    Positive = price up since then; negative = down. Used to give Pass 3
+    GBT the OI × price combinatorial features (long pile-in vs short
+    covering vs capitulation patterns). Returns None when the buffer is
+    too short or any candle's close is <= 0 — defensive, never raises.
+
+    `bars_ago` is expressed on the entry-TF cadence — caller converts
+    `hours × 60 / entry_tf_minutes` before passing in.
+    """
+    if not candles:
+        return None
+    if len(candles) <= bars_ago:
+        return None
+    try:
+        past_close = float(candles[-1 - bars_ago].close)
+        latest_close = float(candles[-1].close)
+    except (AttributeError, ValueError, TypeError):
+        return None
+    if past_close <= 0.0 or latest_close <= 0.0:
+        return None
+    return (latest_close - past_close) / past_close * 100.0
+
+
+def _top_n_heatmap_clusters(
+    heatmap: Any,
+    current_price: float,
+    atr: float,
+    top_n: int = 5,
+) -> dict:
+    """Extract top-N above + top-N below clusters for journaling.
+
+    Arkham-independent — reads from `LiquidityHeatmap.clusters_above/below`
+    which the heatmap builder already sorts by notional (proximity-ranked,
+    see `build_heatmap`). Returns
+      `{"above": [{price, notional_usd, distance_atr}, ...],
+        "below": [...]}`
+    Top-N defaults to 5 per side (rich enough for magnet modelling
+    without bloating journal rows). Empty dict when heatmap is None or
+    neither side has clusters. `distance_atr` is signed toward-price:
+    positive values for above, positive for below (absolute distance in
+    ATR units — sign is implicit in the side key).
+    """
+    if heatmap is None:
+        return {}
+    above = list(getattr(heatmap, "clusters_above", None) or [])
+    below = list(getattr(heatmap, "clusters_below", None) or [])
+    if not above and not below:
+        return {}
+
+    def _encode(cluster, toward_above: bool) -> dict:
+        price = float(getattr(cluster, "price", 0.0) or 0.0)
+        dist_atr: Optional[float] = None
+        if atr > 0 and current_price > 0 and price > 0:
+            dist_atr = (price - current_price) / atr if toward_above else (current_price - price) / atr
+        return {
+            "price": price,
+            "notional_usd": float(getattr(cluster, "notional_usd", 0.0) or 0.0),
+            "distance_atr": dist_atr,
+        }
+
+    out: dict[str, list] = {}
+    if above:
+        out["above"] = [_encode(c, True) for c in above[:top_n]]
+    if below:
+        out["below"] = [_encode(c, False) for c in below[:top_n]]
+    return out
+
+
+def _derive_enrichment(
+    state: MarketState,
+    candles: Optional[list] = None,
+    entry_tf_minutes: int = 3,
+) -> dict:
     """Pull derivatives + heatmap snapshot fields out of MarketState for
     journal persistence. All keys are None when a source is missing — the
-    journal's ALTER TABLE columns default to NULL so that's safe."""
+    journal's ALTER TABLE columns default to NULL so that's safe.
+
+    2026-04-23 extension: pulls every `DerivativesState` field that feeds
+    Pass 3 continuous-feature GBT (absolute OI, 1h OI change, absolute
+    funding + predicted, per-side 1h liquidation notionals, LS
+    z-score-14d) plus price-change windows derived from the entry-TF
+    candle buffer (1h / 4h via `_price_change_pct`) plus top-N heatmap
+    clusters via `_top_n_heatmap_clusters`. `candles` and
+    `entry_tf_minutes` default to None/3 to preserve backward-compat
+    with callers (tests, rehydrate path) that don't thread the buffer.
+    """
     out: dict = {
         "regime_at_entry": None,
         "funding_z_at_entry": None,
@@ -275,6 +381,17 @@ def _derive_enrichment(state: MarketState) -> dict:
         "nearest_liq_cluster_below_notional": None,
         "nearest_liq_cluster_above_distance_atr": None,
         "nearest_liq_cluster_below_distance_atr": None,
+        # 2026-04-23 extension ↓
+        "open_interest_usd_at_entry": None,
+        "oi_change_1h_pct_at_entry": None,
+        "funding_rate_current_at_entry": None,
+        "funding_rate_predicted_at_entry": None,
+        "long_liq_notional_1h_at_entry": None,
+        "short_liq_notional_1h_at_entry": None,
+        "ls_ratio_zscore_14d_at_entry": None,
+        "price_change_1h_pct_at_entry": None,
+        "price_change_4h_pct_at_entry": None,
+        "liq_heatmap_top_clusters": {},
     }
     deriv = getattr(state, "derivatives", None)
     if deriv is not None:
@@ -283,12 +400,21 @@ def _derive_enrichment(state: MarketState) -> dict:
         out["ls_ratio_at_entry"] = getattr(deriv, "long_short_ratio", None)
         out["oi_change_24h_at_entry"] = getattr(deriv, "oi_change_24h_pct", None)
         out["liq_imbalance_1h_at_entry"] = getattr(deriv, "liq_imbalance_1h", None)
+        # 2026-04-23 extension: additional DerivativesState fields that
+        # previously lived only in runtime.
+        out["open_interest_usd_at_entry"] = getattr(deriv, "open_interest_usd", None)
+        out["oi_change_1h_pct_at_entry"] = getattr(deriv, "oi_change_1h_pct", None)
+        out["funding_rate_current_at_entry"] = getattr(deriv, "funding_rate_current", None)
+        out["funding_rate_predicted_at_entry"] = getattr(deriv, "funding_rate_predicted", None)
+        out["long_liq_notional_1h_at_entry"] = getattr(deriv, "long_liq_notional_1h", None)
+        out["short_liq_notional_1h_at_entry"] = getattr(deriv, "short_liq_notional_1h", None)
+        out["ls_ratio_zscore_14d_at_entry"] = getattr(deriv, "ls_ratio_zscore_14d", None)
     hm = getattr(state, "liquidity_heatmap", None)
+    price = float(getattr(state, "current_price", 0.0) or 0.0)
+    atr = float(getattr(state, "atr", 0.0) or 0.0)
     if hm is not None:
         na = getattr(hm, "nearest_above", None)
         nb = getattr(hm, "nearest_below", None)
-        price = float(getattr(state, "current_price", 0.0) or 0.0)
-        atr = float(getattr(state, "atr", 0.0) or 0.0)
         if na is not None:
             out["nearest_liq_cluster_above_price"] = getattr(na, "price", None)
             out["nearest_liq_cluster_above_notional"] = getattr(na, "notional_usd", None)
@@ -299,6 +425,19 @@ def _derive_enrichment(state: MarketState) -> dict:
             out["nearest_liq_cluster_below_notional"] = getattr(nb, "notional_usd", None)
             if atr > 0 and price > 0 and getattr(nb, "price", None):
                 out["nearest_liq_cluster_below_distance_atr"] = (price - nb.price) / atr
+        # 2026-04-23 extension: top-N clusters for richer magnet modelling.
+        out["liq_heatmap_top_clusters"] = _top_n_heatmap_clusters(
+            hm, current_price=price, atr=atr, top_n=5,
+        )
+    # 2026-04-23 extension: price change over 1h / 4h windows from the
+    # entry-TF candle buffer. 1h = 60/entry_tf_minutes bars back; 4h =
+    # 240/entry_tf_minutes. On 3m TF → 20 / 80 bars; buffer's default
+    # size of 100 covers 4h comfortably.
+    if candles and entry_tf_minutes > 0:
+        bars_1h = max(1, int(60 / entry_tf_minutes))
+        bars_4h = max(1, int(240 / entry_tf_minutes))
+        out["price_change_1h_pct_at_entry"] = _price_change_pct(candles, bars_1h)
+        out["price_change_4h_pct_at_entry"] = _price_change_pct(candles, bars_4h)
     return out
 
 
@@ -1383,6 +1522,7 @@ class BotRunner:
         reject_reason: str,
         state: MarketState,
         conf,
+        candles: Optional[list] = None,
     ) -> None:
         """Persist a reject to `rejected_signals` (Phase 7.B1).
 
@@ -1391,7 +1531,10 @@ class BotRunner:
         All snapshot fields default to None so partial data is fine.
         """
         cfg = self.ctx.config
-        enrichment = _derive_enrichment(state)
+        entry_tf_minutes = _timeframe_to_minutes(cfg.trading.entry_timeframe)
+        enrichment = _derive_enrichment(
+            state, candles=candles, entry_tf_minutes=entry_tf_minutes,
+        )
         htf_trend = state.trend_htf
         session = state.active_session
         price = state.current_price
@@ -1985,6 +2128,7 @@ class BotRunner:
                         reject_reason=reject_reason or "unknown",
                         state=state,
                         conf=conf,
+                        candles=candles,
                     )
                 except Exception:
                     logger.debug("record_rejected_signal_failed symbol={}", symbol)
@@ -2072,7 +2216,7 @@ class BotRunner:
                     )
                     await self._record_reject(
                         symbol=symbol, reject_reason="no_setup_zone",
-                        state=state, conf=conf,
+                        state=state, conf=conf, candles=candles,
                     )
                 except Exception:
                     logger.debug("no_setup_zone_reject_log_failed symbol={}", symbol)
@@ -2128,7 +2272,11 @@ class BotRunner:
                 oscillator_raw_values=self._build_oscillator_raw_values(
                     symbol, state,
                 ),
-                **_derive_enrichment(state),
+                **_derive_enrichment(
+                    state,
+                    candles=candles,
+                    entry_tf_minutes=_timeframe_to_minutes(cfg.trading.entry_timeframe),
+                ),
             )
             self.ctx.open_trade_ids[(symbol, pos_side)] = rec.trade_id
             self.ctx.open_trade_opened_at[(symbol, pos_side)] = _utc_now()
