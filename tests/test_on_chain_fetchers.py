@@ -456,3 +456,117 @@ async def test_fetch_token_volume_hits_correct_endpoint_with_hourly_granularity(
     # Probe confirmed sub-hourly returns 500; only 1h works.
     assert params.get("granularity") == "1h"
     assert params.get("timeLast") == "24h"
+
+
+# ── 2026-04-23: histogram fallback for Arkham gap tokens (solana) ─────────
+
+
+@pytest.mark.asyncio
+async def test_fetch_token_volume_falls_back_on_null_primary():
+    """Arkham returns JSON `null` (parsed as Python None) for tokens it
+    recognises but hasn't aggregated into /token/volume. When this
+    happens, the fallback hits /transfers/histogram and returns the
+    last bucket's inflow − outflow."""
+    client = ArkhamClient(api_key="test-key")
+    fake = _FakeClient(queued=[
+        # Primary: /token/volume/solana → Arkham body is JSON null.
+        _FakeResponse(json_body=None),
+        # Fallback leg 1: /transfers/histogram flow=in → most-recent bucket $6.38M
+        _FakeResponse(json_body=_hist(6_385_883.42)),
+        # Fallback leg 2: /transfers/histogram flow=out → most-recent bucket $1.75M
+        _FakeResponse(json_body=_hist(1_751_776.13)),
+    ])
+    client._client = fake  # type: ignore
+    result = await fetch_token_volume_last_hour(client, "solana")
+    assert result is not None
+    # 6.385883M - 1.751776M ≈ 4.634107M (matches the live probe reading)
+    assert abs(result - 4_634_107.29) < 0.01
+    # Confirm both endpoints were hit in sequence.
+    assert len(fake.calls) == 3
+    assert fake.calls[0][0] == "/token/volume/solana"
+    assert fake.calls[1][0] == "/transfers/histogram"
+    assert fake.calls[2][0] == "/transfers/histogram"
+    assert fake.calls[1][1].get("flow") == "in"
+    assert fake.calls[2][1].get("flow") == "out"
+    # Fallback legs must use 1h granularity to match primary semantic.
+    assert fake.calls[1][1].get("granularity") == "1h"
+    # Token passed comma-joined into histogram (Arkham shape).
+    assert fake.calls[1][1].get("tokens") == "solana"
+
+
+@pytest.mark.asyncio
+async def test_fetch_token_volume_falls_back_on_empty_primary_list():
+    """Primary returning `[]` (not null — but still no data) should also
+    trigger the histogram fallback."""
+    client = ArkhamClient(api_key="test-key")
+    fake = _FakeClient(queued=[
+        _FakeResponse(json_body=[]),  # primary empty
+        _FakeResponse(json_body=_hist(1_000_000.0)),
+        _FakeResponse(json_body=_hist(250_000.0)),
+    ])
+    client._client = fake  # type: ignore
+    result = await fetch_token_volume_last_hour(client, "solana")
+    assert result == pytest.approx(750_000.0)
+
+
+@pytest.mark.asyncio
+async def test_fetch_token_volume_primary_non_dict_last_falls_back():
+    """Primary list where the last bucket isn't a dict (defensive) should
+    not crash — just fall back to histogram."""
+    client = ArkhamClient(api_key="test-key")
+    fake = _FakeClient(queued=[
+        _FakeResponse(json_body=["not-a-dict"]),  # malformed
+        _FakeResponse(json_body=_hist(500_000.0)),
+        _FakeResponse(json_body=_hist(100_000.0)),
+    ])
+    client._client = fake  # type: ignore
+    result = await fetch_token_volume_last_hour(client, "solana")
+    assert result == pytest.approx(400_000.0)
+
+
+@pytest.mark.asyncio
+async def test_fetch_token_volume_fallback_returns_none_when_in_leg_fails():
+    """If the fallback's inflow leg returns None, give up — don't
+    fabricate a zero-in value."""
+    client = ArkhamClient(api_key="test-key")
+    fake = _FakeClient(queued=[
+        _FakeResponse(json_body=None),          # primary null
+        _FakeResponse(json_body=None),          # inflow leg fails
+        _FakeResponse(json_body=_hist(100.0)),  # outflow (unreached ideally)
+    ])
+    client._client = fake  # type: ignore
+    result = await fetch_token_volume_last_hour(client, "solana")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_token_volume_fallback_handles_empty_histogram_buckets():
+    """Histogram legs return empty lists → None (no bucket to take from)."""
+    client = ArkhamClient(api_key="test-key")
+    fake = _FakeClient(queued=[
+        _FakeResponse(json_body=None),
+        _FakeResponse(json_body=[]),
+        _FakeResponse(json_body=[]),
+    ])
+    client._client = fake  # type: ignore
+    result = await fetch_token_volume_last_hour(client, "solana")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_token_volume_primary_success_skips_fallback():
+    """Don't waste 2 extra calls when the primary path succeeds."""
+    body = _token_volume_body([("2026-04-22T07:00:00Z", 20_800_110.91, 3_395_308.11)])
+    client = ArkhamClient(api_key="test-key")
+    fake = _FakeClient(queued=[
+        _FakeResponse(json_body=body),
+        # Queue extra responses that must NOT be consumed.
+        _FakeResponse(json_body=_hist(999_999.0)),
+        _FakeResponse(json_body=_hist(999_999.0)),
+    ])
+    client._client = fake  # type: ignore
+    result = await fetch_token_volume_last_hour(client, "bitcoin")
+    assert result == pytest.approx(17_404_802.80, abs=0.01)
+    # Only one call — primary returned a usable bucket.
+    assert len(fake.calls) == 1
+    assert fake.calls[0][0] == "/token/volume/bitcoin"
