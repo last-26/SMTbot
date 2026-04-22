@@ -36,6 +36,7 @@ Failure policy (unchanged from v1):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 from datetime import datetime
@@ -191,6 +192,59 @@ def _clear_cached_stream_id(path: Path) -> None:
             path.unlink()
     except Exception:
         pass
+    # Sidecar filter fingerprint is paired with stream_id — clear together
+    # so a stale fingerprint can't survive an id wipe.
+    _clear_cached_filter_fingerprint(path)
+
+
+def _filter_fingerprint_path(stream_id_path: Path) -> Path:
+    """Sidecar path for the filter fingerprint, derived from stream_id path.
+    `data/arkham_stream_id.txt` → `data/arkham_stream_id.filter.txt`.
+    Kept as a separate file so legacy plain-text stream_id consumers stay
+    backwards-compatible (no JSON parsing in `_read_cached_stream_id`).
+    """
+    return stream_id_path.with_suffix(stream_id_path.suffix + ".filter")
+
+
+def compute_filter_fingerprint(filters: dict) -> str:
+    """Stable short hash of a filter dict. Order-insensitive (sorted JSON
+    canonicalisation), so reordering keys in `build_stream_filters` won't
+    spuriously trigger a stream recreate."""
+    canonical = json.dumps(filters, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _read_cached_filter_fingerprint(stream_id_path: Path) -> Optional[str]:
+    """Read the last-known filter fingerprint from the sidecar. None on
+    missing / empty / read error → caller treats as fingerprint mismatch
+    and forces a fresh stream create. Legacy installations (sidecar
+    absent) pay one create on first run after this feature ships."""
+    sidecar = _filter_fingerprint_path(stream_id_path)
+    try:
+        if not sidecar.exists():
+            return None
+        content = sidecar.read_text(encoding="utf-8").strip()
+        return content or None
+    except Exception:
+        return None
+
+
+def _write_cached_filter_fingerprint(stream_id_path: Path, fingerprint: str) -> None:
+    sidecar = _filter_fingerprint_path(stream_id_path)
+    try:
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(fingerprint, encoding="utf-8")
+    except Exception as e:
+        logger.warning("arkham_filter_fingerprint_write_failed err={!r}", e)
+
+
+def _clear_cached_filter_fingerprint(stream_id_path: Path) -> None:
+    sidecar = _filter_fingerprint_path(stream_id_path)
+    try:
+        if sidecar.exists():
+            sidecar.unlink()
+    except Exception:
+        pass
 
 
 class ArkhamWebSocketListener:
@@ -261,17 +315,34 @@ class ArkhamWebSocketListener:
         """Return a usable stream_id — reusing the cached one if valid,
         creating a new one otherwise.
 
-        Reuse logic:
-          1. Read cached id from disk.
-          2. Call GET /ws/v2/streams; if cached id is in the list,
-             reuse it.
-          3. Otherwise create a new stream, persist its id, return it.
+        Reuse logic (post 2026-04-22 filter-fingerprint check):
+          1. Read cached id + cached filter fingerprint from disk.
+          2. Compute current filter fingerprint from `_tokens` + `_usd_gte`.
+          3. If fingerprints match AND `GET /ws/v2/streams` shows the
+             cached id is still alive → reuse (zero creation fee).
+          4. If fingerprint MISMATCH (filter config changed since last
+             run) → delete the old stream + clear cache + create fresh
+             with the new filter. This is the path that ships when
+             operator changes `whale_tokens` or `whale_threshold_usd`.
+          5. If cached id is stale (server-side timeout) → drop cache,
+             create fresh.
+
+        Filter-fingerprint logic exists because Arkham v2 streams are
+        immutable post-create — silently reusing a stream with a
+        no-longer-current filter would deliver wrong data and waste
+        label-lookup quota on tokens we don't care about.
 
         Any failure falls through to creation; creation failure is
         escalated to the caller's 3-strike disable loop.
         """
+        filters = build_stream_filters(self._tokens, self._usd_gte)
+        current_fp = compute_filter_fingerprint(filters)
+
         cached = _read_cached_stream_id(self._stream_id_path)
-        if cached:
+        cached_fp = _read_cached_filter_fingerprint(self._stream_id_path)
+
+        if cached and cached_fp == current_fp:
+            # Fingerprint match — verify stream is still alive on Arkham side.
             try:
                 streams = await self._client.list_ws_streams()
             except Exception:
@@ -283,19 +354,36 @@ class ArkhamWebSocketListener:
                 }
                 if cached in ids:
                     logger.info(
-                        "arkham_ws_stream_reused stream_id={} (no creation fee)",
-                        cached,
+                        "arkham_ws_stream_reused stream_id={} fp={} "
+                        "(no creation fee)",
+                        cached, current_fp,
                     )
                     return cached
-                # Cached id is stale (deleted, expired, or belongs to
-                # a different key). Clear it so we don't keep checking.
                 logger.info(
-                    "arkham_ws_stream_cache_stale cached={} — creating new",
-                    cached,
+                    "arkham_ws_stream_cache_stale cached={} fp={} — "
+                    "creating new",
+                    cached, current_fp,
                 )
                 _clear_cached_stream_id(self._stream_id_path)
+        elif cached:
+            # Filter changed since last run — old stream delivers wrong
+            # data and burns labels on filtered-out tokens. Delete + recreate.
+            logger.info(
+                "arkham_ws_stream_filter_changed cached_sid={} cached_fp={} "
+                "new_fp={} — deleting old stream + recreating",
+                cached, cached_fp, current_fp,
+            )
+            try:
+                await self._client.delete_ws_stream(cached)
+            except Exception as e:
+                # Non-fatal: Arkham reclaims orphaned streams via timeout.
+                logger.warning(
+                    "arkham_ws_stream_delete_failed err={!r} — "
+                    "Arkham timeout will reclaim", e,
+                )
+            _clear_cached_stream_id(self._stream_id_path)
+
         # Create fresh.
-        filters = build_stream_filters(self._tokens, self._usd_gte)
         result = None
         try:
             result = await self._client.create_ws_stream(filters)
@@ -309,9 +397,10 @@ class ArkhamWebSocketListener:
             return None
         sid = str(sid)
         _write_cached_stream_id(self._stream_id_path, sid)
+        _write_cached_filter_fingerprint(self._stream_id_path, current_fp)
         logger.info(
-            "arkham_ws_stream_created stream_id={} filters={}",
-            sid, filters,
+            "arkham_ws_stream_created stream_id={} fp={} filters={}",
+            sid, current_fp, filters,
         )
         return sid
 

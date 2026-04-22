@@ -557,11 +557,25 @@ class OnChainConfig(BaseModel):
 
     # Phase D — whale-transfer blackout (WebSocket listener feeds the gate).
     # Arkham's WS filter requires `usdGte >= 10_000_000` per the API docs;
-    # the validator enforces this. Runtime default 100M keeps the signal
-    # high-SNR — sub-100M moves are too common to block entries on.
+    # the validator enforces this. Default 150M (bumped 100M → 150M on
+    # 2026-04-22) — at $100M the trial label-lookup quota was burning
+    # ~17k/month from incidental whale events. $150M halves that on
+    # observed flow distributions while preserving the macro-event signal.
     whale_blackout_enabled: bool = False
-    whale_threshold_usd: float = 100_000_000.0
+    whale_threshold_usd: float = 150_000_000.0
     whale_blackout_duration_s: int = 600  # 10 minutes
+    # Token slug filter on the WS stream (Arkham coingecko-style ids).
+    # Restricts incoming whale events to the tokens we actually trade
+    # (5 perps + 2 stablecoins). Without this, every $100M+ CEX↔CEX
+    # transfer in any token reaches us — XRP, ADA, MATIC, LINK, etc.
+    # consume label lookups (each transfer = from + to entity labels)
+    # without affecting any of our blackout decisions, since
+    # `affected_symbols_for` returns empty tuple for unmapped tokens.
+    # Bumped 2026-04-22 with the threshold change above.
+    whale_tokens: list[str] = Field(default_factory=lambda: [
+        "bitcoin", "ethereum", "solana", "dogecoin", "binancecoin",
+        "tether", "usd-coin",
+    ])
 
     # Phase F2 (2026-04-21 post-integration) — Arkham altcoin index
     # modifier. Index is a scalar 0-100 from `/marketdata/altcoin_index`

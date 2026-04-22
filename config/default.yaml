@@ -613,8 +613,20 @@ on_chain:
   # qualifying transfers to the shared WhaleBlackoutState registry;
   # entry_signals reads via is_active on every entry attempt.
   whale_blackout_enabled: true
-  whale_threshold_usd: 100000000.0                 # WS filter (usdGte); ≥10M minimum
+  whale_threshold_usd: 150000000.0                 # WS filter (usdGte); ≥10M min, bumped 100M→150M on 2026-04-22 to halve label-lookup burn
   whale_blackout_duration_s: 600                   # 10 min after event
+  # Token slug whitelist on the WS stream — only transfers in these
+  # tokens reach the listener. Drops gross label-lookup tax from
+  # noise tokens (XRP/ADA/MATIC etc.) that would never affect blackouts
+  # since `affected_symbols_for` returns empty for them. 2026-04-22.
+  whale_tokens:
+    - bitcoin
+    - ethereum
+    - solana
+    - dogecoin
+    - binancecoin
+    - tether
+    - usd-coin
 
   # Phase F2 (2026-04-21) — Arkham altcoin index modifier.
   # `/marketdata/altcoin_index` scalar 0-100. Low → altcoins underperforming

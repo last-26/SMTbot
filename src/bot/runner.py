@@ -625,6 +625,7 @@ class BotRunner:
                     ctx.whale_blackout_state,
                     usd_gte=cfg.on_chain.whale_threshold_usd,
                     blackout_duration_s=cfg.on_chain.whale_blackout_duration_s,
+                    tokens=list(cfg.on_chain.whale_tokens),
                 )
 
         # Macro event blackout — independent of the derivatives subsystem.

@@ -358,9 +358,16 @@ def test_on_chain_defaults_master_and_subfeatures_all_off():
     # Default threshold / duration values match documented pivot.
     assert cfg.on_chain.daily_bias_modifier_delta == 0.15
     assert cfg.on_chain.stablecoin_pulse_penalty == 0.75
-    assert cfg.on_chain.whale_threshold_usd == 100_000_000.0
+    # 2026-04-22: bumped 100M → 150M to halve label-lookup tax on
+    # the WS whale stream (paired with whale_tokens whitelist).
+    assert cfg.on_chain.whale_threshold_usd == 150_000_000.0
     assert cfg.on_chain.whale_blackout_duration_s == 600
     assert cfg.on_chain.api_usage_auto_disable_pct == 95.0
+    # whale_tokens — 5 perps + 2 stablecoins, slug-format (Arkham coingecko ids).
+    assert cfg.on_chain.whale_tokens == [
+        "bitcoin", "ethereum", "solana", "dogecoin", "binancecoin",
+        "tether", "usd-coin",
+    ]
 
 
 def test_on_chain_flags_load_from_yaml():

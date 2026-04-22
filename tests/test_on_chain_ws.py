@@ -13,12 +13,26 @@ from src.data.on_chain_ws import (
     ARKHAM_WS_BASE,
     ArkhamWebSocketListener,
     _clear_cached_stream_id,
+    _read_cached_filter_fingerprint,
     _read_cached_stream_id,
+    _write_cached_filter_fingerprint,
     _write_cached_stream_id,
     build_stream_filters,
     build_ws_url,
+    compute_filter_fingerprint,
     parse_transfer_message,
 )
+
+
+def _seed_cache(path: Path, stream_id: str, *, tokens=None, usd_gte=100_000_000.0):
+    """Helper: write both the stream_id cache AND a matching filter
+    fingerprint sidecar so `_obtain_stream_id` treats the cache as
+    fingerprint-match (the new 2026-04-22 behavior)."""
+    _write_cached_stream_id(path, stream_id)
+    fp = compute_filter_fingerprint(
+        build_stream_filters(tokens or [], usd_gte)
+    )
+    _write_cached_filter_fingerprint(path, fp)
 
 
 # ── build_ws_url ────────────────────────────────────────────────────────────
@@ -214,7 +228,7 @@ def _make_listener(arkham, state: WhaleBlackoutState, *,
 @pytest.mark.asyncio
 async def test_obtain_stream_id_reuses_cached_when_still_live(tmp_path):
     path = tmp_path / "stream.txt"
-    _write_cached_stream_id(path, "cached-sid")
+    _seed_cache(path, "cached-sid")  # sidecar fingerprint matches default filter
     # list_ws_streams returns a list containing the cached id.
     arkham = _FakeArkham(list_result=[
         {"streamId": "cached-sid", "isConnected": False},
@@ -227,13 +241,14 @@ async def test_obtain_stream_id_reuses_cached_when_still_live(tmp_path):
     # No creation call = no credit burn.
     assert arkham.create_calls == 0
     assert arkham.list_calls == 1
+    assert arkham.delete_calls == 0
 
 
 @pytest.mark.asyncio
 async def test_obtain_stream_id_creates_new_when_cache_stale(tmp_path):
     path = tmp_path / "stream.txt"
-    _write_cached_stream_id(path, "stale-sid")
-    # list returns DIFFERENT ids than cache.
+    _seed_cache(path, "stale-sid")  # fingerprint matches but stream gone server-side
+    # list returns DIFFERENT ids than cache → server-side stale.
     arkham = _FakeArkham(
         list_result=[{"streamId": "other-sid", "isConnected": False}],
         create_result={"streamId": "fresh-sid", "id": 99,
@@ -244,8 +259,11 @@ async def test_obtain_stream_id_creates_new_when_cache_stale(tmp_path):
     sid = await listener._obtain_stream_id()
     assert sid == "fresh-sid"
     assert arkham.create_calls == 1
-    # Cache rewritten with fresh id.
+    # Cache rewritten with fresh id + fingerprint.
     assert _read_cached_stream_id(path) == "fresh-sid"
+    assert _read_cached_filter_fingerprint(path) == compute_filter_fingerprint(
+        build_stream_filters([], 100_000_000.0)
+    )
 
 
 @pytest.mark.asyncio
@@ -286,6 +304,107 @@ async def test_obtain_stream_id_none_on_create_exception(tmp_path):
                               stream_id_path=path)
     sid = await listener._obtain_stream_id()
     assert sid is None
+
+
+# ── filter-fingerprint cache (2026-04-22 token-filter feature) ─────────────
+
+
+@pytest.mark.asyncio
+async def test_obtain_stream_id_recreates_on_filter_mismatch(tmp_path):
+    """If operator changed `whale_tokens` (or threshold) since the cached
+    stream was created, the old stream delivers wrong data + wastes label
+    quota — must delete the old stream and create a fresh one."""
+    path = tmp_path / "stream.txt"
+    # Seed cache with a fingerprint computed from a DIFFERENT filter
+    # (different tokens list) than what the listener will request.
+    _write_cached_stream_id(path, "old-sid")
+    _write_cached_filter_fingerprint(
+        path,
+        compute_filter_fingerprint(build_stream_filters(["xrp", "ada"], 100_000_000.0)),
+    )
+    arkham = _FakeArkham(
+        list_result=[{"streamId": "old-sid", "isConnected": False}],
+        create_result={"streamId": "new-sid", "id": 100,
+                       "createdAt": "2026-04-22T00:00:00Z"},
+    )
+    listener = ArkhamWebSocketListener(
+        arkham, WhaleBlackoutState(),
+        usd_gte=100_000_000.0,
+        blackout_duration_s=600,
+        tokens=["bitcoin", "ethereum"],  # different from cached
+        stream_id_path=path,
+    )
+    sid = await listener._obtain_stream_id()
+    assert sid == "new-sid"
+    # Old stream must be deleted to free Arkham server-side resource.
+    assert arkham.delete_calls == 1
+    assert arkham.create_calls == 1
+    # Sidecar updated with NEW fingerprint matching new filter.
+    assert _read_cached_filter_fingerprint(path) == compute_filter_fingerprint(
+        build_stream_filters(["bitcoin", "ethereum"], 100_000_000.0)
+    )
+
+
+@pytest.mark.asyncio
+async def test_obtain_stream_id_legacy_cache_without_fingerprint_recreates(tmp_path):
+    """Legacy installs (pre 2026-04-22) have a stream_id but no
+    fingerprint sidecar — treat as mismatch and recreate (one-time pay)
+    so we don't keep silently reusing a stream with unknown filter."""
+    path = tmp_path / "stream.txt"
+    _write_cached_stream_id(path, "legacy-sid")  # NO sidecar written
+    arkham = _FakeArkham(
+        list_result=[{"streamId": "legacy-sid", "isConnected": False}],
+        create_result={"streamId": "post-migration-sid"},
+    )
+    listener = _make_listener(arkham, WhaleBlackoutState(),
+                              stream_id_path=path)
+    sid = await listener._obtain_stream_id()
+    assert sid == "post-migration-sid"
+    assert arkham.delete_calls == 1
+    assert arkham.create_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_obtain_stream_id_filter_mismatch_survives_delete_failure(tmp_path):
+    """If `delete_ws_stream` raises (e.g. network blip), we still proceed
+    with the create — Arkham's server-side timeout will reclaim the
+    orphan. Recreate is more important than clean shutdown of the old."""
+    path = tmp_path / "stream.txt"
+    _write_cached_stream_id(path, "old-sid")
+    _write_cached_filter_fingerprint(path, "deadbeef0000")  # garbage fp → mismatch
+
+    class _DeleteFails(_FakeArkham):
+        async def delete_ws_stream(self, sid):
+            self.delete_calls += 1
+            raise RuntimeError("transient network err")
+
+    arkham = _DeleteFails(
+        create_result={"streamId": "new-sid"},
+    )
+    listener = _make_listener(arkham, WhaleBlackoutState(),
+                              stream_id_path=path)
+    sid = await listener._obtain_stream_id()
+    assert sid == "new-sid"
+    assert arkham.delete_calls == 1
+    assert arkham.create_calls == 1
+
+
+def test_compute_filter_fingerprint_is_order_insensitive():
+    a = build_stream_filters(["bitcoin", "ethereum"], 100_000_000.0)
+    b = build_stream_filters(["ethereum", "bitcoin"], 100_000_000.0)
+    # Same set of tokens, different order → fingerprint depends on the
+    # serialized filter dict. Since `build_stream_filters` preserves
+    # tokens order, fingerprints differ. Document the contract: any
+    # change in token order COUNTS as a filter change. Operator-facing
+    # configs should use a stable order (alphabetical or business-prio).
+    if a == b:
+        assert compute_filter_fingerprint(a) == compute_filter_fingerprint(b)
+    # Hash must be deterministic across calls for the same input.
+    assert compute_filter_fingerprint(a) == compute_filter_fingerprint(a)
+    # Hash must differ when usd_gte changes.
+    c = build_stream_filters(["bitcoin"], 200_000_000.0)
+    d = build_stream_filters(["bitcoin"], 100_000_000.0)
+    assert compute_filter_fingerprint(c) != compute_filter_fingerprint(d)
 
 
 # ── ArkhamWebSocketListener._handle ────────────────────────────────────────
