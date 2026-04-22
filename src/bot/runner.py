@@ -23,6 +23,7 @@ monitor.register_open, okx_client.enrich_close_fill / get_positions).
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -50,9 +51,15 @@ from src.data.models import Direction, MarketState, Session
 from src.data.on_chain import (
     ArkhamClient,
     fetch_daily_snapshot,
+    fetch_entity_netflow_24h,
     fetch_hourly_stablecoin_pulse,
+    fetch_token_volume_last_hour,
 )
-from src.data.on_chain_types import OnChainSnapshot, WhaleBlackoutState
+from src.data.on_chain_types import (
+    OnChainSnapshot,
+    WATCHED_SYMBOL_TO_TOKEN_ID,
+    WhaleBlackoutState,
+)
 from src.data.on_chain_ws import ArkhamWebSocketListener
 from src.data.public_market_feed import (
     BinancePublicClient,
@@ -420,7 +427,22 @@ class BotContext:
     # Tuple of (bias, pulse, btc_flow, eth_flow, coinbase_skew, bnb_flow,
     # altcoin_idx, fresh, whale_blackout_active). Unchanged tick → skip
     # journal write; mutation → append a row. None on startup.
+    # 2026-04-22 — fingerprint extended with Coinbase/Binance/Bybit
+    # netflow + per-symbol token volume JSON.
     last_on_chain_snapshot_fingerprint: Any = None
+    # 2026-04-22 — per-entity 24h netflow (last completed UTC day) for
+    # Coinbase, Binance, Bybit via `/flow/entity/{entity}`. Refreshed
+    # in the daily-snapshot branch (once per UTC day, like bias itself).
+    # Journal-only; no gate / modifier reads these.
+    cex_coinbase_netflow_24h_usd: Optional[float] = None
+    cex_binance_netflow_24h_usd: Optional[float] = None
+    cex_bybit_netflow_24h_usd: Optional[float] = None
+    # 2026-04-22 — per-symbol most-recent-hour net CEX flow via
+    # `/token/volume/{id}?granularity=1h`. JSON-encoded dict of
+    # {OKX_symbol: usd_netflow_float}. Refreshed on its own cadence
+    # (token_volume_refresh_s, default 3600). Journal-only.
+    token_volume_1h_net_usd_json: Optional[str] = None
+    last_token_volume_ts: float = 0.0
 
 
 # ── Runner ──────────────────────────────────────────────────────────────────
@@ -1962,9 +1984,34 @@ class BotRunner:
                 logger.exception("arkham_daily_snapshot_failed")
                 snap = None
             if snap is not None:
-                # Preserve any live stablecoin-pulse field we already
-                # carry — the daily build returns None for pulse, we
-                # patch it back in from the cached value.
+                # 2026-04-22 — alongside the bias fetch, also pull
+                # per-entity 24h netflow for Coinbase + Binance + Bybit
+                # via `/flow/entity/{entity}`. Same UTC-day cadence
+                # because the underlying data is daily-granular.
+                # Per-entity failures are isolated (one bad entity
+                # leaves the others' values intact). Probe-confirmed
+                # 0 label lookup cost.
+                if cfg.on_chain.entity_netflow_enabled:
+                    for entity in ("coinbase", "binance", "bybit"):
+                        try:
+                            await asyncio.sleep(1.1)  # 1 req/s rate cushion
+                            value = await fetch_entity_netflow_24h(client, entity)
+                        except Exception:
+                            logger.exception(
+                                "arkham_entity_netflow_failed entity={}", entity)
+                            value = None
+                        if value is not None:
+                            setattr(self.ctx,
+                                    f"cex_{entity}_netflow_24h_usd", value)
+                            logger.info(
+                                "arkham_entity_netflow_refreshed "
+                                "entity={} netflow_24h_usd={:.2f}",
+                                entity, float(value),
+                            )
+
+                # Preserve any live stablecoin-pulse + per-entity netflows
+                # + token volume JSON we already carry — the daily build
+                # returns None for those, we patch them back in from cache.
                 self.ctx.on_chain_snapshot = OnChainSnapshot(
                     daily_macro_bias=snap.daily_macro_bias,
                     stablecoin_pulse_1h_usd=self.ctx.stablecoin_pulse_1h_usd,
@@ -1972,6 +2019,10 @@ class BotRunner:
                     cex_eth_netflow_24h_usd=snap.cex_eth_netflow_24h_usd,
                     coinbase_asia_skew_usd=snap.coinbase_asia_skew_usd,
                     bnb_self_flow_24h_usd=snap.bnb_self_flow_24h_usd,
+                    cex_coinbase_netflow_24h_usd=self.ctx.cex_coinbase_netflow_24h_usd,
+                    cex_binance_netflow_24h_usd=self.ctx.cex_binance_netflow_24h_usd,
+                    cex_bybit_netflow_24h_usd=self.ctx.cex_bybit_netflow_24h_usd,
+                    token_volume_1h_net_usd_json=self.ctx.token_volume_1h_net_usd_json,
                     snapshot_age_s=0,
                     stale_threshold_s=snap.stale_threshold_s,
                 )
@@ -2029,6 +2080,10 @@ class BotRunner:
                         cex_eth_netflow_24h_usd=prev.cex_eth_netflow_24h_usd,
                         coinbase_asia_skew_usd=prev.coinbase_asia_skew_usd,
                         bnb_self_flow_24h_usd=prev.bnb_self_flow_24h_usd,
+                        cex_coinbase_netflow_24h_usd=prev.cex_coinbase_netflow_24h_usd,
+                        cex_binance_netflow_24h_usd=prev.cex_binance_netflow_24h_usd,
+                        cex_bybit_netflow_24h_usd=prev.cex_bybit_netflow_24h_usd,
+                        token_volume_1h_net_usd_json=prev.token_volume_1h_net_usd_json,
                         snapshot_age_s=prev.snapshot_age_s,
                         stale_threshold_s=prev.stale_threshold_s,
                     )
@@ -2036,6 +2091,59 @@ class BotRunner:
                     "arkham_stablecoin_pulse_refreshed pulse_usd={:.2f}",
                     float(pulse),
                 )
+
+        # 2026-04-22 — per-symbol token volume (`/token/volume/{id}`
+        # granularity=1h). Hourly cadence matches data granularity.
+        # Probe-confirmed 0 label cost. Per-symbol failures isolated.
+        if cfg.on_chain.token_volume_enabled:
+            tv_refresh_s = float(cfg.on_chain.token_volume_refresh_s)
+            tv_elapsed = now_mono - self.ctx.last_token_volume_ts
+            if tv_elapsed >= tv_refresh_s:
+                volumes: dict[str, float] = {}
+                # Use whatever symbols are configured for this run +
+                # are also in the slug map. Unknown symbols silently skipped.
+                watched = list(getattr(cfg.trading, "symbols", []) or [])
+                for sym in watched:
+                    token_id = WATCHED_SYMBOL_TO_TOKEN_ID.get(sym)
+                    if token_id is None:
+                        continue
+                    try:
+                        await asyncio.sleep(1.1)  # 1 req/s rate cushion
+                        v = await fetch_token_volume_last_hour(client, token_id)
+                    except Exception:
+                        logger.exception(
+                            "arkham_token_volume_failed sym={} token={}",
+                            sym, token_id,
+                        )
+                        v = None
+                    if v is not None:
+                        volumes[sym] = float(v)
+                if volumes:
+                    self.ctx.token_volume_1h_net_usd_json = json.dumps(volumes)
+                    self.ctx.last_token_volume_ts = now_mono
+                    # Patch cached snapshot so the next dedup tick sees the
+                    # new value without waiting on another daily/pulse fetch.
+                    prev = self.ctx.on_chain_snapshot
+                    if prev is not None:
+                        self.ctx.on_chain_snapshot = OnChainSnapshot(
+                            daily_macro_bias=prev.daily_macro_bias,
+                            stablecoin_pulse_1h_usd=prev.stablecoin_pulse_1h_usd,
+                            cex_btc_netflow_24h_usd=prev.cex_btc_netflow_24h_usd,
+                            cex_eth_netflow_24h_usd=prev.cex_eth_netflow_24h_usd,
+                            coinbase_asia_skew_usd=prev.coinbase_asia_skew_usd,
+                            bnb_self_flow_24h_usd=prev.bnb_self_flow_24h_usd,
+                            cex_coinbase_netflow_24h_usd=prev.cex_coinbase_netflow_24h_usd,
+                            cex_binance_netflow_24h_usd=prev.cex_binance_netflow_24h_usd,
+                            cex_bybit_netflow_24h_usd=prev.cex_bybit_netflow_24h_usd,
+                            token_volume_1h_net_usd_json=self.ctx.token_volume_1h_net_usd_json,
+                            snapshot_age_s=prev.snapshot_age_s,
+                            stale_threshold_s=prev.stale_threshold_s,
+                        )
+                    logger.info(
+                        "arkham_token_volume_refreshed symbols={} sample={}",
+                        list(volumes.keys()),
+                        {k: f"{v:.2f}" for k, v in list(volumes.items())[:2]},
+                    )
 
         # Time-series journal row — appends only when the composite
         # fingerprint actually changes. Cadence thus matches Arkham's
@@ -2085,6 +2193,11 @@ class BotRunner:
             self.ctx.altcoin_index_value,
             bool(snap.fresh),
             blackout_active,
+            # 2026-04-22 — entity netflows + per-symbol token volume.
+            snap.cex_coinbase_netflow_24h_usd,
+            snap.cex_binance_netflow_24h_usd,
+            snap.cex_bybit_netflow_24h_usd,
+            snap.token_volume_1h_net_usd_json,
         )
         if self.ctx.last_on_chain_snapshot_fingerprint == fp:
             return
@@ -2102,6 +2215,10 @@ class BotRunner:
                 snapshot_age_s=int(snap.snapshot_age_s),
                 fresh=bool(snap.fresh),
                 whale_blackout_active=blackout_active,
+                cex_coinbase_netflow_24h_usd=snap.cex_coinbase_netflow_24h_usd,
+                cex_binance_netflow_24h_usd=snap.cex_binance_netflow_24h_usd,
+                cex_bybit_netflow_24h_usd=snap.cex_bybit_netflow_24h_usd,
+                token_volume_1h_net_usd_json=snap.token_volume_1h_net_usd_json,
             )
             self.ctx.last_on_chain_snapshot_fingerprint = fp
         except Exception:
@@ -2140,6 +2257,14 @@ class BotRunner:
             "cex_eth_netflow_24h_usd": snap.cex_eth_netflow_24h_usd,
             "coinbase_asia_skew_usd": snap.coinbase_asia_skew_usd,
             "bnb_self_flow_24h_usd": snap.bnb_self_flow_24h_usd,
+            # 2026-04-22 — entity netflow + per-symbol token volume on the
+            # entry-time snapshot. Phase 9 GBT can either consume from here
+            # (entry-frozen) or join the on_chain_snapshots time-series for
+            # mid-trade evolution. Both are valid analytic angles.
+            "cex_coinbase_netflow_24h_usd": snap.cex_coinbase_netflow_24h_usd,
+            "cex_binance_netflow_24h_usd": snap.cex_binance_netflow_24h_usd,
+            "cex_bybit_netflow_24h_usd": snap.cex_bybit_netflow_24h_usd,
+            "token_volume_1h_net_usd_json": snap.token_volume_1h_net_usd_json,
             "snapshot_age_s": int(snap.snapshot_age_s),
             "fresh": bool(snap.fresh),
             "whale_blackout_active": blackout_active,

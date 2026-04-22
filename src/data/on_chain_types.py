@@ -43,8 +43,19 @@ class OnChainSnapshot:
     stablecoin_pulse_1h_usd: Optional[float] = None
     cex_btc_netflow_24h_usd: Optional[float] = None
     cex_eth_netflow_24h_usd: Optional[float] = None
-    coinbase_asia_skew_usd: Optional[float] = None
-    bnb_self_flow_24h_usd: Optional[float] = None
+    coinbase_asia_skew_usd: Optional[float] = None  # legacy / unused
+    bnb_self_flow_24h_usd: Optional[float] = None  # legacy / unused
+    # 2026-04-22 — per-entity 24h netflow (last completed UTC day) via
+    # `/flow/entity/{entity}`. Journal-only; does NOT participate in any
+    # gate or modifier. Phase 9 GBT will test predictive value before any
+    # runtime wiring.
+    cex_coinbase_netflow_24h_usd: Optional[float] = None
+    cex_binance_netflow_24h_usd: Optional[float] = None
+    cex_bybit_netflow_24h_usd: Optional[float] = None
+    # 2026-04-22 — per-symbol most-recent-hour net CEX flow (USD) via
+    # `/token/volume/{id}?granularity=1h`. JSON dict keyed by OKX symbol;
+    # adding a 6th symbol won't require schema migration. Journal-only.
+    token_volume_1h_net_usd_json: Optional[str] = None
     snapshot_age_s: int = 0
     stale_threshold_s: int = 7200
 
@@ -92,6 +103,19 @@ def affected_symbols_for(token_id: str) -> tuple[str, ...]:
     if t in ("binancecoin", "binance-coin", "bnb"):
         return ("BNB-USDT-SWAP",)
     return ()
+
+
+# 2026-04-22 — reverse mapping: OKX perp symbol → Arkham token slug
+# (CoinGecko-style id). Used by the runner's `/token/volume/{id}` fetch
+# pipeline. Adding a new symbol requires extending BOTH this dict AND
+# `affected_symbols_for` above for the chain-native fan-in/out.
+WATCHED_SYMBOL_TO_TOKEN_ID: dict[str, str] = {
+    "BTC-USDT-SWAP": "bitcoin",
+    "ETH-USDT-SWAP": "ethereum",
+    "SOL-USDT-SWAP": "solana",
+    "DOGE-USDT-SWAP": "dogecoin",
+    "BNB-USDT-SWAP": "binancecoin",
+}
 
 
 @dataclass

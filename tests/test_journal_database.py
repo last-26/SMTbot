@@ -535,6 +535,64 @@ async def test_record_on_chain_snapshot_roundtrip():
         assert r["captured_at"] == ts.isoformat()
 
 
+async def test_record_on_chain_snapshot_with_entity_netflow_and_token_volume():
+    """2026-04-22 (FAZ 2/3): per-entity netflow + per-symbol token volume
+    JSON round-trip cleanly through the new schema columns."""
+    import json as _json
+    async with TradeJournal(":memory:") as j:
+        ts = datetime(2026, 4, 22, 9, 0, tzinfo=UTC)
+        token_vols = {"BTC-USDT-SWAP": 17_404_802.80, "ETH-USDT-SWAP": -3_500_000.0}
+        await j.record_on_chain_snapshot(
+            captured_at=ts,
+            daily_macro_bias="neutral",
+            stablecoin_pulse_1h_usd=None,
+            cex_btc_netflow_24h_usd=None,
+            cex_eth_netflow_24h_usd=None,
+            coinbase_asia_skew_usd=None,
+            bnb_self_flow_24h_usd=None,
+            altcoin_index=18,
+            snapshot_age_s=0,
+            fresh=True,
+            whale_blackout_active=False,
+            cex_coinbase_netflow_24h_usd=198_814.90,
+            cex_binance_netflow_24h_usd=50_449_218.15,
+            cex_bybit_netflow_24h_usd=-216_420.77,
+            token_volume_1h_net_usd_json=_json.dumps(token_vols),
+        )
+        rows = await j.list_on_chain_snapshots()
+        assert len(rows) == 1
+        r = rows[0]
+        assert r["cex_coinbase_netflow_24h_usd"] == 198_814.90
+        assert r["cex_binance_netflow_24h_usd"] == 50_449_218.15
+        assert r["cex_bybit_netflow_24h_usd"] == -216_420.77
+        assert _json.loads(r["token_volume_1h_net_usd_json"]) == token_vols
+
+
+async def test_record_on_chain_snapshot_legacy_signature_still_works():
+    """Ensure callers that omit the 2026-04-22 kwargs still work — the
+    new params have default None for backwards compat."""
+    async with TradeJournal(":memory:") as j:
+        ts = datetime(2026, 4, 22, 10, 0, tzinfo=UTC)
+        await j.record_on_chain_snapshot(
+            captured_at=ts,
+            daily_macro_bias="neutral",
+            stablecoin_pulse_1h_usd=1.0,
+            cex_btc_netflow_24h_usd=2.0,
+            cex_eth_netflow_24h_usd=3.0,
+            coinbase_asia_skew_usd=None,
+            bnb_self_flow_24h_usd=None,
+            altcoin_index=None,
+            snapshot_age_s=0,
+            fresh=True,
+            whale_blackout_active=False,
+        )
+        rows = await j.list_on_chain_snapshots()
+        assert rows[0]["cex_coinbase_netflow_24h_usd"] is None
+        assert rows[0]["cex_binance_netflow_24h_usd"] is None
+        assert rows[0]["cex_bybit_netflow_24h_usd"] is None
+        assert rows[0]["token_volume_1h_net_usd_json"] is None
+
+
 async def test_list_on_chain_snapshots_filters_by_time_window():
     async with TradeJournal(":memory:") as j:
         base = datetime(2026, 4, 21, 12, tzinfo=UTC)

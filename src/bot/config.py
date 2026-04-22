@@ -590,6 +590,20 @@ class OnChainConfig(BaseModel):
     # Refresh cadence (seconds) — index is macro-scale, hourly is plenty.
     altcoin_index_refresh_s: int = 3600
 
+    # 2026-04-22 — per-entity (Coinbase + Binance + Bybit) 24h netflow.
+    # Refreshes on the same UTC-day cadence as `daily_macro_bias`.
+    # Probe (2026-04-22) confirmed: 3 credits / call, 0 label lookups,
+    # all three slugs valid. Journal-only signal, no runtime effect.
+    entity_netflow_enabled: bool = True
+
+    # 2026-04-22 — per-symbol CEX hourly volume via `/token/volume/{id}`.
+    # Probe (2026-04-22) confirmed: granularity=1h works, 5m/15m/30m
+    # return 500. Refresh cadence intentionally hourly (matches data
+    # granularity). 5 symbols * 1 call/h * 3 credits = 360/day = ~11k/mo
+    # credits, 0 label lookups. Journal-only signal.
+    token_volume_enabled: bool = True
+    token_volume_refresh_s: int = 3600
+
     # Safety / budget controls.
     # Auto-disable the master when the reported label-usage fraction
     # crosses this percent. Prevents the trial key from being exhausted
@@ -635,7 +649,8 @@ class OnChainConfig(BaseModel):
 
     @field_validator("whale_blackout_duration_s", "stablecoin_pulse_refresh_s",
                      "snapshot_staleness_threshold_s",
-                     "altcoin_index_refresh_s")
+                     "altcoin_index_refresh_s",
+                     "token_volume_refresh_s")
     @classmethod
     def _positive_duration(cls, v: int) -> int:
         if v <= 0:

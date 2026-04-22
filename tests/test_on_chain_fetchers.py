@@ -11,7 +11,9 @@ from src.data import on_chain as on_chain_mod
 from src.data.on_chain import (
     ArkhamClient,
     fetch_daily_snapshot,
+    fetch_entity_netflow_24h,
     fetch_hourly_stablecoin_pulse,
+    fetch_token_volume_last_hour,
 )
 
 
@@ -316,3 +318,141 @@ async def test_get_altcoin_index_none_on_unexpected_shape():
     ])
     aci = await client.get_altcoin_index()
     assert aci is None
+
+
+# ── 2026-04-22: fetch_entity_netflow_24h (FAZ 2) ─────────────────────────
+
+
+def _entity_flow_body(entity: str, daily_buckets: list[tuple[str, float, float]]) -> dict:
+    """Mirror Arkham's `/flow/entity/{entity}` shape (verified via probe).
+    `daily_buckets`: list of (iso_date, inflow_usd, outflow_usd)."""
+    return {
+        entity: [
+            {
+                "time": ts,
+                "inflow": inflow,
+                "outflow": outflow,
+                "cumulativeInflow": inflow,
+                "cumulativeOutflow": outflow,
+            }
+            for ts, inflow, outflow in daily_buckets
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_fetch_entity_netflow_uses_last_bucket():
+    """Verifies the fetcher returns inflow-outflow of the MOST RECENT bucket
+    (Arkham returns full history; we slice to last day)."""
+    body = _entity_flow_body("binance", [
+        ("2026-04-19T00:00:00Z", 100_000_000.0, 80_000_000.0),
+        ("2026-04-20T00:00:00Z", 200_000_000.0, 130_000_000.0),  # latest
+    ])
+    client = _build_client_with_response(body)
+    result = await fetch_entity_netflow_24h(client, "binance")
+    # last bucket: 200M - 130M = 70M
+    assert result == 70_000_000.0
+
+
+@pytest.mark.asyncio
+async def test_fetch_entity_netflow_negative_when_outflow_dominates():
+    body = _entity_flow_body("coinbase", [
+        ("2026-04-20T00:00:00Z", 38_365_467.22, 38_166_652.32),  # real probe sample
+    ])
+    client = _build_client_with_response(body)
+    result = await fetch_entity_netflow_24h(client, "coinbase")
+    # 38.365M - 38.167M = ~198K (matches probe sample)
+    assert result is not None
+    assert abs(result - 198_814.90) < 0.01
+
+
+@pytest.mark.asyncio
+async def test_fetch_entity_netflow_none_on_empty_series():
+    """Empty bucket list → None (not 0.0). Caller treats as "no signal"."""
+    body = {"bybit": []}
+    client = _build_client_with_response(body)
+    result = await fetch_entity_netflow_24h(client, "bybit")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_entity_netflow_none_on_unexpected_shape():
+    client = _build_client_with_response({"unexpected": "string-not-list"})
+    result = await fetch_entity_netflow_24h(client, "binance")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_entity_netflow_hits_correct_endpoint():
+    body = _entity_flow_body("bybit", [("2026-04-20T00:00:00Z", 1.0, 2.0)])
+    client = ArkhamClient(api_key="test-key")
+    fake = _FakeClient(queued=[_FakeResponse(json_body=body)])  # type: ignore
+    client._client = fake  # type: ignore
+    await fetch_entity_netflow_24h(client, "bybit")
+    assert len(fake.calls) == 1
+    path, _params = fake.calls[0]
+    assert path == "/flow/entity/bybit"
+
+
+# ── 2026-04-22: fetch_token_volume_last_hour (FAZ 3) ─────────────────────
+
+
+def _token_volume_body(buckets: list[tuple[str, float, float]]) -> list:
+    """Mirror Arkham's `/token/volume/{id}` shape (verified via probe).
+    `buckets`: list of (iso_ts, in_usd, out_usd)."""
+    return [
+        {
+            "time": ts,
+            "inUSD": in_usd,
+            "outUSD": out_usd,
+            "inValue": in_usd / 100_000.0,  # placeholder native amount
+            "outValue": out_usd / 100_000.0,
+        }
+        for ts, in_usd, out_usd in buckets
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_token_volume_last_hour_uses_last_bucket():
+    body = _token_volume_body([
+        ("2026-04-22T05:00:00Z", 5_000_000.0, 7_000_000.0),
+        ("2026-04-22T06:00:00Z", 12_000_000.0, 4_000_000.0),
+        ("2026-04-22T07:00:00Z", 20_800_110.91, 3_395_308.11),  # real probe sample
+    ])
+    client = _build_client_with_response(body)
+    result = await fetch_token_volume_last_hour(client, "bitcoin")
+    assert result is not None
+    # 20.8M in - 3.4M out = ~17.4M net (positive = deposit pressure)
+    assert abs(result - 17_404_802.80) < 0.01
+
+
+@pytest.mark.asyncio
+async def test_fetch_token_volume_returns_none_on_empty_list():
+    client = _build_client_with_response([])
+    result = await fetch_token_volume_last_hour(client, "ethereum")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_token_volume_negative_when_withdrawals_dominate():
+    body = _token_volume_body([
+        ("2026-04-22T07:00:00Z", 1_000_000.0, 8_500_000.0),
+    ])
+    client = _build_client_with_response(body)
+    result = await fetch_token_volume_last_hour(client, "solana")
+    assert result == -7_500_000.0
+
+
+@pytest.mark.asyncio
+async def test_fetch_token_volume_hits_correct_endpoint_with_hourly_granularity():
+    body = _token_volume_body([("2026-04-22T07:00:00Z", 1.0, 2.0)])
+    client = ArkhamClient(api_key="test-key")
+    fake = _FakeClient(queued=[_FakeResponse(json_body=body)])  # type: ignore
+    client._client = fake  # type: ignore
+    await fetch_token_volume_last_hour(client, "dogecoin")
+    assert len(fake.calls) == 1
+    path, params = fake.calls[0]
+    assert path == "/token/volume/dogecoin"
+    # Probe confirmed sub-hourly returns 500; only 1h works.
+    assert params.get("granularity") == "1h"
+    assert params.get("timeLast") == "24h"

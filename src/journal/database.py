@@ -169,18 +169,27 @@ CREATE INDEX IF NOT EXISTS idx_rejected_outcome    ON rejected_signals(hypotheti
 -- `entry_timestamp <= captured_at <= exit_timestamp` to reconstruct
 -- what on-chain regime the trade lived through.
 CREATE TABLE IF NOT EXISTS on_chain_snapshots (
-    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
-    captured_at                TEXT NOT NULL,
-    daily_macro_bias           TEXT,
-    stablecoin_pulse_1h_usd    REAL,
-    cex_btc_netflow_24h_usd    REAL,
-    cex_eth_netflow_24h_usd    REAL,
-    coinbase_asia_skew_usd     REAL,
-    bnb_self_flow_24h_usd      REAL,
-    altcoin_index              REAL,
-    snapshot_age_s             INTEGER,
-    fresh                      INTEGER,
-    whale_blackout_active      INTEGER
+    id                              INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at                     TEXT NOT NULL,
+    daily_macro_bias                TEXT,
+    stablecoin_pulse_1h_usd         REAL,
+    cex_btc_netflow_24h_usd         REAL,
+    cex_eth_netflow_24h_usd         REAL,
+    coinbase_asia_skew_usd          REAL,
+    bnb_self_flow_24h_usd           REAL,
+    altcoin_index                   REAL,
+    snapshot_age_s                  INTEGER,
+    fresh                           INTEGER,
+    whale_blackout_active           INTEGER,
+    -- 2026-04-22 — per-entity 24h netflow (last completed UTC day) via
+    -- /flow/entity/{entity}. Journal-only; Phase 9 GBT decides predictive value.
+    cex_coinbase_netflow_24h_usd    REAL,
+    cex_binance_netflow_24h_usd     REAL,
+    cex_bybit_netflow_24h_usd       REAL,
+    -- 2026-04-22 — per-symbol most-recent-hour CEX flow via
+    -- /token/volume/{id}?granularity=1h. JSON-encoded dict so adding a 6th
+    -- watched symbol won't trigger a schema migration.
+    token_volume_1h_net_usd_json    TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_on_chain_snap_captured_at ON on_chain_snapshots(captured_at);
@@ -269,6 +278,12 @@ _MIGRATIONS = [
     # so factor-audit can segment rejects by on-chain context too.
     "ALTER TABLE trades ADD COLUMN on_chain_context TEXT",
     "ALTER TABLE rejected_signals ADD COLUMN on_chain_context TEXT",
+    # 2026-04-22 — per-entity (Coinbase, Binance, Bybit) 24h netflow + per-symbol
+    # 1h CEX volume (JSON dict). Journal-only enrichment for Phase 9 GBT.
+    "ALTER TABLE on_chain_snapshots ADD COLUMN cex_coinbase_netflow_24h_usd REAL",
+    "ALTER TABLE on_chain_snapshots ADD COLUMN cex_binance_netflow_24h_usd REAL",
+    "ALTER TABLE on_chain_snapshots ADD COLUMN cex_bybit_netflow_24h_usd REAL",
+    "ALTER TABLE on_chain_snapshots ADD COLUMN token_volume_1h_net_usd_json TEXT",
 ]
 
 
@@ -880,6 +895,10 @@ class TradeJournal:
         snapshot_age_s: Optional[int],
         fresh: bool,
         whale_blackout_active: bool,
+        cex_coinbase_netflow_24h_usd: Optional[float] = None,
+        cex_binance_netflow_24h_usd: Optional[float] = None,
+        cex_bybit_netflow_24h_usd: Optional[float] = None,
+        token_volume_1h_net_usd_json: Optional[str] = None,
     ) -> int:
         """Append one row to `on_chain_snapshots` — time-series of Arkham state.
 
@@ -887,6 +906,10 @@ class TradeJournal:
         changes. Runner's `_maybe_record_on_chain_snapshot` owns dedup; this
         method is a dumb writer and will insert whatever it's given. Returns
         the new row's `id` for callers that want to reference it.
+
+        2026-04-22 — added Coinbase/Binance/Bybit entity netflow + per-symbol
+        token volume JSON. New params have default None for backwards compat
+        with any test fixtures that still call the original signature.
         """
         conn = self._require_conn()
         cur = await conn.execute(
@@ -901,8 +924,12 @@ class TradeJournal:
                    altcoin_index,
                    snapshot_age_s,
                    fresh,
-                   whale_blackout_active
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   whale_blackout_active,
+                   cex_coinbase_netflow_24h_usd,
+                   cex_binance_netflow_24h_usd,
+                   cex_bybit_netflow_24h_usd,
+                   token_volume_1h_net_usd_json
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 _iso(captured_at),
                 daily_macro_bias,
@@ -915,6 +942,10 @@ class TradeJournal:
                 snapshot_age_s,
                 int(fresh),
                 int(whale_blackout_active),
+                cex_coinbase_netflow_24h_usd,
+                cex_binance_netflow_24h_usd,
+                cex_bybit_netflow_24h_usd,
+                token_volume_1h_net_usd_json,
             ),
         )
         await conn.commit()

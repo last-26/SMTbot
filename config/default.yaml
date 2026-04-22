@@ -628,6 +628,17 @@ on_chain:
     - tether
     - usd-coin
 
+  # 2026-04-22 — per-entity (Coinbase + Binance + Bybit) 24h netflow.
+  # Refreshes once per UTC day alongside daily_macro_bias. Journal-only.
+  # Probe-confirmed: 3 credits/call, 0 label lookups per entity.
+  entity_netflow_enabled: true
+
+  # 2026-04-22 — per-symbol CEX hourly volume (`/token/volume/{id}` 1h
+  # granularity, sub-hourly 5m/15m/30m return 500). 5 symbols hourly =
+  # 360 calls/day = ~11k credits/month, 0 label lookups. Journal-only.
+  token_volume_enabled: true
+  token_volume_refresh_s: 3600                     # 1h cadence matches data granularity
+
   # Phase F2 (2026-04-21) — Arkham altcoin index modifier.
   # `/marketdata/altcoin_index` scalar 0-100. Low → altcoins underperforming
   # BTC (BTC-dominance regime). Applies ONLY to altcoin symbols (SOL/DOGE/BNB,

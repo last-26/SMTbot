@@ -417,6 +417,78 @@ class ArkhamClient:
             method="GET", params=params,
         )
 
+    async def get_entity_flow(
+        self,
+        entity: str,
+        *,
+        chains: Optional[list[str]] = None,
+    ) -> Optional[dict]:
+        """Per-entity historical flow time series.
+
+        Calls `GET /flow/entity/{entity}` (3 credits/call, 0 label
+        lookups verified 2026-04-22 — entity-aggregated, no per-address
+        labels returned). Response shape (verified via probe):
+
+            {
+              "<entity_id>": [
+                {"time": ISO_DATE, "inflow": USD, "outflow": USD,
+                 "cumulativeInflow": USD, "cumulativeOutflow": USD},
+                ... daily buckets going back ~4 years ...
+              ]
+            }
+
+        Buckets are DAILY. Most-recent bucket = most-recent complete
+        UTC day. Note that Arkham docs do not document a `timeLast`
+        parameter for this endpoint — full series is always returned.
+
+        `chains` filter accepted but optional; omitting it covers all
+        chains (the default behavior our use case wants).
+
+        Returns the raw response dict on success, None on failure.
+        Caller picks the relevant entity slice and slices by time.
+        """
+        params: dict = {}
+        if chains:
+            params["chains"] = ",".join(chains)
+        return await self._request(
+            f"/flow/entity/{entity}",
+            method="GET",
+            params=params or None,
+        )
+
+    async def get_token_volume(
+        self,
+        token_id: str,
+        *,
+        time_last: str = "24h",
+        granularity: str = "1h",
+    ) -> Optional[list]:
+        """Per-token volume histogram (USD-denominated CEX flows).
+
+        Calls `GET /token/volume/{id}` (3 credits/call, 0 label lookups
+        verified 2026-04-22). Response shape (verified via probe):
+
+            [
+              {"time": ISO, "inUSD": float, "outUSD": float,
+               "inValue": float, "outValue": float},
+              ... `granularity`-spaced buckets across `time_last` window
+            ]
+
+        `granularity` SUPPORTED: "1h" (and presumably "1d"). Sub-hourly
+        values ("5m", "15m", "30m") return HTTP 500 — verified via
+        probe 2026-04-22. Document and stay on hourly until Arkham
+        adds finer granularity.
+
+        Rate limit: 1 req/s (stricter than default). Caller paces.
+        Returns list on success, None on failure.
+        """
+        params = {"timeLast": time_last, "granularity": granularity}
+        return await self._request(
+            f"/token/volume/{token_id}",
+            method="GET",
+            params=params,
+        )
+
     async def get_altcoin_index(self) -> Optional[int]:
         """Current Altcoin Index (scalar 0-100).
 
@@ -802,3 +874,89 @@ async def fetch_hourly_stablecoin_pulse(
         return total
 
     return _sum_usd(inflow) - _sum_usd(outflow)
+
+
+# ── 2026-04-22: per-entity netflow (Coinbase + Binance + Bybit) ────────────
+
+
+async def fetch_entity_netflow_24h(
+    client: "ArkhamClient",
+    entity: str,
+) -> Optional[float]:
+    """Most-recent-day net flow (USD) for a single entity.
+
+    Uses `/flow/entity/{entity}` (3 credits/call, 0 label lookups
+    verified 2026-04-22 via probe). Arkham returns the FULL daily
+    history for the entity going back to 2021-2022; we extract just
+    the most-recent bucket and return its `inflow - outflow`.
+
+    Returned value semantics:
+      * positive → assets flowing INTO the exchange (deposits dominate).
+      * negative → assets flowing OUT of the exchange (withdrawals dominate).
+      * None     → call failed or response shape was wrong.
+
+    Note: Arkham docs do not document a `timeLast` param for this
+    endpoint, so we always fetch full history and slice client-side.
+    Cost is per-call regardless of returned size.
+    """
+    raw = await client.get_entity_flow(entity)
+    if not isinstance(raw, dict):
+        return None
+    # Response is keyed by entity id; take the first list value.
+    series = None
+    for v in raw.values():
+        if isinstance(v, list):
+            series = v
+            break
+    if not series:
+        return None
+    # Most recent bucket = last entry.
+    last = series[-1]
+    if not isinstance(last, dict):
+        return None
+    try:
+        inflow = float(last.get("inflow") or 0)
+        outflow = float(last.get("outflow") or 0)
+    except (TypeError, ValueError):
+        return None
+    return inflow - outflow
+
+
+# ── 2026-04-22: per-token hourly volume (probe confirmed granularity=1h) ───
+
+
+async def fetch_token_volume_last_hour(
+    client: "ArkhamClient",
+    token_id: str,
+) -> Optional[float]:
+    """Most-recent-hour net CEX flow (USD) for a single token.
+
+    Uses `/token/volume/{id}?timeLast=24h&granularity=1h` (3 credits/call,
+    0 label lookups verified 2026-04-22). Sub-hourly granularity (5m, 15m,
+    30m) returned 500 Internal Server Error during probe — only `1h`
+    works on this endpoint as of 2026-04-22.
+
+    Response per bucket: `{time, inUSD, outUSD, inValue, outValue}`.
+    We return the most-recent bucket's `inUSD - outUSD` as a signed
+    USD value:
+      * positive → token deposits to CEX dominate (potential sell pressure).
+      * negative → token withdrawals from CEX dominate (potential supply squeeze).
+      * None     → call failed or response was empty / wrong shape.
+
+    Caller is responsible for rate-limit pacing across multiple tokens
+    (this endpoint shares the 1 req/s ceiling with /transfers/histogram).
+    """
+    buckets = await client.get_token_volume(
+        token_id, time_last="24h", granularity="1h",
+    )
+    if not isinstance(buckets, list) or not buckets:
+        return None
+    last = buckets[-1]
+    if not isinstance(last, dict):
+        return None
+    try:
+        in_usd = float(last.get("inUSD") or 0)
+        out_usd = float(last.get("outUSD") or 0)
+    except (TypeError, ValueError):
+        return None
+    return in_usd - out_usd
