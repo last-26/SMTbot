@@ -167,6 +167,14 @@ class TradeRecord(BaseModel):
     # stays stable across a single datasets.
     on_chain_context: Optional[dict] = None
 
+    # 2026-04-22 — per-pillar raw confluence scores (factor name → weight).
+    # Captured from `ConfluenceScore.factors` at entry time so Pass 2 can
+    # replay-tune per-pillar weights without re-fetching market state.
+    # Empty dict on rows written before this column (pass-1 backfill not
+    # needed; absent factors just decode as {}). Single-writer = runner =
+    # shape stays stable. JSON dict in SQLite.
+    confluence_pillar_scores: dict[str, float] = Field(default_factory=dict)
+
     @property
     def is_open(self) -> bool:
         return self.outcome == TradeOutcome.OPEN
@@ -256,3 +264,37 @@ class RejectedSignal(BaseModel):
     # context (e.g., were `cross_asset_opposition` rejects concentrated
     # on days with bearish daily_macro_bias?).
     on_chain_context: Optional[dict] = None
+
+    # 2026-04-22 — mirrors TradeRecord.confluence_pillar_scores. Feeds
+    # Pass 2 per-pillar weight tuning on the rejected-signal counter-
+    # factual dataset too: if removing `mss_alignment` would have accepted
+    # a reject that pegged WIN, that's useful signal.
+    confluence_pillar_scores: dict[str, float] = Field(default_factory=dict)
+
+
+class WhaleTransferRecord(BaseModel):
+    """One row in the `whale_transfers` table (Phase 8 data layer).
+
+    Streamed from the Arkham WebSocket listener (`on_chain_ws.py`) when
+    a transfer crosses the `whale_threshold_usd` threshold. Runtime entry
+    pipeline does NOT react (gate removed 2026-04-22); this row exists
+    for Phase 9 GBT analysis — joining whale events against trade
+    outcomes via `captured_at` vs `entry_timestamp`/`exit_timestamp`
+    reveals whether specific directional flows (Coinbase→Binance BTC,
+    exchange→cold wallet ETH, etc.) correlate with subsequent price move.
+
+    `from_entity` / `to_entity` / `tx_hash` may be None when Arkham's
+    feed didn't include them on a given message — the gate keeps these
+    optional rather than dropping the row.
+    """
+
+    captured_at: datetime
+    token: str
+    usd_value: float
+    from_entity: Optional[str] = None
+    to_entity: Optional[str] = None
+    tx_hash: Optional[str] = None
+    # JSON list of OKX perp symbols affected (stablecoin events fan out
+    # to every watched symbol; chain-native collapses to one). Mirrors
+    # `affected_symbols_for()` output at event time.
+    affected_symbols: list[str] = Field(default_factory=list)

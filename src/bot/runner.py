@@ -827,14 +827,61 @@ class BotRunner:
 
         Safe to call when `arkham_ws is None` (master off or sub-feature
         off) — early-returns.
+
+        2026-04-22 (gece): wires the `on_transfer` journal callback +
+        `main_loop` so whale events flow into the `whale_transfers`
+        table. The hard gate they used to feed is gone; data capture is
+        the new primary purpose.
         """
         ws = self.ctx.arkham_ws
         if ws is None:
             return
+        # Attach journal callback + loop reference before start so the
+        # first received event already has somewhere to land.
+        try:
+            ws._on_transfer = self._on_whale_transfer_from_ws  # noqa: SLF001
+            ws._main_loop = self.ctx.main_loop                  # noqa: SLF001
+        except Exception:
+            # Listener surface may drift over time; callback is optional —
+            # log and continue rather than crashing startup.
+            logger.exception("arkham_whale_ws_callback_wire_failed")
         try:
             await ws.start()
         except Exception:
             logger.exception("arkham_whale_ws_start_failed")
+
+    async def _on_whale_transfer_from_ws(
+        self,
+        *,
+        token: str,
+        usd_value: float,
+        ts_ms: int,
+        affected_symbols: list[str],
+        extras: dict,
+    ) -> None:
+        """Journal a single whale transfer event. Fire-and-forget from WS.
+
+        Invoked from the Arkham WS listener's `_handle` (worker thread
+        path) via `asyncio.run_coroutine_threadsafe` onto the main loop.
+        Exceptions are swallowed so a slow/failed DB write never kills
+        the WS reader.
+        """
+        try:
+            captured_at = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+            await self.ctx.journal.record_whale_transfer(
+                captured_at=captured_at,
+                token=token,
+                usd_value=float(usd_value),
+                from_entity=extras.get("from_entity"),
+                to_entity=extras.get("to_entity"),
+                tx_hash=extras.get("tx_hash"),
+                affected_symbols=list(affected_symbols),
+            )
+        except Exception:
+            logger.exception(
+                "whale_transfer_journal_write_failed token={} usd={:.0f}",
+                token, usd_value,
+            )
 
     async def _stop_on_chain(self) -> None:
         """Release the Arkham HTTP client + WS listener on shutdown.
@@ -997,12 +1044,6 @@ class BotRunner:
                     ema_veto_enabled=cfg.analysis.ema_veto_enabled,
                     ema_veto_fast_period=cfg.analysis.ema_veto_fast_period,
                     ema_veto_slow_period=cfg.analysis.ema_veto_slow_period,
-                    whale_blackout_enabled=(
-                        cfg.on_chain.enabled
-                        and cfg.on_chain.whale_blackout_enabled
-                    ),
-                    whale_blackout=self.ctx.whale_blackout_state,
-                    whale_blackout_symbol=symbol_,
                 )
             except Exception:
                 logger.exception(
@@ -1282,6 +1323,10 @@ class BotRunner:
             pillar_btc_bias=self._pillar_bias_label("BTC-USDT-SWAP"),
             pillar_eth_bias=self._pillar_bias_label("ETH-USDT-SWAP"),
             on_chain_context=self._on_chain_context_dict(),
+            confluence_pillar_scores={
+                f.name: float(f.weight)
+                for f in getattr(conf, "factors", []) or []
+            },
         )
 
     def _is_ltf_reversal(self, ltf: LTFState, open_side: str, max_age: int) -> bool:
@@ -1720,12 +1765,6 @@ class BotRunner:
                     and cfg.on_chain.daily_bias_enabled
                 ),
                 daily_bias_delta=cfg.on_chain.daily_bias_modifier_delta,
-                whale_blackout_enabled=(
-                    cfg.on_chain.enabled
-                    and cfg.on_chain.whale_blackout_enabled
-                ),
-                whale_blackout=self.ctx.whale_blackout_state,
-                whale_blackout_symbol=symbol,
                 stablecoin_pulse_enabled=(
                     cfg.on_chain.enabled
                     and cfg.on_chain.stablecoin_pulse_enabled
@@ -1747,6 +1786,24 @@ class BotRunner:
                     cfg.on_chain.altcoin_index_bullish_threshold),
                 altcoin_index_penalty=(
                     cfg.on_chain.altcoin_index_modifier_delta),
+                # 2026-04-22 — flow_alignment soft directional signal.
+                # Replaces the whale hard gate; penalty defaults to 0.25
+                # in Pass 1 (tuned in Pass 2).
+                flow_alignment_enabled=(
+                    cfg.on_chain.enabled
+                    and cfg.on_chain.flow_alignment_enabled
+                ),
+                flow_alignment_penalty=cfg.on_chain.flow_alignment_penalty,
+                flow_alignment_noise_floor_usd=(
+                    cfg.on_chain.flow_alignment_noise_floor_usd),
+                flow_alignment_btc_netflow_24h_usd=(
+                    self.ctx.on_chain_snapshot.cex_btc_netflow_24h_usd
+                    if self.ctx.on_chain_snapshot is not None else None
+                ),
+                flow_alignment_eth_netflow_24h_usd=(
+                    self.ctx.on_chain_snapshot.cex_eth_netflow_24h_usd
+                    if self.ctx.on_chain_snapshot is not None else None
+                ),
             )
         except Exception:
             logger.exception("plan_build_failed symbol={}", symbol)
@@ -1939,6 +1996,7 @@ class BotRunner:
                     else None
                 ),
                 on_chain_context=self._on_chain_context_dict(),
+                confluence_pillar_scores=dict(plan.confluence_pillar_scores or {}),
                 **_derive_enrichment(state),
             )
             self.ctx.open_trade_ids[(symbol, pos_side)] = rec.trade_id
@@ -2679,6 +2737,7 @@ class BotRunner:
                 market_structure=_structure_str(state),
                 trend_regime_at_entry=meta.trend_regime_at_entry,
                 on_chain_context=self._on_chain_context_dict(),
+                confluence_pillar_scores=dict(plan.confluence_pillar_scores or {}),
                 **_derive_enrichment(state),
             )
             self.ctx.open_trade_ids[key] = rec.trade_id
@@ -2754,6 +2813,7 @@ class BotRunner:
                 pillar_btc_bias=self._pillar_bias_label("BTC-USDT-SWAP"),
                 pillar_eth_bias=self._pillar_bias_label("ETH-USDT-SWAP"),
                 on_chain_context=self._on_chain_context_dict(),
+                confluence_pillar_scores=dict(plan.confluence_pillar_scores or {}),
             )
         except Exception:
             logger.debug(

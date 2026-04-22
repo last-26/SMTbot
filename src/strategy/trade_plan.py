@@ -42,6 +42,11 @@ class TradePlan:
     sl_source: str = ""           # "order_block" / "fvg" / "swing" / "atr_fallback"
     confluence_score: float = 0.0
     confluence_factors: list[str] = field(default_factory=list)
+    # 2026-04-22 — per-pillar raw score dict (ConfluenceFactor.name → weight).
+    # Mirrors `confluence_factors` but preserves contribution magnitude so
+    # Pass 2 can Bayesian-tune per-pillar weights against closed-trade
+    # outcomes. Empty dict when no factors fired (e.g., direction UNDEFINED).
+    confluence_pillar_scores: dict[str, float] = field(default_factory=dict)
     reason: str = ""              # human-readable summary
     # Partial-TP ladder from the zone builder: list of (price, share_fraction)
     # ordered near→far, summing to 1.0. Default `[(tp_price, 1.0)]` preserves

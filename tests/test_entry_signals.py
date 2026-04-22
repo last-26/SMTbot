@@ -786,27 +786,6 @@ def test_pending_eval_catches_cross_asset_opposition():
     assert result == "cross_asset_opposition"
 
 
-def test_pending_eval_catches_whale_blackout():
-    """Whale event fires mid-pending → whale_transfer_blackout."""
-    class _StubBlackout:
-        def is_active(self, sym, now_ms):
-            return True
-
-    state = _state_with_vwaps(
-        direction=Direction.BULLISH, price=100.0, vwaps=(99.0, 99.0, 99.0),
-    )
-    result = evaluate_pending_invalidation_gates(
-        state=state,
-        candles=_bull_ema_candles(),
-        direction=Direction.BULLISH,
-        entry_price=100.0,
-        whale_blackout_enabled=True,
-        whale_blackout=_StubBlackout(),
-        whale_blackout_symbol="BTC-USDT-SWAP",
-    )
-    assert result == "whale_transfer_blackout"
-
-
 def test_pending_eval_disabled_gates_do_not_fire():
     """Even with bearish EMA stack, ema_veto_enabled=False → no cancel."""
     state = _state_with_vwaps(
@@ -842,23 +821,3 @@ def test_pending_eval_check_order_vwap_first():
     assert result == "vwap_misaligned"
 
 
-def test_pending_eval_whale_blackout_exception_swallowed():
-    """A corrupt blackout state must not propagate."""
-    class _BoomBlackout:
-        def is_active(self, sym, now_ms):
-            raise RuntimeError("corrupt")
-
-    state = _state_with_vwaps(
-        direction=Direction.BULLISH, price=100.0, vwaps=(99.0, 99.0, 99.0),
-    )
-    # Should silently treat the gate as fail-open (return None).
-    result = evaluate_pending_invalidation_gates(
-        state=state,
-        candles=_bull_ema_candles(),
-        direction=Direction.BULLISH,
-        entry_price=100.0,
-        whale_blackout_enabled=True,
-        whale_blackout=_BoomBlackout(),
-        whale_blackout_symbol="BTC-USDT-SWAP",
-    )
-    assert result is None

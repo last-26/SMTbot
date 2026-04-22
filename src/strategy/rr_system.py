@@ -96,6 +96,7 @@ def calculate_trade_plan(
     sl_source: str = "",
     confluence_score: float = 0.0,
     confluence_factors: list[str] | None = None,
+    confluence_pillar_scores: Optional[dict[str, float]] = None,
     reason: str = "",
 ) -> TradePlan:
     """Compute a fully-sized TradePlan.
@@ -256,6 +257,7 @@ def calculate_trade_plan(
         sl_source=sl_source,
         confluence_score=confluence_score,
         confluence_factors=list(confluence_factors or []),
+        confluence_pillar_scores=dict(confluence_pillar_scores or {}),
         reason=reason,
     )
 

@@ -531,7 +531,17 @@ class OnChainConfig(BaseModel):
     Sub-features (layered on top of master):
       * daily_bias_enabled         — Phase C: ±delta confluence modifier.
       * stablecoin_pulse_enabled   — Phase E: below_confluence penalty.
-      * whale_blackout_enabled     — Phase D: hard gate via WS listener.
+      * whale_blackout_enabled     — 2026-04-22: HARD GATE REMOVED. Now
+        purely controls whether the WS listener runs (streams whale
+        transfers into the `whale_transfers` journal + `whale_blackout_active`
+        snapshot bool). No runtime entry / pending invalidation effect.
+        Legacy name preserved to avoid YAML migration; rename tracked as
+        Pass 2 cleanup.
+      * flow_alignment_enabled     — 2026-04-22: soft directional signal.
+        Combines stablecoin pulse + BTC/ETH netflow into a score [-1, +1];
+        misaligned direction pays additive penalty on min_confluence.
+        Default-weighted (no tuning in Pass 1). Tuned in Pass 2 once
+        Arkham coverage is uniform across the dataset.
     Phase B (journal enrichment) is always-on when `enabled=true` — no
     separate flag, the `on_chain_context` JSON column just stays NULL
     whenever the snapshot is unavailable.
@@ -555,14 +565,23 @@ class OnChainConfig(BaseModel):
     stablecoin_pulse_threshold_usd: float = 50_000_000.0
     stablecoin_pulse_penalty: float = 0.75
 
-    # Phase D — whale-transfer blackout (WebSocket listener feeds the gate).
+    # Phase D — Arkham whale-transfer pipeline.
+    # 2026-04-22 (gece): RUNTIME HARD GATE REMOVED. This flag now only
+    # controls whether the WS listener (`ArkhamWebSocketListener`) runs —
+    # whale events still stream into the `whale_transfers` journal table
+    # and flip the informational `whale_blackout_active` bool on every
+    # `on_chain_snapshots` row. Entry pipeline no longer rejects on whale
+    # events; pending limits are no longer invalidated. The flag name is
+    # preserved to avoid YAML migration.
     # Arkham's WS filter requires `usdGte >= 10_000_000` per the API docs;
     # the validator enforces this. Default 150M (bumped 100M → 150M on
     # 2026-04-22) — at $100M the trial label-lookup quota was burning
-    # ~17k/month from incidental whale events. $150M halves that on
-    # observed flow distributions while preserving the macro-event signal.
+    # ~17k/month from incidental whale events.
     whale_blackout_enabled: bool = False
     whale_threshold_usd: float = 150_000_000.0
+    # State-activity window. Within this window after a whale event the
+    # `WhaleBlackoutState.is_active()` returns True → snapshot logs
+    # `whale_blackout_active=true`. NOT a runtime gate (removed 2026-04-22).
     whale_blackout_duration_s: int = 600  # 10 minutes
     # Token slug filter on the WS stream (Arkham coingecko-style ids).
     # Restricts incoming whale events to the tokens we actually trade
@@ -589,6 +608,22 @@ class OnChainConfig(BaseModel):
     altcoin_index_modifier_delta: float = 0.5
     # Refresh cadence (seconds) — index is macro-scale, hourly is plenty.
     altcoin_index_refresh_s: int = 3600
+
+    # 2026-04-22 (gece) — flow_alignment soft directional signal.
+    # Combines `stablecoin_pulse_1h_usd` + `cex_btc_netflow_24h_usd` +
+    # `cex_eth_netflow_24h_usd` into a [-1, +1] score: +1 = bullish
+    # aligned (stables INflow + BTC/ETH OUTflow from CEX), -1 = bearish
+    # aligned. Misaligned direction (long on bearish score OR short on
+    # bullish score) pays additive penalty on `min_confluence_score`.
+    # Default-weighted for Pass 1 (no tuning on current 41 trades, where
+    # Arkham coverage is inconsistent). Pass 2 will tune penalty +
+    # noise_floor against a uniform Arkham-coverage dataset.
+    flow_alignment_enabled: bool = True
+    flow_alignment_penalty: float = 0.25
+    # Signals below this USD magnitude treated as noise → contribute 0
+    # (not +1 / -1) to the score, regardless of sign. Prevents random
+    # sub-$1M flow ticks from dragging the signal around.
+    flow_alignment_noise_floor_usd: float = 1_000_000.0
 
     # 2026-04-22 — per-entity (Coinbase + Binance + Bybit) 24h netflow.
     # Refreshes on the same UTC-day cadence as `daily_macro_bias`.
@@ -627,7 +662,9 @@ class OnChainConfig(BaseModel):
     @field_validator("daily_bias_stablecoin_threshold_usd",
                      "daily_bias_btc_netflow_threshold_usd",
                      "stablecoin_pulse_threshold_usd",
-                     "stablecoin_pulse_penalty")
+                     "stablecoin_pulse_penalty",
+                     "flow_alignment_penalty",
+                     "flow_alignment_noise_floor_usd")
     @classmethod
     def _non_negative(cls, v: float) -> float:
         if v < 0:

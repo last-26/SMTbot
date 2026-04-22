@@ -48,6 +48,67 @@ from loguru import logger
 
 from src.data.on_chain_types import WhaleBlackoutState, affected_symbols_for
 
+
+def parse_transfer_extras(raw: str) -> dict[str, Optional[str]]:
+    """Best-effort extraction of optional transfer metadata for journaling.
+
+    Returns a dict with `from_entity`, `to_entity`, `tx_hash`, all
+    possibly-None. Used alongside `parse_transfer_message` when
+    persisting whale events to the journal (added 2026-04-22). Never
+    raises — a malformed message just yields an all-None dict.
+    """
+    out: dict[str, Optional[str]] = {
+        "from_entity": None,
+        "to_entity": None,
+        "tx_hash": None,
+    }
+    try:
+        msg = json.loads(raw)
+    except (TypeError, ValueError):
+        return out
+    if not isinstance(msg, dict):
+        return out
+    payload = msg.get("payload")
+    if not isinstance(payload, dict):
+        return out
+    transfer = payload.get("transfer")
+    if not isinstance(transfer, dict):
+        return out
+
+    def _label(obj: Any) -> Optional[str]:
+        """Arkham surfaces `{name, arkhamEntity:{name}}`-style dicts for
+        entity-labelled addresses. Fall back to the raw address string
+        when no label is present."""
+        if obj is None:
+            return None
+        if isinstance(obj, str):
+            return obj or None
+        if isinstance(obj, dict):
+            entity = obj.get("arkhamEntity") or obj.get("entity")
+            if isinstance(entity, dict):
+                name = entity.get("name") or entity.get("id")
+                if name:
+                    return str(name)
+            if obj.get("name"):
+                return str(obj["name"])
+            if obj.get("address"):
+                return str(obj["address"])
+        return None
+
+    out["from_entity"] = _label(
+        transfer.get("fromAddress") or transfer.get("from")
+    )
+    out["to_entity"] = _label(
+        transfer.get("toAddress") or transfer.get("to")
+    )
+    tx_hash = (
+        transfer.get("transactionHash")
+        or transfer.get("txHash")
+        or transfer.get("hash")
+    )
+    out["tx_hash"] = str(tx_hash) if tx_hash else None
+    return out
+
 # Base host for the v2 WS endpoint. The full URL is built with
 # `?stream_id=<sid>` at connect time.
 ARKHAM_WS_BASE = "wss://api.arkm.com/ws/v2/transfers"
@@ -264,6 +325,8 @@ class ArkhamWebSocketListener:
         reconnect_min_s: float = 1.0,
         reconnect_max_s: float = 60.0,
         max_consecutive_failures: int = 3,
+        on_transfer: Optional[Any] = None,
+        main_loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
         self._client = arkham_client
         self._state = blackout_state
@@ -279,6 +342,16 @@ class ArkhamWebSocketListener:
         self._task: Optional[asyncio.Task] = None
         self._disabled = False
         self._stream_id: Optional[str] = None
+        # 2026-04-22 — optional journal-write callback. Signature:
+        #   on_transfer(token: str, usd: float, ts_ms: int,
+        #               affected: list[str], extras: dict) -> Awaitable[None]
+        # Callback is awaited on the main event loop via
+        # `asyncio.run_coroutine_threadsafe` when `main_loop` is provided,
+        # otherwise via `asyncio.create_task`. Exceptions are swallowed
+        # inside `_handle` so a slow / broken journal write never kills
+        # the WS reader. Pass None to disable journaling entirely.
+        self._on_transfer = on_transfer
+        self._main_loop = main_loop
 
     @property
     def disabled(self) -> bool:
@@ -487,7 +560,7 @@ class ArkhamWebSocketListener:
                 backoff = min(backoff * 2, self._reconnect_max_s)
 
     def _handle(self, raw: str) -> None:
-        """Route one WS message into the blackout registry."""
+        """Route one WS message into the blackout registry + optional journal."""
         parsed = parse_transfer_message(raw, self._usd_gte)
         if parsed is None:
             return
@@ -503,3 +576,26 @@ class ArkhamWebSocketListener:
             "symbols={} until_ms={}",
             token, usd_value, list(symbols), until_ms,
         )
+
+        # 2026-04-22 — journal raw transfer (post hard-gate-removal).
+        # Runtime entry is no longer gated; GBT learns direction from the
+        # `whale_transfers` table at Phase 9. Fire-and-forget so WS reader
+        # never blocks on DB latency.
+        if self._on_transfer is not None:
+            try:
+                extras = parse_transfer_extras(raw)
+                coro = self._on_transfer(
+                    token=token,
+                    usd_value=usd_value,
+                    ts_ms=ts_ms,
+                    affected_symbols=list(symbols),
+                    extras=extras,
+                )
+                if self._main_loop is not None:
+                    asyncio.run_coroutine_threadsafe(coro, self._main_loop)
+                else:
+                    asyncio.create_task(coro)
+            except Exception as e:
+                logger.warning(
+                    "arkham_transfer_journal_dispatch_failed err={!r}", e,
+                )

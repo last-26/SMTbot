@@ -609,12 +609,16 @@ on_chain:
   stablecoin_pulse_threshold_usd: 50000000.0
   stablecoin_pulse_penalty: 0.75
 
-  # Phase D — whale-transfer blackout hard gate. WS listener pushes
-  # qualifying transfers to the shared WhaleBlackoutState registry;
-  # entry_signals reads via is_active on every entry attempt.
+  # Phase D — Arkham whale-transfer pipeline.
+  # 2026-04-22 (gece): RUNTIME HARD GATE REMOVED. Flag now only gates
+  # the WS listener lifecycle; whale events flow into `whale_transfers`
+  # journal table + `on_chain_snapshots.whale_blackout_active` bool
+  # (informational). Entry pipeline + pending-limit invalidation no
+  # longer react to whale events. flow_alignment soft signal (below)
+  # replaces the directional intuition whale blackout attempted to capture.
   whale_blackout_enabled: true
   whale_threshold_usd: 150000000.0                 # WS filter (usdGte); ≥10M min, bumped 100M→150M on 2026-04-22 to halve label-lookup burn
-  whale_blackout_duration_s: 600                   # 10 min after event
+  whale_blackout_duration_s: 600                   # State-activity window (informational flag only, not a gate)
   # Token slug whitelist on the WS stream — only transfers in these
   # tokens reach the listener. Drops gross label-lookup tax from
   # noise tokens (XRP/ADA/MATIC etc.) that would never affect blackouts
@@ -649,6 +653,19 @@ on_chain:
   altcoin_index_bullish_threshold: 75              # index ≥ this → altcoin shorts penalised
   altcoin_index_modifier_delta: 0.5                # threshold bump when misaligned
   altcoin_index_refresh_s: 3600                    # 1h — macro, no need to poll faster
+
+  # 2026-04-22 (gece) — flow_alignment soft directional signal.
+  # Combines stablecoin pulse + BTC/ETH netflow into a [-1, +1] score:
+  #   +1 = bullish aligned (stables FLOW IN + BTC/ETH FLOW OUT of CEX)
+  #   -1 = bearish aligned (stables FLOW OUT + BTC/ETH FLOW IN to CEX)
+  # Misaligned direction pays additive penalty on min_confluence_score.
+  # Replaces the whale blackout's directional intuition now that the hard
+  # gate is gone. Ships with DEFAULT weight (Pass 1): 41-trade dataset has
+  # inconsistent Arkham coverage, so penalty magnitude is not tuned until
+  # Pass 2 when coverage is uniform.
+  flow_alignment_enabled: true
+  flow_alignment_penalty: 0.25                     # additive threshold bump on misalignment (full magnitude at |score|=1.0)
+  flow_alignment_noise_floor_usd: 1000000.0        # sub-$1M signals treated as zero to filter noise
 
   # Safety / budget controls.
   api_usage_auto_disable_pct: 95.0

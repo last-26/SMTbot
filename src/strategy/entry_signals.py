@@ -16,7 +16,7 @@ once per poll. If it returns None, we sit the bar out.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 from src.analysis.fvg import FVG
 from src.analysis.multi_timeframe import (
@@ -389,6 +389,74 @@ def _stablecoin_pulse_penalty(
     return penalty if misaligned else 0.0
 
 
+def _flow_alignment_score(
+    stablecoin_pulse_1h_usd: Optional[float],
+    btc_netflow_24h_usd: Optional[float],
+    eth_netflow_24h_usd: Optional[float],
+    noise_floor_usd: float = 1_000_000.0,
+) -> float:
+    """Return a directional alignment score in [-1, +1].
+
+    Combines three Arkham signals into a single directional bias:
+      * +1 → strong bullish alignment (stablecoin inflow + BTC/ETH outflow
+        from CEX; cash arriving, supply leaving)
+      * -1 → strong bearish alignment (stables leaving + BTC/ETH arriving;
+        profit taking pattern)
+      *  0 → neutral / conflicting / insufficient data
+
+    Weights: stables 0.4, BTC 0.4, ETH 0.2 (BTC is market leader; stables
+    are timeliest because refreshed hourly vs 24h for BTC/ETH).
+
+    Each input below `noise_floor_usd` contributes 0 (not ±1), so low-
+    magnitude flow ticks don't drag the score around. None inputs also
+    contribute 0 — fail-open when Arkham data is missing.
+
+    2026-04-22: new signal replacing the whale-transfer hard gate's
+    directional intuition. Ships with default weight in Pass 1; tuned
+    in Pass 2 against uniform-coverage dataset.
+    """
+    def _sign(x: Optional[float]) -> int:
+        if x is None:
+            return 0
+        if abs(x) < float(noise_floor_usd):
+            return 0
+        return 1 if x > 0 else -1
+
+    stable_dir = _sign(stablecoin_pulse_1h_usd)
+    # BTC/ETH flowing OUT of CEX (negative netflow) is bullish → invert.
+    btc_dir = -_sign(btc_netflow_24h_usd)
+    eth_dir = -_sign(eth_netflow_24h_usd)
+    score = 0.4 * stable_dir + 0.4 * btc_dir + 0.2 * eth_dir
+    return max(-1.0, min(1.0, score))
+
+
+def _flow_alignment_penalty(
+    *,
+    direction: Direction,
+    score: float,
+    penalty: float,
+) -> float:
+    """Additive confluence-threshold bump when the flow score opposes direction.
+
+    Rule (mirrors `_stablecoin_pulse_penalty` / `_altcoin_index_penalty`):
+      * long + score < 0   → misaligned (bearish flow regime), +penalty*|score|
+      * short + score > 0  → misaligned (bullish flow regime), +penalty*|score|
+      * aligned or |score|=0 → 0 (no bump)
+
+    Scales linearly with |score| so weak signals pay a soft penalty and
+    strong aligned moves pay the full magnitude. 2026-04-22 default
+    `penalty=0.25` in YAML (Pass 2 will tune).
+    """
+    if penalty <= 0.0:
+        return 0.0
+    if score == 0.0:
+        return 0.0
+    dir_sign = 1 if direction == Direction.BULLISH else -1
+    if dir_sign * score >= 0.0:
+        return 0.0
+    return float(penalty) * abs(float(score))
+
+
 def _altcoin_index_penalty(
     *,
     direction: Direction,
@@ -462,6 +530,11 @@ def generate_entry_intent(
     altcoin_index_bearish_threshold: int = 25,
     altcoin_index_bullish_threshold: int = 75,
     altcoin_index_penalty: float = 0.5,
+    flow_alignment_enabled: bool = False,
+    flow_alignment_penalty: float = 0.0,
+    flow_alignment_noise_floor_usd: float = 1_000_000.0,
+    flow_alignment_btc_netflow_24h_usd: Optional[float] = None,
+    flow_alignment_eth_netflow_24h_usd: Optional[float] = None,
 ) -> Optional[EntryIntent]:
     """Compute confluence + pick an SL. Returns None when not tradable."""
     if state.current_price <= 0:
@@ -510,6 +583,18 @@ def generate_entry_intent(
             bearish_threshold=altcoin_index_bearish_threshold,
             bullish_threshold=altcoin_index_bullish_threshold,
             penalty=altcoin_index_penalty,
+        )
+    if flow_alignment_enabled:
+        alignment = _flow_alignment_score(
+            stablecoin_pulse_1h_usd=stablecoin_pulse_usd,
+            btc_netflow_24h_usd=flow_alignment_btc_netflow_24h_usd,
+            eth_netflow_24h_usd=flow_alignment_eth_netflow_24h_usd,
+            noise_floor_usd=flow_alignment_noise_floor_usd,
+        )
+        effective_min_conf += _flow_alignment_penalty(
+            direction=confluence.direction,
+            score=alignment,
+            penalty=flow_alignment_penalty,
         )
     if not confluence.is_tradable(effective_min_conf):
         return None
@@ -724,9 +809,6 @@ def build_trade_plan_with_reason(
     trend_regime_conditional_scoring_enabled: bool = False,
     daily_bias_enabled: bool = False,
     daily_bias_delta: float = 0.0,
-    whale_blackout_enabled: bool = False,
-    whale_blackout: Optional[Any] = None,
-    whale_blackout_symbol: Optional[str] = None,
     stablecoin_pulse_enabled: bool = False,
     stablecoin_pulse_usd: Optional[float] = None,
     stablecoin_pulse_threshold_usd: float = 50_000_000.0,
@@ -737,6 +819,16 @@ def build_trade_plan_with_reason(
     altcoin_index_bearish_threshold: int = 25,
     altcoin_index_bullish_threshold: int = 75,
     altcoin_index_penalty: float = 0.5,
+    # 2026-04-22 — flow_alignment soft signal. Replaces whale-blackout
+    # directional intuition. Misaligned direction pays additive threshold
+    # penalty scaled by |score|. Stablecoin input reuses
+    # `stablecoin_pulse_usd`; BTC/ETH netflow come from the Arkham
+    # daily snapshot (UTC-day completed series).
+    flow_alignment_enabled: bool = False,
+    flow_alignment_penalty: float = 0.0,
+    flow_alignment_noise_floor_usd: float = 1_000_000.0,
+    flow_alignment_btc_netflow_24h_usd: Optional[float] = None,
+    flow_alignment_eth_netflow_24h_usd: Optional[float] = None,
 ) -> tuple[Optional[TradePlan], str]:
     """Same as `build_trade_plan_from_state` but returns `(plan, reason)`.
 
@@ -802,6 +894,11 @@ def build_trade_plan_with_reason(
         altcoin_index_bearish_threshold=altcoin_index_bearish_threshold,
         altcoin_index_bullish_threshold=altcoin_index_bullish_threshold,
         altcoin_index_penalty=altcoin_index_penalty,
+        flow_alignment_enabled=flow_alignment_enabled,
+        flow_alignment_penalty=flow_alignment_penalty,
+        flow_alignment_noise_floor_usd=flow_alignment_noise_floor_usd,
+        flow_alignment_btc_netflow_24h_usd=flow_alignment_btc_netflow_24h_usd,
+        flow_alignment_eth_netflow_24h_usd=flow_alignment_eth_netflow_24h_usd,
     )
     if intent is None:
         # Distinguish the three upstream `generate_entry_intent` None paths.
@@ -841,6 +938,18 @@ def build_trade_plan_with_reason(
                 bullish_threshold=altcoin_index_bullish_threshold,
                 penalty=altcoin_index_penalty,
             )
+        if flow_alignment_enabled:
+            alignment = _flow_alignment_score(
+                stablecoin_pulse_1h_usd=stablecoin_pulse_usd,
+                btc_netflow_24h_usd=flow_alignment_btc_netflow_24h_usd,
+                eth_netflow_24h_usd=flow_alignment_eth_netflow_24h_usd,
+                noise_floor_usd=flow_alignment_noise_floor_usd,
+            )
+            effective_min_conf += _flow_alignment_penalty(
+                direction=conf.direction,
+                score=alignment,
+                penalty=flow_alignment_penalty,
+            )
         if not conf.is_tradable(effective_min_conf):
             return None, "below_confluence"
         if allowed_sessions and state.active_session not in allowed_sessions:
@@ -874,27 +983,14 @@ def build_trade_plan_with_reason(
     if _cross_asset_opposes(pillar_opposition, intent.direction):
         return None, "cross_asset_opposition"
 
-    # 2026-04-21 — Arkham whale-transfer blackout (Phase D). Event-
-    # driven preemptive veto: when Arkham's WebSocket has recorded a
-    # qualifying whale transfer (notional ≥ `whale_threshold_usd`) for
-    # this symbol in the last `whale_blackout_duration_s`, block new
-    # entries. Open positions are untouched (their OCO handles exit).
-    # Fails open on flag=False or blackout state absent; per-symbol
-    # check protects chain-native assets (BTC event → only BTC blocks)
-    # while stablecoin events expand to every watched perp.
-    if (
-        whale_blackout_enabled
-        and whale_blackout is not None
-        and whale_blackout_symbol is not None
-    ):
-        try:
-            import time as _time  # localised to keep module imports clean
-            now_ms = int(_time.time() * 1000)
-            if whale_blackout.is_active(whale_blackout_symbol, now_ms):
-                return None, "whale_transfer_blackout"
-        except Exception:
-            # A corrupt blackout state must not crash entry pipeline.
-            pass
+    # 2026-04-22 (gece) — Arkham whale-transfer HARD GATE REMOVED.
+    # Previously (Phase D, 2026-04-21): a $150M+ CEX↔CEX transfer rejected
+    # new entries for the affected symbol(s) for 10 min. Operator feedback:
+    # whale events are directionally ambiguous, not neutral — gating kills
+    # both winners and losers with roughly equal probability. New model:
+    # the WS listener streams events into `whale_transfers` journal (for
+    # Phase 9 GBT) and the `flow_alignment_penalty` soft signal replaces
+    # the directional intuition. See CLAUDE.md changelog 2026-04-22 (gece).
 
     if _should_skip_for_derivatives(
         getattr(state, "derivatives", None),
@@ -931,6 +1027,9 @@ def build_trade_plan_with_reason(
             else:
                 sl_price = intent.entry_price + min_dist
 
+    pillar_scores = {
+        f.name: float(f.weight) for f in intent.confluence.factors
+    }
     plan = calculate_trade_plan(
         direction=intent.direction,
         entry_price=intent.entry_price,
@@ -946,6 +1045,7 @@ def build_trade_plan_with_reason(
         sl_source=intent.sl_source,
         confluence_score=intent.confluence.score,
         confluence_factors=intent.confluence.factor_names,
+        confluence_pillar_scores=pillar_scores,
         reason=f"{intent.direction.value} via {intent.sl_source}",
     )
 
@@ -997,17 +1097,14 @@ def evaluate_pending_invalidation_gates(
     ema_veto_enabled: bool = True,
     ema_veto_fast_period: int = 9,
     ema_veto_slow_period: int = 21,
-    whale_blackout_enabled: bool = False,
-    whale_blackout: Optional[Any] = None,
-    whale_blackout_symbol: Optional[str] = None,
 ) -> Optional[str]:
     """Re-evaluate the HARD veto gates against current state for a pending limit.
 
     Used by the runner's pending-poll cycle (2026-04-22) to detect mid-pending
-    invalidation: a sharp market turn or new whale event between limit
-    placement and the 7-bar (21-min) timeout. If any gate would now reject
-    a NEW entry of the same direction, the pending limit is canceled before
-    a fill at a no-longer-favorable level.
+    invalidation: a sharp market turn between limit placement and the 7-bar
+    (21-min) timeout. If any gate would now reject a NEW entry of the same
+    direction, the pending limit is canceled before a fill at a no-longer-
+    favorable level.
 
     Returns the first failing gate's reject_reason string, or None if all
     pass (pending should remain active).
@@ -1021,7 +1118,10 @@ def evaluate_pending_invalidation_gates(
     Order matches the live entry path in `build_trade_plan_with_reason` so
     rejected_signals reasons are consistent with the new-entry vocabulary:
       vwap_misaligned → ema_momentum_contra → cross_asset_opposition
-      → whale_transfer_blackout
+
+    2026-04-22 (gece): whale_transfer_blackout gate removed (paired with
+    the new-entry path). flow_alignment is a SOFT signal, not evaluated
+    here (it shifts confluence threshold; rescore disabled by design).
     """
     if vwap_hard_veto_enabled and _vwap_hard_veto(state, direction, entry_price):
         return "vwap_misaligned"
@@ -1036,19 +1136,9 @@ def evaluate_pending_invalidation_gates(
     if _cross_asset_opposes(pillar_opposition, direction):
         return "cross_asset_opposition"
 
-    if (
-        whale_blackout_enabled
-        and whale_blackout is not None
-        and whale_blackout_symbol is not None
-    ):
-        try:
-            import time as _time
-            now_ms = int(_time.time() * 1000)
-            if whale_blackout.is_active(whale_blackout_symbol, now_ms):
-                return "whale_transfer_blackout"
-        except Exception:
-            # Same defensive contract as the live entry path.
-            pass
+    # 2026-04-22 (gece) — whale_transfer_blackout gate removed here too,
+    # paired with the new-entry path. Pending-limit invalidation now fires
+    # only on vwap/ema/cross-asset flips. See changelog.
 
     return None
 

@@ -29,7 +29,12 @@ import aiosqlite
 
 from src.data.models import Direction
 from src.execution.models import CloseFill, ExecutionReport
-from src.journal.models import RejectedSignal, TradeOutcome, TradeRecord
+from src.journal.models import (
+    RejectedSignal,
+    TradeOutcome,
+    TradeRecord,
+    WhaleTransferRecord,
+)
 from src.strategy.risk_manager import RiskManager, TradeResult
 from src.strategy.trade_plan import TradePlan
 
@@ -106,7 +111,13 @@ CREATE TABLE IF NOT EXISTS trades (
     demo_artifact           INTEGER,
     artifact_reason         TEXT,
 
-    on_chain_context        TEXT
+    on_chain_context        TEXT,
+
+    -- 2026-04-22 — per-pillar raw scores (ConfluenceFactor.name → weight)
+    -- as JSON dict. Enables Pass 2 replay-tuning of per-pillar weights
+    -- without re-fetching market state. '{}' on rows written before this
+    -- column (backfill not required).
+    confluence_pillar_scores TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_trades_outcome      ON trades(outcome);
@@ -154,7 +165,13 @@ CREATE TABLE IF NOT EXISTS rejected_signals (
     hypothetical_bars_to_tp INTEGER,
     hypothetical_bars_to_sl INTEGER,
 
-    on_chain_context        TEXT
+    on_chain_context        TEXT,
+
+    -- 2026-04-22 — mirrors trades.confluence_pillar_scores. Rejected-signal
+    -- counter-factuals feed Pass 2 per-pillar weight tuning too: removing
+    -- `mss_alignment` weight might flip a reject into accept; GBT/Optuna
+    -- needs the raw weights to simulate that.
+    confluence_pillar_scores TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_rejected_symbol_ts  ON rejected_signals(symbol, signal_timestamp);
@@ -193,6 +210,28 @@ CREATE TABLE IF NOT EXISTS on_chain_snapshots (
 );
 
 CREATE INDEX IF NOT EXISTS idx_on_chain_snap_captured_at ON on_chain_snapshots(captured_at);
+
+-- 2026-04-22 — whale_transfers time-series (Phase 8 data layer).
+-- Streamed from `ArkhamWebSocketListener._handle` when a transfer crosses
+-- `whale_threshold_usd` and the token is in the configured whitelist.
+-- Runtime entry gate removed 2026-04-22 — this table exists purely for
+-- Phase 9 GBT analysis (join against trades via captured_at). Stores the
+-- raw event so directional classification (Coinbase→Binance etc.) can be
+-- learned from outcomes instead of hardcoded.
+CREATE TABLE IF NOT EXISTS whale_transfers (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at      TEXT NOT NULL,
+    token            TEXT NOT NULL,
+    usd_value        REAL NOT NULL,
+    from_entity      TEXT,
+    to_entity        TEXT,
+    tx_hash          TEXT,
+    -- JSON list of OKX perp symbols affected (from `affected_symbols_for`).
+    affected_symbols TEXT NOT NULL DEFAULT '[]'
+);
+
+CREATE INDEX IF NOT EXISTS idx_whale_transfers_captured_at ON whale_transfers(captured_at);
+CREATE INDEX IF NOT EXISTS idx_whale_transfers_token       ON whale_transfers(token);
 """
 
 
@@ -219,6 +258,7 @@ _COLUMNS = [
     "real_market_entry_valid", "real_market_exit_valid",
     "demo_artifact", "artifact_reason",
     "on_chain_context",
+    "confluence_pillar_scores",
 ]
 
 
@@ -235,6 +275,7 @@ _REJECTED_COLUMNS = [
     "pillar_btc_bias", "pillar_eth_bias",
     "hypothetical_outcome", "hypothetical_bars_to_tp", "hypothetical_bars_to_sl",
     "on_chain_context",
+    "confluence_pillar_scores",
 ]
 
 
@@ -284,6 +325,11 @@ _MIGRATIONS = [
     "ALTER TABLE on_chain_snapshots ADD COLUMN cex_binance_netflow_24h_usd REAL",
     "ALTER TABLE on_chain_snapshots ADD COLUMN cex_bybit_netflow_24h_usd REAL",
     "ALTER TABLE on_chain_snapshots ADD COLUMN token_volume_1h_net_usd_json TEXT",
+    # 2026-04-22 (gece) — per-pillar raw confluence scores JSON. Unlocks
+    # Pass 2 per-pillar weight tuning. Default '{}' so pre-migration rows
+    # decode as an empty dict (no attributed weights).
+    "ALTER TABLE trades ADD COLUMN confluence_pillar_scores TEXT NOT NULL DEFAULT '{}'",
+    "ALTER TABLE rejected_signals ADD COLUMN confluence_pillar_scores TEXT NOT NULL DEFAULT '{}'",
 ]
 
 
@@ -323,6 +369,7 @@ def _record_to_row(rec: TradeRecord) -> tuple:
         rec.artifact_reason,
         (json.dumps(rec.on_chain_context)
          if rec.on_chain_context is not None else None),
+        json.dumps(rec.confluence_pillar_scores or {}),
     )
 
 
@@ -344,6 +391,7 @@ def _rejected_to_row(rec: RejectedSignal) -> tuple:
         rec.hypothetical_outcome, rec.hypothetical_bars_to_tp, rec.hypothetical_bars_to_sl,
         (json.dumps(rec.on_chain_context)
          if rec.on_chain_context is not None else None),
+        json.dumps(rec.confluence_pillar_scores or {}),
     )
 
 
@@ -383,7 +431,30 @@ def _row_to_rejected(row: aiosqlite.Row) -> RejectedSignal:
         hypothetical_bars_to_tp=row["hypothetical_bars_to_tp"],
         hypothetical_bars_to_sl=row["hypothetical_bars_to_sl"],
         on_chain_context=_parse_on_chain_context(row),
+        confluence_pillar_scores=_parse_pillar_scores(row),
     )
+
+
+def _parse_pillar_scores(row: aiosqlite.Row) -> dict[str, float]:
+    """Decode `confluence_pillar_scores` JSON; empty dict on any issue so
+    legacy rows and malformed entries read as empty rather than erroring."""
+    raw = _safe_col(row, "confluence_pillar_scores")
+    if raw is None:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    # Coerce values to float where possible; drop non-numeric entries.
+    out: dict[str, float] = {}
+    for key, value in parsed.items():
+        try:
+            out[str(key)] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def _parse_on_chain_context(row: aiosqlite.Row) -> Optional[dict]:
@@ -464,6 +535,7 @@ def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
         demo_artifact=_safe_bool(row, "demo_artifact"),
         artifact_reason=_safe_col(row, "artifact_reason"),
         on_chain_context=_parse_on_chain_context(row),
+        confluence_pillar_scores=_parse_pillar_scores(row),
     )
 
 
@@ -573,6 +645,7 @@ class TradeJournal:
         nearest_liq_cluster_below_distance_atr: Optional[float] = None,
         trend_regime_at_entry: Optional[str] = None,
         on_chain_context: Optional[dict] = None,
+        confluence_pillar_scores: Optional[dict[str, float]] = None,
     ) -> TradeRecord:
         """Insert an OPEN row describing a freshly-placed trade.
 
@@ -624,6 +697,7 @@ class TradeJournal:
             nearest_liq_cluster_below_distance_atr=nearest_liq_cluster_below_distance_atr,
             trend_regime_at_entry=trend_regime_at_entry,
             on_chain_context=on_chain_context,
+            confluence_pillar_scores=dict(confluence_pillar_scores or {}),
         )
         placeholders = ", ".join("?" * len(_COLUMNS))
         cols = ", ".join(_COLUMNS)
@@ -760,6 +834,7 @@ class TradeJournal:
         pillar_btc_bias: Optional[str] = None,
         pillar_eth_bias: Optional[str] = None,
         on_chain_context: Optional[dict] = None,
+        confluence_pillar_scores: Optional[dict[str, float]] = None,
     ) -> RejectedSignal:
         """Insert a single row into `rejected_signals`.
 
@@ -801,6 +876,7 @@ class TradeJournal:
             pillar_btc_bias=pillar_btc_bias,
             pillar_eth_bias=pillar_eth_bias,
             on_chain_context=on_chain_context,
+            confluence_pillar_scores=dict(confluence_pillar_scores or {}),
         )
         placeholders = ", ".join("?" * len(_REJECTED_COLUMNS))
         cols = ", ".join(_REJECTED_COLUMNS)
@@ -975,6 +1051,93 @@ class TradeJournal:
         async with conn.execute(sql, params) as cur:
             rows = await cur.fetchall()
         return [dict(r) for r in rows]
+
+    async def record_whale_transfer(
+        self,
+        *,
+        captured_at: datetime,
+        token: str,
+        usd_value: float,
+        from_entity: Optional[str] = None,
+        to_entity: Optional[str] = None,
+        tx_hash: Optional[str] = None,
+        affected_symbols: Optional[list[str]] = None,
+    ) -> int:
+        """Append one row to `whale_transfers`.
+
+        Called from the Arkham WS listener on every qualifying event
+        (post-2026-04-22: no longer gates runtime; raw event captured so
+        Phase 9 GBT can learn directional classification from outcomes).
+        Returns the new row id; caller ignores it in the normal fire-and-
+        forget path.
+        """
+        conn = self._require_conn()
+        cur = await conn.execute(
+            """INSERT INTO whale_transfers (
+                   captured_at, token, usd_value,
+                   from_entity, to_entity, tx_hash,
+                   affected_symbols
+               ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                _iso(captured_at),
+                token,
+                float(usd_value),
+                from_entity,
+                to_entity,
+                tx_hash,
+                json.dumps(list(affected_symbols or [])),
+            ),
+        )
+        await conn.commit()
+        return int(cur.lastrowid or 0)
+
+    async def list_whale_transfers(
+        self,
+        *,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        token: Optional[str] = None,
+    ) -> list[WhaleTransferRecord]:
+        """Read whale transfers in capture-time order. Filters stack (AND).
+
+        Parses `affected_symbols` JSON on the way out — empty list if
+        missing / malformed so downstream analysis never crashes on a
+        bad row.
+        """
+        conn = self._require_conn()
+        sql = "SELECT * FROM whale_transfers WHERE 1=1"
+        params: list = []
+        if since is not None:
+            sql += " AND captured_at >= ?"
+            params.append(_iso(since))
+        if until is not None:
+            sql += " AND captured_at <= ?"
+            params.append(_iso(until))
+        if token is not None:
+            sql += " AND token = ?"
+            params.append(token)
+        sql += " ORDER BY captured_at ASC, id ASC"
+        async with conn.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        out: list[WhaleTransferRecord] = []
+        for r in rows:
+            raw_symbols = r["affected_symbols"] if "affected_symbols" in r.keys() else "[]"
+            try:
+                parsed_symbols = json.loads(raw_symbols or "[]")
+                if not isinstance(parsed_symbols, list):
+                    parsed_symbols = []
+            except (TypeError, ValueError):
+                parsed_symbols = []
+            out.append(WhaleTransferRecord(
+                captured_at=_parse_iso(r["captured_at"]),
+                token=r["token"],
+                usd_value=r["usd_value"],
+                from_entity=r["from_entity"],
+                to_entity=r["to_entity"],
+                tx_hash=r["tx_hash"],
+                affected_symbols=[str(s) for s in parsed_symbols],
+            ))
+        return out
 
     # ── Reads ───────────────────────────────────────────────────────────────
 

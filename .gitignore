@@ -60,6 +60,11 @@ data/exports/
 # Arkham on-chain WS stream id cache (gitignored — reused across restarts
 # to avoid the v1 session-creation fee; contents are an API-key-scoped id)
 data/arkham_stream_id.txt
+data/arkham_stream_id.txt.filter
+
+# Pass 1 / Pass 2 analysis + tune report outputs (local artefacts; commit the
+# scripts, not the generated reports).
+reports/
 
 # IDE
 .vscode/

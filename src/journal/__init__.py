@@ -11,7 +11,12 @@ The journal is the bridge between one bot run and the next:
 from __future__ import annotations
 
 from src.journal.database import TradeJournal
-from src.journal.models import RejectedSignal, TradeOutcome, TradeRecord
+from src.journal.models import (
+    RejectedSignal,
+    TradeOutcome,
+    TradeRecord,
+    WhaleTransferRecord,
+)
 from src.journal.reporter import (
     avg_r,
     calmar,
@@ -38,6 +43,7 @@ __all__ = [
     "TradeJournal",
     "TradeRecord",
     "TradeOutcome",
+    "WhaleTransferRecord",
     "avg_r",
     "calmar",
     "equity_curve",
