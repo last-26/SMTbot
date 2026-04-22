@@ -931,32 +931,92 @@ async def fetch_token_volume_last_hour(
 ) -> Optional[float]:
     """Most-recent-hour net CEX flow (USD) for a single token.
 
-    Uses `/token/volume/{id}?timeLast=24h&granularity=1h` (3 credits/call,
-    0 label lookups verified 2026-04-22). Sub-hourly granularity (5m, 15m,
-    30m) returned 500 Internal Server Error during probe — only `1h`
-    works on this endpoint as of 2026-04-22.
+    **Primary path:** `/token/volume/{id}?timeLast=24h&granularity=1h`
+    (3 credits/call, 0 label lookups verified 2026-04-22). Returns a
+    list of per-bucket `{time, inUSD, outUSD, inValue, outValue}` dicts.
+    Works for BTC, ETH, DOGE, BNB, MATIC, AVAX, and other EVM-indexed
+    tokens. Sub-hourly granularity (5m/15m/30m) returns 500 — hourly only.
 
-    Response per bucket: `{time, inUSD, outUSD, inValue, outValue}`.
-    We return the most-recent bucket's `inUSD - outUSD` as a signed
-    USD value:
+    **Fallback path (2026-04-23):** Arkham's `/token/volume/{id}`
+    returns HTTP 200 + JSON body `null` (not an error, not an empty
+    list) for tokens that Arkham recognises but hasn't aggregated into
+    the volume pipeline. Confirmed cases as of 2026-04-23: `solana`,
+    `wrapped-solana`. Root cause appears to be SPL chain accounting
+    differs from EVM deposit/withdraw semantics, so the aggregation
+    didn't land in the same bucket pipeline. When the primary path
+    returns None/null/empty, we call `_token_netflow_via_histogram_1h`
+    — the lower-level `/transfers/histogram` endpoint DOES index
+    solana and returns per-hour in/out USD sums. Two calls (in + out)
+    with 1.1s rate pause.
+
+    Returns signed USD:
       * positive → token deposits to CEX dominate (potential sell pressure).
-      * negative → token withdrawals from CEX dominate (potential supply squeeze).
-      * None     → call failed or response was empty / wrong shape.
+      * negative → token withdrawals from CEX dominate (supply squeeze).
+      * None     → both primary and fallback failed.
 
-    Caller is responsible for rate-limit pacing across multiple tokens
-    (this endpoint shares the 1 req/s ceiling with /transfers/histogram).
+    Caller paces across multiple tokens (1 req/s ceiling shared with
+    `/transfers/histogram`). Fallback adds 2 extra calls per gap-token
+    per hour → ~150 extra credits/day for the single known gap (solana);
+    negligible inside the 10k trial quota.
     """
     buckets = await client.get_token_volume(
         token_id, time_last="24h", granularity="1h",
     )
-    if not isinstance(buckets, list) or not buckets:
+    # Primary path succeeded + yielded a usable bucket array.
+    if isinstance(buckets, list) and buckets:
+        last = buckets[-1]
+        if isinstance(last, dict):
+            try:
+                in_usd = float(last.get("inUSD") or 0)
+                out_usd = float(last.get("outUSD") or 0)
+                return in_usd - out_usd
+            except (TypeError, ValueError):
+                pass
+    # Fallback path — Arkham gap tokens (solana, wrapped-solana known
+    # as of 2026-04-23). One extra rate-pause inside the helper for
+    # the second leg; caller's own pacing already covered leg 1.
+    return await _token_netflow_via_histogram_1h(client, token_id)
+
+
+async def _token_netflow_via_histogram_1h(
+    client: "ArkhamClient",
+    token_id: str,
+    *,
+    rate_pause_s: float = 1.1,
+) -> Optional[float]:
+    """Fallback per-token 1h net CEX flow via `/transfers/histogram`.
+
+    Used when `/token/volume/{id}` returns null for a token Arkham
+    recognises but hasn't aggregated (solana as of 2026-04-23). Two
+    histogram calls (flow=in + flow=out) against `base=type:cex` over
+    a 24h window with 1h granularity; we take the LAST bucket of each
+    (the current hour) and return `in.usd - out.usd`.
+
+    Distinct from `_net_flow_via_histogram` which sums the full window
+    — we need just the freshest hour, matching the primary endpoint's
+    semantic.
+
+    Returns None on any leg failure (network, parse, missing buckets).
+    Returns 0.0 when both legs succeed but last-bucket USD is zero.
+    """
+    inflow = await client.get_transfers_histogram(
+        base="type:cex", tokens=[token_id], flow="in",
+        time_last="24h", granularity="1h",
+    )
+    await asyncio.sleep(rate_pause_s)
+    outflow = await client.get_transfers_histogram(
+        base="type:cex", tokens=[token_id], flow="out",
+        time_last="24h", granularity="1h",
+    )
+    if not isinstance(inflow, list) or not isinstance(outflow, list):
         return None
-    last = buckets[-1]
-    if not isinstance(last, dict):
+    if not inflow or not outflow:
+        return None
+    last_in = inflow[-1]
+    last_out = outflow[-1]
+    if not isinstance(last_in, dict) or not isinstance(last_out, dict):
         return None
     try:
-        in_usd = float(last.get("inUSD") or 0)
-        out_usd = float(last.get("outUSD") or 0)
+        return float(last_in.get("usd") or 0) - float(last_out.get("usd") or 0)
     except (TypeError, ValueError):
         return None
-    return in_usd - out_usd
