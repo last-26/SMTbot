@@ -695,9 +695,10 @@ async def fetch_daily_snapshot(
       * bearish  mirror
       * neutral  otherwise or any component missing
 
-    Cost: 4 `/transfers/histogram` calls per invocation (in+out × 2
-    tokens sets). At 4 credits/call × 1 call/day = 16 credits/day =
-    ~480 credits/month. Well inside budget for a once-daily refresh.
+    Cost: 6 `/transfers/histogram` calls per invocation (in+out × 3
+    tokens sets — stablecoins, BTC, ETH). At 4 credits/call × 1
+    call/day = 24 credits/day = ~720 credits/month. Well inside budget
+    for a once-daily refresh.
 
     `entity_ids` and `interval` kwargs are preserved for backwards
     compat but ignored by the histogram path. Returns None when both
@@ -715,10 +716,10 @@ async def fetch_daily_snapshot(
     btc_netflow = await _net_flow_via_histogram(
         client, tokens=["bitcoin"], time_last=time_last,
     )
-    # ETH netflow is informational (journal context) — not part of the
-    # bias rule. Skipped here to save 2 histogram calls per refresh;
-    # schedule it separately if operator wants it stamped on every row.
-    eth_netflow: Optional[float] = None
+    await asyncio.sleep(1.1)
+    eth_netflow = await _net_flow_via_histogram(
+        client, tokens=["ethereum"], time_last=time_last,
+    )
 
     if stablecoin_change is None and btc_netflow is None:
         return None

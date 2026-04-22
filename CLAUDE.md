@@ -23,6 +23,18 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 
 ## Changelog
 
+### 2026-04-22 — ETH netflow re-enabled in daily macro snapshot
+
+- **Trigger:** operator review of overnight `on_chain_snapshots` table revealed `cex_eth_netflow_24h_usd` was always NULL. Rationale to re-add: ETH leads altcoin price action; capturing its CEX netflow now (passive data layer) lets Phase 9 GBT segment altcoin trades by ETH flow regime, and unblocks future Phase 12 conditional rules (e.g. "allow alt longs only when ETH netflow ≤ 0").
+- **Fix — `src/data/on_chain.py:fetch_daily_macro_snapshot`:** added a third `_net_flow_via_histogram` call for `tokens=["ethereum"]` after the BTC leg, with the same 1.1s rate-limit cushion. Result is written to `OnChainSnapshot.cex_eth_netflow_24h_usd` (previously hardcoded `None`). Bias rule unchanged — still keys off stablecoins + BTC only; ETH is journal-only.
+- **Cost delta:** 4 → 6 histogram calls per daily refresh. +8 credits/day, +240 credits/month. ~720 credits/month total for daily-bias path. Comfortably inside the 10k trial quota.
+- **Schema/journal:** column already existed (added 2026-04-21 eve, late-2). No migration. New rows write the actual value; old rows stay NULL.
+- **Re-eval triggers:**
+  1. ETH-netflow column NULL fraction on new snapshot rows should drop to ≤10% (matches BTC leg's expected reliability). Higher = ETH histogram leg failing — investigate `arkham_*` log lines.
+  2. Phase 9 GBT: does ETH netflow add lift over BTC netflow alone for altcoin (SOL/DOGE) trade outcome prediction? If feature importance < BTC's, drop back to `None`. If competitive or higher, promote to bias rule.
+  3. Credit usage: monthly Arkham burn should sit ≈7.2k (from ~7k pre-change). If trending higher than expected, consider widening daily refresh cadence (currently UTC-day-rollover).
+- **Tests:** 139 on-chain related passing. No test mocked `fetch_daily_macro_snapshot` directly, so no fixture updates needed.
+
 ### 2026-04-21 (eve, late-2) — `on_chain_snapshots` time-series table (Phase 8 data layer)
 
 - **Trigger:** operator flagged that on-chain context is frozen at entry-time on each `trades` row — pozisyon ömrü boyunca bias flip / whale event / pulse misalignment görünmez. Exit-time snapshot ayrı kolonda tutmak az değer (causality yok, kapanış deterministik). Daha temiz çözüm: ayrı time-series tablo.
@@ -83,7 +95,7 @@ Single-day five-phase integration. Full commit-level detail in `git log --grep="
 - **E — stablecoin pulse penalty.** Pure helper `_stablecoin_pulse_penalty`. Misaligned (long + outflow or short + inflow) → +penalty on threshold. Rejects under existing `below_confluence` string (not new reason) — factor-audit segments by context.
 - **F1 — hourly pulse via `/transfers/histogram`.** Previously stub (Arkham's `entity_balance_changes` only supports 7d/14d/30d). Two histogram calls (flow=in + flow=out), 1.1s cushion (1 req/s rate limit). `base=type:cex` captures every CEX in one query. None on leg failure, 0.0 on empty buckets.
 - **F2 — altcoin-index penalty.** `/marketdata/altcoin_index` scalar 0-100. Penalty bump applies ONLY to altcoins (not BTC/ETH), only on misaligned direction (long alt in BTC-dominance OR short alt in altseason). Asymmetric by design.
-- **F3 — 24h daily bias.** Rebuilt on `/transfers/histogram` with `granularity=1d, time_last=24h` (vs 7d minimum of `entity_balance_changes`). 4 calls per refresh (stables-in/out, BTC-in/out). ETH netflow dropped (was informational).
+- **F3 — 24h daily bias.** Rebuilt on `/transfers/histogram` with `granularity=1d, time_last=24h` (vs 7d minimum of `entity_balance_changes`). 6 calls per refresh (stables-in/out, BTC-in/out, ETH-in/out). ETH netflow re-enabled 2026-04-22 — informational column on every snapshot, NOT in bias rule (still BTC + stables only). See 2026-04-22 changelog entry.
 - **v2 WS migration (critical credit fix).** Operator dashboard revealed `POST /ws/sessions` (v1) costs 500 credits/call — 2 probes burned 92.5% of 30-day quota. Migrated to `POST /ws/v2/streams` (persistent, ~0 creation fee). `data/arkham_stream_id.txt` (gitignored) persists stream id across restarts. Startup: read cache → `GET /ws/v2/streams` verify → reuse or create+persist. `stop()` leaves stream in place. v1 methods kept as deprecated with docstring warnings.
 
 **Key API-shape discoveries (undocumented but enforced):**
