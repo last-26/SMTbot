@@ -155,175 +155,35 @@ tests). Six new test files: `test_flow_alignment.py` (16 tests),
    <5/day = Arkham WS fetch failing or threshold too high; >500/day =
    threshold too low. Expect 20-100/day at 150M.
 
-### 2026-04-21 (eve, late-2) — `on_chain_snapshots` time-series table (Phase 8 data layer)
+### Historical context (pre-Pass-1, 2026-04-19 → 2026-04-21)
 
-- **Trigger:** operator flagged that on-chain context is frozen at entry-time on each `trades` row — pozisyon ömrü boyunca bias flip / whale event / pulse misalignment görünmez. Exit-time snapshot ayrı kolonda tutmak az değer (causality yok, kapanış deterministik). Daha temiz çözüm: ayrı time-series tablo.
-- **New table — `on_chain_snapshots`:** `captured_at`, `daily_macro_bias`, `stablecoin_pulse_1h_usd`, `cex_btc_netflow_24h_usd`, `cex_eth_netflow_24h_usd`, `coinbase_asia_skew_usd`, `bnb_self_flow_24h_usd`, `altcoin_index`, `snapshot_age_s`, `fresh`, `whale_blackout_active`. Index on `captured_at`. Created via `CREATE TABLE IF NOT EXISTS` in `_SCHEMA` (no ALTER migration — same idempotent startup path hits new + existing DBs).
-- **Dedup-gated writer.** Runner's `_refresh_on_chain_snapshots` calls `_maybe_record_on_chain_snapshot` at tail. Fingerprint tuple `(bias, pulse, btc_flow, eth_flow, coinbase_skew, bnb_flow, altcoin_idx, fresh, whale_blackout_active)` compared against `ctx.last_on_chain_snapshot_fingerprint`. Match → skip; differ → single insert + fingerprint update. `snapshot_age_s` deliberately NOT in fingerprint (grows every tick; would churn ~1 row / 180s even on no-op ticks). `fresh` bool IS in fingerprint — staleness flip is a meaningful observation. Journal failures log + swallow via `arkham_snapshot_journal_failed`.
-- **Expected cadence:** ~hourly pulse + hourly altcoin-index + once-per-UTC-day bias → 2-3 rows/hour typical, ~72/day, ~2200/month. Well inside SQLite comfort zone.
-- **Phase 9 usage (documented intent, not shipped).** Analysis scripts will join `trades` onto this table via `entry_timestamp ≤ captured_at ≤ exit_timestamp`, reconstructing "which on-chain regimes did this trade live through." Enables hypothesis: "entry'de bullish bias → mid-trade flip → did outcome change?" GBT features: bias-flip-during-lifetime bool, whale-event-during-lifetime bool, pulse-sign-change-during-lifetime bool. NO runtime reaction mechanism yet — Phase 12 candidate pending Phase 9 signal validation.
-- **Dataset:** `rl.clean_since` **unchanged**. Additive read-only table, zero entry/exit geometry change. Existing `on_chain_context` on trade rows preserved (complementary — entry snapshot vs lifetime journey).
-- **Re-eval triggers:**
-  1. Row count growth. <1 row/hour average over 24h = dedup too aggressive OR Arkham fetcher failing. Inspect `arkham_*_refreshed` log lines vs table row count.
-  2. Phase 9 signal. If `bias_flipped_during_lifetime` segment shows < 5% outcome delta vs `no_flip` segment, reactive mechanism isn't worth building. If > 10%, promote to Phase 12 design.
-- **Tests:** 953 passing (+7: 2 journal, 5 runner). `test_refresh_dedups_unchanged_snapshot` locks the no-churn contract.
+Design decisions baked into the current code. Git log (`git log --before=2026-04-22`) has per-commit detail; this section exists so new readers understand *why* the code looks the way it does without excavating history.
 
-### 2026-04-21 (eve, late) — Hard RR 1:3 → 1:2 + ETH SL floor widening
+**Scalp-native pivot (2026-04-19).** Full strategic rebuild: zone source priority rewired (`vwap_retest → ema21_pullback → fvg_entry → sweep_retest → liq_pool_near`), pillar weights rebalanced toward oscillator / VWAP / money-flow / divergence with structure demoted, Pine overlay script trimmed of dead confluence rows. Partial TP disabled (`execution.partial_tp_enabled=false`) — full-win payout 2R, break-even WR 33%. HTF S/R ceiling + Premium/Discount hard vetoes disabled — both are Pass 3 candidates to return as soft-weighted factors. `vwap_1m_alignment` kept at 0.2 weight as a GBT probe.
 
-- **Trigger:** operator review of early session. Wins were wicking TP and reversing before the market-trigger TP could fill (maker-TP limit now handles this but 3R TP still far from typical post-fill momentum envelope). ETH losses were hitting the 0.6% floor too often — stops writing faster than 3m noise envelope.
-- **Fix — `config/default.yaml` + pydantic defaults:**
-  - `execution.target_rr_ratio: 3.0 → 2.0` (hard RR cap)
-  - `trading.default_rr_ratio: 3.0 → 2.0` (pre-zone fallback; test guard renamed `test_default_yaml_runner_tp_is_hard_1_2`)
-  - `execution.sl_lock_mfe_r: 2.0 → 1.3` — 2R threshold would coincide with 2R TP (lock never fires). 1.3R preserves "65% of the way to TP" proportion (old was 2R/3R = 67%).
-  - `execution.tp_min_rr_floor: 1.5 → 1.0` — under 1:2, a 1.5R floor would bind on nearly every revise.
-  - `min_sl_distance_pct_per_symbol.ETH-USDT-SWAP: 0.006 → 0.008` — DOGE level, still below SOL's 0.010. Notional auto-shrinks to keep $R flat (per SL widening contract).
-- **Expected behavior change:**
-  - Winners: TP closer, higher fill rate (maker-TP or market-trigger). Full-win payout 3R → 2R. Break-even WR 25% → 33%.
-  - MFE lock fires at 1.3R instead of 2R — "almost-win → BE" more sensitive. More trades locked to BE; fewer "locked and fell back to BE" vs "walked on to TP" bucket (since TP is now closer).
-  - ETH: wider stop envelope. Same $R, smaller notional. Fewer false stops from noise.
-- **Safety rails:** hard-RR test (`test_default_yaml_runner_tp_is_hard_1_2`) locks the contract — if anyone drifts one value without the other, test fails at CI. MFE lock + floor scaled together so lock still fires before TP and revise still has headroom.
-- **Dataset:** `rl.clean_since` **unchanged**. Exit-geometry tune (R distribution re-centered at 2R max instead of 3R max), same entry contract. Factor-audit will pick up the regime shift via `target_rr_ratio` categorical.
-- **Re-eval triggers:**
-  1. Win-rate post-flip. Old break-even (25%) was challenging; 33% should be within reach but tighter. If WR post-flip < 30%, tighten confluence threshold or re-examine zone sources.
-  2. Avg realized R on wins. Should land 1.8-2.0R (with maker-TP, closer to 2.0). Anything systematically below 1.5R suggests early TP revise shrinking it further — bump `tp_revise_min_delta_atr`.
-  3. MFE-lock fire rate. Expected up vs old config (threshold lowered 35%). If >80% of trades lock, consider bumping to 1.5R; if <40%, reconsider threshold.
-  4. ETH stop-out rate on bias-aligned trades. Should drop 15-25% with wider floor. If unchanged, the issue wasn't floor-related; re-eval zone sources for ETH.
-- **Tests:** 946 passing. Guard test renamed + asserts 2.0.
+**Fee-aware ceil sizing (2026-04-19 late).** `num_contracts = ceil(max_risk / per_contract_cost)` with `per_contract_cost = (sl_pct + fee_reserve_pct) × contracts_unit_usdt`. Guarantees realized SL loss (price + fee reserve) ≥ target R across every symbol; overshoot bounded by one per-contract step (< $3/position). Capped path (leverage ceiling) still floors to respect the hard cap.
 
+**Execution hardening day (2026-04-20).** Five fixes, one dev day:
+- **MFE-triggered SL lock (Option A)** — at MFE ≥ 1.3R, cancel + replace runner OCO with SL at entry + fee buffer. One-shot per position. Kills "almost-win → round-trip to -1R" bucket.
+- **Maker-TP resting limit** — post-only reduce-only limit sits at TP price alongside the OCO. Primary (maker fill); OCO market-trigger = fallback. `clOrdId` prefix `smttp` distinguishes from entry limits (`smtbot`).
+- **Phantom-cancel fix** — `poll_pending` / `cancel_pending` only drop the row on success or idempotent-gone (`51400/51401/51402`); transient failures preserve the row for next poll retry. Eliminated orphan-limit-to-OCO race during brief OKX outages.
+- **Stale-algoId + startup reconcile** — `revise_runner_tp` forwards `_on_sl_moved` so journal `algo_ids` stays in sync. Startup runs `_cancel_orphan_pending_limits` + `_cancel_surplus_ocos`.
+- **Flat-USDT override** — `trading.risk_amount_usdt` / `RISK_AMOUNT_USDT` env bypasses `balance × risk_pct`. 10%-of-balance safety rail at config load.
 
+**Hard 1:2 RR cap + dynamic TP revision (2026-04-21 eve).** `target_rr_ratio=2.0` (tightened from 3.0), `tp_min_rr_floor=1.0` (from 1.5), `sl_lock_mfe_r=1.3` (scaled from 2.0). `PositionMonitor.revise_runner_tp` cancels + places runner OCO per cycle with `tp_revise_min_delta_atr=0.5` gate + 30s cooldown. ETH `min_sl_distance_pct` bumped 0.006 → 0.008 (DOGE-level; wider noise envelope). Test guard `test_default_yaml_runner_tp_is_hard_1_2` locks the contract.
 
-- **Trigger:** first post-activation observation — all 5 bullish-day shorts cleared confluence despite Arkham penalties (bias ×0.9 + pulse +0.5 threshold). Operator flagged that 10% bias + 0.5 penalty on a raw 5.0+ score is effectively ignored; if this stays invisible in data, Phase 9 GBT won't have signal to learn from.
-- **Fix — `config/default.yaml` + `src/bot/config.py` defaults:**
-  - `daily_bias_modifier_delta: 0.10 → 0.15` (bullish short penalty ×0.85 instead of ×0.90)
-  - `stablecoin_pulse_penalty: 0.5 → 0.75` (misaligned threshold 3.0 → 3.75)
-- **Expected behavior change:** raw confluence under ~4.2 on misaligned trades now rejects (vs ~3.7 before). Today's 5 shorts (raw 4.96-6.20) still pass, but setups in the 4.0-4.5 raw band become the first Arkham-induced rejects. Effective handicap on misaligned trades ~22% (was ~15%).
-- **Re-eval trigger (data-driven tune):** after 30 closed trades with Arkham flags on, check journal for `below_confluence` rejects where `on_chain_context` shows misalignment:
-  - Penalty-induced reject fraction `<5%` of total → bump 2× (delta=0.30, penalty=1.0)
-  - `5-30%` → hold current values
-  - `>30%` → drop back to 0.10 / 0.5 (over-filtering)
-- **Dataset:** `rl.clean_since` unchanged. Quantitative tune within same feature-set; Phase 9 GBT segments by config hash as well as `arkham_active`. Tests: 1 updated (default-value assertion), 1 adjusted (override test now uses 0.20 as non-default). Full suite 946 passed.
+**Arkham on-chain integration (2026-04-21).** Phase A-E + F1-F3 + v2 WS migration, all in one day. Delivered: `ArkhamClient` (httpx, auto-disable at 95% usage), `OnChainSnapshot` + `WhaleBlackoutState` state, daily macro bias modifier (±0.15), hourly stablecoin pulse penalty (+0.75 threshold bump), altcoin-index penalty (+0.5 on misaligned altcoin trades), whale WS listener (hard gate — since removed 2026-04-22). Credit-safe via v2 persistent WS streams (`/ws/v2/streams`) + filter-fingerprint sidecar — zero credit burn on restart. `on_chain_snapshots` time-series table (eve-late) captures every state mutation for Pass 3 lifetime joins.
 
-### 2026-04-21 — Arkham on-chain integration (Phase A-E + F1-F3 + v2 WS migration)
+**Zone refinements (2026-04-21).** VWAP-band zone anchor (Convention X): long zone mid at `VWAP + 0.4σ`, short at `VWAP − 0.4σ` (operator preference, pulls entry closer to VWAP than plain 0.5 midpoint). Pending zone timeout 10 → 7 bars (21 min on 3m; tighter pullback window matches scalp-native zone half-life).
 
-Single-day five-phase integration. Full commit-level detail in `git log --grep="Arkham"`. This consolidates what matters for future decisions.
+**TP-revise hardening (2026-04-19 → 2026-04-20).** Immutable `plan_sl_price` on `_Tracked` (survives SL-to-BE). `51400 verify-before-replace` via `list_pending_algos` + `_verify_algo_gone` (prevents double-stops). Mark-price OCO triggers (`trigger_px_type="mark"`) on all paths. Binance cross-check via `BinancePublicClient.get_kline_around` validates entry/exit inside concurrent real-market candle; journal schema v3 adds `demo_artifact` + `artifact_reason` flags; `scripts/report.py --exclude-artifacts`.
 
-**Phases shipped:**
-- **A — foundation.** `ArkhamClient` (httpx.AsyncClient, token-less rate limiting, header usage parsing, 95% auto-disable). `OnChainSnapshot`, `WhaleBlackoutState` (extend-never-shorten), `affected_symbols_for()` (stablecoins fan out, chain-natives collapse). `OnChainConfig` with master + 4 sub-feature flags (default False in pydantic, True in `config/default.yaml`). Journal schema: `on_chain_context TEXT` on trades + rejected_signals (idempotent ALTER). API key via env only.
-- **B — snapshot pipeline + journal enrichment.** Scheduler runs once per tick, shared across symbols. UTC-day-rollover for daily, monotonic cadence for pulse + altcoin index. Fetch failure keeps last-known snapshot; `fresh` flag degrades gate downstream. `_on_chain_context_dict` writes JSON to every journal row.
-- **C — daily bias modifier.** Applied in `calculate_confluence` top-level. Bullish → long × (1+δ), short × (1-δ). Delta ∈ [0.0, 0.5] enforced at config load. Stale snapshot → (1.0, 1.0).
-- **D — whale blackout hard gate.** `ArkhamWebSocketListener` mirrors LiquidationStream pattern. 3-strike consecutive-failure disable. Gate sits between `cross_asset_opposition` and `crowded_skip`. Stablecoin events fan out to all 5 symbols; chain-native collapses to one.
-- **E — stablecoin pulse penalty.** Pure helper `_stablecoin_pulse_penalty`. Misaligned (long + outflow or short + inflow) → +penalty on threshold. Rejects under existing `below_confluence` string (not new reason) — factor-audit segments by context.
-- **F1 — hourly pulse via `/transfers/histogram`.** Previously stub (Arkham's `entity_balance_changes` only supports 7d/14d/30d). Two histogram calls (flow=in + flow=out), 1.1s cushion (1 req/s rate limit). `base=type:cex` captures every CEX in one query. None on leg failure, 0.0 on empty buckets.
-- **F2 — altcoin-index penalty.** `/marketdata/altcoin_index` scalar 0-100. Penalty bump applies ONLY to altcoins (not BTC/ETH), only on misaligned direction (long alt in BTC-dominance OR short alt in altseason). Asymmetric by design.
-- **F3 — 24h daily bias.** Rebuilt on `/transfers/histogram` with `granularity=1d, time_last=24h` (vs 7d minimum of `entity_balance_changes`). 6 calls per refresh (stables-in/out, BTC-in/out, ETH-in/out). ETH netflow re-enabled 2026-04-22 — informational column on every snapshot, NOT in bias rule (still BTC + stables only). See 2026-04-22 changelog entry.
-- **v2 WS migration (critical credit fix).** Operator dashboard revealed `POST /ws/sessions` (v1) costs 500 credits/call — 2 probes burned 92.5% of 30-day quota. Migrated to `POST /ws/v2/streams` (persistent, ~0 creation fee). `data/arkham_stream_id.txt` (gitignored) persists stream id across restarts. Startup: read cache → `GET /ws/v2/streams` verify → reuse or create+persist. `stop()` leaves stream in place. v1 methods kept as deprecated with docstring warnings.
-
-**Key API-shape discoveries (undocumented but enforced):**
-- `orderBy` is REQUIRED on `/intelligence/entity_balance_changes` (400 without it).
-- `interval` only accepts `7d`, `14d`, `30d`.
-- WS v1 subscribe envelope: `{"id":"1","type":"subscribe","payload":{"filters":{"usdGte":N,"tokens":[...]}}}`.
-- `tokens` param on histogram = comma-joined string; on `entity_balance_changes` = repeated query params.
-- WS v2 has NO subscribe message — filters baked into the stream at creation.
-
-**Credit budget (post-v2):** ~7k credits/month at current cadence. Inside 10k trial quota. Dropping `stablecoin_pulse_refresh_s` 1h → 3h brings it to ~2.2k/month.
-
-**Dataset contract:** `rl.clean_since` NOT bumped for Arkham activation. Phase 9 GBT segments by `arkham_active=true` + `on_chain_context IS NOT NULL`, not by timestamp cut. This is the deliberate divergence from the usual flip-protocol.
-
-**Re-evaluation triggers:**
-1. `on_chain_context IS NOT NULL` fraction on new rows should be ≥90% when master on. Lower = fetcher failure path being hit (investigate rate budget / API reachability).
-2. Penalty-induced `below_confluence` fraction — see 2026-04-21 eve weight-bump entry for current thresholds.
-3. Whale blackout frequency. <1/week = threshold too high (raise to $200M). >5/hour during bull runs = threshold too low (drop to $250M).
-4. Locked-and-fell-back % after daily-bias modifier — if bullish-day shorts consistently hit SL and bearish-day longs consistently hit TP, modifier is anti-correlated with edge (turn off).
-
-**Rollback:** flip `on_chain.enabled: false` + restart. Zero log lines from `arkham_*`, `state.on_chain=None`, new journal rows write `on_chain_context=NULL`, historical rows preserved.
-
-**Not in scope / Phase 12 candidates:**
-- F4 per-entity flow divergence (`/flow/entity/{entity}` — Coinbase premium pattern). Macro horizon mismatch with scalp. Deferred.
-- F5 swap volume (`/swaps` — DEX activity). Indirect for futures. Deferred.
-- Asymmetric penalty direction (long-only or short-only). Symmetric by default until data shows asymmetry.
-- Per-symbol altcoin-index override (SOL vs DOGE respond differently to BTC dominance).
-
-### 2026-04-21 — VWAP-band zone anchor (Convention X, 0.7/0.3)
-
-- **Trigger:** operator flagged that `_vwap_zone` limit landed at 0.5σ midpoint (arbitrary 50/50 between VWAP and ±1σ band). Wanted Fib-lite anchor pulling limit closer to VWAP on directional side — catches pullback before full retrace.
-- **Fix:** `AnalysisConfig.vwap_zone_long_anchor: 0.7` (validator [0.5, 1.0]) + `vwap_zone_short_anchor: 0.3` (validator [0.0, 0.5]). Zone midpoint: `low + (2·long_anchor − 1)·(high − low)` for long; `low + 2·short_anchor·(high − low)` for short. Default formula preserved for legacy callers (no-arg). `liq_pool_near` still uses plain midpoint (cluster IS target).
-- **Geometry:** long limit now at VWAP + 0.4σ (was +0.5σ); short at VWAP − 0.4σ. ~10% of band-width tighter pullback required. Per-unit R improves when filled.
-- **Safety rail:** validator enforces entry stays on correct structural side of VWAP. Typo `long_anchor=0.3` would place long BELOW VWAP and break SL-past-zone contract — rejected at config load.
-- **Re-eval (≥30 trades):** vwap_retest fraction of zone-source selection, avg-R vs other sources, whether EQ-hug (0.65/0.35) or outer-band (0.8/0.2) tune better.
-
-### 2026-04-21 — Pending zone timeout 10 → 7 bars (21 min)
-
-- **Trigger:** on 3m TF, 30-minute fill window exceeded zone half-life for scalp-native sources (`vwap_retest`, `ema21_pullback`, `fvg_entry`). Operator requested tighter 21-min window.
-- **Fix:** `execution.zone_max_wait_bars: 10 → 7` (YAML + pydantic + `setup_planner.build_zone_setup` default). `algoritma.md` §5, §10, §12 synced.
-- **Expected:** 2-3 bar retrace fills unaffected (majority). 7-10 bar "slow retrace" group now cancels, confluence re-evaluated next cycle with fresh zone. No R spent on cancels.
-- **Re-eval (≥30 trades):** `zone_timeout_cancel` reject ratio. >30% = too aggressive (bump to 8); <10% = can tighten further (5-6). Per-source cadence may be warranted (1m sources 3-4 bars, 3m 7, HTF longer).
-
-### 2026-04-20 — Execution hardening day (5 fixes, one dev day)
-
-Five fixes shipped same day targeting execution correctness. Full commit-level detail in `git log`.
-
-**MFE-triggered SL lock (Option A).** When MFE ≥ 2R, cancel+replace runner OCO with SL at entry+fee_buffer. One-shot flag (`_Tracked.sl_lock_applied`) prevents retry spin. Direction guard (long `new_sl < tp`, short `>`) prevents wrong-side tightening. Failure handling mirrors `revise_runner_tp`. Config: `sl_lock_enabled=true`, `sl_lock_mfe_r=2.0`, `sl_lock_at_r=0.0` (BE+fee_buffer; >0 = locked profit). Purpose: eliminate "almost-win" round-trip -1R losses observed on trades that wicked near TP then reversed. **Re-eval (≥30 trades):** fire frequency (<30% = threshold too high, bump down to 1.5R); distribution of realized R on locked trades (should bimodal — near-0R or 3R); locked-and-fell-back % (>60% = lock load-bearing; <30% = neutral insurance).
-
-**Resting TP limit alongside OCO (maker-TP, wick capture).** `tp_resting_limit_enabled=true`. On every bot-opened position, two TP orders live: OCO (market-on-trigger, fallback) + post-only reduce-only limit at TP (maker, primary). `clOrdId` prefix `smttp` distinguishes from entry limits (`smtbot`). `revise_runner_tp` cancels+replaces in lockstep with OCO; `lock_sl_at` leaves TP limit untouched. Fixes trade `414b4ca5`-class wick-and-reverse where market-on-trigger missed the fill. Startup rehydrate re-places fresh TP limit for every non-BE journal OPEN row (orphan-sweep wipes resting limits, rehydrate regenerates). **Re-eval (≥30 trades):** fraction of wins with TP-limit-fill vs OCO-market-trigger (>70% validates); exit price ≤ planned TP on wins (no slippage).
-
-**Phantom-cancel orphan fix.** `poll_pending` + `cancel_pending` formerly emitted CANCELED and dropped pending row even on non-idempotent cancel failure (generic exception or sCode 50001). Now only pops row on (a) success or (b) idempotent-gone `{51400, 51401, 51402}`. Non-gone failures preserve row for next poll retry. `cancel_pending` re-raises for caller visibility. Root cause of three orphan limits during brief OKX outages that later filled into unprotected positions.
-
-**Stale-algoId + startup reconciliation.** `revise_runner_tp` now calls `_on_sl_moved` callback (mirrors `lock_sl_at`), so journal `algo_ids` stays in sync with in-memory state across restart. Startup reconcile gained two passes: `_cancel_orphan_pending_limits` (cancels all resting limits — they're orphan by construction pre-first-tick) + `_cancel_surplus_ocos` (compares live OCOs vs journal, cancels surplus). Fixes DOGE 2-OCO stacking bug where stale journal pointed to a dead algo while live orphan sat unmanaged.
-
-**Flat-USDT $R override + zone-resize ceil parity.** New `trading.risk_amount_usdt` / `RISK_AMOUNT_USDT` env override bypasses `balance × risk_pct` sizing. Safety rail: override ≤ 10% of account balance (ValueError at config load on exceed). `setup_planner.apply_zone_to_plan` flipped floor→ceil for contract rounding (matches 2026-04-19 `rr_system` ceil), eliminating residual $2-$13 spread from floor-rounding in zone re-size path. Operator playbook: demo `RISK_AMOUNT_USDT=50`; bump manually as balance grows (e.g., $8k → $75).
-
-**Process learning:** *code commit ≠ live behavior.* Fix not applied until process restart. Added to operator contract.
-
-### 2026-04-19 (late night) — Fee-aware ceil sizing (equal USDT SL/TP across symbols)
-
-- **Trigger:** post-partial-disable, per-position `risk_amount_usdt` still varied $40-$54 on $55 target. Root cause: `int(notional // contracts_unit_usdt)` floor-rounding truncates harder on high-price symbols (BTC ctu≈$680) than fine-step (DOGE ctu≈$0.35).
-- **Fix — `rr_system.py`:** un-capped path uses `num_contracts = ceil(max_risk / per_contract_cost)` where `per_contract_cost = (sl_pct + fee_reserve_pct) × contracts_unit_usdt`. Realized SL loss (price + fee reserve) clears target; overshoot bounded by one per-contract step (<$3 per position). Capped path (leverage/margin ceiling) still floors — respecting the hard cap wins over equal-risk. `actual_risk_usdt` journal field stays price-only (not effective) so RL rewards compare clean.
-- **Dataset:** `rl.clean_since` bumped `2026-04-19T17:35:00Z → 2026-04-19T19:55:00Z`. Realized-R distribution flipped from left-skewed-below-target to clustered-at-or-above. Mixing the two would blur expectancy math.
-- **Re-eval (≥30 trades):** `risk_amount_usdt` distribution clusters ≥ target with tail bounded at `target + per_contract_cost`. Flat-below = ceil not engaging (capped-path dominance). sCode 51008 incidence should stay at zero (ceil bumps notional slightly but margin buffer has headroom).
-
-### 2026-04-19 — Scalp-native pivot series (consolidated)
-
-Single-day rewire sequence. Detailed commits preserved in git log (`git log --oneline --grep="2026-04-19"`). 2026-04-20 MFE-lock and 2026-04-19 (late night, cont. #2) ceil-sizing kept verbatim above — re-evaluation still pending; everything below is stable.
-
-**Scalp-native rewire (morning):**
-- Zone priority: `vwap_retest → ema21_pullback → fvg_entry (3m) → sweep_retest → liq_pool_near`. HTF 15m FVG demoted to opt-in.
-- New sources: `ema21_pullback` (EMA21/55 stack + price within `zone_atr × ATR` of EMA21), entry-TF `fvg_entry`.
-- Liquidity flipped from entry-driver to TP-driver. `liq_pool_near` gated by `liq_entry_near_max_atr=1.5` + notional `≥ 2.5× side-median`.
-- Weights rebalanced toward oscillator/overlay (`vwap_composite=1.25`, `money_flow=1.0`, `osc_HCS=1.5`, `divergence=1.25`); structure weights trimmed. Candle buffer `last(50) → last(100)` for EMA55 SMA-seed.
-- TP ladder (`tp_ladder_enabled=true`, shares `[0.40, 0.35, 0.25]`) — inert because `partial_tp_enabled=false` (disabled same day).
-
-**Gate changes (sequential):**
-- `analysis.premium_discount_veto_enabled: true → false` — range-bound tape rejected every zone on `wrong_side_of_premium_discount`. Re-enable post-Phase-9 as soft/weighted factor (~10-15% weight).
-- `analysis.htf_sr_ceiling_enabled: true → false` — hard 1:3 + tight 15m levels killed nearly all longs via `htf_tp_ceiling`; flag also gates `_push_sl_past_htf_zone`. `min_sl_distance_pct_per_symbol` floors still primary wick protection. Re-evaluate Phase-9; consider splitting flag into TP-ceiling vs SL-push.
-
-**Unprotected-position hardening (pm):**
-- **Zone SL floor re-apply** — `apply_zone_to_plan(min_sl_distance_pct=…)` re-widens structural SL past per-symbol floor (mirrors entry_signals widening; R flat via notional re-size).
-- **Pre-attach mark-vs-SL guard** — `runner._handle_pending_filled` reads mark before `attach_algos`; if already breached, skip + best-effort close.
-- **Coinalyze 429 non-blocking** — `self._rate_pause_until` replaces `asyncio.sleep(retry_after)` (event loop no longer stalls 57s).
-- **Inline pending drain** — `run_once` drains pending between symbols, not once-per-tick; fill→OCO-attach latency 180s → <10s.
-- **Attach-failure log enrichment** — `OrderRejected.code` + `.payload` surfaced.
-- Symbol count 7→5 (dropped DOGE+XRP; per-slot margin +40%). Later ADA↔DOGE swap (`sCode 54031` OI cap). Per-symbol overrides for absent symbols kept in YAML.
-
-**Hard 1:3 RR cap + dynamic TP revision (night):**
-- `apply_zone_to_plan(target_rr_cap=3.0)` — zone-derived TP force-clamped to `entry ± 3 × sl_distance`. `execution.target_rr_ratio` + `trading.default_rr_ratio` both 3.0 (guarded by `test_default_yaml_runner_tp_is_hard_1_3`).
-- `PositionMonitor.revise_runner_tp` — runner OCO cancel+place per cycle, gates: `tp_revise_min_delta_atr=0.5`, cooldown 30s, floor 1.5R. BE-aware via `_Tracked.sl_price`.
-
-**VWAP band-based zone (night):**
-- Pine `ta.vwap(src, anchor, stdev_mult=1.0)` emits `vwap_3m_upper/lower` in SMT Signals.
-- `_vwap_zone` uses bands when 3m VWAP is nearest; zone mid = `vwap ± 0.5σ`. ATR fallback when Pine bands missing.
-- Entry distance from market `0.77-1.54%` → `0.52-0.63%`.
-
-**Partial TP disabled (late night):**
-- `execution.partial_tp_enabled: true → false`. Full-win payout 2.25R → 3R; "almost-win" +0.75R bucket gone (TP1-reversal now full -1R). Break-even WR shift 22% → 25%.
-- `move_sl_to_be_after_tp1` flag kept but inert. Runner coverage bumped to full `num_contracts`. Existing split positions keep 2-OCO structure until closed.
-
-**TP-revise hardening + demo-wick artefact cross-check (late night):**
-- **Immutable `plan_sl_price`** — `_Tracked` preserves plan SL distance for dynamic TP math even after SL-to-BE mutates `sl_price`. Sentinel `0.0` = unknown, disables revise.
-- **51400 verify-before-replace** — `OKXClient.list_pending_algos` + `_verify_algo_gone` confirms algo truly absent after idempotent cancel code before placing replacement OCO (prevents double-stops).
-- **Mark-price SL/TP triggers** — `place_oco_algo(trigger_px_type="mark")` on all OCO paths. Demo last-price-only wicks no longer fire.
-- **Binance artefact cross-check** — new `BinancePublicClient.get_kline_around`; `_cross_check_close_artefacts` validates entry+exit inside concurrent Binance USD-M 1m candle (tolerance 5 bps). Journal schema v3 adds `demo_artifact`, `artifact_reason`. `scripts/report.py --exclude-artifacts`.
-
-**`vwap_1m_alignment` re-opened at 0.2 (eve):** low-weight probe for Phase-9 GBT to evaluate per-TF VWAP alpha independent of composite.
+**Deliberately closed features (flags preserved in code):**
+- `execution.partial_tp_enabled=false` (2026-04-19 late) — Pass 3 re-enable candidate if WR < 33%.
+- `analysis.htf_sr_ceiling_enabled=false` (2026-04-19) — split into TP-ceiling vs SL-push if Pass 3 shows asymmetric lift.
+- `analysis.premium_discount_veto_enabled=false` (2026-04-19) — return as soft weighted factor (~10-15% weight-equivalent) post-Pass-3.
+- `analysis.vwap_hard_veto_enabled=false` (guard, flip per session).
+- `execution.htf_fvg_entry_enabled=false` (opt-in; Pass 3 GBT confirms 15m FVG signal first).
 
 ---
 
@@ -394,7 +254,7 @@ Modules have docstrings; a tour for orientation:
 
 - `src/data/` — TV bridge, `MarketState` assembly, candle buffers, Binance liq WS, Coinalyze REST, economic calendar (Finnhub + FairEconomy), HTF cache, **Arkham client + WS listener + on-chain types**.
 - `src/analysis/` — Structure (MSS/BOS/CHoCH), FVG, OB, liquidity, ATR-scaled S/R, multi-TF confluence + regime-conditional weights + **daily-bias modifier**, derivatives regime, **ADX trend regime**, **EMA momentum veto**, **displacement / premium-discount** gates.
-- `src/strategy/` — R:R math, SL hierarchy, entry orchestration (+ **stablecoin-pulse / altcoin-index penalties + whale-blackout gate**), **setup planner** (zone-based limit-order plans), cross-asset snapshot veto, risk manager.
+- `src/strategy/` — R:R math, SL hierarchy, entry orchestration (+ **Arkham soft signals: daily-bias / stablecoin-pulse / altcoin-index / flow_alignment / per_symbol_cex_flow penalties**), **setup planner** (zone-based limit-order plans), cross-asset snapshot veto, risk manager.
 - `src/execution/` — python-okx wrapper (sync → `asyncio.to_thread`), order router (`place_limit_entry` / `cancel_pending_entry` / `place_reduce_only_limit` / market fallback), REST-poll position monitor with **PENDING** state + **MFE-lock + TP-revise + maker-TP tracking**, typed errors.
 - `src/journal/` — async SQLite, schema v3 trade records (+ `on_chain_context`, `demo_artifact`), `rejected_signals` + counter-factual stamps, `on_chain_snapshots` time-series, pure-function reporter.
 - `src/bot/` — YAML/env config, async outer loop (`BotRunner.run_once` — closes → snapshot → pending → per-symbol cycle), on-chain snapshot scheduler, CLI entry.
@@ -417,13 +277,17 @@ End-to-end tick walkthrough: see `docs/trade_lifecycle.md`.
 
 ### Hard gates (reject, not scored)
 
-`displacement_candle` · `ema_momentum_contra` · `vwap_misaligned` · `cross_asset_opposition` (altcoin veto when BTC+ETH both oppose) · `whale_transfer_blackout` (on-chain, 100M+ CEX↔CEX transfer, 10min window). *`premium_discount_zone` and `htf_tp_ceiling` are wired but currently disabled — see changelog 2026-04-19.*
+`displacement_candle` · `ema_momentum_contra` · `vwap_misaligned` · `cross_asset_opposition` (altcoin veto when BTC+ETH both oppose). *`premium_discount_zone` + `htf_tp_ceiling` wired but disabled (Pass 3 soft-weighted re-add candidates). Whale `whale_transfer_blackout` gate REMOVED 2026-04-22 — see changelog; directional intuition moved to `flow_alignment` soft signal.*
 
-### Arkham modifiers (soft, additive to threshold)
+### Arkham soft signals (threshold bumps, not gates)
 
-- **Daily bias** — bullish/bearish classification from 24h CEX BTC netflow + stablecoin balance changes. Confluence multiplier ×(1±δ) on long/short; δ=0.15 default (bumped from 0.10 on 2026-04-21 eve).
-- **Stablecoin pulse** — hourly USDT+USDC CEX netflow. Misaligned (long + stables leaving OR short + stables arriving) bumps `below_confluence` threshold by 0.75.
-- **Altcoin index** — 0-100 scalar. ≤25 (BTC-dominance) penalises altcoin longs; ≥75 (altseason) penalises altcoin shorts. Bumps threshold by 0.5. BTC/ETH trades exempt.
+All bump `min_confluence_score` when misaligned; aligned → 0. Tune in Pass 3.
+
+- **Daily bias** — 24h CEX BTC netflow + stablecoin balance → bullish/bearish/neutral. Confluence multiplier `×(1±0.15)`.
+- **Stablecoin pulse** — hourly USDT+USDC CEX netflow. Misaligned → `+0.75` threshold bump.
+- **Altcoin index** — 0–100 scalar. ≤25 penalises altcoin longs; ≥75 penalises altcoin shorts. `+0.5` bump. BTC/ETH exempt.
+- **flow_alignment** (NEW 2026-04-22) — 6-input directional score `[-1, +1]`: stablecoin pulse (0.25) + BTC netflow (0.25) + ETH (0.15) + Coinbase (0.15) + Binance (0.10) + Bybit (0.10). Stables IN = bullish, BTC/ETH/entity OUT = bullish. Misaligned → `0.25 × |score|` bump.
+- **per_symbol_cex_flow** (NEW 2026-04-22) — traded symbol's own 1h token flow. INTO CEX = bearish for symbol, OUT = bullish. Binary `+0.25` bump above $5M floor.
 
 ### Zone-based entry
 
@@ -445,7 +309,7 @@ All config in `config/default.yaml` (self-documenting). Top-level sections: `bot
 
 **`.env` keys:** `OKX_API_KEY`, `OKX_API_SECRET`, `OKX_PASSPHRASE`, `OKX_DEMO_FLAG`, `COINALYZE_API_KEY`, `FINNHUB_API_KEY`, `ARKHAM_API_KEY`, `RISK_AMOUNT_USDT` (optional flat-$ override), `TV_MCP_PORT`, `LOG_LEVEL`.
 
-**Reject reasons (unified):** `below_confluence`, `no_setup_zone`, `wrong_side_of_premium_discount`, `vwap_misaligned`, `ema_momentum_contra`, `cross_asset_opposition`, `whale_transfer_blackout`, `session_filter`, `macro_event_blackout`, `crowded_skip`, `no_sl_source`, `zero_contracts`, `htf_tp_ceiling`, `tp_too_tight`, `insufficient_contracts_for_split`, `zone_timeout_cancel`, `pending_invalidated`, `pending_hard_gate_invalidated` (2026-04-22 — mid-pending hard-gate flip). Sub-floor SL distances are **widened**, not rejected. Every reject writes to `rejected_signals` with `on_chain_context` JSON (when Arkham master on).
+**Reject reasons (unified):** `below_confluence`, `no_setup_zone`, `vwap_misaligned`, `ema_momentum_contra`, `cross_asset_opposition`, `session_filter`, `macro_event_blackout`, `crowded_skip`, `no_sl_source`, `zero_contracts`, `tp_too_tight`, `zone_timeout_cancel`, `pending_invalidated`, `pending_hard_gate_invalidated` (mid-pending hard-gate flip). Deprecated but kept in vocabulary for legacy rows: `whale_transfer_blackout` (gate removed 2026-04-22), `wrong_side_of_premium_discount`, `htf_tp_ceiling`, `insufficient_contracts_for_split` (flags disabled). Sub-floor SL distances are **widened**, not rejected. Every reject writes to `rejected_signals` with `on_chain_context` + `confluence_pillar_scores` + `oscillator_raw_values` JSON columns.
 
 **Circuit breakers (currently loosened for data collection):** `max_consecutive_losses=9999`, `max_daily_loss_pct=40`, `max_drawdown_pct=40`, `min_rr_ratio=1.5`. Restore to `5 / 15 / 25 / 2.0` after 20+ post-pivot closed trades.
 
@@ -483,7 +347,7 @@ Things that aren't self-evident from the code. Inline comments cover the *what*;
 - **`bars_ago=0` is legitimate "just now".** Use `int(x) if x is not None else 99`, not `int(x or 99)` — the latter silently clobbers the freshest signal.
 - **Blackout decision is BEFORE TV settle.** Saves ~46s per blacked-out symbol.
 - **Derivatives failures isolate.** WS disconnect / 401 / 429 → `state.derivatives=None`, strategy degrades to pure price-structure.
-- **On-chain failures isolate.** Arkham snapshot None / stale / master-off → modifiers multiply 1.0, penalties add 0, whale gate never fires. Pre-Arkham behavior preserved.
+- **On-chain failures isolate.** Arkham snapshot None / stale / master-off → modifiers multiply 1.0, penalties add 0, WS listener self-disables after 3 consecutive failures. Pre-Arkham behavior preserved.
 - **FairEconomy `nextweek.json` 404 is normal** (file published mid-week). Without it the bot is blind to next-Mon/Tue events when run late in the week.
 
 ### Multi-pair + multi-TF
