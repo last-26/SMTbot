@@ -1,8 +1,8 @@
 # CLAUDE.md — Crypto Futures Trading Bot
 
-AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar confluence, cross-asset + regime-aware vetoes. Demo-runnable end-to-end today; the near-term goal is to collect a clean dataset, then learn from it.
+AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar confluence, cross-asset + regime-aware vetoes, Arkham on-chain soft signals. Demo-runnable end-to-end; Pass 1 complete 2026-04-22 — restart-ready for Pass 2 uniform-feature dataset collection.
 
-**Architectural principle:** Claude Code is the *orchestrator* (writes Pine, trains RL, debugs). Runtime decisions are made by the Python bot, **not** Claude. TradingView = eyes, OKX = hands, Python = brain.
+**Architectural principle:** Claude Code is the *orchestrator* (writes Pine, runs tuning, debugs). Runtime decisions are made by the Python bot, **not** Claude. TradingView = eyes, OKX = hands, Python = brain.
 
 ---
 
@@ -11,186 +11,149 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 - **Strategy:** zone-based scalper. Confluence ≥ threshold → identify zone → post-only limit order at zone edge → wait N bars → fill | cancel.
 - **Pairs:** 5 OKX perps — `BTC / ETH / SOL / DOGE / BNB`. 5 concurrent slots on cross margin (all active, no queue).
 - **Entry TF:** 3m. HTF context 15m, LTF confirmation 1m.
-- **Scoring:** 5 pillars (Market Structure, Liquidity, Money Flow, VWAP, Divergence) + hard gates (displacement, EMA momentum, VWAP, cross-asset opposition) + ADX regime-conditional weights. *Premium/discount gate and HTF TP/SR ceiling temporarily disabled 2026-04-19 — see changelog; P/D to be re-enabled as a soft/weighted factor (~10-15%) post-Phase-9, HTF ceiling re-evaluated after Phase 9 GBT.*
+- **Scoring:** 5 pillars (Market Structure, Liquidity, Money Flow, VWAP, Divergence) + hard gates (displacement, EMA momentum, VWAP, cross-asset opposition) + ADX regime-conditional weights. Confluence threshold `min_confluence_score=3.75` (Pass 1 Optuna tune, 2026-04-22). *Premium/discount gate and HTF TP/SR ceiling temporarily disabled 2026-04-19 — see changelog; re-evaluated as Pass 3 candidates.*
 - **Execution:** post-only limit → regular limit → market-at-edge fallback. Single-leg OCO SL/TP at hard **1:2 RR** (tightened 1:3→1:2 on 2026-04-21 eve; partial TP disabled 2026-04-19 late-night — see changelog; `move_sl_to_be_after_tp1` flag kept but inert while partial off). Dynamic TP revision re-anchors the runner OCO to `entry ± 2 × sl_distance` every cycle, floor at 1.0R. **MFE-triggered SL lock (Option A, 2026-04-20)**: once MFE ≥ 1.3R (scaled from 2R when RR cap tightened), the runner OCO's SL is pulled to entry (+fee buffer) so the remaining 0.7R of target is risk-free. One-shot per position. **Maker-TP resting limit (2026-04-20)**: post-only reduce-only limit sits at TP price alongside the OCO — captures wicks as maker, avoids market-trigger latency.
 - **Sizing:** fee-aware ceil on per-contract total cost so total realized SL loss (price + fee reserve) ≥ target_risk across every symbol (2026-04-19 late-night-2). Overshoot bounded by one per-contract step (< $3 per position). Operator override via `RISK_AMOUNT_USDT` env (2026-04-20) bypasses percent-mode sizing; 10%-of-balance safety ceiling.
-- **Journal:** async SQLite, schema v3 (+ `on_chain_context`, `demo_artifact`). `rejected_signals` table with counter-factual outcome pegging. Separate `on_chain_snapshots` time-series table captures every Arkham state mutation for Phase 9 trade-lifetime joins.
-- **On-chain (Arkham):** runtime soft signals — daily bias ±15%, hourly stablecoin pulse +0.75 threshold penalty, altcoin-index +0.5 penalty on misaligned altcoin trades, **flow_alignment** soft directional signal combining stablecoin + BTC/ETH + Coinbase/Binance/Bybit 24h netflow (weights 0.25/0.25/0.15/0.15/0.10/0.10, default penalty 0.25), **per_symbol_cex_flow** soft penalty on misaligned token flow (default penalty 0.25, $5M noise floor). **Whale hard gate removed 2026-04-22 (gece)**; WS listener streams events to `whale_transfers` journal table for Phase 9 GBT directional learning. Credit-safe via v2 persistent WS streams + filter-fingerprint cache. Per-entity netflow + per-symbol 1h volume promoted from journal-only to runtime 2026-04-22 (gece, late). All Arkham weights Pass 2'de tune. See changelog for re-eval triggers.
-- **Tests:** 1011, all green. Demo-runnable end-to-end.
-- **Data cutoff (`rl.clean_since`):** `2026-04-19T19:55:00Z` (bumped after ceil sizing flipped — realized-R distribution shifts from clustered-below-target to clustered-at-or-above-target). Arkham activation did NOT bump — dataset segments by `arkham_active` categorical.
+- **Journal:** async SQLite, schema includes `on_chain_context`, `demo_artifact`, `confluence_pillar_scores`, `oscillator_raw_values` (all JSON). Separate tables: `rejected_signals` (counter-factual outcome pegged), `on_chain_snapshots` (Arkham state mutation time-series), `whale_transfers` (raw WS events for Phase 9 directional learning).
+- **On-chain (Arkham):** runtime soft signals only — daily bias ±15%, hourly stablecoin pulse +0.75 threshold penalty, altcoin-index +0.5 penalty on misaligned altcoin trades, **flow_alignment** 6-input directional score (stablecoin + BTC/ETH + Coinbase/Binance/Bybit 24h netflow; weights 0.25/0.25/0.15/0.15/0.10/0.10; default penalty 0.25), **per_symbol_cex_flow** binary penalty on misaligned symbol 1h volume (default 0.25, $5M floor). Whale HARD GATE removed 2026-04-22 — WS listener feeds `whale_transfers` journal for Pass 3 directional classification. Credit-safe via v2 persistent WS streams + filter-fingerprint cache. All Arkham weights tuned in Pass 3.
+- **Pass 2 instrumentation:** every trade row now captures `confluence_pillar_scores` (factor name → weight dict) and `oscillator_raw_values` (per-TF dict with 1m/3m/15m OscillatorTableData numerics: wt1/wt2/rsi/rsi_mfi/stoch_k/d/momentum/divergence flags). Both sourced from existing runner TF-switch cache — zero extra TV latency.
+- **Tests:** 1028, all green. Demo-runnable end-to-end.
+- **Data cutoff (`rl.clean_since`):** `2026-04-19T19:55:00Z` through Pass 1; operator bumps to restart-timestamp for Pass 2 with fresh DB + uniform feature coverage.
 
 ---
 
 ## Changelog
 
-### 2026-04-22 (gece, late) — Arkham journal-only → runtime promotion (per-entity netflow + per-symbol CEX volume) + confluence threshold 3 → 3.75
+### 2026-04-22 — Pass 1 restructure day (consolidated)
 
-**Trigger:** operator wants a CLEAN restart where every new data row has every Arkham feature populated uniformly, so that Pass 2 tuning isn't hamstrung by mixed-feature coverage like Pass 1 was. The FAZ 2 (per-entity 24h netflow Coinbase/Binance/Bybit) and FAZ 3 (per-symbol 1h CEX volume) additions from 2026-04-22 afternoon were shipped journal-only pending Phase 9 GBT validation; promoting them now means the restart kicks off with ALL Arkham signals active and journalled, so Pass 2 GBT has one uniform dataset to learn from.
+Single-day dev arc spanning five sub-waves — ETH netflow re-enable, Arkham
+FAZ 2 expansion, pending-limit hard-gate early-cancel, whale hard gate
+removal + flow_alignment + Pass 1 tooling, and the gece-late runtime
+promotion of per-entity / per-symbol Arkham data + oscillator raw values
++ confluence threshold 3 → 3.75. Individual commits preserve per-change
+detail in git log (`git log --oneline --grep="2026-04-22"`); this entry
+captures the end-state behaviour that survives into Pass 2.
 
-**flow_alignment extended 3 → 6 inputs.** [src/strategy/entry_signals.py:_flow_alignment_score](src/strategy/entry_signals.py)
-- Previous 3-input weights (stables 0.4, BTC 0.4, ETH 0.2) rebalanced to six:
-  - stablecoin pulse **0.25** (hourly, natural sign: IN=bullish)
-  - BTC netflow **0.25** (daily, inverted: OUT=bullish)
-  - ETH netflow **0.15** (daily, inverted)
-  - Coinbase netflow **0.15** (daily, inverted; highest per-entity weight — "Coinbase premium" institutional pattern is well-established in crypto regime analysis)
-  - Binance netflow **0.10** (daily, inverted; ~Asia retail, noisier)
-  - Bybit netflow **0.10** (daily, inverted; leverage/derivatives flow)
-- Sum still 1.0; score still [-1, +1]; penalty pattern unchanged (`penalty × |score|` additive bump when misaligned).
-- Runner (`src/bot/runner.py`) now pulls all 3 per-entity values from `ctx.on_chain_snapshot.cex_{coinbase,binance,bybit}_netflow_24h_usd` and forwards via 3 new kwargs on `build_trade_plan_with_reason`.
+**Runtime behaviour changes:**
 
-**`per_symbol_cex_flow_penalty` — NEW soft signal.** [src/strategy/entry_signals.py:_per_symbol_cex_flow_penalty](src/strategy/entry_signals.py)
-- Uses the traded symbol's OWN 1h token flow (`on_chain_snapshots.token_volume_1h_net_usd_json[symbol]`) as a directional check.
-- Semantic INVERSION from stablecoins: token flowing INTO CEX = BEARISH for symbol (selling setup); OUT = BULLISH (cold/DEX accumulation). Binary penalty (not magnitude-scaled, mirrors `_stablecoin_pulse_penalty` pattern) when misaligned above the noise floor.
-- Config: `per_symbol_cex_flow_enabled=true`, `per_symbol_cex_flow_penalty=0.25`, `per_symbol_cex_flow_noise_floor_usd=5_000_000.0`. Higher floor than flow_alignment because single-token 1h buckets see routine $1M moves.
-- Runner helper `_per_symbol_cex_flow_for(symbol)` parses the JSON dict per-cycle, returns None on missing key / bad JSON / absent snapshot.
+1. **Whale hard gate REMOVED.** Previously `whale_transfer_blackout`
+   rejected new entries and cancelled pendings for 10 min after any
+   150M+ CEX↔CEX transfer — directionally ambiguous, killing winners
+   and losers equally. WS listener now only streams events into the new
+   `whale_transfers` journal table (for Phase 9 directional learning) +
+   informational `whale_blackout_active` snapshot bool. Config flag
+   `whale_blackout_enabled` repurposed to gate listener lifecycle only
+   (name preserved to avoid YAML migration).
 
-**Confluence threshold 3 → 3.75 (Pass 1 tune applied).** [config/default.yaml:min_confluence_score](config/default.yaml)
-- 42-trade threshold sweep from `scripts/tune_confluence.py` (Optuna, 300 trials):
-  - thr=3.00: n=42 WR=47.6% net=+13.46R
-  - thr=3.50: n=40 WR=50.0% net=+15.67R
-  - thr=3.75: n=37 WR=51.4% net=+16.08R ← operator pick
-  - thr=4.00: n=31 WR=48.4% net= +7.35R (over-filter)
-- Cuts 5 trades (4 losses, 1 win) from the historical window; +3.8pp WR shift on the dataset.
-- Re-eval trigger: after 30 new closed trades post-restart — if accept rate drops below 0.5/day sustained, retreat to 3.5. Pass 2 tunes per-symbol thresholds once uniform Arkham coverage gives enough stratification.
+2. **Soft Arkham signals live.** Four threshold-penalty signals feeding
+   `min_confluence_score` additive bumps:
+   - `daily_bias_modifier_delta` 0.15 (±15% confluence multiplier)
+   - `stablecoin_pulse_penalty` 0.75
+   - `altcoin_index_penalty` 0.5 (altcoin-only)
+   - `flow_alignment_penalty` 0.25 — NEW 6-input directional score
+     combining stablecoin + BTC/ETH + Coinbase/Binance/Bybit 24h
+     netflow (weights 0.25/0.25/0.15/0.15/0.10/0.10; BTC/ETH/entity
+     signs inverted so OUT-of-CEX = bullish). Replaces the whale gate's
+     directional intuition.
+   - `per_symbol_cex_flow_penalty` 0.25 — NEW per-traded-symbol 1h
+     token flow (`token_volume_1h_net_usd_json[symbol]`). Token INTO
+     CEX = bearish for symbol, OUT = bullish. Binary misalignment
+     penalty above $5M noise floor.
 
-**Pass 2 surface expanded.** Now Pass 2 Optuna knob set will cover:
-- All 6 flow_alignment input weights (currently hardcoded ratios)
-- `flow_alignment_penalty` + `flow_alignment_noise_floor_usd`
-- `per_symbol_cex_flow_penalty` + `per_symbol_cex_flow_noise_floor_usd`
-- All previously planned: Arkham modifier deltas + per-pillar weights (via `confluence_pillar_scores` journaling)
+   FAZ 2 (per-entity netflow) + FAZ 3 (per-symbol token volume) were
+   initially shipped journal-only (afternoon); promoted to runtime
+   gece-late so Pass 2 has uniform-feature coverage from day one.
 
-**Dataset contract — `rl.clean_since` still UNCHANGED.** Will bump to restart-timestamp in Phase G (operator restart). Post-restart: uniform Arkham coverage on every row, flow_alignment scores computed per-cycle, per-symbol flow penalty active, per-pillar scores captured. Exactly the uniform-feature dataset Pass 2 needs.
+3. **Pending limit hard-gate early-cancel** (eve wave). Helper
+   `evaluate_pending_invalidation_gates` re-runs
+   `vwap_misaligned → ema_momentum_contra → cross_asset_opposition` on
+   every poll for pending limits. First failing gate cancels the
+   pending; new `pending_hard_gate_invalidated` reject_reason.
+   Previously pending limits would fill into reversed conditions.
 
-**Re-eval triggers (added):**
-1. **Per-symbol flow hit rate** — fraction of entries where `|per_symbol_netflow|` ≥ $5M. <10% → floor too high, tighten to $3M. >90% → floor too low, raise to $10M. Target: 30-60%.
-2. **Per-entity non-zero fraction on snapshot rows** — Coinbase/Binance/Bybit netflow column NULL fraction should be < 5% on post-restart rows. Higher = Arkham fetch failures; investigate `arkham_entity_flow_refresh_failed` log pattern.
-3. **flow_alignment score distribution** — median |score| should land 0.15-0.50 with full 6 inputs. If < 0.10 signals are cancelling (balanced market, harmless); if > 0.70 most trades penalty-hit (over-weighted, revisit `flow_alignment_penalty`).
+4. **Confluence threshold 3 → 3.75.** Optuna 42-trade sweep showed
+   plateau at 3.75 (WR +3.8pp to 51.4%, net_R +16.08R vs baseline
+   +13.46R). Above 3.75 the curve over-filters (4.0 drops n=31,
+   net=+7.35R). Re-eval after 30 new closed trades post-restart; if
+   accept rate < 0.5/day sustained, retreat to 3.5.
 
-**Tests:** 1000 → **1011** (+11: 5 extended flow_alignment tests for new inputs, 9 new per_symbol_cex_flow tests; 3 prior flow_alignment tests removed because magnitude-specific). All pass.
+5. **ETH netflow re-enabled** in daily Arkham snapshot — journal column
+   populated on every new row (not in bias rule yet; re-evaluate in
+   Pass 2 GBT).
 
-### 2026-04-22 (gece) — Whale hard gate removed · flow_alignment soft signal · per-pillar journaling · Pass 1 tooling
+**Pass 2 instrumentation (journal schema additions):**
 
-Single-day restructure driven by two operator insights: (1) the `whale_transfer_blackout` hard gate is directionally ambiguous — killing both winners and losers with roughly equal probability rather than carrying signal; (2) the 41-trade post-pivot dataset is dense enough to start Phase 9 GBT + Pass 1 Bayesian tuning *now*, rather than waiting for the Phase 8 "50 trades" gate.
+- `trades.confluence_pillar_scores` + `rejected_signals.confluence_pillar_scores`
+  — JSON dict `{factor_name: weight}` captured from ConfluenceScore at
+  entry / reject time. Unlocks Pass 2 per-pillar Bayesian weight
+  tuning (impossible before without re-fetching market state).
+- `trades.oscillator_raw_values` + `rejected_signals.oscillator_raw_values`
+  — JSON dict keyed by TF (`"1m"` / `"3m"` / `"15m"`), each value a
+  full `OscillatorTableData.model_dump()` (wt1, wt2, wt_vwap_fast,
+  rsi, rsi_mfi, stoch_k, stoch_d, momentum, divergence flags,
+  last_signal). Captured at entry time (market-entry path) or
+  placement time (pending-fill + pending-cancel paths via
+  `PendingSetupMeta.oscillator_raw_values_at_placement`). No extra TV
+  latency — 15m sourced from existing `htf_state_cache` populated
+  during HTF switch pass; 1m sourced from `ltf_cache[symbol].oscillator`
+  (LTFState gained the field). Enables Pass 2 GBT continuous-magnitude
+  features (WaveTrend depth, RSI band, Stoch K/D position) plus
+  cross-TF divergence detection.
+- `whale_transfers` time-series table — raw WS events (captured_at,
+  token, usd_value, from_entity, to_entity, tx_hash, affected_symbols).
+  Phase 9 joins against `trades.entry_timestamp` to learn which
+  directional flows correlate with outcome.
 
-**Runtime change — whale hard gate removed.** [src/strategy/entry_signals.py](src/strategy/entry_signals.py)
-- `build_trade_plan_with_reason` no longer evaluates `whale_transfer_blackout`; function signature drops `whale_blackout_enabled/whale_blackout/whale_blackout_symbol` params. Reject reason stays in the vocabulary for backward compat (old journal rows) but is unreachable at runtime.
-- `evaluate_pending_invalidation_gates` (2026-04-22 sabah FAZ) likewise drops the whale check; pending limits now only invalidate on `vwap_misaligned → ema_momentum_contra → cross_asset_opposition` flips.
-- WS listener lifecycle **unchanged** — `on_chain.whale_blackout_enabled` config flag still controls whether the Arkham WS runs, and the snapshot's `whale_blackout_active` bool still flips for `on_chain_snapshots` time-series logging (informational only now).
+**Pass 1 tooling:**
 
-**Replacement directional signal — `flow_alignment_score`.** [src/strategy/entry_signals.py](src/strategy/entry_signals.py), `_flow_alignment_score` + `_flow_alignment_penalty`
-- Combines `stablecoin_pulse_1h_usd` + `cex_btc_netflow_24h_usd` + `cex_eth_netflow_24h_usd` into a [-1, +1] directional score. Weights: stables 0.4, BTC 0.4, ETH 0.2 (BTC market leader; stables timeliest). BTC/ETH signs INVERTED (OUT of CEX = bullish).
-- Noise-floor filter (`$1M` default) zeroes sub-threshold signals to prevent jitter.
-- Misaligned direction pays additive threshold bump (`_flow_alignment_penalty`) scaled linearly by `|score|`. Default penalty `0.25` (third of stablecoin_pulse_penalty=0.75 — soft introduction). Pass 2 will tune.
-- Integrated via same pattern as `_stablecoin_pulse_penalty` / `_altcoin_index_penalty` — `effective_min_conf += penalty` after direction resolved.
+- `scripts/analyze.py` — xgboost GBT feature importance + SHAP + per-
+  factor WR + rejected-signal counter-factual. Arkham segmentation
+  marked DESCRIPTIVE ONLY (Pass 1 coverage inconsistent).
+- `scripts/tune_confluence.py` — Optuna TPE over NON-Arkham knobs
+  (confluence_threshold + 3 hard gate bools). Walk-forward 73/27
+  split with overfit warning. Pass 2 extension scaffold in
+  `scripts/replay_decisions.py` (Arkham knob + pillar-weight replay
+  stub present, wiring pending Pass 2).
 
-**Raw whale event journaling — new `whale_transfers` table.** [src/journal/database.py](src/journal/database.py)
-- Schema: `(captured_at, token, usd_value, from_entity, to_entity, tx_hash, affected_symbols)`. Indexed on captured_at + token.
-- WS listener (`ArkhamWebSocketListener`) gained optional `on_transfer` callback + `main_loop` reference. Runner's `_start_on_chain_ws` wires both before `ws.start()`; `_on_whale_transfer_from_ws` runs on the main loop via `asyncio.run_coroutine_threadsafe` (WS callback thread-safe path).
-- Extras parsed via new `parse_transfer_extras()` helper — best-effort from_entity/to_entity/tx_hash, all optional (Arkham's `fromAddress`/`arkhamEntity` shape handling).
-- **Purpose:** Phase 9 GBT joins `whale_transfers.captured_at` against `trades.entry_timestamp`/`exit_timestamp` to learn whether specific directional flows (Coinbase→Binance BTC, exchange→cold ETH) correlate with subsequent outcome. No hardcoded directional classification — dataset-driven.
+**Deleted:** `tests/test_whale_blackout_gate.py` (~210 lines, gate
+removed); 2 pending-whale tests in `test_entry_signals.py`.
 
-**Per-pillar score journaling — new `confluence_pillar_scores` column.** [src/journal/database.py](src/journal/database.py), [src/journal/models.py](src/journal/models.py)
-- `trades` + `rejected_signals` gain `confluence_pillar_scores TEXT NOT NULL DEFAULT '{}'` (JSON dict: factor name → weight). Idempotent ALTER migration.
-- Captured from `ConfluenceScore.factors` at plan-build time via `{f.name: float(f.weight) for f in ...}`. TradePlan gained parallel field.
-- Runner forwards to `record_open` (both zone-fill path + direct-market path) + `record_rejected_signal` (main reject path + pending-cancel path).
-- **Purpose:** unblock Pass 2 per-pillar weight tuning. Today's replay can only vary `confluence_score >= threshold` (binary); with pillar scores saved, Pass 2 Bayesian opt can re-weight each pillar and recompute composite without refetching market state.
+**Dataset contract:** `rl.clean_since` UNCHANGED through this dev day
+(stays at `2026-04-19T19:55:00Z`). Operator bumps to restart-timestamp
+during the Pass 1 → Pass 2 transition when the bot is restarted with
+a fresh DB. Post-restart data has uniform feature coverage: Arkham
+always on, all soft signals live, per-pillar + per-TF oscillator
+captured on every row.
 
-**Config — flow_alignment knobs + whale comment updates.** [src/bot/config.py](src/bot/config.py), [config/default.yaml](config/default.yaml)
-- New: `flow_alignment_enabled: true`, `flow_alignment_penalty: 0.25`, `flow_alignment_noise_floor_usd: 1_000_000.0`. Non-negativity validators.
-- `whale_blackout_enabled` docstring + YAML comment rewritten: flag now controls WS lifecycle only, no runtime gate. Name preserved to avoid YAML migration (rename tracked as Pass 2 cleanup).
-- `whale_blackout_duration_s` repurposed to "state-activity window" for the informational `whale_blackout_active` snapshot bool.
+**Tests:** 946 → 1028 (net +82 after removing deprecated whale-gate
+tests). Six new test files: `test_flow_alignment.py` (16 tests),
+`test_whale_transfers_journal.py` (7), `test_per_symbol_cex_flow.py`
+(9), `test_scripts_analyze.py` (3), `test_scripts_tune_confluence.py`
+(9), `test_oscillator_raw_values.py` (17).
 
-**Pass 1 tooling (parallel subagent work — see separate commit):**
-- `scripts/analyze.py` — Phase 9 GBT (xgboost + SHAP + per-factor WR + counter-factual rejected-signal analysis). Markdown report to `reports/analyze_TIMESTAMP.md`.
-- `scripts/tune_confluence.py` + `scripts/replay_decisions.py` — Optuna over **NON-Arkham** knobs (global + per-symbol confluence threshold, 3 hard gate bool toggles). Walk-forward 30/11 split with overfit warning. Pass 2 extension scaffold present for Arkham knobs + pillar weights.
-- Tests: `test_flow_alignment.py`, `test_whale_transfers_journal.py`, `test_scripts_analyze.py`, `test_scripts_tune_confluence.py`.
+**Re-eval triggers (consolidated — monitor after Pass 2 data collection):**
 
-**Tests:** ~967 → ~995 (+28: 14 flow_alignment unit + 7 whale_transfers journal + smoke tests for new scripts). Deleted: `tests/test_whale_blackout_gate.py` (~210 lines — gate gone). Modified: `tests/test_entry_signals.py` pending-eval whale tests dropped (2 tests).
-
-**Data contract:** `rl.clean_since` **UNCHANGED** in Pass 1 (stays at `2026-04-19T19:55:00Z`). Bumped manually by operator in Phase G after tuning applied + bot restarted — kicks off Pass 2 data collection with uniform Arkham coverage + per-pillar scores + flow_alignment journal trail. Old rows decode `confluence_pillar_scores` as empty dict (backfill not required).
-
-**Re-eval triggers:**
-1. **Whale removal impact** — track trade count post-restart with simulated "would have been blocked by whale_transfer_blackout" counter via Phase 9 join of `whale_transfers.captured_at` against each entry's 10-minute pre-window. If the simulated-blocked subset has materially better WR than the accepted subset, gate was signal (re-enable with softer directional rule); if similar/worse, confirmed noise.
-2. **Flow alignment hit rate** — fraction of entries where `|flow_alignment_score| > 0` vs `= 0`. <10% non-zero → penalty too-rare to matter; tighten noise floor. >90% → penalty dominates; loosen floor. Target: 30-60% non-zero.
-3. **Flow alignment directional lift** — Pass 2 GBT segments by sign(score). If aligned-direction trades outperform misaligned by ≥5pp WR, keep penalty; if neutral, drop signal (Phase 12).
-4. **Per-pillar coverage** — `confluence_pillar_scores IS NOT NULL AND != '{}'` fraction on rows post-restart. Should be 100% (every accepted trade has factors). If < 90%, empty-factor paths are slipping through — investigate.
-5. **Pass 1 tuning Gate** — from `tune_confluence.py` output: validate.net_r ≥ 0.5 × train.net_r (no-catastrophic-overfit). If violated, skip apply + re-tune with narrower search space.
-
-**Pass 2 scope (documented intent, separate plan):**
-- Re-run GBT + Bayesian on uniform-Arkham-coverage dataset.
-- Expand knob set to Arkham: `daily_bias_modifier_delta`, `stablecoin_pulse_penalty`, `altcoin_index_penalty`, `flow_alignment_penalty`.
-- First per-pillar weight tuning (now enabled by `confluence_pillar_scores` journaling).
-- Full Arkham integration promotions (entity netflow + token volume to runtime factors if GBT lift exists).
-- Real-money transition (sub-account, `RISK_AMOUNT_USDT=10-20`).
-
-### 2026-04-22 (eve) — Pending limit hard-gate early-cancel
-
-- **Trigger:** operator observation that limit entries sit pending for up to 7 bars (21 min on 3m) without ANY mid-flight checks. When market sharply turns mid-pending (whale event, BTC+ETH consensus flip, momentum reversal, VWAP cross), the limit fills at a no-longer-favorable level and trade goes straight to stop. Five overnight wins were ALSO accompanied by losers that filled into reversed conditions.
-- **Fix — pure consistency, no new strategy:** the same HARD veto gates that reject a NEW entry now also invalidate WAITING entries. New helper `evaluate_pending_invalidation_gates` in [src/strategy/entry_signals.py](src/strategy/entry_signals.py) re-runs `vwap_misaligned → ema_momentum_contra → cross_asset_opposition → whale_transfer_blackout` against current state for any pending limit. First failing gate triggers cancel.
-- **Runner integration — `_maybe_invalidate_pending_for`** ([src/bot/runner.py](src/bot/runner.py)): called from `_run_one_symbol` BEFORE the existing pending-skip dedup. Cancel reason carries the specific gate (`hard_gate:vwap_misaligned`); `_handle_pending_canceled` maps all `hard_gate:*` reasons to the new `pending_hard_gate_invalidated` rejected_signals reason for Phase 9 segment-by-cause analysis.
-- **Deliberately NOT included:** confluence rescore (pullback strategy expects natural confluence fluctuation during the wait), price-drift cancel (price moving away IS the pullback by design), HTF S/R ceiling check (relevant only at entry plan time). Only "would now reject a NEW entry of the same direction" cases trigger cancel.
-- **Failure isolation:** helper exceptions log + swallow; cancel-call exceptions log + swallow. Worst case: pending sits one extra cycle. Never blocks the symbol's normal entry/exit flow.
-- **New reject reason:** `pending_hard_gate_invalidated` added to the unified vocabulary. Distinct from existing `pending_invalidated` (catches OKX-side cancellations) and `zone_timeout_cancel` (7-bar timeout).
-- **Re-eval triggers:**
-  1. Frequency check after ≥30 trades — `pending_hard_gate_invalidated` count vs `zone_timeout_cancel` count. If hard-gate fires more than 25% as often as timeout, the gates may be too aggressive (fail-positive on winners). If <5%, mid-pending market shifts may not be the real loss source — re-investigate.
-  2. Counter-factual outcome via `peg_rejected_outcomes.py`: would these cancels have been winners? If the cancelled-pending counterfactual WR is materially better than the open-trade WR for the symbol, the gate is over-blocking. Targeted gate disable is then the right call.
-  3. Per-gate breakdown — log line `pending_hard_gate_invalidated symbol=... gate=...` carries the specific gate. If one gate dominates (e.g. 90% are `vwap_misaligned`), that gate's threshold may be too tight.
-- **Tests:** 978 passing (+10: 7 helper unit tests + 2 runner-cycle integration + 1 cancel/event-dispatch round-trip).
-
-### 2026-04-22 (afternoon) — Arkham FAZ 2 expansion (WS budget + entity netflow + token volume)
-
-Three-part Arkham capability bump driven by trial-quota analysis (only 558/10k labels burned over 22 days; credits effectively unmetered on trial). Endpoint inventory + cost matrix probed via `scripts/probe_arkham.py`. **All shipped as journal-only data layers; zero runtime decision impact.** Phase 9 GBT decides predictive value before any wiring.
-
-**FAZ 0 — WS stream label-budget kurtarma.** [src/data/on_chain_ws.py](src/data/on_chain_ws.py)
-- New `OnChainConfig.whale_tokens` (BTC/ETH/SOL/DOGE/BNB + USDT/USDC) — restricts WS to tokens we trade, drops noise (XRP/ADA/MATIC/LINK transfers were burning labels for blackouts that `affected_symbols_for` discards anyway).
-- `whale_threshold_usd` default bumped 100M → 150M (paired). Probe-confirmed monthly burn was projecting ~17k labels at 100M; combined fix targets ~5k/month.
-- **Filter-fingerprint sidecar** (`*.filter` next to stream_id cache) — Arkham v2 streams immutable post-create, so config changes silently reused old streams. New logic: hash filter dict, compare on startup, delete-old + recreate on mismatch. Legacy installs (no sidecar) recreate once.
-
-**FAZ 1 — Probe script v2.** [scripts/probe_arkham.py](scripts/probe_arkham.py) extended with 4 probes (subscription usage, entity flow, token volume granularity, sub-hourly histogram). Critical findings:
-- `/flow/entity/{entity}` works for `binance`, `coinbase`, **`bybit`** (operator's hunch confirmed). Returns daily series 2021/2022 → present. ~3 credits/call, **0 labels**.
-- `/token/volume/{id}` granularity: `1h` works (24 buckets, USD-denominated), `5m`/`15m`/`30m` return 500. Sub-hourly NOT supported.
-- `/transfers/histogram` with `timeGte`/`timeLte` 15m window returns 500 → custom minute-precision windows not accepted.
-- `/subscription/intel-usage` is the canonical usage endpoint (not `/user/usage` which 405s on trial). Response shape: `{totalCount, totalLimit, chainUsage, periodStart}`.
-- Full probe run consumed **0 labels** — all four endpoints aggregate-only.
-
-**FAZ 2 — Per-entity 24h netflow.** [src/data/on_chain.py:get_entity_flow + fetch_entity_netflow_24h](src/data/on_chain.py)
-- Coinbase + Binance + Bybit netflow (last completed UTC day) via `/flow/entity/{entity}`. Refreshed in the daily-snapshot branch (UTC-day cadence — matches data granularity).
-- 3 new columns on `on_chain_snapshots`: `cex_{coinbase,binance,bybit}_netflow_24h_usd`. Idempotent ALTER TABLE migrations.
-- Per-entity failures isolated; one bad slug leaves others intact.
-
-**FAZ 3 — Per-symbol 1h CEX volume.** [src/data/on_chain.py:get_token_volume + fetch_token_volume_last_hour](src/data/on_chain.py)
-- `/token/volume/{id}?granularity=1h` per watched OKX perp (5 symbols). Returns `{inUSD, outUSD, ...}` per hour; we record the most-recent bucket's `inUSD - outUSD` as USD net flow.
-- New cadence `token_volume_refresh_s` (1h). 5 symbols × 24/day × 3 credits = ~360/day = ~11k credits/month, **0 labels**.
-- `WATCHED_SYMBOL_TO_TOKEN_ID` reverse map in `on_chain_types.py` (OKX symbol → CoinGecko slug). Adding a 6th pair extends both this AND `affected_symbols_for`.
-- Storage: single TEXT column `token_volume_1h_net_usd_json` (JSON dict keyed by OKX symbol) — adding a symbol won't trigger schema migration.
-- Probe run shows partial-success behavior in the wild: SOL returned None on one fetch, other 4 symbols recorded normally.
-
-**FAZ 4 — Cancelled.** Sub-hourly stablecoin pulse delta would have used `/transfers/histogram` with `timeGte`/`timeLte` — probe returned 500. Documented in `scripts/probe_arkham.py` for future re-eval if Arkham adds support.
-
-**Cost analysis (post-ship, all four FAZ together):**
-- WS: 17k → ~5k labels/month (token whitelist + threshold bump)
-- Daily entity flow: +9 credits/day (~270/month), 0 labels
-- Hourly token volume: +360 credits/day (~11k/month), 0 labels
-- Net trial-quota impact: label burn DROPS from ~17k/month projected to ~5k/month observed; credits irrelevant on trial.
-
-**Re-eval triggers:**
-1. Probe row count growth — `on_chain_snapshots` now bumps fingerprint on entity netflow + token volume changes too. Expected cadence 5-10 rows/hour during waking hours (token volume changes hourly).
-2. Phase 9 GBT — segment trades by `cex_bybit_netflow_24h_usd` sign; if no lift over Coinbase/Binance, drop Bybit. Inverse: if Bybit dominates, reweight Phase 12 design.
-3. SOL token volume coverage — observed one None from `/token/volume/solana`. If chronic, Arkham's SOL coverage may be too thin; document and exclude from Phase 9 token-volume features for SOL specifically.
-
-**Tests:** 968 passing (+15 across FAZ 0/2/3). Smoke verified end-to-end with real Arkham data.
-
-### 2026-04-22 — ETH netflow re-enabled in daily macro snapshot
-
-- **Trigger:** operator review of overnight `on_chain_snapshots` table revealed `cex_eth_netflow_24h_usd` was always NULL. Rationale to re-add: ETH leads altcoin price action; capturing its CEX netflow now (passive data layer) lets Phase 9 GBT segment altcoin trades by ETH flow regime, and unblocks future Phase 12 conditional rules (e.g. "allow alt longs only when ETH netflow ≤ 0").
-- **Fix — `src/data/on_chain.py:fetch_daily_macro_snapshot`:** added a third `_net_flow_via_histogram` call for `tokens=["ethereum"]` after the BTC leg, with the same 1.1s rate-limit cushion. Result is written to `OnChainSnapshot.cex_eth_netflow_24h_usd` (previously hardcoded `None`). Bias rule unchanged — still keys off stablecoins + BTC only; ETH is journal-only.
-- **Cost delta:** 4 → 6 histogram calls per daily refresh. +8 credits/day, +240 credits/month. ~720 credits/month total for daily-bias path. Comfortably inside the 10k trial quota.
-- **Schema/journal:** column already existed (added 2026-04-21 eve, late-2). No migration. New rows write the actual value; old rows stay NULL.
-- **Re-eval triggers:**
-  1. ETH-netflow column NULL fraction on new snapshot rows should drop to ≤10% (matches BTC leg's expected reliability). Higher = ETH histogram leg failing — investigate `arkham_*` log lines.
-  2. Phase 9 GBT: does ETH netflow add lift over BTC netflow alone for altcoin (SOL/DOGE) trade outcome prediction? If feature importance < BTC's, drop back to `None`. If competitive or higher, promote to bias rule.
-  3. Credit usage: monthly Arkham burn should sit ≈7.2k (from ~7k pre-change). If trending higher than expected, consider widening daily refresh cadence (currently UTC-day-rollover).
-- **Tests:** 139 on-chain related passing. No test mocked `fetch_daily_macro_snapshot` directly, so no fixture updates needed.
+1. **flow_alignment hit rate** — fraction of entries with `|score|>0`.
+   Target 30-60%. <10% → lower noise floor; >90% → raise floor.
+2. **flow_alignment directional lift** — aligned vs misaligned trades
+   in Pass 2 data. ≥5pp WR delta → keep signal; neutral → Phase 12
+   drop candidate.
+3. **per_symbol_cex_flow fire rate** — Target 30-60%. <10% → floor
+   $3M; >90% → floor $10M.
+4. **Per-entity netflow NULL fraction** on snapshot rows should be
+   <5%. Higher = Arkham fetch failures; inspect `arkham_entity_flow_*`.
+5. **Confluence threshold 3.75** — sustain ≥0.5 accepts/day. Lower →
+   retreat to 3.5.
+6. **Per-pillar coverage** — `confluence_pillar_scores != '{}'` should
+   be 100% on post-restart rows. Lower = entry path regression.
+7. **Oscillator per-TF coverage** on post-restart rows: 3m ~100%,
+   15m ~100% on non-already-open entries, 1m ≥95% (LTF read may time
+   out). Lower = TF-switch cache regression.
+8. **Pass 1 → Pass 2 tune overfit gate** — Pass 2 Optuna OOS net_R ≥
+   0.5 × IS net_R AND OOS WR ≥ IS WR − 5pp before applying changes.
+9. **Whale transfer event rate** — `whale_transfers` inserts per day.
+   <5/day = Arkham WS fetch failing or threshold too high; >500/day =
+   threshold too low. Expect 20-100/day at 150M.
 
 ### 2026-04-21 (eve, late-2) — `on_chain_snapshots` time-series table (Phase 8 data layer)
 
@@ -592,77 +555,85 @@ OKX_DEMO_FLAG=0 .venv/Scripts/python.exe -m src.bot --config config/default.yaml
 
 ## Forward roadmap
 
-The bot is ready to run. Everything below is sequenced and gated — don't skip steps.
+Sequenced in "Pass" + "Phase" vocabulary. Pass 1 combined the original Phase 8 (data collection) + Phase 9 (GBT analysis) + a lightweight Phase 10 (Bayesian weight tuning, not deep RL). The original phase numbering survives only inside Phase 11 (live transition) and Phase 12 (post-stable experiments).
 
-### Phase 8 — Data collection (active)
+### Pass 1 — COMPLETE (2026-04-22)
 
-**Goal:** accumulate a clean post-pivot dataset. No code changes unless factor-audit reveals a regression.
+Combined on a 42-trade dataset (`rl.clean_since=2026-04-19T19:55:00Z`):
 
-- Run demo bot. `rl.clean_since=2026-04-19T19:55:00Z` keeps reporter + RL on post-pivot data only.
-- Run `scripts/factor_audit.py` every ~10 closed trades — early-warning on factor regressions before they eat the dataset.
-- Run `scripts/peg_rejected_outcomes.py --commit` weekly to stamp counter-factual outcomes on rejected signals.
-- `on_chain_snapshots` table passively accumulates Arkham state mutations (~2200 rows/month). Phase 9 joins this onto `trades` via `entry_timestamp ≤ captured_at ≤ exit_timestamp` to test whether mid-trade on-chain shifts (bias flip, whale event, pulse sign change) correlate with outcome. No runtime reaction until signal is validated.
+- **Data collection:** demo bot ran 2026-04-19 through 2026-04-22, 42 closed trades (WR 47.6%, net +13.46R, Sharpe 0.33).
+- **GBT analysis** via `scripts/analyze.py` — xgboost feature importance + SHAP + per-factor WR + rejected-signal counter-factual. Arkham segmentation descriptive only (coverage inconsistent across the window).
+- **Bayesian tune** via `scripts/tune_confluence.py` — Optuna TPE over NON-Arkham knobs (confluence_threshold + 3 hard gate bools), walk-forward 73/27 split.
+- **Applied tune:** `min_confluence_score` 3 → 3.75 (curve plateau; +3.8pp WR on historical sample). No other knobs changed (Arkham coverage inconsistent, per-pillar + per-TF oscillator data not yet captured — both instrumented for Pass 2).
+- **Concurrent feature work:** whale hard gate removed, `flow_alignment_score` 6-input + `per_symbol_cex_flow_penalty` soft signals live, `whale_transfers` + `confluence_pillar_scores` + `oscillator_raw_values (1m/3m/15m)` journal instrumentation shipped. See changelog 2026-04-22 entry.
 
-**Gate to leave:** ≥50 closed post-pivot trades, WR ≥ 45%, avg R ≥ 0, ≥2 trend-regimes represented, net PnL ≥ 0.
+### Pass 2 — Data collection (post-restart, active)
 
-**If the gate fails:** factor-audit output is diagnostic. Expect 2-3 iterations of per-symbol threshold / weight / veto tuning before the gate holds. Do not shortcut to GBT or RL until the gate holds.
+**Goal:** accumulate a uniform-feature dataset. Every new row post-restart carries full Arkham context + per-pillar scores + per-TF oscillator numerics + whale-transfer time-series. 5-day window targeted before Pass 2 tune runs.
 
-### Phase 9 — GBT analysis
+- Operator restarts bot with fresh DB (backup preserved as `data/trades.db.pass1_backup_*`).
+- `rl.clean_since` bumped to restart-timestamp.
+- Demo bot runs. No code changes unless factor-audit reveals a regression.
+- Run `scripts/factor_audit.py` every ~10 closed trades.
+- Run `scripts/peg_rejected_outcomes.py --commit` daily.
+- Passive accumulation of `on_chain_snapshots`, `whale_transfers`, per-pillar + per-TF oscillator journal rows.
 
-**Goal:** learn which factors and factor combos actually predict outcome on clean data.
+**Gate to leave:** ≥30 closed trades, Arkham `on_chain_context` populated on 100% of rows, `confluence_pillar_scores` populated on 100%, `oscillator_raw_values` populated on ≥90% for each TF, net PnL ≥ 0, WR ≥ 45%.
 
-- `scripts/analyze.py` (xgboost) on clean trades: feature importance, partial dependence plots, SHAP values per feature.
-- Include `rejected_signals` counter-factuals as negative-class data — reveals which reject reasons threw away winners.
-- **Arkham segmentation** — segment by `arkham_active` categorical + `on_chain_context` dict fields (daily_macro_bias, stablecoin_pulse_1h_usd, altcoin_index). Measure whether Arkham's penalties kept the bot out of losing trades or blocked winners.
-- Output: per-symbol threshold / factor weight / veto threshold recommendations + Arkham weight re-tune.
-- Manual tune YAML based on GBT signal. Re-run Phase 8 with new config, check that WR improves.
+**If the gate fails:** factor-audit is diagnostic. Expect 1-2 iterations of per-symbol confluence threshold tuning before the gate holds. Do NOT start Pass 3 until the gate holds — overfitting a broken dataset is worse than collecting more clean data.
 
-**Gate to leave:** GBT + manual tuning plateau — two consecutive tuning rounds produce no measurable WR improvement.
+### Pass 3 — Full Bayesian tuning on uniform data
 
-### Phase 10 — RL training
+**Goal:** tune every knob Pass 1 deferred. Arkham coverage is now uniform; per-pillar + per-TF oscillator columns unlock richer continuous feature space.
 
-**Goal:** use RL to tune parameters GBT can't optimize well (interaction effects, regime transitions).
+**Tunable knob set (all via Optuna TPE + walk-forward):**
+- Arkham modifier deltas: `daily_bias_modifier_delta`, `stablecoin_pulse_penalty`, `altcoin_index_penalty`.
+- Flow alignment: `flow_alignment_penalty`, `flow_alignment_noise_floor_usd`, plus all 6 input weights (stables, BTC, ETH, Coinbase, Binance, Bybit — currently hardcoded 0.25/0.25/0.15/0.15/0.10/0.10).
+- Per-symbol CEX flow: `per_symbol_cex_flow_penalty`, `per_symbol_cex_flow_noise_floor_usd`.
+- Per-pillar weights (5 pillars × continuous) using `confluence_pillar_scores` column.
+- Per-symbol confluence thresholds (Pass 1 kept global at 3.75).
+- 3 hard gate toggles (vwap_hard_veto, ema_veto, cross_asset_opposition).
 
-- Framework: stable-baselines3 (PPO or SAC). Environment: `gymnasium` wrapper around replay of clean trades.
-- **Scope: parameter tuner, not decision maker.** RL adjusts factor weights, thresholds, zone-source priorities — not "should I trade this." The 5-pillar + hard-gate structure is fixed.
-- Reward shape: `pnl_r + setup_penalty + drawdown_penalty + consistency_bonus`. Tuned on walk-forward backtests, not a single hold-out set.
-- **Walk-forward is mandatory.** Train on months 1-3, validate on month 4; slide window monthly. Any parameter set that doesn't improve on out-of-sample never ships.
-- Checkpoint cadence: every 10k env steps, keep last 5. Manual review of parameter drift before deploying.
+**Method:** extend `scripts/replay_decisions.py` (scaffold already present) with pillar-reweight + Arkham-modifier replay paths. Run `scripts/tune_confluence.py` with expanded `suggest_config`.
 
-**Gate to leave:** RL parameters produce ≥15% WR improvement on walk-forward OOS **and** drawdown stays within 1.1× of manual-tuned baseline. Otherwise the ceiling is structural, not parametric — stay on manual tuning and revisit after 100+ more trades.
+**GBT re-run:** `scripts/analyze.py` auto-expands feature matrix when `oscillator_raw_values` non-empty; Pass 3 GBT gets continuous features (WT magnitude, RSI position, Stoch K/D, momentum) + Arkham segments (now trustworthy with uniform coverage) + whale-transfer derived features (via join).
 
-### Phase 11 — Post-RL: live transition + scaling
+**Gate to leave:** Pass 3 Optuna OOS net_R ≥ 0.5 × IS net_R AND OOS WR ≥ IS WR − 5pp. Otherwise structural ceiling — hold on tuning, collect more data, proceed to Phase 11 stability rather than over-fitting a small dataset.
 
-**Goal:** move from demo to live with survivable position sizing, then scale risk by performance.
+### Phase 11 — Live transition + scaling
 
-- **Live transition:** new OKX live account (not demo migration). Sub-account recommended. Start with **$500-1000 risk capital**, `risk_pct=0.5%` (or `RISK_AMOUNT_USDT=10`), `max_concurrent_positions=2`. Cross margin with explicit notional cap.
-- **Stability period:** 2 weeks / 30 trades with no code changes. Compare live WR and avg R to demo baseline within ±5%. Slippage, fill latency, and partial fills WILL differ — measure, don't assume.
-- **Scaling rules:** only scale after 100 live trades. Double `RISK_AMOUNT_USDT` only if 30-day rolling WR ≥ demo WR - 3% and drawdown stays ≤ 15%. Asymmetric: downside scales faster than upside (halve on any 10-trade rolling WR < 30%).
-- **Monitoring:** journal-backed dashboard (simple pure-Python or Streamlit). Alert on: drawdown >20%, 5-loss streak, OKX rate-limit 429, fill latency P95 >2s, daily realized PnL < -2R, Arkham credit usage >80%/month.
+**Goal:** move from demo to live with survivable sizing, scale by performance.
+
+- **Live transition:** new OKX live account (sub-account recommended). Start `RISK_AMOUNT_USDT=$10-20`, `max_concurrent_positions=2`, cross margin, explicit notional cap.
+- **Stability period:** 2 weeks / 30 live trades with no code changes. Compare live WR + avg R to demo baseline within ±5%.
+- **Scaling rules:** only after 100 live trades. Double `RISK_AMOUNT_USDT` only if 30-day rolling WR ≥ demo WR − 3% AND drawdown ≤ 15%. Asymmetric: halve on any 10-trade rolling WR < 30%.
+- **Monitoring:** journal-backed dashboard (pure-Python or Streamlit). Alert on: drawdown >20%, 5-loss streak, OKX 429, fill latency P95 >2s, daily realized PnL < -2R, Arkham credit usage >80%/month.
 
 ### Phase 12 — Future enhancements (post-stable)
 
-These are candidates, **not commitments.** Re-evaluate after Phase 11 stability.
+Candidates, **not commitments.** Re-evaluate after Phase 11 stability.
 
-- **Arkham F4/F5** — per-entity flow divergence (Coinbase premium) + swap volume (DEX activity). Both deferred at integration time due to scalp-horizon mismatch; revisit if Phase 9 shows on-chain edge dominated by the F1-F3 set and F4/F5 could extend coverage.
-- **HTF Order Block re-add** — Pine 3m OBs failed post-pivot (0% WR in Sprint 3). 15m OBs may survive; factor-audit should confirm HTF OB signal before re-enabling.
-- **Pine overlay split** — `smt_overlay.pine` → `_structure.pine` + `_levels.pine`. Parallelizes TV recompute per symbol-switch. Worth the refactor only if freshness-poll latency becomes a bottleneck.
-- **Additional pairs** — 6th+ OKX perp. Coinalyze budget allows ~6 symbols at free tier. Add parametrized instrument spec test + per-symbol YAML overrides + `affected_symbols_for` extension before bringing online.
-- **1m as a zone source in `setup_planner`** — add `ltf_fvg_entry` and/or `ltf_sweep_retest`. Same pattern as existing sources, `max_wait_bars` likely 3-4 (not 7). Data-driven: revisit after Phase 9 GBT confirms 1m factors carry weight.
-- **1m-triggered dynamic trail / runner management** — dynamic exit after TP1 using the 1m oscillator. Complements (does not replace) `ltf_reversal_close`. Revisit after 100+ post-pivot closed trades.
-- **ATR-trailing SL after MFE threshold (Option B to MFE-lock)** — continue trailing SL after the 2R lock fires. `trail_atr` tuning load-bearing (too tight = shaken, too wide = reduces to Option A). Only worth the code if Option A's locked-and-fell-back data shows a meaningful "resumed to +2.5R then reversed" bucket.
-- **Multi-strategy ensemble** — after scalper matures, add a separate swing module (higher TFs, different pillar weights) and route to shared execution layer. Only meaningful once scalper is provably stable.
-- **Auto-retrain loop** — monthly RL refresh on rolling window. Cron + CI pipeline. Meaningless until Phase 11 is steady.
-- **Alt-exchange support** — Bybit / Binance futures. Current execution layer is OKX-specific; abstracting `ExchangeClient` is 2-3 weeks of careful refactor.
-- **Asymmetric Arkham penalties** — today penalties are symmetric (both directions can be penalised by misalignment). If Phase 9 shows shorts benefit more from the veto than longs, split into `long_penalty` / `short_penalty` knobs.
-- **Per-symbol Arkham overrides** — e.g., SOL vs DOGE may respond differently to BTC dominance. Requires more data than current budget supports — Phase 12 candidate.
+- **Deep RL (SB3/PPO) parameter tuner** — requires 100+ live-trade dataset. Phase 10 original deep-RL scope was superseded by Pass 1/3 Bayesian TPE which handles 6D-10D parameter search natively. Deep RL only if Bayesian plateau hits a structural ceiling AND the high-dim interaction effects are measurable.
+- **Arkham F4/F5** — per-entity flow divergence (Coinbase premium delta vs Binance inflow) + DEX swap volume. Deferred at integration; revisit if Pass 3 shows per-entity netflow alone has edge.
+- **Asymmetric Arkham penalties** — split symmetric penalties into `long_penalty` / `short_penalty` knobs. Depends on Pass 3 data showing direction asymmetry.
+- **Per-symbol Arkham overrides** — SOL vs DOGE may respond differently to BTC dominance / altcoin index. Pass 3 candidate.
+- **Whale transfer directional classification** — GBT on `whale_transfers` join reveals which flows predict direction. If signal exists, add `whale_directional_score` soft factor (replacement for the removed hard gate in a data-informed form).
+- **HTF Order Block re-add** — Pine 3m OBs failed post-pivot; 15m OBs may survive. Factor-audit confirms before re-enable.
+- **Additional pairs** — 6th+ OKX perp. Coinalyze budget allows ~6 symbols at free tier.
+- **1m as zone source in `setup_planner`** — `ltf_fvg_entry` / `ltf_sweep_retest`. Pass 3 GBT confirms 1m factors carry weight first.
+- **1m-triggered dynamic trail / runner management** — dynamic exit after TP1 using 1m oscillator. Complements `ltf_reversal_close`.
+- **ATR-trailing SL after MFE threshold (Option B)** — continue trailing after 1.3R lock. Only if Option A's locked-and-fell-back data shows a meaningful "resumed then reversed" bucket.
+- **Pine overlay split** — `smt_overlay.pine` → `_structure.pine` + `_levels.pine`. Worth the refactor only if freshness-poll latency becomes a bottleneck.
+- **Multi-strategy ensemble** — scalper + swing module routing to shared execution layer. Only meaningful once scalper is provably stable.
+- **Auto-retrain loop** — monthly Optuna refresh on rolling window. Cron + CI pipeline. Meaningless until Phase 11 is steady.
+- **Alt-exchange support** — Bybit / Binance futures. Current execution layer OKX-specific; abstracting `ExchangeClient` is 2-3 weeks careful refactor.
 
 ### What is explicitly NOT on the roadmap
 
-- **Decision-making RL.** Structural decisions (5-pillar, hard gates, zone-based entry) stay fixed. RL is a parameter tuner.
+- **Decision-making RL.** Structural decisions (5-pillar, hard gates, zone-based entry, per-symbol flow) stay fixed. Bayesian / RL are parameter tuners only.
 - **Claude Code as runtime decider.** Claude writes code and analyzes logs; it does not decide trades per candle.
-- **Higher-frequency scalping (1m/30s entry).** TV freshness-poll latency makes sub-minute entry TFs unreliable. Infrastructure rewrite (direct exchange WS feed + in-process indicators) would be a different project.
-- **Leverage > 100x or custom margin modes outside cross.** Operator caps and OKX caps combine to forbid this. Do not revisit without a risk memo.
+- **Sub-minute entry TFs (1m / 30s).** TV freshness-poll latency makes these unreliable. Infrastructure rewrite (direct exchange WS + in-process indicators) would be a different project.
+- **Leverage > 100x or non-cross margin modes.** Operator cap + OKX cap combine to forbid. Requires risk memo to revisit.
 
 ---
 

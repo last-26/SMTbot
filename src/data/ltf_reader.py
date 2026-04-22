@@ -15,14 +15,25 @@ not the previous chart state.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
-from src.data.models import Direction
+from src.data.models import Direction, OscillatorTableData
 
 
 @dataclass
 class LTFState:
-    """Compact view of the LTF oscillator for the defensive-close gate."""
+    """Compact view of the LTF oscillator for the defensive-close gate.
+
+    Core fields (rsi / wt_state / wt_cross / last_signal / trend) feed the
+    defensive-close logic in Madde F. 2026-04-22 (gece, late) added the
+    full `oscillator` attachment so the runner can journal per-TF raw
+    oscillator numerics (wt1/wt2/rsi_mfi/stoch_k/d/momentum/divergence
+    flags) at entry / pending-placement time for Pass 2 GBT features.
+
+    `oscillator` is Optional to preserve backward compatibility with
+    existing LTFState constructors in tests — legacy callers see no
+    change, new callers attach the full snapshot.
+    """
     symbol: str
     timeframe: str
     price: float
@@ -32,6 +43,7 @@ class LTFState:
     last_signal: str         # "BUY" / "SELL" / "GOLD_BUY" / …
     last_signal_bars_ago: int
     trend: Direction         # BULLISH / BEARISH / RANGING — heuristic
+    oscillator: Optional[OscillatorTableData] = None
 
 
 def _trend_from_oscillator(wt_state: str, rsi: float) -> Direction:
@@ -74,4 +86,9 @@ class LTFReader:
             last_signal=osc.last_signal,
             last_signal_bars_ago=osc.last_signal_bars_ago,
             trend=_trend_from_oscillator(osc.wt_state, osc.rsi),
+            # 2026-04-22 (gece, late) — full oscillator snapshot attached so
+            # the runner can journal per-TF raw numerics at entry time.
+            # Defensive-close logic only reads the flat fields above; this
+            # attachment is additive and never mutates.
+            oscillator=osc.model_copy(deep=True),
         )

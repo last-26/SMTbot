@@ -175,6 +175,18 @@ class TradeRecord(BaseModel):
     # shape stays stable. JSON dict in SQLite.
     confluence_pillar_scores: dict[str, float] = Field(default_factory=dict)
 
+    # 2026-04-22 (gece, late) — oscillator raw numeric snapshot at entry
+    # (+ placement time for pending-fills). Shape:
+    #   {"1m": {...OscillatorTableData fields...},
+    #    "3m": {...},
+    #    "15m": {...}}
+    # Any TF may be missing when the cache was cleared (already-open HTF
+    # skip, LTF read failure, non-bridge tests). Feeds Pass 2 GBT as
+    # continuous features — wt1/wt2, rsi, rsi_mfi, stoch_k/d, momentum,
+    # divergence flags per TF. Enables multi-TF patterns ("1m oversold +
+    # 15m trending up") that factor names alone can't express.
+    oscillator_raw_values: dict[str, dict] = Field(default_factory=dict)
+
     @property
     def is_open(self) -> bool:
         return self.outcome == TradeOutcome.OPEN
@@ -270,6 +282,11 @@ class RejectedSignal(BaseModel):
     # factual dataset too: if removing `mss_alignment` would have accepted
     # a reject that pegged WIN, that's useful signal.
     confluence_pillar_scores: dict[str, float] = Field(default_factory=dict)
+
+    # 2026-04-22 (gece, late) — mirrors TradeRecord.oscillator_raw_values.
+    # Captured at reject time (or pending placement time for mid-pending
+    # cancels). Shape identical: {"1m": {...}, "3m": {...}, "15m": {...}}.
+    oscillator_raw_values: dict[str, dict] = Field(default_factory=dict)
 
 
 class WhaleTransferRecord(BaseModel):

@@ -117,7 +117,15 @@ CREATE TABLE IF NOT EXISTS trades (
     -- as JSON dict. Enables Pass 2 replay-tuning of per-pillar weights
     -- without re-fetching market state. '{}' on rows written before this
     -- column (backfill not required).
-    confluence_pillar_scores TEXT NOT NULL DEFAULT '{}'
+    confluence_pillar_scores TEXT NOT NULL DEFAULT '{}',
+
+    -- 2026-04-22 (gece, late) — oscillator raw numeric snapshot at entry
+    -- time. JSON dict keyed by TF ("1m" / "3m" / "15m"); each value is a
+    -- dump of `OscillatorTableData` fields (wt1, wt2, rsi, rsi_mfi,
+    -- stoch_k, stoch_d, momentum, divergence flags, etc.). Any TF may be
+    -- missing when cache was empty (already-open HTF skip, LTF timeout).
+    -- Empty dict '{}' on pre-migration rows.
+    oscillator_raw_values TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_trades_outcome      ON trades(outcome);
@@ -171,7 +179,14 @@ CREATE TABLE IF NOT EXISTS rejected_signals (
     -- counter-factuals feed Pass 2 per-pillar weight tuning too: removing
     -- `mss_alignment` weight might flip a reject into accept; GBT/Optuna
     -- needs the raw weights to simulate that.
-    confluence_pillar_scores TEXT NOT NULL DEFAULT '{}'
+    confluence_pillar_scores TEXT NOT NULL DEFAULT '{}',
+
+    -- 2026-04-22 (gece, late) — mirrors trades.oscillator_raw_values.
+    -- Rejected signals also carry per-TF oscillator numerics so Pass 2
+    -- counter-factual analysis has continuous features for the reject
+    -- subset too (e.g., "would a lower oscillator_raw_values.3m.rsi
+    -- threshold have admitted this reject?").
+    oscillator_raw_values TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_rejected_symbol_ts  ON rejected_signals(symbol, signal_timestamp);
@@ -259,6 +274,7 @@ _COLUMNS = [
     "demo_artifact", "artifact_reason",
     "on_chain_context",
     "confluence_pillar_scores",
+    "oscillator_raw_values",
 ]
 
 
@@ -276,6 +292,7 @@ _REJECTED_COLUMNS = [
     "hypothetical_outcome", "hypothetical_bars_to_tp", "hypothetical_bars_to_sl",
     "on_chain_context",
     "confluence_pillar_scores",
+    "oscillator_raw_values",
 ]
 
 
@@ -330,6 +347,12 @@ _MIGRATIONS = [
     # decode as an empty dict (no attributed weights).
     "ALTER TABLE trades ADD COLUMN confluence_pillar_scores TEXT NOT NULL DEFAULT '{}'",
     "ALTER TABLE rejected_signals ADD COLUMN confluence_pillar_scores TEXT NOT NULL DEFAULT '{}'",
+    # 2026-04-22 (gece, late) — per-TF oscillator raw values JSON. Unlocks
+    # continuous-feature GBT on RSI / WaveTrend / Stoch / MFI magnitudes
+    # across 1m/3m/15m. Default '{}' for legacy rows. Empty dict on fresh
+    # rows when upstream caches are unavailable (tests without bridge etc.).
+    "ALTER TABLE trades ADD COLUMN oscillator_raw_values TEXT NOT NULL DEFAULT '{}'",
+    "ALTER TABLE rejected_signals ADD COLUMN oscillator_raw_values TEXT NOT NULL DEFAULT '{}'",
 ]
 
 
@@ -370,6 +393,7 @@ def _record_to_row(rec: TradeRecord) -> tuple:
         (json.dumps(rec.on_chain_context)
          if rec.on_chain_context is not None else None),
         json.dumps(rec.confluence_pillar_scores or {}),
+        json.dumps(rec.oscillator_raw_values or {}),
     )
 
 
@@ -392,6 +416,7 @@ def _rejected_to_row(rec: RejectedSignal) -> tuple:
         (json.dumps(rec.on_chain_context)
          if rec.on_chain_context is not None else None),
         json.dumps(rec.confluence_pillar_scores or {}),
+        json.dumps(rec.oscillator_raw_values or {}),
     )
 
 
@@ -432,7 +457,33 @@ def _row_to_rejected(row: aiosqlite.Row) -> RejectedSignal:
         hypothetical_bars_to_sl=row["hypothetical_bars_to_sl"],
         on_chain_context=_parse_on_chain_context(row),
         confluence_pillar_scores=_parse_pillar_scores(row),
+        oscillator_raw_values=_parse_oscillator_raw_values(row),
     )
+
+
+def _parse_oscillator_raw_values(row: aiosqlite.Row) -> dict[str, dict]:
+    """Decode `oscillator_raw_values` JSON; empty dict on any issue.
+
+    Expected shape: `{"1m": {...}, "3m": {...}, "15m": {...}}` — any TF
+    subset is valid. Each TF value is a dict of OscillatorTableData
+    fields. Malformed rows, legacy rows, and non-dict values decode as
+    `{}` so downstream consumers never see a surprising shape.
+    """
+    raw = _safe_col(row, "oscillator_raw_values")
+    if raw is None:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    # Filter to well-formed entries — each value must itself be a dict.
+    out: dict[str, dict] = {}
+    for tf, value in parsed.items():
+        if isinstance(value, dict):
+            out[str(tf)] = dict(value)
+    return out
 
 
 def _parse_pillar_scores(row: aiosqlite.Row) -> dict[str, float]:
@@ -536,6 +587,7 @@ def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
         artifact_reason=_safe_col(row, "artifact_reason"),
         on_chain_context=_parse_on_chain_context(row),
         confluence_pillar_scores=_parse_pillar_scores(row),
+        oscillator_raw_values=_parse_oscillator_raw_values(row),
     )
 
 
@@ -646,6 +698,7 @@ class TradeJournal:
         trend_regime_at_entry: Optional[str] = None,
         on_chain_context: Optional[dict] = None,
         confluence_pillar_scores: Optional[dict[str, float]] = None,
+        oscillator_raw_values: Optional[dict[str, dict]] = None,
     ) -> TradeRecord:
         """Insert an OPEN row describing a freshly-placed trade.
 
@@ -698,6 +751,7 @@ class TradeJournal:
             trend_regime_at_entry=trend_regime_at_entry,
             on_chain_context=on_chain_context,
             confluence_pillar_scores=dict(confluence_pillar_scores or {}),
+            oscillator_raw_values=dict(oscillator_raw_values or {}),
         )
         placeholders = ", ".join("?" * len(_COLUMNS))
         cols = ", ".join(_COLUMNS)
@@ -835,6 +889,7 @@ class TradeJournal:
         pillar_eth_bias: Optional[str] = None,
         on_chain_context: Optional[dict] = None,
         confluence_pillar_scores: Optional[dict[str, float]] = None,
+        oscillator_raw_values: Optional[dict[str, dict]] = None,
     ) -> RejectedSignal:
         """Insert a single row into `rejected_signals`.
 
@@ -877,6 +932,7 @@ class TradeJournal:
             pillar_eth_bias=pillar_eth_bias,
             on_chain_context=on_chain_context,
             confluence_pillar_scores=dict(confluence_pillar_scores or {}),
+            oscillator_raw_values=dict(oscillator_raw_values or {}),
         )
         placeholders = ", ".join("?" * len(_REJECTED_COLUMNS))
         cols = ", ".join(_REJECTED_COLUMNS)

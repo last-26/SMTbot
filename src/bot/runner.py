@@ -334,6 +334,13 @@ class PendingSetupMeta:
     signal_state: MarketState
     placed_at: datetime
     trend_regime_at_entry: Optional[str] = None
+    # 2026-04-22 (gece, late) — per-TF oscillator numerics captured at
+    # PLACEMENT TIME. Carried through to fill so the journal row reflects
+    # the decision moment (not the later fill moment; charts may have
+    # drifted by the time the limit hits). Empty dict when upstream
+    # caches were unavailable at placement (bridge=None, LTF timeout,
+    # already-open HTF skip).
+    oscillator_raw_values_at_placement: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -1274,6 +1281,66 @@ class BotRunner:
             return None
         return bias.value
 
+    def _build_oscillator_raw_values(
+        self,
+        symbol: str,
+        entry_state: Optional[MarketState],
+    ) -> dict[str, dict]:
+        """Snapshot oscillator numeric values across 1m/3m/15m TFs.
+
+        Reads from three independent sources (the runner's per-cycle TF
+        sweep populates each):
+
+          * 3m (entry TF)  — `entry_state.oscillator` just read at entry
+            settle; passed in explicitly because this helper is called
+            after the entry state is built.
+          * 15m (HTF)      — `ctx.htf_state_cache[symbol].oscillator`
+            populated during the HTF pass (runner.py §2a). Cleared on
+            the already-open skip, so entries on just-closed symbols
+            may see the freshest HTF; entries skipping HTF see {}.
+          * 1m (LTF)       — `ctx.ltf_cache[symbol].oscillator` (added
+            2026-04-22 gece-late to LTFState). None when LTF read
+            failed or bridge=None.
+
+        Each TF's value is the `OscillatorTableData.model_dump()` dict
+        (wt1, wt2, wt_state, wt_cross, wt_vwap_fast, rsi, rsi_state,
+        rsi_mfi, rsi_mfi_bias, stoch_k, stoch_d, stoch_state,
+        last_signal, last_signal_bars_ago, last_wt_div,
+        last_wt_div_bars_ago, momentum). Missing TF → key absent (not
+        an empty sub-dict — so downstream consumers can distinguish
+        "wasn't captured" from "captured but all zero").
+
+        Returned dict is JSON-serialisable and shape-stable across runs;
+        suitable for direct forwarding to `record_open` /
+        `record_rejected_signal`. Never raises — any access failure
+        silently produces {} for that TF.
+        """
+        out: dict[str, dict] = {}
+        try:
+            if entry_state is not None:
+                osc_3m = getattr(entry_state, "oscillator", None)
+                if osc_3m is not None:
+                    out["3m"] = osc_3m.model_dump()
+        except Exception:
+            pass
+        try:
+            htf = self.ctx.htf_state_cache.get(symbol)
+            if htf is not None:
+                osc_15m = getattr(htf, "oscillator", None)
+                if osc_15m is not None:
+                    out["15m"] = osc_15m.model_dump()
+        except Exception:
+            pass
+        try:
+            ltf = self.ctx.ltf_cache.get(symbol)
+            if ltf is not None:
+                osc_1m = getattr(ltf, "oscillator", None)
+                if osc_1m is not None:
+                    out["1m"] = osc_1m.model_dump()
+        except Exception:
+            pass
+        return out
+
     def _per_symbol_cex_flow_for(self, symbol: str) -> Optional[float]:
         """Extract the per-symbol 1h CEX net flow (USD) from the Arkham
         snapshot's JSON dict.
@@ -1362,6 +1429,9 @@ class BotRunner:
                 f.name: float(f.weight)
                 for f in getattr(conf, "factors", []) or []
             },
+            oscillator_raw_values=self._build_oscillator_raw_values(
+                symbol, state,
+            ),
         )
 
     def _is_ltf_reversal(self, ltf: LTFState, open_side: str, max_age: int) -> bool:
@@ -2055,6 +2125,9 @@ class BotRunner:
                 ),
                 on_chain_context=self._on_chain_context_dict(),
                 confluence_pillar_scores=dict(plan.confluence_pillar_scores or {}),
+                oscillator_raw_values=self._build_oscillator_raw_values(
+                    symbol, state,
+                ),
                 **_derive_enrichment(state),
             )
             self.ctx.open_trade_ids[(symbol, pos_side)] = rec.trade_id
@@ -2600,6 +2673,14 @@ class BotRunner:
                 if trend_regime and trend_regime != TrendRegime.UNKNOWN
                 else None
             ),
+            # 2026-04-22 (gece, late) — capture oscillator snapshot at
+            # placement time. Carried through to fill's record_open and
+            # pending-cancel's record_rejected_signal so the journal row
+            # reflects the decision moment's data, not the later
+            # fill/cancel moment when caches may have rotated.
+            oscillator_raw_values_at_placement=(
+                self._build_oscillator_raw_values(symbol, state)
+            ),
         )
         logger.info(
             "zone_limit_placed symbol={} side={} order_id={} entry={:.4f} "
@@ -2796,6 +2877,13 @@ class BotRunner:
                 trend_regime_at_entry=meta.trend_regime_at_entry,
                 on_chain_context=self._on_chain_context_dict(),
                 confluence_pillar_scores=dict(plan.confluence_pillar_scores or {}),
+                # 2026-04-22 (gece, late) — journal oscillator snapshot
+                # captured at pending PLACEMENT (not fill) so the row
+                # reflects the decision moment. Fill may happen minutes
+                # after placement and the caches may have rotated.
+                oscillator_raw_values=dict(
+                    meta.oscillator_raw_values_at_placement or {}
+                ),
                 **_derive_enrichment(state),
             )
             self.ctx.open_trade_ids[key] = rec.trade_id
@@ -2872,6 +2960,14 @@ class BotRunner:
                 pillar_eth_bias=self._pillar_bias_label("ETH-USDT-SWAP"),
                 on_chain_context=self._on_chain_context_dict(),
                 confluence_pillar_scores=dict(plan.confluence_pillar_scores or {}),
+                # 2026-04-22 (gece, late) — same placement-time oscillator
+                # snapshot used by the pending-fill path. The cancel might
+                # fire 7 bars after placement; we still log the
+                # decision-moment numerics so Pass 2 can segment cancels
+                # by what the oscillator looked like when the limit went in.
+                oscillator_raw_values=dict(
+                    meta.oscillator_raw_values_at_placement or {}
+                ),
             )
         except Exception:
             logger.debug(
