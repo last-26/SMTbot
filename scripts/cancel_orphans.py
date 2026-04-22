@@ -1,15 +1,26 @@
 """One-shot cleanup: cancel known orphan pending limits + orphan OCOs.
 
-Orphans identified 2026-04-20 post-postmortem:
-  - DOGE OCO 3494715650050920448 (sl=0.09296) — stale from 05:44 revise whose
-    new algoId was never written back to the journal, so the 07:07 restart
-    rehydrated the pre-revise id and left this one un-tracked on OKX.
-  - ETH pending limit 3495274735394340864 (@ 2280.04 sz=29) — pre-restart
-    resting limit; startup reconciliation does not rehydrate pending limits.
-  - BNB pending limit 3495272138516185088 (@ 620.3  sz=1182) — same class.
+Historical run (2026-04-20 post-postmortem) — now archived:
+  - DOGE OCO 3494715650050920448 / ETH limit 3495274735394340864 /
+    BNB limit 3495272138516185088. Script was run, orphans removed;
+    the permanent fixes (revise_runner_tp journal update + startup
+    reconciliation for orphans) prevent recurrence of that exact class.
 
-Run once, then the permanent fixes (revise_runner_tp journal update +
-startup reconciliation for orphans) prevent recurrence.
+2026-04-23 run — Pass 1 → Pass 2 transition. Operator manually closed
+5 open positions on OKX before the DB wipe but did not also cancel
+the attached OCO algos and two resting limits. Fresh-DB startup
+detected them (`orphan_oco_no_journal_row` ERROR log per algo) but
+left them in place per safety policy — an OCO with no journal row
+might be protecting an un-tracked position, so the auto-cancel code
+deliberately stays hands-off. In this specific case the orphans are
+truly un-paired (0 live positions) and safe to sweep.
+  - DOGE OCO 3502645596580777984 (sl=0.0972  tp=0.09584 sz=65)
+  - BNB  OCO 3502601267250237440 (sl=644.6   tp=638.8   sz=1292)
+  - BTC  OCO 3502294562696105984 (sl=79185.1 tp=78238.6 sz=13)
+  - SOL  OCO 3502258920440238080 (sl=88.7    tp=86.07   sz=58)
+  - ETH  OCO 3502241723558957056 (sl=2416.51 tp=2358.98 sz=26)
+  - DOGE limit 3502730384189411328 (short @ 0.09725 sz=103)
+  - SOL  limit 3502729003156099072 (short @ 87.81   sz=95)
 """
 
 from __future__ import annotations
@@ -27,10 +38,15 @@ from src.execution.okx_client import OKXClient, OKXCredentials
 
 
 # (kind, inst_id, id)  — kind in {"limit", "algo"}
+# 2026-04-23 Pass 1 → Pass 2 transition orphans (see module docstring).
 TARGETS: list[tuple[str, str, str]] = [
-    ("algo", "DOGE-USDT-SWAP", "3494715650050920448"),
-    ("limit", "ETH-USDT-SWAP", "3495274735394340864"),
-    ("limit", "BNB-USDT-SWAP", "3495272138516185088"),
+    ("algo",  "DOGE-USDT-SWAP", "3502645596580777984"),
+    ("algo",  "BNB-USDT-SWAP",  "3502601267250237440"),
+    ("algo",  "BTC-USDT-SWAP",  "3502294562696105984"),
+    ("algo",  "SOL-USDT-SWAP",  "3502258920440238080"),
+    ("algo",  "ETH-USDT-SWAP",  "3502241723558957056"),
+    ("limit", "DOGE-USDT-SWAP", "3502730384189411328"),
+    ("limit", "SOL-USDT-SWAP",  "3502729003156099072"),
 ]
 
 # OKX "already-gone" codes that we treat as idempotent success.
