@@ -184,18 +184,25 @@ analysis:
   # was pegged by nearly every Pine OB/FVG width. Wide-ATR pairs (SOL/DOGE/
   # XRP) routinely need more breathing room than BTC/ETH. Values below sit
   # ~1–1.5× typical 3m ATR-as-% per symbol. Unlisted → global.
+  #
+  # 2026-04-23 (Pass 2 early): operator raised RISK_AMOUNT_USDT to $100
+  # and flagged TP/SL levels as "too tight" — floors were doubling as the
+  # binding constraint on most entries, landing SL well inside 1m-3m
+  # noise envelopes. Floors bumped 25-50% to give wicks real breathing
+  # room. R ($100) stays flat; notional auto-shrinks (`risk_amount / sl_pct`).
+  # Example — BNB: old 0.5% floor × $20k notional = $100 R; new 0.7% ×
+  # $14.3k = $100 R. 40% less leverage exposure, 40% more wick protection.
+  # Re-eval after 20+ closed trades post-bump: if wick-out rate > 40%,
+  # loosen further; if accept-rate crumbles (entries hit notional min),
+  # tighten one step.
   min_sl_distance_pct_per_symbol:
-    BTC-USDT-SWAP: 0.004
-    # 2026-04-21 (eve): 0.006 → 0.008. Operator flagged ETH stops writing
-    # losses too fast — floor was tighter than typical 3m noise envelope
-    # (~0.7-0.9% on current vol). Widened to DOGE level (0.008), still
-    # below SOL's 0.010. Notional auto-shrinks to keep $R flat.
-    ETH-USDT-SWAP: 0.008
-    SOL-USDT-SWAP: 0.010
-    DOGE-USDT-SWAP: 0.008
-    XRP-USDT-SWAP: 0.008
-    ADA-USDT-SWAP: 0.008   # SOL/DOGE-profile thin alt
-    BNB-USDT-SWAP: 0.005   # major-class, deep book — BTC-tight floor
+    BTC-USDT-SWAP: 0.006    # 2026-04-23 Pass 2: 0.004 → 0.006 (+50%); previously sub-ATR floor wicked frequently
+    ETH-USDT-SWAP: 0.010    # 2026-04-23 Pass 2: 0.008 → 0.010 (+25%); earlier 0.006→0.008 on 2026-04-21 eve
+    SOL-USDT-SWAP: 0.012    # 2026-04-23 Pass 2: 0.010 → 0.012 (+20%)
+    DOGE-USDT-SWAP: 0.010   # 2026-04-23 Pass 2: 0.008 → 0.010 (+25%)
+    XRP-USDT-SWAP: 0.010    # kept parallel to DOGE (symbol currently not watched, floor preserved for reinstatement)
+    ADA-USDT-SWAP: 0.010    # SOL/DOGE-profile thin alt (2026-04-23 Pass 2: 0.008 → 0.010, parallel bump; currently not watched)
+    BNB-USDT-SWAP: 0.007    # 2026-04-23 Pass 2: 0.005 → 0.007 (+40%); previously tied with global default (0.005)
   # Confluence weight overrides — empty = DEFAULT_WEIGHTS from
   # src/analysis/multi_timeframe.py (Moderate rebalance baseline below is
   # already baked into code). Only keys set here override; others stay at
