@@ -207,6 +207,15 @@ class PositionMonitor:
                     self._cancel_tp_limit_best_effort(
                         tracked.inst_id, tracked.tp_limit_order_id,
                     )
+                # 2026-04-23 — symmetric sweep for algo_ids. When the
+                # maker-TP fills first (or any other natural close path
+                # leaves the OCO unfired), the co-placed SL/TP algos
+                # stay live. Without this cancel they orphan on OKX's
+                # book until next startup reconcile.
+                if tracked.algo_ids:
+                    self._cancel_algos_best_effort(
+                        tracked.inst_id, list(tracked.algo_ids),
+                    )
                 to_remove.append(key)
             else:
                 snap = live_snaps[key]
@@ -661,6 +670,53 @@ class PositionMonitor:
             if str(row.get("algoId", "")) == str(algo_id):
                 return False
         return True
+
+    def _cancel_algos_best_effort(
+        self, inst_id: str, algo_ids: list[str],
+    ) -> None:
+        """Cancel every algo in `algo_ids` on a natural close.
+
+        Background (2026-04-23 BTC orphan OCO postmortem): when the
+        maker-TP resting limit fills first, the position goes to zero,
+        but OKX does NOT auto-cancel the co-placed OCO's still-resting
+        SL/TP algos. Without this sweep the OCO lingers on the book
+        as an orphan until the next startup reconcile catches it —
+        leaving the account momentarily exposed to a double-trigger
+        if a wick hits the stale SL before the next boot.
+
+        Tolerates the same non-fatal paths as `_cancel_tp_limit_best_effort`:
+        already-filled / already-canceled codes are logged at debug,
+        everything else at warning. The resting algo becomes inert if
+        the cancel races (position is flat, reduce-only semantics), but
+        leaving it behind trips `_cancel_surplus_ocos` on next startup.
+        """
+        for algo_id in algo_ids:
+            if not algo_id:
+                continue
+            try:
+                self.client.cancel_algo(inst_id, algo_id)
+                logger.info(
+                    "close_sweep_algo_canceled inst={} algo={}",
+                    inst_id, algo_id,
+                )
+            except OrderRejected as exc:
+                if self._cancel_error_is_already_gone(exc):
+                    logger.debug(
+                        "close_sweep_algo_already_gone inst={} algo={} "
+                        "code={}",
+                        inst_id, algo_id, exc.code,
+                    )
+                else:
+                    logger.warning(
+                        "close_sweep_algo_cancel_failed inst={} algo={} "
+                        "code={} — will retry on next startup sweep",
+                        inst_id, algo_id, exc.code,
+                    )
+            except Exception:
+                logger.exception(
+                    "close_sweep_algo_cancel_exception inst={} algo={}",
+                    inst_id, algo_id,
+                )
 
     def _cancel_tp_limit_best_effort(self, inst_id: str, order_id: str) -> None:
         """Cancel a resting TP limit. Tolerates all non-fatal paths:
