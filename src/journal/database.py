@@ -256,7 +256,17 @@ CREATE TABLE IF NOT EXISTS on_chain_snapshots (
     -- 2026-04-22 — per-symbol most-recent-hour CEX flow via
     -- /token/volume/{id}?granularity=1h. JSON-encoded dict so adding a 6th
     -- watched symbol won't trigger a schema migration.
-    token_volume_1h_net_usd_json    TEXT
+    token_volume_1h_net_usd_json    TEXT,
+    -- 2026-04-23 (night-late) — 4th + 5th venues. Live probe vs.
+    -- `type:cex` aggregate showed named-entity coverage (CB+BN+BY) captured
+    -- only ~1-6% of the full CEX BTC netflow signal. Bitfinex (+$193M/24h,
+    -- Tether-adjacent, historical BTC lead) and Kraken (−$216M/24h,
+    -- Western retail/institutional exit) were the largest single named
+    -- inflow / outflow. Journal-only; Pass 3 Optuna decides whether to
+    -- wire into _flow_alignment_score (today 6 inputs, weights 0.25/0.25/
+    -- 0.15/0.15/0.10/0.10).
+    cex_bitfinex_netflow_24h_usd    REAL,
+    cex_kraken_netflow_24h_usd      REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_on_chain_snap_captured_at ON on_chain_snapshots(captured_at);
@@ -435,6 +445,15 @@ _MIGRATIONS = [
     "ALTER TABLE rejected_signals ADD COLUMN price_change_1h_pct_at_entry REAL",
     "ALTER TABLE rejected_signals ADD COLUMN price_change_4h_pct_at_entry REAL",
     "ALTER TABLE rejected_signals ADD COLUMN liq_heatmap_top_clusters_json TEXT NOT NULL DEFAULT '{}'",
+    # 2026-04-23 (night-late) — 4th + 5th venues added journal-only. Live probe vs.
+    # `type:cex` aggregate showed named-entity coverage (CB+BN+BY) captured only
+    # ~1-6% of the full CEX BTC netflow signal. Bitfinex (biggest single named
+    # INFLOW, Tether-adjacent) and Kraken (biggest single named OUTFLOW, Western
+    # retail/institutional exit) added as the two most informative additions.
+    # Pre-migration rows keep NULL — Pass 3 tune drops first ~N rows where
+    # these are NULL from per-entity feature columns.
+    "ALTER TABLE on_chain_snapshots ADD COLUMN cex_bitfinex_netflow_24h_usd REAL",
+    "ALTER TABLE on_chain_snapshots ADD COLUMN cex_kraken_netflow_24h_usd REAL",
 ]
 
 
@@ -1216,6 +1235,8 @@ class TradeJournal:
         cex_binance_netflow_24h_usd: Optional[float] = None,
         cex_bybit_netflow_24h_usd: Optional[float] = None,
         token_volume_1h_net_usd_json: Optional[str] = None,
+        cex_bitfinex_netflow_24h_usd: Optional[float] = None,
+        cex_kraken_netflow_24h_usd: Optional[float] = None,
     ) -> int:
         """Append one row to `on_chain_snapshots` — time-series of Arkham state.
 
@@ -1227,6 +1248,9 @@ class TradeJournal:
         2026-04-22 — added Coinbase/Binance/Bybit entity netflow + per-symbol
         token volume JSON. New params have default None for backwards compat
         with any test fixtures that still call the original signature.
+        2026-04-23 (night-late) — added Bitfinex + Kraken (biggest named inflow
+        / outflow in live probe vs. `type:cex` aggregate). Journal-only;
+        _flow_alignment_score still reads the original 6 inputs.
         """
         conn = self._require_conn()
         cur = await conn.execute(
@@ -1245,8 +1269,10 @@ class TradeJournal:
                    cex_coinbase_netflow_24h_usd,
                    cex_binance_netflow_24h_usd,
                    cex_bybit_netflow_24h_usd,
-                   token_volume_1h_net_usd_json
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   token_volume_1h_net_usd_json,
+                   cex_bitfinex_netflow_24h_usd,
+                   cex_kraken_netflow_24h_usd
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 _iso(captured_at),
                 daily_macro_bias,
@@ -1263,6 +1289,8 @@ class TradeJournal:
                 cex_binance_netflow_24h_usd,
                 cex_bybit_netflow_24h_usd,
                 token_volume_1h_net_usd_json,
+                cex_bitfinex_netflow_24h_usd,
+                cex_kraken_netflow_24h_usd,
             ),
         )
         await conn.commit()

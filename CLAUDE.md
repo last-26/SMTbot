@@ -15,7 +15,7 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 - **Execution:** post-only limit → regular limit → market-at-edge fallback. Single-leg OCO SL/TP at hard **1:2 RR** (tightened 1:3→1:2 on 2026-04-21 eve; partial TP disabled 2026-04-19 late-night — see changelog; `move_sl_to_be_after_tp1` flag kept but inert while partial off). Dynamic TP revision re-anchors the runner OCO to `entry ± 2 × sl_distance` every cycle, floor at 1.0R. **MFE-triggered SL lock (Option A, 2026-04-20)**: once MFE ≥ 1.3R (scaled from 2R when RR cap tightened), the runner OCO's SL is pulled to entry (+fee buffer) so the remaining 0.7R of target is risk-free. One-shot per position. **Maker-TP resting limit (2026-04-20)**: post-only reduce-only limit sits at TP price alongside the OCO — captures wicks as maker, avoids market-trigger latency.
 - **Sizing:** fee-aware ceil on per-contract total cost so total realized SL loss (price + fee reserve) ≥ target_risk across every symbol (2026-04-19 late-night-2). Overshoot bounded by one per-contract step (< $3 per position). Operator override via `RISK_AMOUNT_USDT` env (2026-04-20) bypasses percent-mode sizing; 10%-of-balance safety ceiling. Per-symbol `min_sl_distance_pct_per_symbol` floors bumped 25–50% on 2026-04-23 (Pass 2) for R=$100 breathing room: BTC 0.006, ETH 0.010, SOL 0.012, DOGE 0.010, BNB 0.007.
 - **Journal:** async SQLite, schema includes `on_chain_context`, `demo_artifact`, `confluence_pillar_scores`, `oscillator_raw_values` (all JSON). Separate tables: `rejected_signals` (counter-factual outcome pegged), `on_chain_snapshots` (Arkham state mutation time-series), `whale_transfers` (raw WS events for Phase 9 directional learning).
-- **On-chain (Arkham):** runtime soft signals only — daily bias ±15%, hourly stablecoin pulse +0.75 threshold penalty, altcoin-index +0.5 penalty on misaligned altcoin trades, **flow_alignment** 6-input directional score (stablecoin + BTC/ETH + Coinbase/Binance/Bybit 24h netflow; weights 0.25/0.25/0.15/0.15/0.10/0.10; default penalty 0.25), **per_symbol_cex_flow** binary penalty on misaligned symbol 1h volume (default 0.25, $5M floor). Whale HARD GATE removed 2026-04-22 — WS listener feeds `whale_transfers` journal for Pass 3 directional classification. Per-symbol token_volume fallback (2026-04-23): when Arkham `/token/volume/{id}` returns JSON `null` (confirmed for `solana`, `wrapped-solana`), `fetch_token_volume_last_hour` falls back to `/transfers/histogram` (flow=in + flow=out, last bucket) — zero coverage gap for the traded symbol set. **Netflow freeze fix (2026-04-23 night):** per-entity netflow rewritten from `/flow/entity/{entity}` (daily buckets, froze at UTC day close) to `/transfers/histogram?base=<entity>&granularity=1h&time_last=24h`; same fix for BTC/ETH aggregate. Daily-bundle refresh flipped from UTC-day gate to 5-min monotonic cadence (`on_chain.daily_snapshot_refresh_s: 300`) so `on_chain_snapshots` DB rows actually replace frozen values intraday. Credit-safe via v2 persistent WS streams + filter-fingerprint cache. All Arkham weights tuned in Pass 3.
+- **On-chain (Arkham):** runtime soft signals only — daily bias ±15%, hourly stablecoin pulse +0.75 threshold penalty, altcoin-index +0.5 penalty on misaligned altcoin trades, **flow_alignment** 6-input directional score (stablecoin + BTC/ETH + Coinbase/Binance/Bybit 24h netflow; weights 0.25/0.25/0.15/0.15/0.10/0.10; default penalty 0.25), **per_symbol_cex_flow** binary penalty on misaligned symbol 1h volume (default 0.25, $5M floor). **Bitfinex + Kraken 24h netflow captured journal-only** (2026-04-23 night-late, 4th + 5th named venues — biggest single inflow / outflow in live probe vs. `type:cex` aggregate; not yet wired into `_flow_alignment_score` — Pass 3 decides weights). Whale HARD GATE removed 2026-04-22 — WS listener feeds `whale_transfers` journal for Pass 3 directional classification. Per-symbol token_volume fallback (2026-04-23): when Arkham `/token/volume/{id}` returns JSON `null` (confirmed for `solana`, `wrapped-solana`), `fetch_token_volume_last_hour` falls back to `/transfers/histogram` (flow=in + flow=out, last bucket) — zero coverage gap for the traded symbol set. **Netflow freeze fix (2026-04-23 night):** per-entity netflow rewritten from `/flow/entity/{entity}` (daily buckets, froze at UTC day close) to `/transfers/histogram?base=<entity>&granularity=1h&time_last=24h`; same fix for BTC/ETH aggregate. Daily-bundle refresh flipped from UTC-day gate to 5-min monotonic cadence (`on_chain.daily_snapshot_refresh_s: 300`) so `on_chain_snapshots` DB rows actually replace frozen values intraday. Credit-safe via v2 persistent WS streams + filter-fingerprint cache. All Arkham weights tuned in Pass 3.
 - **Pass 2 instrumentation:** every trade row now captures `confluence_pillar_scores` (factor name → weight dict) and `oscillator_raw_values` (per-TF dict with 1m/3m/15m OscillatorTableData numerics: wt1/wt2/rsi/rsi_mfi/stoch_k/d/momentum/divergence flags). Both sourced from existing runner TF-switch cache — zero extra TV latency.
 - **Tests:** 1063, all green. Demo-runnable end-to-end.
 - **Data cutoff (`rl.clean_since`):** `2026-04-22T20:33:24Z` — Pass 2 restart cut. Pre-restart DB (42 Pass 1 trades) archived as `data/trades.db.pass1_backup_2026-04-22T203324Z`. Fresh DB created on first bot startup; every new row post-restart carries uniform feature coverage.
@@ -217,6 +217,39 @@ Wiring via three new helpers in `src/bot/runner.py`:
 2. **Accept-rate per symbol post-bump** — if per-symbol accepts drop materially (e.g., BNB from ~1/hour to <1/4h) because notional floor hits OKX minimum, one-step tightening justified.
 3. **Enrichment column coverage** — `open_interest_usd_at_entry IS NOT NULL` fraction on post-restart rows should approach 100% for symbols where Coinalyze snapshot stays fresh. Lower = cache freshness regression.
 4. **Price change window hit rate** — `price_change_1h_pct_at_entry IS NOT NULL` on market-entry trades should be ~100%, 0% on pending-fill trades (expected by design). Mismatch = wiring regression.
+
+### 2026-04-23 (night-late) — Bitfinex + Kraken added as 4th + 5th named venues (journal-only)
+
+Ad-hoc coverage audit. Operator asked where the aggregate BTC CEX inflow was landing after observing the live snapshot's `cex_btc_netflow_24h_usd = +$2.46B` while the named trio (Coinbase + Binance + Bybit) summed to net −$144M. Live Arkham probe across 14 named CEX entities (BTC 24h, via `/transfers/histogram?base=<entity>&granularity=1h&time_last=24h`) showed:
+
+| Metric | Value | % of aggregate |
+|---|---:|---:|
+| `type:cex` aggregate (live) | +$3.40B | 100% |
+| Tracked 3 (CB+BN+BY) | −$45M | −1.3% |
+| Bitfinex (biggest named inflow) | +$193M | +5.7% |
+| Kraken (biggest named outflow) | −$210M | −6.2% |
+| Kalan (unlabeled CEX clusters) | ~+$3.46B | ~%100 |
+
+Named-entity coverage captured only ~1-7% of the full CEX BTC netflow signal — the remainder sits in Arkham's CEX-clustered but unlabeled hot wallets (OTC desks, market-maker CEX accounts, smaller / new venues). Limitation of Arkham labeling, not a probe bug.
+
+**Fix (journal-only):** added Bitfinex + Kraken to the per-entity fetch loop and journal. No runtime scoring change — `_flow_alignment_score` still reads the original 6 inputs (stable + BTC + ETH + CB + BN + BY). Pass 3 Optuna decides whether + how to weight the two new inputs once uniform post-restart data exists.
+
+**Wiring:**
+- `src/data/on_chain_types.py` — two new optional float fields on `OnChainSnapshot`: `cex_bitfinex_netflow_24h_usd`, `cex_kraken_netflow_24h_usd`.
+- `src/bot/runner.py` — fetch loop extended: `for entity in ("coinbase", "binance", "bybit", "bitfinex", "kraken")`. `BotContext` carries the two new fields; all four `OnChainSnapshot(...)` construction sites plumb them through. Fingerprint tuple includes both so mutations trigger a fresh journal row.
+- `src/journal/database.py` — CREATE TABLE + two idempotent `ALTER TABLE … ADD COLUMN` migrations; INSERT column list + values extended. `record_on_chain_snapshot` signature gained two keyword args with `= None` defaults.
+- `on_chain_context` dict that flows into `trades` / `rejected_signals` now exposes both fields (enables Pass 3 GBT to train on 5 entities instead of 3 without re-joining snapshot rows by timestamp).
+
+**Cost:** +2 histogram calls per 5-min daily-bundle cycle → +24 calls/h × 2 entities = +48 req/h. Label-free (verified). Total label budget untouched (558/10k/mo).
+
+**Not done:** `_flow_alignment_score` signature, config weights, per-symbol overrides. Intentionally deferred — mechanical weight add without Pass 3 data would be a guess; journal capture is the minimum that unblocks Pass 3 tuning.
+
+**Tests:** 1063 → 1063, all green (new fields default to `None`, existing callers unchanged; migrations idempotent).
+
+**Re-eval triggers:**
+1. **Bitfinex / Kraken coverage** on `on_chain_snapshots` rows captured after this commit — both columns should be NON-NULL on ≥95% of rows. Zero-rate = fetcher silently failing for those slugs (try `bitfinex-fx` / other variants before widening the fix).
+2. **Bitfinex inflow magnitude sanity** — median |net| over 7 days should be ≥$30M. Below that = signal too thin to warrant weight allocation in Pass 3.
+3. **Kraken outflow persistence** — one-shot bearish-lean days don't prove edge. 14-day rolling sign persistence is the signal; Pass 3 GBT segments on it.
 
 ### 2026-04-23 (night) — Arkham netflow freeze fix (per-entity + BTC/ETH 24h + cadence)
 

@@ -54,6 +54,16 @@ class OnChainSnapshot:
     cex_coinbase_netflow_24h_usd: Optional[float] = None
     cex_binance_netflow_24h_usd: Optional[float] = None
     cex_bybit_netflow_24h_usd: Optional[float] = None
+    # 2026-04-23 (night-late) — 4th + 5th venues added journal-only.
+    # Live probe against `type:cex` aggregate showed named-entity coverage
+    # (CB+BN+BY) was only ~1-6% of the full CEX BTC netflow signal.
+    # Bitfinex surfaced as the largest single named INFLOW (+$193M/24h,
+    # Tether-adjacent, historical BTC lead); Kraken as the largest single
+    # OUTFLOW (−$216M/24h, Western retail/institutional exit). Not yet
+    # wired into `_flow_alignment_score` — Pass 3 Optuna will decide
+    # weights once uniform post-restart data accumulates.
+    cex_bitfinex_netflow_24h_usd: Optional[float] = None
+    cex_kraken_netflow_24h_usd: Optional[float] = None
     # 2026-04-22 — per-symbol most-recent-hour net CEX flow (USD) via
     # `/token/volume/{id}?granularity=1h`. JSON dict keyed by OKX symbol;
     # adding a 6th symbol won't require schema migration. Initially
