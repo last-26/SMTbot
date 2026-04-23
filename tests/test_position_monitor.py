@@ -644,3 +644,112 @@ def test_lock_sl_at_leaves_tp_limit_untouched():
     assert client.tp_limits_placed == []
     t = mon._tracked[("BTC-USDT-SWAP", "long")]
     assert t.tp_limit_order_id == "TP_LIMIT_PRESERVED"
+
+
+# ── Close-path algo sweep (2026-04-23 BTC orphan OCO postmortem) ───────────
+
+
+def test_poll_close_sweeps_algo_ids():
+    """When a tracked position closes (maker-TP filled, OCO still resting),
+    poll() should cancel every algo in `tracked.algo_ids` so nothing
+    orphans on OKX's book until the next startup reconcile."""
+    client = FakeRevisableClient()
+    mon = PositionMonitor(client, margin_mode="cross")
+    client.snapshots = [_snap()]
+    mon.register_open(
+        "BTC-USDT-SWAP", "long", size=3.0, entry_price=67000.0,
+        algo_ids=["ALGO_RUNNER"], tp_limit_order_id="TP_LIMIT_ID",
+    )
+    mon.poll()                    # position still open → nothing cancelled
+    assert client.cancelled == []
+    assert client.cancelled_orders == []
+
+    client.snapshots = []         # maker-TP filled → position flat
+    fills = mon.poll()
+    assert len(fills) == 1
+    # Maker-TP limit AND runner OCO both swept.
+    assert client.cancelled_orders == [("BTC-USDT-SWAP", "TP_LIMIT_ID")]
+    assert client.cancelled == [("BTC-USDT-SWAP", "ALGO_RUNNER")]
+    assert mon.tracked_count == 0
+
+
+def test_poll_close_sweeps_multiple_algos():
+    """Pre-SL-to-BE positions carry both TP1 and runner algos. On close
+    both should be swept."""
+    client = FakeRevisableClient()
+    mon = PositionMonitor(client, margin_mode="cross")
+    client.snapshots = [_snap()]
+    mon.register_open(
+        "BTC-USDT-SWAP", "long", size=3.0, entry_price=67000.0,
+        algo_ids=["TP1_ALGO", "RUNNER_ALGO"],
+    )
+    mon.poll()
+    client.snapshots = []
+    fills = mon.poll()
+    assert len(fills) == 1
+    assert client.cancelled == [
+        ("BTC-USDT-SWAP", "TP1_ALGO"),
+        ("BTC-USDT-SWAP", "RUNNER_ALGO"),
+    ]
+
+
+def test_poll_close_sweep_tolerates_already_gone_code():
+    """If the OCO already triggered (SL fired), the cancel returns
+    `51400/51401/51402`. Sweep must swallow and proceed — no exception
+    escapes, poll still emits the CloseFill."""
+    client = FakeRevisableClient(
+        cancel_raises=OrderRejected(
+            "algo does not exist", code="51400", payload={},
+        ),
+    )
+    mon = PositionMonitor(client, margin_mode="cross")
+    client.snapshots = [_snap()]
+    mon.register_open(
+        "BTC-USDT-SWAP", "long", size=3.0, entry_price=67000.0,
+        algo_ids=["ALGO_RUNNER"],
+    )
+    mon.poll()
+    client.snapshots = []
+    fills = mon.poll()          # must not raise
+    assert len(fills) == 1
+    # We still attempted the cancel; 51400 was swallowed.
+    assert client.cancelled == [("BTC-USDT-SWAP", "ALGO_RUNNER")]
+
+
+def test_poll_close_sweep_tolerates_unknown_cancel_error():
+    """Non-idempotent errors (e.g. transient 500, network blip) must also
+    not crash the sweep — log-and-continue semantics mirror
+    `_cancel_tp_limit_best_effort`."""
+    client = FakeRevisableClient(
+        cancel_raises=OrderRejected(
+            "server err", code="50004", payload={},
+        ),
+    )
+    mon = PositionMonitor(client, margin_mode="cross")
+    client.snapshots = [_snap()]
+    mon.register_open(
+        "BTC-USDT-SWAP", "long", size=3.0, entry_price=67000.0,
+        algo_ids=["ALGO_RUNNER"],
+    )
+    mon.poll()
+    client.snapshots = []
+    fills = mon.poll()          # must not raise
+    assert len(fills) == 1
+    assert client.cancelled == [("BTC-USDT-SWAP", "ALGO_RUNNER")]
+
+
+def test_poll_close_sweep_skips_empty_algo_list():
+    """Position registered without algo_ids (e.g. a bare test harness).
+    Close path must not blow up — sweep helper just iterates an empty
+    list."""
+    client = FakeRevisableClient()
+    mon = PositionMonitor(client, margin_mode="cross")
+    client.snapshots = [_snap()]
+    mon.register_open(
+        "BTC-USDT-SWAP", "long", size=3.0, entry_price=67000.0,
+    )
+    mon.poll()
+    client.snapshots = []
+    fills = mon.poll()
+    assert len(fills) == 1
+    assert client.cancelled == []      # nothing to cancel
