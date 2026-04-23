@@ -165,6 +165,9 @@ def test_size_unchanged_does_not_trigger():
 
 def test_full_close_does_not_trigger_sl_move():
     # Size dropped all the way to 0 → it's a CloseFill, not a partial.
+    # SL-to-BE replacement must NOT fire (no placement on a dead position);
+    # the 2026-04-23 close-sweep DOES cancel any still-resting algos so
+    # they don't orphan on OKX's book.
     client = _FakeClient(positions=[])                       # nothing live
     monitor = PositionMonitor(client, move_sl_to_be_enabled=True)
     monitor.register_open(
@@ -174,8 +177,14 @@ def test_full_close_does_not_trigger_sl_move():
     fills = monitor.poll()
     assert len(fills) == 1
     assert isinstance(fills[0], CloseFill)
-    assert client.cancelled == []
+    # No replacement OCO placed (the key contract of SL-to-BE on a
+    # full close: nothing to protect, nothing to replace).
     assert client.placed == []
+    # Close-sweep cancelled both algo_ids (orphan-OCO prevention).
+    assert client.cancelled == [
+        ("BTC-USDT-SWAP", "ALG1"),
+        ("BTC-USDT-SWAP", "ALG2"),
+    ]
 
 
 # ── BE offset (fee buffer past entry) ─────────────────────────────────────
