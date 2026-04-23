@@ -15,9 +15,9 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 - **Execution:** post-only limit → regular limit → market-at-edge fallback. Single-leg OCO SL/TP at hard **1:2 RR** (tightened 1:3→1:2 on 2026-04-21 eve; partial TP disabled 2026-04-19 late-night — see changelog; `move_sl_to_be_after_tp1` flag kept but inert while partial off). Dynamic TP revision re-anchors the runner OCO to `entry ± 2 × sl_distance` every cycle, floor at 1.0R. **MFE-triggered SL lock (Option A, 2026-04-20)**: once MFE ≥ 1.3R (scaled from 2R when RR cap tightened), the runner OCO's SL is pulled to entry (+fee buffer) so the remaining 0.7R of target is risk-free. One-shot per position. **Maker-TP resting limit (2026-04-20)**: post-only reduce-only limit sits at TP price alongside the OCO — captures wicks as maker, avoids market-trigger latency.
 - **Sizing:** fee-aware ceil on per-contract total cost so total realized SL loss (price + fee reserve) ≥ target_risk across every symbol (2026-04-19 late-night-2). Overshoot bounded by one per-contract step (< $3 per position). Operator override via `RISK_AMOUNT_USDT` env (2026-04-20) bypasses percent-mode sizing; 10%-of-balance safety ceiling. Per-symbol `min_sl_distance_pct_per_symbol` floors bumped 25–50% on 2026-04-23 (Pass 2) for R=$100 breathing room: BTC 0.006, ETH 0.010, SOL 0.012, DOGE 0.010, BNB 0.007.
 - **Journal:** async SQLite, schema includes `on_chain_context`, `demo_artifact`, `confluence_pillar_scores`, `oscillator_raw_values` (all JSON). Separate tables: `rejected_signals` (counter-factual outcome pegged), `on_chain_snapshots` (Arkham state mutation time-series), `whale_transfers` (raw WS events for Phase 9 directional learning).
-- **On-chain (Arkham):** runtime soft signals only — daily bias ±15%, hourly stablecoin pulse +0.75 threshold penalty, altcoin-index +0.5 penalty on misaligned altcoin trades, **flow_alignment** 6-input directional score (stablecoin + BTC/ETH + Coinbase/Binance/Bybit 24h netflow; weights 0.25/0.25/0.15/0.15/0.10/0.10; default penalty 0.25), **per_symbol_cex_flow** binary penalty on misaligned symbol 1h volume (default 0.25, $5M floor). Whale HARD GATE removed 2026-04-22 — WS listener feeds `whale_transfers` journal for Pass 3 directional classification. Per-symbol token_volume fallback (2026-04-23): when Arkham `/token/volume/{id}` returns JSON `null` (confirmed for `solana`, `wrapped-solana`), `fetch_token_volume_last_hour` falls back to `/transfers/histogram` (flow=in + flow=out, last bucket) — zero coverage gap for the traded symbol set. Credit-safe via v2 persistent WS streams + filter-fingerprint cache. All Arkham weights tuned in Pass 3.
+- **On-chain (Arkham):** runtime soft signals only — daily bias ±15%, hourly stablecoin pulse +0.75 threshold penalty, altcoin-index +0.5 penalty on misaligned altcoin trades, **flow_alignment** 6-input directional score (stablecoin + BTC/ETH + Coinbase/Binance/Bybit 24h netflow; weights 0.25/0.25/0.15/0.15/0.10/0.10; default penalty 0.25), **per_symbol_cex_flow** binary penalty on misaligned symbol 1h volume (default 0.25, $5M floor). Whale HARD GATE removed 2026-04-22 — WS listener feeds `whale_transfers` journal for Pass 3 directional classification. Per-symbol token_volume fallback (2026-04-23): when Arkham `/token/volume/{id}` returns JSON `null` (confirmed for `solana`, `wrapped-solana`), `fetch_token_volume_last_hour` falls back to `/transfers/histogram` (flow=in + flow=out, last bucket) — zero coverage gap for the traded symbol set. **Netflow freeze fix (2026-04-23 night):** per-entity netflow rewritten from `/flow/entity/{entity}` (daily buckets, froze at UTC day close) to `/transfers/histogram?base=<entity>&granularity=1h&time_last=24h`; same fix for BTC/ETH aggregate. Daily-bundle refresh flipped from UTC-day gate to 5-min monotonic cadence (`on_chain.daily_snapshot_refresh_s: 300`) so `on_chain_snapshots` DB rows actually replace frozen values intraday. Credit-safe via v2 persistent WS streams + filter-fingerprint cache. All Arkham weights tuned in Pass 3.
 - **Pass 2 instrumentation:** every trade row now captures `confluence_pillar_scores` (factor name → weight dict) and `oscillator_raw_values` (per-TF dict with 1m/3m/15m OscillatorTableData numerics: wt1/wt2/rsi/rsi_mfi/stoch_k/d/momentum/divergence flags). Both sourced from existing runner TF-switch cache — zero extra TV latency.
-- **Tests:** 1057, all green. Demo-runnable end-to-end.
+- **Tests:** 1063, all green. Demo-runnable end-to-end.
 - **Data cutoff (`rl.clean_since`):** `2026-04-22T20:33:24Z` — Pass 2 restart cut. Pre-restart DB (42 Pass 1 trades) archived as `data/trades.db.pass1_backup_2026-04-22T203324Z`. Fresh DB created on first bot startup; every new row post-restart carries uniform feature coverage.
 
 ---
@@ -217,6 +217,48 @@ Wiring via three new helpers in `src/bot/runner.py`:
 2. **Accept-rate per symbol post-bump** — if per-symbol accepts drop materially (e.g., BNB from ~1/hour to <1/4h) because notional floor hits OKX minimum, one-step tightening justified.
 3. **Enrichment column coverage** — `open_interest_usd_at_entry IS NOT NULL` fraction on post-restart rows should approach 100% for symbols where Coinalyze snapshot stays fresh. Lower = cache freshness regression.
 4. **Price change window hit rate** — `price_change_1h_pct_at_entry IS NOT NULL` on market-entry trades should be ~100%, 0% on pending-fill trades (expected by design). Mismatch = wiring regression.
+
+### 2026-04-23 (night) — Arkham netflow freeze fix (per-entity + BTC/ETH 24h + cadence)
+
+Two paired data bugs and a cadence rewrite, all in one sitting. DB audit on the fresh Pass 2 table showed per-entity Arkham values (Coinbase/Binance/Bybit 24h netflow) bit-exact identical across 17 consecutive `on_chain_snapshots` rows spanning ~24h — impossible for rolling 24h data on live markets. Parallel check on BTC/ETH 24h netflow found the same lock-up: 5 pre-midnight rows changed, everything after 2026-04-23T00:01 UTC stood still. Live Arkham probe vs. journal:
+
+| Entity / Metric | Journal value | Live probe | Error |
+|---|---:|---:|---|
+| Coinbase 24h | +$198,815 | +$344,000,000 | ~1,700× off |
+| Binance 24h | +$50,449,218 | +$11,200,000 | ~4.5× off |
+| Bybit 24h | −$216,421 | +$23,800,000 | **SIGN FLIPPED** |
+| BTC 24h | −$1,058,000,000 | −$785,000,000 | ~34% off |
+| ETH 24h | +$72,900,000 | −$197,000,000 | **SIGN FLIPPED** |
+
+**Root causes (two separate bugs):**
+
+1. **`/flow/entity/{entity}` returns DAILY buckets.** Called via `fetch_entity_netflow_24h`, it returned "most recent complete UTC day" — frozen until next day closes, regardless of wall-clock drift. `/flow/entity/*` has no 1h granularity mode.
+2. **`_net_flow_via_histogram` used `granularity="1d"`.** Same daily-bucket freeze for BTC/ETH aggregate netflow. Pre-UTC-midnight the active bucket still moved (why first 5 rows looked alive); post-midnight the bucket value became immutable.
+
+**Fix (`src/data/on_chain.py`):**
+
+- `_net_flow_via_histogram` — granularity flipped `"1d"` → `"1h"`. Same in/out diff logic, now reads the rolling 24h hourly histogram.
+- `fetch_entity_netflow_24h` — rewritten to call `/transfers/histogram?base=<entity>&granularity=1h&time_last=24h` twice (flow=in + flow=out) and sum the full 24-bucket series. Return shape unchanged — downstream runner / journal / flow_alignment scoring untouched.
+
+**Cadence flip (`src/bot/runner.py` + `config.py` + `default.yaml`):**
+
+Granularity fix alone wasn't enough — the whole daily-bundle branch was UTC-day-gated (`if last_on_chain_daily_date != today: …`). That meant the fix would only take effect once per 24h, and the frozen journal rows would continue overwriting the fingerprint cache dedup logic nothing. New `on_chain.daily_snapshot_refresh_s: 300` (5 min) runs the bundle on monotonic cadence. Context field `last_on_chain_daily_date: date` replaced by `last_on_chain_daily_ts: float`.
+
+- **5-min choice:** live bucket-update probe (3 samples, 75s apart) showed closed buckets (10:00, 11:00) bit-exact identical; active bucket (12:00) grew T0=$130.3M → T1(+76s)=$139.7M → T2(+77s)=$139.7M. Arkham indexer repopulates the active hour every 60-120s. 5 min sits safely above that noise floor, still catches intraday inflection within 2-3 samples per direction change.
+- **Cost:** 12 histogram calls/cycle × 12 cycles/h = 144 calls/h. All histogram endpoints label-free (confirmed — label budget 558/10k/mo untouched). Rate-limit headroom: 12 calls × 1.1s = 13.2s of a 300s window (4.4% utilization).
+
+**DB consequence:** `on_chain_snapshots` fingerprint-dedup skips no-op ticks; with fresh rolling-24h data, the fingerprint now mutates on most 5-min cycles → new rows land continuously instead of one-per-day.
+
+**Pass 2 dataset caveat (saved to memory):** The first 8 post-restart closed trades were entered against frozen per-entity + BTC/ETH netflow values (and possibly flipped signs). Pass 3 GBT / Bayesian tune should drop those 8 trades from flow_alignment + per-entity feature columns while keeping them for non-Arkham features. `entry_timestamp` cutoff = this commit's timestamp.
+
+**Tests:** `test_on_chain_fetchers.py` — 5 obsolete `_entity_flow_body` mocks deleted, 5 new histogram-based tests + 1 snapshot-granularity lock-in added. `test_runner_on_chain.py` — 3 UTC-date-gate tests rewritten to monotonic cadence (`test_refresh_daily_respects_cadence`, `test_refresh_daily_refetches_after_cadence_elapsed`, `test_refresh_daily_failure_keeps_previous_snapshot` seeding simplified). Full suite 1057 → **1063 passing**.
+
+**Re-eval triggers:**
+
+1. **`on_chain_snapshots` unique row rate** post-restart — at 5-min cadence on changing markets, expect ≥ 6 new rows/hour. < 2/hour = fingerprint dedup collision (two successive fetches returned identical values) OR Arkham fetch failing silently.
+2. **Per-entity freeze regression** — SQL: `SELECT COUNT(DISTINCT cex_coinbase_netflow_24h_usd) FROM on_chain_snapshots WHERE captured_at > <fix-commit-ts>`. Value < 5 over a 24h window means the histogram-based fetcher is itself returning stale data (Arkham indexer down, or the base=<entity> filter not matching).
+3. **Label budget drift** — `arkham_client.label_usage_pct` should stay flat at ~5-6% (558/10k baseline). Any upward drift means a histogram call is accidentally hitting a label-charging endpoint; investigate.
+4. **Signs flipped in new rows** — periodic spot-check: pick a row, live-probe Arkham `/transfers/histogram?base=bybit&flow=in/out&granularity=1h&time_last=24h`, sum in−out, compare to stored `cex_bybit_netflow_24h_usd`. Drift > 10% = indexer re-balance or aggregation logic drift.
 
 ### Historical context (pre-Pass-1, 2026-04-19 → 2026-04-21)
 
