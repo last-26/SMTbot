@@ -721,16 +721,25 @@ async def _net_flow_via_histogram(
     given window. Two `/transfers/histogram` calls with 1s rate-limit
     cushion between them.
 
+    **2026-04-23 fix:** switched from `granularity="1d"` to `"1h"` and
+    sum 24 hourly buckets. Prior path with `1d` returned a single
+    daily bucket that froze at UTC day close and stayed constant for
+    the next ~24h — so the `24h` netflow value pinned to the previous
+    complete UTC day instead of rolling hourly. Probe 2026-04-23
+    confirmed `1h` gives a true rolling window that updates each hour
+    as new buckets close, and the in-progress bucket updates ~every
+    60-120s as Arkham's indexer catches up to new transfers.
+
     Returns None if either leg fails; 0.0 when both return empty.
     """
     inflow = await client.get_transfers_histogram(
         base="type:cex", tokens=tokens, flow="in",
-        time_last=time_last, granularity="1d",
+        time_last=time_last, granularity="1h",
     )
     await asyncio.sleep(rate_pause_s)
     outflow = await client.get_transfers_histogram(
         base="type:cex", tokens=tokens, flow="out",
-        time_last=time_last, granularity="1d",
+        time_last=time_last, granularity="1h",
     )
     if inflow is None or outflow is None:
         return None
@@ -882,44 +891,48 @@ async def fetch_hourly_stablecoin_pulse(
 async def fetch_entity_netflow_24h(
     client: "ArkhamClient",
     entity: str,
+    *,
+    rate_pause_s: float = 1.1,
 ) -> Optional[float]:
-    """Most-recent-day net flow (USD) for a single entity.
+    """Rolling 24h net flow (USD) into/out of a single CEX entity.
 
-    Uses `/flow/entity/{entity}` (3 credits/call, 0 label lookups
-    verified 2026-04-22 via probe). Arkham returns the FULL daily
-    history for the entity going back to 2021-2022; we extract just
-    the most-recent bucket and return its `inflow - outflow`.
+    **2026-04-23 rewrite:** previously used `/flow/entity/{entity}`
+    which returns DAILY buckets and froze at the most-recent complete
+    UTC day — so between 00:00 UTC and 24:00 UTC the "24h netflow"
+    value was pinned to yesterday's full-day close instead of rolling
+    hourly. Probe 2026-04-23 showed values drifted 2x to sign-inverted
+    vs live state (Coinbase +$198K stored vs +$344M live; Bybit sign
+    flipped).
 
-    Returned value semantics:
+    New path: two `/transfers/histogram` calls with `base=<entity>`,
+    `granularity="1h"`, `time_last="24h"` — 25 hourly buckets — then
+    sum in − out across all buckets. True rolling 24h; in-progress
+    hour updates ~every 60-120s as Arkham's indexer catches up.
+
+    Returned value semantics unchanged:
       * positive → assets flowing INTO the exchange (deposits dominate).
       * negative → assets flowing OUT of the exchange (withdrawals dominate).
       * None     → call failed or response shape was wrong.
 
-    Note: Arkham docs do not document a `timeLast` param for this
-    endpoint, so we always fetch full history and slice client-side.
-    Cost is per-call regardless of returned size.
+    Cost: 2 `/transfers/histogram` calls per entity per invocation,
+    same rate-limit cushion as `_net_flow_via_histogram`.
     """
-    raw = await client.get_entity_flow(entity)
-    if not isinstance(raw, dict):
+    inflow = await client.get_transfers_histogram(
+        base=entity, flow="in",
+        time_last="24h", granularity="1h",
+    )
+    await asyncio.sleep(rate_pause_s)
+    outflow = await client.get_transfers_histogram(
+        base=entity, flow="out",
+        time_last="24h", granularity="1h",
+    )
+    if inflow is None or outflow is None:
         return None
-    # Response is keyed by entity id; take the first list value.
-    series = None
-    for v in raw.values():
-        if isinstance(v, list):
-            series = v
-            break
-    if not series:
-        return None
-    # Most recent bucket = last entry.
-    last = series[-1]
-    if not isinstance(last, dict):
-        return None
-    try:
-        inflow = float(last.get("inflow") or 0)
-        outflow = float(last.get("outflow") or 0)
-    except (TypeError, ValueError):
-        return None
-    return inflow - outflow
+    total_in = sum(float(b.get("usd") or 0) for b in inflow
+                   if isinstance(b, dict))
+    total_out = sum(float(b.get("usd") or 0) for b in outflow
+                    if isinstance(b, dict))
+    return total_in - total_out
 
 
 # ── 2026-04-22: per-token hourly volume (probe confirmed granularity=1h) ───

@@ -171,6 +171,36 @@ async def test_daily_snapshot_neutral_when_stable_delta_below_threshold():
 
 
 @pytest.mark.asyncio
+async def test_daily_snapshot_uses_hourly_granularity():
+    """2026-04-23 fix: daily snapshot's histogram calls must use
+    granularity=1h (not 1d) so the rolling 24h window updates every
+    hour instead of pinning to the last-closed UTC day.
+
+    Call sequence: stable_in, stable_out, btc_in, btc_out, eth_in,
+    eth_out (6 calls via 3 token sets × 2 legs).
+    """
+    client = ArkhamClient(api_key="test-key")
+    # 6 responses — one per (token, flow) pair
+    queue = [_FakeResponse(json_body=_hist(1.0)) for _ in range(6)]
+    fake = _FakeClient(queued=queue)  # type: ignore
+    client._client = fake  # type: ignore
+    await fetch_daily_snapshot(
+        client,
+        stablecoin_threshold_usd=50_000_000.0,
+        btc_netflow_threshold_usd=50_000_000.0,
+        stale_threshold_s=7200,
+    )
+    assert len(fake.calls) == 6
+    for path, params in fake.calls:
+        assert path == "/transfers/histogram"
+        assert params.get("granularity") == "1h", (
+            f"regression: {path} using {params.get('granularity')!r} — "
+            "must be 1h so the rolling 24h window doesn't freeze at UTC day close"
+        )
+        assert params.get("timeLast") == "24h"
+
+
+@pytest.mark.asyncio
 async def test_daily_snapshot_returns_none_when_both_legs_fail():
     """All 8 attempts (4 calls × max_retries=2 in test) return 500.
     Both stablecoin + BTC legs report None → whole snapshot is None."""
@@ -320,78 +350,88 @@ async def test_get_altcoin_index_none_on_unexpected_shape():
     assert aci is None
 
 
-# ── 2026-04-22: fetch_entity_netflow_24h (FAZ 2) ─────────────────────────
+# ── 2026-04-23: fetch_entity_netflow_24h (rolling 1h-granularity histogram) ─
 
 
-def _entity_flow_body(entity: str, daily_buckets: list[tuple[str, float, float]]) -> dict:
-    """Mirror Arkham's `/flow/entity/{entity}` shape (verified via probe).
-    `daily_buckets`: list of (iso_date, inflow_usd, outflow_usd)."""
-    return {
-        entity: [
-            {
-                "time": ts,
-                "inflow": inflow,
-                "outflow": outflow,
-                "cumulativeInflow": inflow,
-                "cumulativeOutflow": outflow,
-            }
-            for ts, inflow, outflow in daily_buckets
-        ]
-    }
+def _hist_multi(buckets: list[tuple[str, float]]) -> list:
+    """Multi-bucket histogram response shape: `[{time, count, usd}, ...]`."""
+    return [{"time": ts, "count": 1, "usd": usd} for ts, usd in buckets]
 
 
 @pytest.mark.asyncio
-async def test_fetch_entity_netflow_uses_last_bucket():
-    """Verifies the fetcher returns inflow-outflow of the MOST RECENT bucket
-    (Arkham returns full history; we slice to last day)."""
-    body = _entity_flow_body("binance", [
-        ("2026-04-19T00:00:00Z", 100_000_000.0, 80_000_000.0),
-        ("2026-04-20T00:00:00Z", 200_000_000.0, 130_000_000.0),  # latest
+async def test_fetch_entity_netflow_sums_hourly_buckets():
+    """Sum of in − sum of out across all 1h buckets in the 24h window."""
+    inflow = _hist_multi([
+        (f"2026-04-23T{h:02d}:00:00Z", 10_000_000.0) for h in range(24)
+    ])  # 24 × 10M = 240M in
+    outflow = _hist_multi([
+        (f"2026-04-23T{h:02d}:00:00Z", 7_000_000.0) for h in range(24)
+    ])  # 24 × 7M = 168M out
+    client = ArkhamClient(api_key="test-key")
+    client._client = _FakeClient(queued=[  # type: ignore
+        _FakeResponse(json_body=inflow),
+        _FakeResponse(json_body=outflow),
     ])
-    client = _build_client_with_response(body)
     result = await fetch_entity_netflow_24h(client, "binance")
-    # last bucket: 200M - 130M = 70M
-    assert result == 70_000_000.0
+    assert result == 72_000_000.0  # 240M - 168M
 
 
 @pytest.mark.asyncio
 async def test_fetch_entity_netflow_negative_when_outflow_dominates():
-    body = _entity_flow_body("coinbase", [
-        ("2026-04-20T00:00:00Z", 38_365_467.22, 38_166_652.32),  # real probe sample
-    ])
-    client = _build_client_with_response(body)
-    result = await fetch_entity_netflow_24h(client, "coinbase")
-    # 38.365M - 38.167M = ~198K (matches probe sample)
-    assert result is not None
-    assert abs(result - 198_814.90) < 0.01
-
-
-@pytest.mark.asyncio
-async def test_fetch_entity_netflow_none_on_empty_series():
-    """Empty bucket list → None (not 0.0). Caller treats as "no signal"."""
-    body = {"bybit": []}
-    client = _build_client_with_response(body)
-    result = await fetch_entity_netflow_24h(client, "bybit")
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_fetch_entity_netflow_none_on_unexpected_shape():
-    client = _build_client_with_response({"unexpected": "string-not-list"})
-    result = await fetch_entity_netflow_24h(client, "binance")
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_fetch_entity_netflow_hits_correct_endpoint():
-    body = _entity_flow_body("bybit", [("2026-04-20T00:00:00Z", 1.0, 2.0)])
+    inflow = _hist_multi([("2026-04-23T00:00:00Z", 1_000_000.0)])
+    outflow = _hist_multi([("2026-04-23T00:00:00Z", 5_000_000.0)])
     client = ArkhamClient(api_key="test-key")
-    fake = _FakeClient(queued=[_FakeResponse(json_body=body)])  # type: ignore
+    client._client = _FakeClient(queued=[  # type: ignore
+        _FakeResponse(json_body=inflow),
+        _FakeResponse(json_body=outflow),
+    ])
+    result = await fetch_entity_netflow_24h(client, "bybit")
+    assert result == -4_000_000.0
+
+
+@pytest.mark.asyncio
+async def test_fetch_entity_netflow_none_when_outflow_leg_fails():
+    """One leg failing → None (caller treats as no-signal)."""
+    client = ArkhamClient(api_key="test-key", max_retries=1)
+    client._client = _FakeClient(queued=[  # type: ignore
+        _FakeResponse(json_body=_hist_multi([("2026-04-23T00:00:00Z", 1.0)])),
+        _FakeResponse(status_code=500),
+    ])
+    result = await fetch_entity_netflow_24h(client, "coinbase")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_entity_netflow_zero_on_empty_buckets():
+    """Both legs empty list → 0.0 (valid signal: no flow this window)."""
+    client = ArkhamClient(api_key="test-key")
+    client._client = _FakeClient(queued=[  # type: ignore
+        _FakeResponse(json_body=[]),
+        _FakeResponse(json_body=[]),
+    ])
+    result = await fetch_entity_netflow_24h(client, "binance")
+    assert result == 0.0
+
+
+@pytest.mark.asyncio
+async def test_fetch_entity_netflow_hits_histogram_with_entity_base():
+    """Verify the new endpoint + params (histogram, base=<entity>, 1h/24h)."""
+    client = ArkhamClient(api_key="test-key")
+    fake = _FakeClient(queued=[  # type: ignore
+        _FakeResponse(json_body=[]),
+        _FakeResponse(json_body=[]),
+    ])
     client._client = fake  # type: ignore
     await fetch_entity_netflow_24h(client, "bybit")
-    assert len(fake.calls) == 1
-    path, _params = fake.calls[0]
-    assert path == "/flow/entity/bybit"
+    assert len(fake.calls) == 2
+    for path, params in fake.calls:
+        assert path == "/transfers/histogram"
+        assert params.get("base") == "bybit"
+        assert params.get("granularity") == "1h"
+        assert params.get("timeLast") == "24h"
+    # first call is inflow, second is outflow
+    assert fake.calls[0][1].get("flow") == "in"
+    assert fake.calls[1][1].get("flow") == "out"
 
 
 # ── 2026-04-22: fetch_token_volume_last_hour (FAZ 3) ─────────────────────
