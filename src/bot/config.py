@@ -561,6 +561,18 @@ class OnChainConfig(BaseModel):
     daily_bias_modifier_delta: float = 0.15
     daily_bias_stablecoin_threshold_usd: float = 50_000_000.0
     daily_bias_btc_netflow_threshold_usd: float = 50_000_000.0
+    # 2026-04-23 — "daily" is a misnomer now. The bundle (bias + BTC/ETH
+    # 24h netflow + per-entity Coinbase/Binance/Bybit 24h netflow) used to
+    # refresh once per UTC day, which froze DB rows for hours once the
+    # underlying Arkham queries were rewritten from daily buckets to rolling
+    # 24h histogram windows. Refresh now on a monotonic cadence so new
+    # `on_chain_snapshots` rows actually replace stale values.
+    #   5 min chosen from live probe: Arkham indexer repopulates the
+    #   active-hour bucket every 60-120s; 5 min is safely above that,
+    #   catches intraday inflection without polling identical buckets.
+    #   12 histogram calls per cycle × 12 cycles/h = 144 calls/h; label-
+    #   free endpoints, so label budget (10k/mo, currently 558) untouched.
+    daily_snapshot_refresh_s: int = 300
 
     # Phase E — stablecoin pulse cross-asset penalty.
     # Default penalty bumped 0.5 → 0.75 on 2026-04-21 (eve), paired with the

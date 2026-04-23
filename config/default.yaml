@@ -613,6 +613,11 @@ on_chain:
   daily_bias_modifier_delta: 0.15
   daily_bias_stablecoin_threshold_usd: 50000000.0  # ≥ this → bullish contribution
   daily_bias_btc_netflow_threshold_usd: 50000000.0 # ≤ -this → bullish (BTC leaving CEX)
+  # 2026-04-23 — cadence for the "daily" bundle (bias + BTC/ETH 24h netflow
+  # + per-entity Coinbase/Binance/Bybit 24h netflow). Was once-per-UTC-day,
+  # which froze DB rows after the histogram rewrite. 5 min tracks Arkham's
+  # ~60-120s indexer refresh; label-free histogram calls so 0 label burn.
+  daily_snapshot_refresh_s: 300
 
   # Phase E — stablecoin hourly pulse; misaligned → +penalty on min_confluence threshold.
   # 2026-04-21 (eve) — bumped 0.5 → 0.75 paired with daily_bias bump. Re-eval

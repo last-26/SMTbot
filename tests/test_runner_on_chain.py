@@ -121,8 +121,10 @@ async def test_refresh_noop_when_client_hard_disabled(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_refresh_daily_fetches_once_per_utc_day(monkeypatch):
-    cfg = _make_on_chain_cfg()
+async def test_refresh_daily_respects_cadence(monkeypatch):
+    # 2026-04-23 — was "fetches once per UTC day". Bundle now refreshes
+    # on `daily_snapshot_refresh_s` cadence so DB rows unfreeze intraday.
+    cfg = _make_on_chain_cfg(daily_snapshot_refresh_s=300)
     runner = _make_runner(cfg, arkham_client=_FakeArkhamClient())
 
     daily_calls: list[int] = []
@@ -151,18 +153,16 @@ async def test_refresh_daily_fetches_once_per_utc_day(monkeypatch):
     assert runner.ctx.on_chain_snapshot is not None
     assert runner.ctx.on_chain_snapshot.daily_macro_bias == "bullish"
     assert runner.ctx.on_chain_snapshot.stablecoin_pulse_1h_usd == 75_000_000.0
-    assert runner.ctx.last_on_chain_daily_date == datetime.now(tz=UTC).date()
+    assert runner.ctx.last_on_chain_daily_ts > 0.0
 
-    # Second call on the same day — daily must NOT refetch. Pulse may
-    # re-fire depending on monotonic clock, but both together prove the
-    # daily cache is honored.
+    # Second call immediately — daily skips because elapsed < refresh_s.
     await runner._refresh_on_chain_snapshots()
-    assert len(daily_calls) == 1  # still 1
+    assert len(daily_calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_refresh_daily_refetches_on_utc_day_rollover(monkeypatch):
-    cfg = _make_on_chain_cfg()
+async def test_refresh_daily_refetches_after_cadence_elapsed(monkeypatch):
+    cfg = _make_on_chain_cfg(daily_snapshot_refresh_s=300)
     runner = _make_runner(cfg, arkham_client=_FakeArkhamClient())
 
     daily_calls: list[int] = []
@@ -181,13 +181,13 @@ async def test_refresh_daily_refetches_on_utc_day_rollover(monkeypatch):
     monkeypatch.setattr("src.bot.runner.fetch_daily_snapshot", _daily)
     monkeypatch.setattr("src.bot.runner.fetch_hourly_stablecoin_pulse", _pulse)
 
-    # Pretend we already fetched on a prior day.
-    yesterday = (datetime.now(tz=UTC) - timedelta(days=1)).date()
-    runner.ctx.last_on_chain_daily_date = yesterday
-
     await runner._refresh_on_chain_snapshots()
     assert len(daily_calls) == 1
-    assert runner.ctx.last_on_chain_daily_date == datetime.now(tz=UTC).date()
+
+    # Rewind the monotonic bookkeeping past the cadence window.
+    runner.ctx.last_on_chain_daily_ts -= 301.0
+    await runner._refresh_on_chain_snapshots()
+    assert len(daily_calls) == 2
 
 
 @pytest.mark.asyncio
@@ -239,9 +239,8 @@ async def test_refresh_daily_failure_keeps_previous_snapshot(monkeypatch):
         stale_threshold_s=7200,
     )
     runner.ctx.on_chain_snapshot = prev
-    runner.ctx.last_on_chain_daily_date = (
-        datetime.now(tz=UTC) - timedelta(days=1)
-    ).date()
+    # last_on_chain_daily_ts left at 0.0 — cadence elapsed by definition,
+    # so the daily branch fires and exercises the None-return path.
 
     async def _daily_fails(client, **kw):
         return None  # matches the fetcher's "failure → None" contract

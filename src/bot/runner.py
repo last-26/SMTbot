@@ -558,9 +558,11 @@ class BotContext:
     # instance so the gate can unconditionally check `.is_active()`
     # without None-guarding every call site.
     whale_blackout_state: Any = None
-    # Scheduler bookkeeping. UTC date of the last daily fetch + monotonic
-    # timestamp of the last pulse fetch. Zero / None means "never fetched".
-    last_on_chain_daily_date: Any = None              # datetime.date
+    # Scheduler bookkeeping. Monotonic timestamps for the daily-bundle and
+    # hourly-pulse fetches. 0.0 means "never fetched".
+    # 2026-04-23 — daily bundle flipped from UTC-date gate to monotonic
+    # cadence so DB rows refresh intraday (see daily_snapshot_refresh_s).
+    last_on_chain_daily_ts: float = 0.0
     last_on_chain_pulse_ts: float = 0.0
     # Phase F2 — Arkham altcoin index scalar + last-fetch monotonic ts.
     altcoin_index_value: Optional[int] = None
@@ -2384,9 +2386,11 @@ class BotRunner:
             stays whatever it was (expected None).
           * `arkham_client is None` (master flag flipped on but client
             not built, or hard-disabled at 95% label usage) → no-op.
-          * daily snapshot refreshes when the current UTC day differs
-            from `last_on_chain_daily_date` (one fetch per wall-clock
-            day, regardless of tick cadence).
+          * daily-bundle (bias + BTC/ETH 24h netflow + per-entity
+            Coinbase/Binance/Bybit 24h netflow) refreshes on
+            `daily_snapshot_refresh_s` cadence (default 300s). Was once-
+            per-UTC-day pre-2026-04-23; flipped to monotonic so
+            `on_chain_snapshots` rows replace frozen values intraday.
           * hourly pulse refreshes when `now_monotonic -
             last_on_chain_pulse_ts >= refresh_s` (default 3600s).
           * Every fetch is wrapped in a broad try/except — Arkham outage
@@ -2403,10 +2407,12 @@ class BotRunner:
         if getattr(client, "hard_disabled", False):
             return
 
-        now_utc = _utc_now()
-        today = now_utc.date()
-        # Daily fetch — once per UTC day.
-        if self.ctx.last_on_chain_daily_date != today:
+        now_mono_daily = time.monotonic()
+        daily_refresh_s = float(cfg.on_chain.daily_snapshot_refresh_s)
+        daily_elapsed = now_mono_daily - self.ctx.last_on_chain_daily_ts
+        # Daily bundle — cadence-gated (2026-04-23). Was UTC-day-gated;
+        # flipped so DB rows refresh intraday (see config docstring).
+        if daily_elapsed >= daily_refresh_s:
             try:
                 snap = await fetch_daily_snapshot(
                     client,
@@ -2423,12 +2429,11 @@ class BotRunner:
                 snap = None
             if snap is not None:
                 # 2026-04-22 — alongside the bias fetch, also pull
-                # per-entity 24h netflow for Coinbase + Binance + Bybit
-                # via `/flow/entity/{entity}`. Same UTC-day cadence
-                # because the underlying data is daily-granular.
-                # Per-entity failures are isolated (one bad entity
-                # leaves the others' values intact). Probe-confirmed
-                # 0 label lookup cost.
+                # per-entity 24h netflow for Coinbase + Binance + Bybit.
+                # 2026-04-23 fix — switched from `/flow/entity/{entity}`
+                # (daily buckets, froze at UTC day close) to
+                # `/transfers/histogram` with `base=<entity>&granularity=1h`
+                # → true rolling 24h. Per-entity failures are isolated.
                 if cfg.on_chain.entity_netflow_enabled:
                     for entity in ("coinbase", "binance", "bybit"):
                         try:
@@ -2464,7 +2469,7 @@ class BotRunner:
                     snapshot_age_s=0,
                     stale_threshold_s=snap.stale_threshold_s,
                 )
-                self.ctx.last_on_chain_daily_date = today
+                self.ctx.last_on_chain_daily_ts = now_mono_daily
                 logger.info(
                     "arkham_daily_snapshot_refreshed bias={} "
                     "btc_netflow={} eth_netflow={}",
