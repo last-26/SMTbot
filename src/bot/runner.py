@@ -2633,6 +2633,7 @@ class BotRunner:
                             cex_bybit_netflow_24h_usd=prev.cex_bybit_netflow_24h_usd,
                             cex_bitfinex_netflow_24h_usd=prev.cex_bitfinex_netflow_24h_usd,
                             cex_kraken_netflow_24h_usd=prev.cex_kraken_netflow_24h_usd,
+                            cex_okx_netflow_24h_usd=prev.cex_okx_netflow_24h_usd,
                             token_volume_1h_net_usd_json=self.ctx.token_volume_1h_net_usd_json,
                             snapshot_age_s=prev.snapshot_age_s,
                             stale_threshold_s=prev.stale_threshold_s,

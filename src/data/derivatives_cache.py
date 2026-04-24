@@ -100,6 +100,14 @@ class DerivativesCache:
         self._funding_history: dict[str, list[float]] = {s: [] for s in self.watched}
         self._ls_history: dict[str, list[float]] = {s: [] for s in self.watched}
         self._oi_refresh_counter: dict[str, int] = {s: 0 for s in self.watched}
+        # 2026-04-24 — per-exchange capture runs every Nth cycle, not every
+        # cycle. Per-symbol refresh already consumes ~25 Coinalyze calls/min
+        # at default refresh_interval_s=60; adding 3 extra batch calls each
+        # cycle sustained the 40/min burst limit and funding+predicted kept
+        # hitting 429. Every-3-cycles = once per ~3 min, plenty for journal-
+        # only capture + leaves a 2-cycle gap for the token bucket to refill.
+        self._per_exchange_cycle_counter: int = 0
+        self._per_exchange_every_n_cycles: int = 3
         self._stop = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
 
@@ -154,19 +162,24 @@ class DerivativesCache:
                 except Exception as e:
                     logger.warning("deriv_refresh_failed symbol={} err={!r}",
                                    symbol, e)
-            # 2026-04-24 — per-exchange batch capture for Pass 3 journal.
-            # Runs once per full refresh cycle (not per symbol) because each
-            # endpoint takes `symbols=sym1,sym2,...` up to 20 entries and we
-            # cover 5 symbols × 3 exchanges = 15 in a single call. +3 calls
-            # per cycle total, label-free, well inside the 40/min budget.
-            # Failures isolate per metric — OI may land while funding misses.
+            # 2026-04-24 — per-exchange batch capture (Binance/Bybit/OKX
+            # OI + funding + predicted funding). Runs every Nth cycle (not
+            # every cycle) because per-symbol refresh already consumes ~25
+            # Coinalyze calls/min at refresh_interval_s=60; adding 3 batch
+            # calls each cycle sustained 40/min burst and funding kept 429.
+            # Every-3-cycles = once per ~3 min, 28-call cycles interleave
+            # with 25-call cycles so the token bucket breathes. Journal-
+            # only capture — 3-min granularity is plenty for Pass 3.
             if not self._stop.is_set():
-                try:
-                    await self._refresh_per_exchange_snapshot()
-                except Exception as e:
-                    logger.warning(
-                        "deriv_per_exchange_refresh_failed err={!r}", e,
-                    )
+                self._per_exchange_cycle_counter += 1
+                if (self._per_exchange_cycle_counter
+                        % self._per_exchange_every_n_cycles == 0):
+                    try:
+                        await self._refresh_per_exchange_snapshot()
+                    except Exception as e:
+                        logger.warning(
+                            "deriv_per_exchange_refresh_failed err={!r}", e,
+                        )
             try:
                 await asyncio.wait_for(
                     self._stop.wait(), timeout=self.refresh_interval_s,
