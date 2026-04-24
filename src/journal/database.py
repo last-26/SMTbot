@@ -266,7 +266,12 @@ CREATE TABLE IF NOT EXISTS on_chain_snapshots (
     -- wire into _flow_alignment_score (today 6 inputs, weights 0.25/0.25/
     -- 0.15/0.15/0.10/0.10).
     cex_bitfinex_netflow_24h_usd    REAL,
-    cex_kraken_netflow_24h_usd      REAL
+    cex_kraken_netflow_24h_usd      REAL,
+    -- 2026-04-24 — 6th venue: OKX self-signal. Bot trades on OKX so
+    -- this captures the venue's own flow. 24h net ≈ 0 structurally
+    -- (turnover ~$1.86B but balanced in/out, max hourly |net| $58M).
+    -- Journal-only; Pass 3 decides whether a 1h-window OKX slot adds value.
+    cex_okx_netflow_24h_usd         REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_on_chain_snap_captured_at ON on_chain_snapshots(captured_at);
@@ -454,6 +459,9 @@ _MIGRATIONS = [
     # these are NULL from per-entity feature columns.
     "ALTER TABLE on_chain_snapshots ADD COLUMN cex_bitfinex_netflow_24h_usd REAL",
     "ALTER TABLE on_chain_snapshots ADD COLUMN cex_kraken_netflow_24h_usd REAL",
+    # 2026-04-24 — 6th venue: OKX (bot's own trading exchange). Journal-only;
+    # 24h net ≈ 0 by design but captured for parity + Pass 3 exploration.
+    "ALTER TABLE on_chain_snapshots ADD COLUMN cex_okx_netflow_24h_usd REAL",
 ]
 
 
@@ -1237,6 +1245,7 @@ class TradeJournal:
         token_volume_1h_net_usd_json: Optional[str] = None,
         cex_bitfinex_netflow_24h_usd: Optional[float] = None,
         cex_kraken_netflow_24h_usd: Optional[float] = None,
+        cex_okx_netflow_24h_usd: Optional[float] = None,
     ) -> int:
         """Append one row to `on_chain_snapshots` — time-series of Arkham state.
 
@@ -1251,6 +1260,8 @@ class TradeJournal:
         2026-04-23 (night-late) — added Bitfinex + Kraken (biggest named inflow
         / outflow in live probe vs. `type:cex` aggregate). Journal-only;
         _flow_alignment_score still reads the original 6 inputs.
+        2026-04-24 — added OKX as 6th venue (bot's own exchange). Self-signal;
+        24h net ≈ 0 by design (balanced turnover) but captured for parity.
         """
         conn = self._require_conn()
         cur = await conn.execute(
@@ -1271,8 +1282,9 @@ class TradeJournal:
                    cex_bybit_netflow_24h_usd,
                    token_volume_1h_net_usd_json,
                    cex_bitfinex_netflow_24h_usd,
-                   cex_kraken_netflow_24h_usd
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   cex_kraken_netflow_24h_usd,
+                   cex_okx_netflow_24h_usd
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 _iso(captured_at),
                 daily_macro_bias,
@@ -1291,6 +1303,7 @@ class TradeJournal:
                 token_volume_1h_net_usd_json,
                 cex_bitfinex_netflow_24h_usd,
                 cex_kraken_netflow_24h_usd,
+                cex_okx_netflow_24h_usd,
             ),
         )
         await conn.commit()

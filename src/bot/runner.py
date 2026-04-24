@@ -593,6 +593,11 @@ class BotContext:
     # _flow_alignment_score still reads the original 6 inputs.
     cex_bitfinex_netflow_24h_usd: Optional[float] = None
     cex_kraken_netflow_24h_usd: Optional[float] = None
+    # 2026-04-24 — 6th venue: OKX. Bot trades here so its own netflow is a
+    # natural self-signal. 24h net ≈ 0 structurally (turnover $1.86B but
+    # balanced in/out, −0.12% bias); $58M max hourly |net|. Journal-only;
+    # Pass 3 decides whether to add a short-window OKX slot separately.
+    cex_okx_netflow_24h_usd: Optional[float] = None
     # 2026-04-22 — per-symbol most-recent-hour net CEX flow via
     # `/token/volume/{id}?granularity=1h`. JSON-encoded dict of
     # {OKX_symbol: usd_netflow_float}. Refreshed on its own cadence
@@ -2448,8 +2453,12 @@ class BotRunner:
                     # only ~1-6% of the full CEX BTC netflow signal; these
                     # two were the biggest named single inflow / outflow.
                     # Not wired into _flow_alignment_score yet (Pass 3).
+                    # 2026-04-24 — OKX added as 6th venue (journal-only).
+                    # Bot trades on OKX so its own netflow is a natural
+                    # self-signal even though 24h net ≈ 0 (balanced,
+                    # $1.86B turnover with $58M max hourly |net|).
                     for entity in ("coinbase", "binance", "bybit",
-                                   "bitfinex", "kraken"):
+                                   "bitfinex", "kraken", "okx"):
                         try:
                             await asyncio.sleep(1.1)  # 1 req/s rate cushion
                             value = await fetch_entity_netflow_24h(client, entity)
@@ -2481,6 +2490,7 @@ class BotRunner:
                     cex_bybit_netflow_24h_usd=self.ctx.cex_bybit_netflow_24h_usd,
                     cex_bitfinex_netflow_24h_usd=self.ctx.cex_bitfinex_netflow_24h_usd,
                     cex_kraken_netflow_24h_usd=self.ctx.cex_kraken_netflow_24h_usd,
+                    cex_okx_netflow_24h_usd=self.ctx.cex_okx_netflow_24h_usd,
                     token_volume_1h_net_usd_json=self.ctx.token_volume_1h_net_usd_json,
                     snapshot_age_s=0,
                     stale_threshold_s=snap.stale_threshold_s,
@@ -2544,6 +2554,7 @@ class BotRunner:
                         cex_bybit_netflow_24h_usd=prev.cex_bybit_netflow_24h_usd,
                         cex_bitfinex_netflow_24h_usd=prev.cex_bitfinex_netflow_24h_usd,
                         cex_kraken_netflow_24h_usd=prev.cex_kraken_netflow_24h_usd,
+                        cex_okx_netflow_24h_usd=prev.cex_okx_netflow_24h_usd,
                         token_volume_1h_net_usd_json=prev.token_volume_1h_net_usd_json,
                         snapshot_age_s=prev.snapshot_age_s,
                         stale_threshold_s=prev.stale_threshold_s,
@@ -2663,8 +2674,10 @@ class BotRunner:
             snap.token_volume_1h_net_usd_json,
             # 2026-04-23 (night-late) — bitfinex + kraken added to fingerprint
             # so any change in these two triggers a fresh journal row.
+            # 2026-04-24 — okx added to fingerprint, same rationale.
             snap.cex_bitfinex_netflow_24h_usd,
             snap.cex_kraken_netflow_24h_usd,
+            snap.cex_okx_netflow_24h_usd,
         )
         if self.ctx.last_on_chain_snapshot_fingerprint == fp:
             return
@@ -2688,6 +2701,7 @@ class BotRunner:
                 token_volume_1h_net_usd_json=snap.token_volume_1h_net_usd_json,
                 cex_bitfinex_netflow_24h_usd=snap.cex_bitfinex_netflow_24h_usd,
                 cex_kraken_netflow_24h_usd=snap.cex_kraken_netflow_24h_usd,
+                cex_okx_netflow_24h_usd=snap.cex_okx_netflow_24h_usd,
             )
             self.ctx.last_on_chain_snapshot_fingerprint = fp
         except Exception:
@@ -2736,6 +2750,8 @@ class BotRunner:
             # 2026-04-23 (night-late) — 4th + 5th venues, journal-only.
             "cex_bitfinex_netflow_24h_usd": snap.cex_bitfinex_netflow_24h_usd,
             "cex_kraken_netflow_24h_usd": snap.cex_kraken_netflow_24h_usd,
+            # 2026-04-24 — 6th venue (OKX self-signal), journal-only.
+            "cex_okx_netflow_24h_usd": snap.cex_okx_netflow_24h_usd,
             "token_volume_1h_net_usd_json": snap.token_volume_1h_net_usd_json,
             "snapshot_age_s": int(snap.snapshot_age_s),
             "fresh": bool(snap.fresh),

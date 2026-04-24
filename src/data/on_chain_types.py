@@ -64,6 +64,14 @@ class OnChainSnapshot:
     # weights once uniform post-restart data accumulates.
     cex_bitfinex_netflow_24h_usd: Optional[float] = None
     cex_kraken_netflow_24h_usd: Optional[float] = None
+    # 2026-04-24 — 6th venue added journal-only. Bot trades on OKX so
+    # the venue's own netflow is a natural self-signal. Live probe showed
+    # turnover ~$1.86B/24h (matches Bitfinex scale) but 24h net ≈ 0 because
+    # in/out are structurally balanced (−0.12% bias); hourly moves reach
+    # $58M. Captured at 24h grain for parity with the other 5 entities;
+    # Pass 3 will decide whether to add a 1h-windowed OKX slot separately.
+    # Not wired into `_flow_alignment_score`.
+    cex_okx_netflow_24h_usd: Optional[float] = None
     # 2026-04-22 — per-symbol most-recent-hour net CEX flow (USD) via
     # `/token/volume/{id}?granularity=1h`. JSON dict keyed by OKX symbol;
     # adding a 6th symbol won't require schema migration. Initially
