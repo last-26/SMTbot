@@ -14,7 +14,7 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 - **Scoring:** 5 pillars (Market Structure, Liquidity, Money Flow, VWAP, Divergence) + hard gates (displacement, EMA momentum, VWAP, cross-asset opposition) + ADX regime-conditional weights. Confluence threshold `min_confluence_score=3.75` (Pass 1 Optuna tune, 2026-04-22). *Premium/discount gate and HTF TP/SR ceiling temporarily disabled 2026-04-19 — see changelog; re-evaluated as Pass 3 candidates.*
 - **Execution:** post-only limit → regular limit → market-at-edge fallback. Single-leg OCO SL/TP at hard **1:2 RR** (tightened 1:3→1:2 on 2026-04-21 eve; partial TP disabled 2026-04-19 late-night — see changelog; `move_sl_to_be_after_tp1` flag kept but inert while partial off). Dynamic TP revision re-anchors the runner OCO to `entry ± 2 × sl_distance` every cycle, floor at 1.0R. **MFE-triggered SL lock (Option A, 2026-04-20)**: once MFE ≥ 1.3R (scaled from 2R when RR cap tightened), the runner OCO's SL is pulled to entry (+fee buffer) so the remaining 0.7R of target is risk-free. One-shot per position. **Maker-TP resting limit (2026-04-20)**: post-only reduce-only limit sits at TP price alongside the OCO — captures wicks as maker, avoids market-trigger latency.
 - **Sizing:** fee-aware ceil on per-contract total cost so total realized SL loss (price + fee reserve) ≥ target_risk across every symbol (2026-04-19 late-night-2). Overshoot bounded by one per-contract step (< $3 per position). Operator override via `RISK_AMOUNT_USDT` env (2026-04-20) bypasses percent-mode sizing; 10%-of-balance safety ceiling. Per-symbol `min_sl_distance_pct_per_symbol` floors: BTC 0.004, ETH 0.008, SOL 0.010, DOGE 0.008, BNB 0.005 (reverted 2026-04-24 after the 2026-04-23 Pass 2 bump mechanically widened TPs at fixed 1:2 RR and collapsed post-bump WR 66.7%→22.2% across 9 trades — see changelog).
-- **Journal:** async SQLite, schema includes `on_chain_context`, `demo_artifact`, `confluence_pillar_scores`, `oscillator_raw_values` (all JSON). **Per-exchange derivatives snapshot (2026-04-24):** 3 JSON columns (`oi_per_exchange_usd_json_at_entry`, `funding_rate_per_exchange_json_at_entry`, `funding_rate_predicted_per_exchange_json_at_entry`) capture Binance/Bybit/OKX metrics per trade for Pass 3 funding-spread + OI-share features. Separate tables: `rejected_signals` (counter-factual outcome pegged), `on_chain_snapshots` (Arkham state mutation time-series), `whale_transfers` (raw WS events for Phase 9 directional learning).
+- **Journal:** async SQLite, schema includes `on_chain_context`, `demo_artifact`, `confluence_pillar_scores`, `oscillator_raw_values` (all JSON). Separate tables: `rejected_signals` (counter-factual outcome pegged), `on_chain_snapshots` (Arkham state mutation time-series), `whale_transfers` (raw WS events for Phase 9 directional learning). *Per-exchange derivatives capture attempted 2026-04-24 and reverted same day — Coinalyze free-tier 40/min ceiling can't sustain it alongside per-symbol baseline (25 calls/cycle).*
 - **On-chain (Arkham):** runtime soft signals only — daily bias ±15%, hourly stablecoin pulse +0.75 threshold penalty, altcoin-index +0.5 penalty on misaligned altcoin trades, **flow_alignment** 6-input directional score (stablecoin + BTC/ETH + Coinbase/Binance/Bybit 24h netflow; weights 0.25/0.25/0.15/0.15/0.10/0.10; default penalty 0.25), **per_symbol_cex_flow** binary penalty on misaligned symbol 1h volume (default 0.25, $5M floor). **Bitfinex + Kraken 24h netflow captured journal-only** (2026-04-23 night-late, 4th + 5th named venues — biggest single inflow / outflow in live probe vs. `type:cex` aggregate). **OKX 24h netflow captured journal-only** (2026-04-24, 6th venue — bot's own trading exchange, self-signal; 24h net ≈ 0 structurally but $58M max hourly |net|). None of 4/5/6 yet wired into `_flow_alignment_score` — Pass 3 decides weights. Whale HARD GATE removed 2026-04-22 — WS listener feeds `whale_transfers` journal for Pass 3 directional classification. Per-symbol token_volume fallback (2026-04-23): when Arkham `/token/volume/{id}` returns JSON `null` (confirmed for `solana`, `wrapped-solana`), `fetch_token_volume_last_hour` falls back to `/transfers/histogram` (flow=in + flow=out, last bucket) — zero coverage gap for the traded symbol set. **Netflow freeze fix (2026-04-23 night):** per-entity netflow rewritten from `/flow/entity/{entity}` (daily buckets, froze at UTC day close) to `/transfers/histogram?base=<entity>&granularity=1h&time_last=24h`; same fix for BTC/ETH aggregate. Daily-bundle refresh flipped from UTC-day gate to 5-min monotonic cadence (`on_chain.daily_snapshot_refresh_s: 300`) so `on_chain_snapshots` DB rows actually replace frozen values intraday. Credit-safe via v2 persistent WS streams + filter-fingerprint cache. All Arkham weights tuned in Pass 3.
 - **Pass 2 instrumentation:** every trade row now captures `confluence_pillar_scores` (factor name → weight dict) and `oscillator_raw_values` (per-TF dict with 1m/3m/15m OscillatorTableData numerics: wt1/wt2/rsi/rsi_mfi/stoch_k/d/momentum/divergence flags). Both sourced from existing runner TF-switch cache — zero extra TV latency.
 - **Tests:** 1063, all green. Demo-runnable end-to-end.
@@ -348,7 +348,50 @@ Per-symbol post-bump: BTC 1/3, ETH 0/1, SOL 0/1, DOGE 0/2, BNB 1/2. DOGE+SOL (wi
 4. **`no_sl_source` / `tp_too_tight` reject spikes** — BTC 0.4% floor can occasionally land SL inside OKX fee + mark drift; if either reject rate > 5% of entry attempts, tighten that specific symbol's floor one step (e.g. BTC 0.004 → 0.005).
 5. **If post-revert metrics fail** — do NOT re-bump floors. Either collect more data (regime-driven noise) or investigate upstream signal quality (confluence threshold, pillar weights). Bump mechanism is proven harmful at fixed 1:2 RR.
 
-### 2026-04-24 — Per-exchange derivatives journal capture (Binance/Bybit/OKX)
+### 2026-04-24 (evening) — Per-exchange derivatives capture REVERTED
+
+After 4 fix iterations against Coinalyze's 40/min free-tier rate limit, operator called it: **"çekemediklerimizi dbden kaldırırız"** — keep what works, drop what doesn't. Full revert shipped as `4fb1018` (−369 lines net). Rationale:
+
+Per-symbol refresh baseline is ~20 calls/cycle (OI + funding + predicted + liq_history + ls_ratio × 5 symbols). At `refresh_interval_s=60s`, that's ~16-17 calls/min sustained. 60s rolling server-side window continuously saturated to ~80% of the 40/min ceiling from per-symbol alone. 3 extra per-exchange batch calls (OI + funding + predicted) fire as a burst, pushing instantaneous rate over the limit. Server 429s on whichever endpoint is called second in the burst.
+
+Iterations of fix-and-test:
+
+| Commit | Fix attempt | Result |
+|---|---|---|
+| `21e8f49` | 2s sleep between per-exchange batches | 429 on funding stayed |
+| `55c8a70` | cadence 3, OKX 3rd construction site | Funding still 429 |
+| `a262d50` | cadence 5, early-skip, 3s sleep | Still 429 |
+| `9526909` | drop predicted_funding from per-symbol | 429 shifted to /open-interest instead |
+| `4fb1018` | **full revert** | This commit |
+
+On the last run (03:29:35 UTC, cadence-5), 6 consecutive per-exchange fires between 06:34-07:07 local ALL 429'd on the first `/open-interest` call → zero data captured. Pattern shift (funding→OI) suggested endpoint-level limiting that our client-side 40/min token bucket can't predict.
+
+**Revert removes:**
+- 3 JSON columns on `trades` + `rejected_signals` (`oi_per_exchange_usd_json_at_entry`, `funding_rate_per_exchange_json_at_entry`, `funding_rate_predicted_per_exchange_json_at_entry`) via idempotent `ALTER TABLE ... DROP COLUMN` migrations
+- 3 `DerivativesState` dict fields (`oi_per_exchange_usd`, `funding_per_exchange`, `funding_predicted_per_exchange`)
+- `_refresh_per_exchange_snapshot` method + cycle counter + cadence knob in `DerivativesCache`
+- Per-exchange symbol map + `_batch_fetch_current_values` + `_regroup_by_okx_symbol` helpers + 3 batch fetcher methods in `CoinalyzeClient`
+- Corresponding signatures + serializers + readers in `database.py`
+- 3 dict fields on `TradeRecord` + `RejectedSignal` models
+- `_parse_per_exchange_dict` helper
+
+**Revert preserves** (unrelated features stay):
+- OKX as 6th Arkham netflow venue (`202f107`) — different feature, works fine
+- All single-exchange derivatives journal enrichment (2026-04-23 eve, 9 REAL columns + 1 JSON column: OI, funding_current, funding_predicted, liq notionals, LS z-score, price_change 1h/4h, heatmap top clusters)
+- Core on_chain_snapshots schema (all 6 named venues, daily bias, stablecoin pulse, altcoin index, per-symbol token volume JSON)
+- All other Pass 2 instrumentation (confluence_pillar_scores, oscillator_raw_values, whale_transfers)
+
+**Pre-revert path for re-enable (Pass 3+):**
+
+1. **Upgrade Coinalyze tier** — paid plans offer 500/min+ which trivialises the capacity tension.
+2. **First reduce per-symbol cost** — `fetch_liquidation_history` is the cheapest drop (Binance WS already provides this, the Coinalyze call is a gap-filler for WS throttle). Frees ~5 calls/min per cycle. Could also drop `fetch_long_short_ratio` (1h bucket, changes slowly; z-score still works from 336h seeded history).
+3. **Revisit with tooling** — if Coinalyze rate still tight, decouple per-exchange fetch into own asyncio task with 15-min cadence + aggressive rate-pause awareness (option C from iter-5 discussion, not shipped).
+
+**Lessons captured to memory** (`feedback_free_tier_rate_budget_backfired.md`): when a feature requires API calls near a known sustained rate limit, the first iteration should audit the EXISTING sustained rate before adding new calls. If baseline is >70% of the ceiling, don't add a parallel burst.
+
+**Tests:** 131 targeted pass across 7 suites. Operator restart required to clear the now-unused column population attempts; DROP COLUMN migrations run on next startup.
+
+### 2026-04-24 — Per-exchange derivatives journal capture (Binance/Bybit/OKX) [REVERTED — see 2026-04-24 (evening) above]
 
 Operator flagged that bot trades derivatives on OKX/Bybit/Binance but the
 journal only holds ONE exchange's snapshot per symbol (liquidity-ranked via
