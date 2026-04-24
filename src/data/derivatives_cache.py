@@ -107,7 +107,13 @@ class DerivativesCache:
         # hitting 429. Every-3-cycles = once per ~3 min, plenty for journal-
         # only capture + leaves a 2-cycle gap for the token bucket to refill.
         self._per_exchange_cycle_counter: int = 0
-        self._per_exchange_every_n_cycles: int = 3
+        # 2026-04-24 (iter 2) — cadence bumped 3 → 5 after observing that
+        # even 3-cycle spacing kept hitting 429 on funding batch. Root
+        # cause: Coinalyze's server-side rolling 60s counter stays saturated
+        # because per-symbol refresh's 25-call burst leaves no recovery
+        # window. 5-cycle cadence = ~7.5 min first fire, ~5 min steady
+        # state. Pass 3 tolerates this granularity (funding changes slow).
+        self._per_exchange_every_n_cycles: int = 5
         self._stop = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
 
@@ -277,13 +283,24 @@ class DerivativesCache:
         Each metric fails independently — a funding outage leaves the
         OI-per-exchange dict populated and vice versa.
 
-        Inter-batch sleep (2.0s) spreads the 3 back-to-back calls across
-        ~4s so Coinalyze's server-side rate counter (40/min, with burst
-        detection stricter than the client-side token bucket) doesn't 429
-        on the 2nd/3rd call. Live post-restart log showed OI geçiyor,
-        funding+predicted sürekli 429; 2s spacing is enough for 1.33
-        tokens to refill server-side (0.667 tokens/sec)."""
-        _INTER_BATCH_SLEEP_S = 2.0
+        Inter-batch sleep (3.0s) spreads the 3 back-to-back calls across
+        ~6s so Coinalyze's server-side rate counter (40/min, with burst
+        detection stricter than the client-side token bucket) can refill
+        ~2 tokens between each call.
+
+        2026-04-24 (iter 2) — early-skip when the coinalyze client is in
+        its 429 pause window. Burning 3 doomed calls (OI→succeed, funding
+        →429→set pause, predicted→short-circuit None) wastes the budget
+        and produces partial data that misleads Pass 3 (OI only, no
+        funding). Better to skip entirely and retry next cadence cycle."""
+        _INTER_BATCH_SLEEP_S = 3.0
+        if self.coinalyze._rate_pause_until > time.monotonic():
+            remaining = self.coinalyze._rate_pause_until - time.monotonic()
+            logger.info(
+                "deriv_per_exchange_skipped_rate_paused remaining_s={:.1f}",
+                remaining,
+            )
+            return
         try:
             oi_map = await self.coinalyze.fetch_per_exchange_oi_usd()
         except Exception as e:
