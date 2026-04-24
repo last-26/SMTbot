@@ -213,11 +213,16 @@ class DerivativesCache:
         )
         state.liq_stream_healthy = self.liq_stream is not None
 
-        # 2) Coinalyze snapshot (5 API calls).
+        # 2) Coinalyze snapshot (4 API calls — predicted_funding dropped
+        #    2026-04-24 to free ~5 calls/min from the 40/min budget; now
+        #    owned by _refresh_per_exchange_snapshot from Binance slot).
         snap = await self.coinalyze.fetch_snapshot(symbol)
         if snap is not None:
             state.funding_rate_current = snap.funding_rate_current
-            state.funding_rate_predicted = snap.funding_rate_predicted
+            # funding_rate_predicted intentionally NOT reassigned here — it
+            # holds the last per-exchange-refresh value. Reassigning to
+            # snap.funding_rate_predicted (now hardcoded 0.0) would wipe it
+            # every per-symbol cycle.
             state.open_interest_usd = snap.open_interest_usd
             state.long_short_ratio = snap.long_short_ratio
             state.coinalyze_snapshot_age_s = 0.0
@@ -327,6 +332,14 @@ class DerivativesCache:
             state.funding_predicted_per_exchange = dict(
                 pred_map.get(symbol, {}),
             )
+            # 2026-04-24 — also refresh the single-exchange
+            # `funding_rate_predicted` (Binance slot, primary venue) here
+            # since per-symbol refresh no longer fetches it. Only update
+            # when we actually have fresh data — if pred_map is empty (429
+            # on that batch), keep the prior value rather than zeroing it.
+            pred_for_symbol = pred_map.get(symbol, {})
+            if "binance" in pred_for_symbol:
+                state.funding_rate_predicted = pred_for_symbol["binance"]
         n_hits = sum(1 for s in self._states.values() if s.oi_per_exchange_usd)
         if n_hits > 0:
             logger.info(

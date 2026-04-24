@@ -460,14 +460,23 @@ class CoinalyzeClient:
     # ── Aggregate snapshot ────────────────────────────────────────────────
 
     async def fetch_snapshot(self, okx_symbol: str) -> Optional[DerivativesSnapshot]:
-        """5 sequential per-symbol calls. Paralleling would blow the bucket."""
+        """4 sequential per-symbol calls.
+
+        2026-04-24 — `fetch_predicted_funding` dropped from per-symbol
+        refresh to free ~5 calls/min from the 40/min Coinalyze budget.
+        It's a journal-only field (no runtime consumer) and the per-
+        exchange batch captures it for Binance/Bybit/OKX every ~5 cycles
+        — primary (Binance) value is refreshed there and written into
+        `state.funding_rate_predicted` by `_refresh_per_exchange_snapshot`.
+        Staleness between per-exchange fires: up to ~8-10 min. Predicted
+        funding updates only each ~8h cycle on exchanges, so this is
+        comfortably below the natural update cadence."""
         cn_sym = self._symbol_map.get(okx_symbol)
         if not cn_sym:
             return None
 
         oi = await self.fetch_current_oi_usd(cn_sym)
         funding = await self.fetch_current_funding(cn_sym)
-        predicted = await self.fetch_predicted_funding(cn_sym)
         liq = await self.fetch_liquidation_history(cn_sym, "1hour", 1)
         ls = await self.fetch_long_short_ratio(cn_sym, "1hour")
 
@@ -475,7 +484,10 @@ class CoinalyzeClient:
             symbol=okx_symbol,
             ts_ms=int(time.time() * 1000),
             funding_rate_current=funding or 0.0,
-            funding_rate_predicted=predicted or 0.0,
+            # 2026-04-24 — populated by _refresh_per_exchange_snapshot
+            # (every ~5 cycles, Binance slot). 0.0 here = "use prior value
+            # from state" since _refresh_one no longer reassigns this field.
+            funding_rate_predicted=0.0,
             open_interest_usd=oi or 0.0,
             long_short_ratio=(ls or {}).get("ratio", 1.0),
             long_share=(ls or {}).get("long_share", 0.5),
