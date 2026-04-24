@@ -142,12 +142,34 @@ class CoinalyzeClient:
     async def ensure_symbol_map(self, watched: list[str]) -> None:
         """Populate `self._symbol_map` from `/future-markets`.
 
-        Idempotent — only calls the endpoint once (flag sticks even on empty
-        response so we never thrash the rate budget during outages).
+        Idempotent on success — only calls the endpoint once (flag sticks
+        so we never thrash the rate budget during outages).
+
+        2026-04-24 — retry once on transient 429 at startup. Previously a
+        single 429 on `/future-markets` (e.g. from a rapid restart pushing
+        the Coinalyze rate-counter over) would permanently latch
+        `_symbol_map_loaded=True` with an empty map, disabling the entire
+        derivatives stack for the session. Now: if `_request` shortcircuits
+        because `_rate_pause_until` is set, wait for the pause to clear
+        (capped at 90s) and retry once. A second 429 after the full wait
+        = genuine outage, latch as before.
         """
         if self._symbol_map_loaded:
             return
+
         data = await self._request("/future-markets", {}, cost=1)
+        # If we likely 429'd, wait for the pause window and retry once.
+        if not data and self._rate_pause_until > time.monotonic():
+            wait_s = min(
+                self._rate_pause_until - time.monotonic() + 1.0, 90.0,
+            )
+            logger.warning(
+                "coinalyze_symbol_map_rate_limited waiting_s={:.1f} retrying_once",
+                wait_s,
+            )
+            await asyncio.sleep(wait_s)
+            data = await self._request("/future-markets", {}, cost=1)
+
         if not data:
             logger.warning("coinalyze_symbol_map_empty; derivatives will be None")
             self._symbol_map_loaded = True
