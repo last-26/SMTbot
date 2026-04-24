@@ -13,7 +13,7 @@ AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar conf
 - **Entry TF:** 3m. HTF context 15m, LTF confirmation 1m.
 - **Scoring:** 5 pillars (Market Structure, Liquidity, Money Flow, VWAP, Divergence) + hard gates (displacement, EMA momentum, VWAP, cross-asset opposition) + ADX regime-conditional weights. Confluence threshold `min_confluence_score=3.75` (Pass 1 Optuna tune, 2026-04-22). *Premium/discount gate and HTF TP/SR ceiling temporarily disabled 2026-04-19 — see changelog; re-evaluated as Pass 3 candidates.*
 - **Execution:** post-only limit → regular limit → market-at-edge fallback. Single-leg OCO SL/TP at hard **1:2 RR** (tightened 1:3→1:2 on 2026-04-21 eve; partial TP disabled 2026-04-19 late-night — see changelog; `move_sl_to_be_after_tp1` flag kept but inert while partial off). Dynamic TP revision re-anchors the runner OCO to `entry ± 2 × sl_distance` every cycle, floor at 1.0R. **MFE-triggered SL lock (Option A, 2026-04-20)**: once MFE ≥ 1.3R (scaled from 2R when RR cap tightened), the runner OCO's SL is pulled to entry (+fee buffer) so the remaining 0.7R of target is risk-free. One-shot per position. **Maker-TP resting limit (2026-04-20)**: post-only reduce-only limit sits at TP price alongside the OCO — captures wicks as maker, avoids market-trigger latency.
-- **Sizing:** fee-aware ceil on per-contract total cost so total realized SL loss (price + fee reserve) ≥ target_risk across every symbol (2026-04-19 late-night-2). Overshoot bounded by one per-contract step (< $3 per position). Operator override via `RISK_AMOUNT_USDT` env (2026-04-20) bypasses percent-mode sizing; 10%-of-balance safety ceiling. Per-symbol `min_sl_distance_pct_per_symbol` floors bumped 25–50% on 2026-04-23 (Pass 2) for R=$100 breathing room: BTC 0.006, ETH 0.010, SOL 0.012, DOGE 0.010, BNB 0.007.
+- **Sizing:** fee-aware ceil on per-contract total cost so total realized SL loss (price + fee reserve) ≥ target_risk across every symbol (2026-04-19 late-night-2). Overshoot bounded by one per-contract step (< $3 per position). Operator override via `RISK_AMOUNT_USDT` env (2026-04-20) bypasses percent-mode sizing; 10%-of-balance safety ceiling. Per-symbol `min_sl_distance_pct_per_symbol` floors: BTC 0.004, ETH 0.008, SOL 0.010, DOGE 0.008, BNB 0.005 (reverted 2026-04-24 after the 2026-04-23 Pass 2 bump mechanically widened TPs at fixed 1:2 RR and collapsed post-bump WR 66.7%→22.2% across 9 trades — see changelog).
 - **Journal:** async SQLite, schema includes `on_chain_context`, `demo_artifact`, `confluence_pillar_scores`, `oscillator_raw_values` (all JSON). Separate tables: `rejected_signals` (counter-factual outcome pegged), `on_chain_snapshots` (Arkham state mutation time-series), `whale_transfers` (raw WS events for Phase 9 directional learning).
 - **On-chain (Arkham):** runtime soft signals only — daily bias ±15%, hourly stablecoin pulse +0.75 threshold penalty, altcoin-index +0.5 penalty on misaligned altcoin trades, **flow_alignment** 6-input directional score (stablecoin + BTC/ETH + Coinbase/Binance/Bybit 24h netflow; weights 0.25/0.25/0.15/0.15/0.10/0.10; default penalty 0.25), **per_symbol_cex_flow** binary penalty on misaligned symbol 1h volume (default 0.25, $5M floor). **Bitfinex + Kraken 24h netflow captured journal-only** (2026-04-23 night-late, 4th + 5th named venues — biggest single inflow / outflow in live probe vs. `type:cex` aggregate; not yet wired into `_flow_alignment_score` — Pass 3 decides weights). Whale HARD GATE removed 2026-04-22 — WS listener feeds `whale_transfers` journal for Pass 3 directional classification. Per-symbol token_volume fallback (2026-04-23): when Arkham `/token/volume/{id}` returns JSON `null` (confirmed for `solana`, `wrapped-solana`), `fetch_token_volume_last_hour` falls back to `/transfers/histogram` (flow=in + flow=out, last bucket) — zero coverage gap for the traded symbol set. **Netflow freeze fix (2026-04-23 night):** per-entity netflow rewritten from `/flow/entity/{entity}` (daily buckets, froze at UTC day close) to `/transfers/histogram?base=<entity>&granularity=1h&time_last=24h`; same fix for BTC/ETH aggregate. Daily-bundle refresh flipped from UTC-day gate to 5-min monotonic cadence (`on_chain.daily_snapshot_refresh_s: 300`) so `on_chain_snapshots` DB rows actually replace frozen values intraday. Credit-safe via v2 persistent WS streams + filter-fingerprint cache. All Arkham weights tuned in Pass 3.
 - **Pass 2 instrumentation:** every trade row now captures `confluence_pillar_scores` (factor name → weight dict) and `oscillator_raw_values` (per-TF dict with 1m/3m/15m OscillatorTableData numerics: wt1/wt2/rsi/rsi_mfi/stoch_k/d/momentum/divergence flags). Both sourced from existing runner TF-switch cache — zero extra TV latency.
@@ -292,6 +292,61 @@ Granularity fix alone wasn't enough — the whole daily-bundle branch was UTC-da
 2. **Per-entity freeze regression** — SQL: `SELECT COUNT(DISTINCT cex_coinbase_netflow_24h_usd) FROM on_chain_snapshots WHERE captured_at > <fix-commit-ts>`. Value < 5 over a 24h window means the histogram-based fetcher is itself returning stale data (Arkham indexer down, or the base=<entity> filter not matching).
 3. **Label budget drift** — `arkham_client.label_usage_pct` should stay flat at ~5-6% (558/10k baseline). Any upward drift means a histogram call is accidentally hitting a label-charging endpoint; investigate.
 4. **Signs flipped in new rows** — periodic spot-check: pick a row, live-probe Arkham `/transfers/histogram?base=bybit&flow=in/out&granularity=1h&time_last=24h`, sum in−out, compare to stored `cex_bybit_netflow_24h_usd`. Drift > 10% = indexer re-balance or aggregation logic drift.
+
+### 2026-04-24 — SL floor bump reverted (Pass 2 postmortem)
+
+Single-commit revert of the 2026-04-23 evening per-symbol `min_sl_distance_pct_per_symbol` bump after a 15-trade post-bump window showed unambiguous performance collapse. Operator flagged the shift from scalp-duration holds to multi-hour positions losing in chop; DB audit confirmed.
+
+**Data (pre-bump vs. post-bump, window = clean_since → 2026-04-24 01:00 UTC):**
+
+| Metric | Pre-bump (n=6) | Post-bump (n=9) | Delta |
+|---|---:|---:|---:|
+| Win rate | 66.7% | 22.2% | **−44.4pp** |
+| Net R | +4.15 | −6.01 | **−10.16R** |
+| Mean R | +0.69 | −0.67 | −1.36R |
+| Hold time | 70.6 min | 394.3 min | **5.6×** |
+| Mean SL dist % | 0.683% | 0.822% | +20.3% |
+| Mean TP dist % | 1.367% | 1.644% | +20.2% |
+| Trade frequency | 1.35/h | 0.38/h | 3.6× slower |
+| `zone_timeout_cancel` rejects | 14 | 52 | **3.7×** |
+
+Per-symbol post-bump: BTC 1/3, ETH 0/1, SOL 0/1, DOGE 0/2, BNB 1/2. DOGE+SOL (widest %-bump) went 0/3.
+
+**Causal chain (code-verified):**
+
+1. **Fixed 1:2 RR → mechanical TP widening.** `tp_price = entry ± sl_distance × target_rr_ratio` at [rr_system.py:170-172](src/strategy/rr_system.py). A 50% SL floor bump locks in a 50% wider TP with no escape path.
+2. **Dynamic TP revision re-anchors the wider distance for the full lifetime.** [runner.py:1273-1285](src/bot/runner.py) reads immutable `plan_sl_price` (captured at fill) every 30s and re-computes TP at `entry ± 2 × sl_distance`. The floor-widened SL therefore persists as widened TP across cycles.
+3. **MFE-lock (1.3R) triggers later in absolute price.** Lock distance = `1.3 × sl_pct × entry` → BTC pre-bump $327 move, post-bump $491 (+50%). The "almost-win → risk-free" safety net fires less often in choppy tape; 1.0R trades peak and fall back to −1R instead of locking at BE. Accounts for most of the 7/9 post-bump loss cluster.
+4. **Zone edges widened → pending limits starve.** `apply_zone_to_plan` re-applies the floor at [setup_planner.py:510-518](src/strategy/setup_planner.py); widened edges miss fills more often, inflating `zone_timeout_cancel`.
+
+**Confounds considered:** Arkham netflow freeze (first 8 post-restart trades frozen) affected 6 pre-bump + 2 post-bump rows — biases AGAINST pre-bump group, yet pre-bump still won 66.7%, so the signal-quality confound actually understates the bump impact. Market regime (chop) amplifies the mechanism but is not causal. Sample (n=6/9) small, but effect size (−44pp WR, 5.6× hold) far exceeds plausible noise and mechanism is reproducible in code.
+
+**Reverted values (match pre-2026-04-23 Pass 1 profile):**
+
+| Symbol | Bumped | Reverted | Rationale |
+|---|---:|---:|---|
+| BTC-USDT-SWAP | 0.006 | **0.004** | Pass 1 baseline |
+| ETH-USDT-SWAP | 0.010 | **0.008** | preserves 2026-04-21 eve 0.006→0.008 bump |
+| SOL-USDT-SWAP | 0.012 | **0.010** | Pass 1 baseline |
+| DOGE-USDT-SWAP | 0.010 | **0.008** | Pass 1 baseline |
+| BNB-USDT-SWAP | 0.007 | **0.005** | back to global-default parity |
+| XRP / ADA (not watched) | 0.010 | **0.008** | parallel revert |
+
+`RISK_AMOUNT_USDT=$100` unchanged; fee-aware ceil sizer auto-widens notional (`risk / sl_pct = notional`) so R stays flat. `target_rr_ratio=2.0` and `sl_lock_mfe_r=1.3` unchanged — Pass 3 tune candidates, not bump-triggered knobs.
+
+**4 open positions at revert time (ETH 21:13 / SOL 22:00 / BTC 00:53 / BNB 01:01) retain their bumped SL/TP** — retroactive cancel+replace risks race conditions with `_pending` and algo-sweep code. They clear naturally via SL/TP hit or timeout.
+
+**Explicitly NOT done:** partial asymmetric revert (only DOGE+SOL), `target_rr_ratio` tighten, `sl_lock_mfe_r` lower. All deferred to Pass 3 tune — mechanical bump revert is the smallest change that restores the Pass 1 trade-shape profile.
+
+**Tests:** config change only, no code touched. 1063 tests unchanged.
+
+**Re-eval triggers:**
+
+1. **Post-revert WR** over 10 closed trades — target ≥ 40% (break-even @ 1:2 RR is 33.3%, Pass 1 baseline was 47.6%).
+2. **Post-revert hold time** — target < 150 min median (pre-bump was 70 min; 150 min is ~2× pre-bump, still sub-chop-horizon).
+3. **`zone_timeout_cancel` rate** as fraction of total rejects — target < 25% (post-bump was 32%; pre-bump was ~16%).
+4. **`no_sl_source` / `tp_too_tight` reject spikes** — BTC 0.4% floor can occasionally land SL inside OKX fee + mark drift; if either reject rate > 5% of entry attempts, tighten that specific symbol's floor one step (e.g. BTC 0.004 → 0.005).
+5. **If post-revert metrics fail** — do NOT re-bump floors. Either collect more data (regime-driven noise) or investigate upstream signal quality (confluence threshold, pillar weights). Bump mechanism is proven harmful at fixed 1:2 RR.
 
 ### Historical context (pre-Pass-1, 2026-04-19 → 2026-04-21)
 

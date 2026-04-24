@@ -185,24 +185,24 @@ analysis:
   # XRP) routinely need more breathing room than BTC/ETH. Values below sit
   # ~1–1.5× typical 3m ATR-as-% per symbol. Unlisted → global.
   #
-  # 2026-04-23 (Pass 2 early): operator raised RISK_AMOUNT_USDT to $100
-  # and flagged TP/SL levels as "too tight" — floors were doubling as the
-  # binding constraint on most entries, landing SL well inside 1m-3m
-  # noise envelopes. Floors bumped 25-50% to give wicks real breathing
-  # room. R ($100) stays flat; notional auto-shrinks (`risk_amount / sl_pct`).
-  # Example — BNB: old 0.5% floor × $20k notional = $100 R; new 0.7% ×
-  # $14.3k = $100 R. 40% less leverage exposure, 40% more wick protection.
-  # Re-eval after 20+ closed trades post-bump: if wick-out rate > 40%,
-  # loosen further; if accept-rate crumbles (entries hit notional min),
-  # tighten one step.
+  # 2026-04-24: REVERTED the 2026-04-23 Pass 2 floor bump. A 15-trade window
+  # (6 pre-bump, 9 post-bump) showed WR collapse 66.7%→22.2%, net −10.16R,
+  # hold time 5.6× longer (70→394 min). Fixed 1:2 RR means a wider SL
+  # mechanically widens TP in lockstep; wider TPs got whipsawed in the
+  # choppy market regime and MFE-lock (1.3R absolute R-multiple) became
+  # harder to trigger at the wider absolute price distance. zone_timeout_cancel
+  # rejects also spiked 3.7× (14→52) because widened zone edges missed fills.
+  # Reverted values = Pass 1 profile that produced +13.46R over 42 trades.
+  # R=$100 stays flat; fee-aware ceil sizer widens notional back (risk/sl_pct).
+  # See CLAUDE.md 2026-04-24 changelog entry for full postmortem.
   min_sl_distance_pct_per_symbol:
-    BTC-USDT-SWAP: 0.006    # 2026-04-23 Pass 2: 0.004 → 0.006 (+50%); previously sub-ATR floor wicked frequently
-    ETH-USDT-SWAP: 0.010    # 2026-04-23 Pass 2: 0.008 → 0.010 (+25%); earlier 0.006→0.008 on 2026-04-21 eve
-    SOL-USDT-SWAP: 0.012    # 2026-04-23 Pass 2: 0.010 → 0.012 (+20%)
-    DOGE-USDT-SWAP: 0.010   # 2026-04-23 Pass 2: 0.008 → 0.010 (+25%)
-    XRP-USDT-SWAP: 0.010    # kept parallel to DOGE (symbol currently not watched, floor preserved for reinstatement)
-    ADA-USDT-SWAP: 0.010    # SOL/DOGE-profile thin alt (2026-04-23 Pass 2: 0.008 → 0.010, parallel bump; currently not watched)
-    BNB-USDT-SWAP: 0.007    # 2026-04-23 Pass 2: 0.005 → 0.007 (+40%); previously tied with global default (0.005)
+    BTC-USDT-SWAP: 0.004    # 2026-04-24 REVERT from 0.006 (Pass 2 bump backfired)
+    ETH-USDT-SWAP: 0.008    # 2026-04-24 REVERT from 0.010 (keeps the 2026-04-21 eve level: 0.006→0.008 then)
+    SOL-USDT-SWAP: 0.010    # 2026-04-24 REVERT from 0.012
+    DOGE-USDT-SWAP: 0.008   # 2026-04-24 REVERT from 0.010
+    XRP-USDT-SWAP: 0.008    # parallel revert (symbol not watched; consistent with DOGE profile)
+    ADA-USDT-SWAP: 0.008    # parallel revert (symbol not watched)
+    BNB-USDT-SWAP: 0.005    # 2026-04-24 REVERT from 0.007; back to global-default parity
   # Confluence weight overrides — empty = DEFAULT_WEIGHTS from
   # src/analysis/multi_timeframe.py (Moderate rebalance baseline below is
   # already baked into code). Only keys set here override; others stay at
