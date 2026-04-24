@@ -61,6 +61,18 @@ class DerivativesState:
     liq_stream_healthy: bool = False
     coinalyze_snapshot_age_s: float = 9999.0
 
+    # 2026-04-24 — per-exchange derivatives snapshot (Binance/Bybit/OKX). The
+    # single-exchange fields above are the liquidity-ranked primary source
+    # (usually Binance); these dicts capture the same metrics across the 3
+    # venues the bot actually trades against. Journal-only (Pass 3 prep);
+    # the classifier and runtime scoring keep using the single-exchange
+    # values. Empty dict when `_per_exchange_symbol_map` is unpopulated
+    # (startup, credits exhausted) or when a specific venue doesn't host the
+    # symbol (DOGE on OKX, etc.).
+    oi_per_exchange_usd: dict = field(default_factory=dict)
+    funding_per_exchange: dict = field(default_factory=dict)
+    funding_predicted_per_exchange: dict = field(default_factory=dict)
+
 
 class DerivativesCache:
     def __init__(
@@ -142,6 +154,19 @@ class DerivativesCache:
                 except Exception as e:
                     logger.warning("deriv_refresh_failed symbol={} err={!r}",
                                    symbol, e)
+            # 2026-04-24 — per-exchange batch capture for Pass 3 journal.
+            # Runs once per full refresh cycle (not per symbol) because each
+            # endpoint takes `symbols=sym1,sym2,...` up to 20 entries and we
+            # cover 5 symbols × 3 exchanges = 15 in a single call. +3 calls
+            # per cycle total, label-free, well inside the 40/min budget.
+            # Failures isolate per metric — OI may land while funding misses.
+            if not self._stop.is_set():
+                try:
+                    await self._refresh_per_exchange_snapshot()
+                except Exception as e:
+                    logger.warning(
+                        "deriv_per_exchange_refresh_failed err={!r}", e,
+                    )
             try:
                 await asyncio.wait_for(
                     self._stop.wait(), timeout=self.refresh_interval_s,
@@ -230,6 +255,48 @@ class DerivativesCache:
         state.regime = analysis.regime.value
 
         state.ts_ms = now_ms
+
+    async def _refresh_per_exchange_snapshot(self) -> None:
+        """2026-04-24 — fan out Binance/Bybit/OKX OI + funding + predicted
+        funding into each `DerivativesState`. Journal-only; runtime scoring
+        keeps reading the single-exchange fields. 3 API calls total per
+        refresh cycle (each covers all watched symbols via comma batching).
+        Each metric fails independently — a funding outage leaves the
+        OI-per-exchange dict populated and vice versa."""
+        try:
+            oi_map = await self.coinalyze.fetch_per_exchange_oi_usd()
+        except Exception as e:
+            logger.warning("deriv_per_exchange_oi_failed err={!r}", e)
+            oi_map = {}
+        try:
+            fund_map = await self.coinalyze.fetch_per_exchange_funding()
+        except Exception as e:
+            logger.warning("deriv_per_exchange_funding_failed err={!r}", e)
+            fund_map = {}
+        try:
+            pred_map = await self.coinalyze.fetch_per_exchange_predicted_funding()
+        except Exception as e:
+            logger.warning(
+                "deriv_per_exchange_predicted_funding_failed err={!r}", e,
+            )
+            pred_map = {}
+        for symbol in self.watched:
+            state = self._states[symbol]
+            state.oi_per_exchange_usd = dict(oi_map.get(symbol, {}))
+            state.funding_per_exchange = dict(fund_map.get(symbol, {}))
+            state.funding_predicted_per_exchange = dict(
+                pred_map.get(symbol, {}),
+            )
+        n_hits = sum(1 for s in self._states.values() if s.oi_per_exchange_usd)
+        if n_hits > 0:
+            logger.info(
+                "deriv_per_exchange_refreshed symbols_with_oi={} "
+                "symbols_with_funding={} symbols_with_predicted={}",
+                n_hits,
+                sum(1 for s in self._states.values() if s.funding_per_exchange),
+                sum(1 for s in self._states.values()
+                    if s.funding_predicted_per_exchange),
+            )
 
     # ── Query ─────────────────────────────────────────────────────────────
 
