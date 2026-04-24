@@ -68,14 +68,6 @@ class CoinalyzeClient:
         self._max_retries = max_retries
         self._symbol_map: dict[str, str] = {}
         self._symbol_map_loaded = False
-        # 2026-04-24 — per-exchange map for journal-only Pass 3 capture.
-        # Shape: {okx_sym: {exchange_code: coinalyze_sym}} covering Binance
-        # (.A), Bybit (.6), OKX (.3). Populated alongside `_symbol_map` in
-        # `ensure_symbol_map`; empty until that runs. Missing exchanges for a
-        # given symbol stay absent from the inner dict (vs. None-filled) so
-        # callers distinguish "market doesn't exist on this venue" from
-        # "fetch returned None".
-        self._per_exchange_symbol_map: dict[str, dict[str, str]] = {}
         # Token bucket — 40 tokens/minute.
         self._rate_tokens = 40.0
         self._rate_capacity = 40.0
@@ -204,19 +196,6 @@ class CoinalyzeClient:
             logger.info("coinalyze_mapping okx={} coinalyze={}",
                         okx_sym, chosen["symbol"])
 
-            # 2026-04-24 — also record per-exchange symbols for Binance /
-            # Bybit / OKX so the per-exchange journal fetchers can resolve
-            # each venue's Coinalyze symbol without rescanning candidates.
-            per_ex: dict[str, str] = {}
-            for code, label in (("A", "binance"), ("6", "bybit"),
-                                ("3", "okx")):
-                for c in candidates:
-                    if c.get("symbol", "").endswith(f".{code}"):
-                        per_ex[label] = c["symbol"]
-                        break
-            if per_ex:
-                self._per_exchange_symbol_map[okx_sym] = per_ex
-
         self._symbol_map_loaded = True
 
     def coinalyze_symbol(self, okx_symbol: str) -> Optional[str]:
@@ -251,88 +230,6 @@ class CoinalyzeClient:
         return await self._fetch_current_value(
             "/predicted-funding-rate", coinalyze_symbol,
         )
-
-    # ── Per-exchange batch endpoints (2026-04-24, journal-only) ───────────
-    #
-    # One batch call covers all watched symbols × Binance/Bybit/OKX (up to 15
-    # symbols; API limit is 20). Cost: 1 call per metric regardless of how
-    # many symbols are watched. Returns {okx_symbol: {exchange_label: value}}
-    # dicts. Missing venues omitted (not None-filled) so the caller can tell
-    # "not supported on this venue" apart from a fetch failure. On any
-    # failure the method returns an empty dict and logs a warning — callers
-    # must tolerate this and skip writing, not raise.
-
-    async def _batch_fetch_current_values(
-        self,
-        path: str,
-        params: Optional[dict] = None,
-    ) -> dict[str, float]:
-        """Batch variant of `_fetch_current_value`. Builds a comma-joined
-        `symbols=...` query spanning every (okx_sym, exchange_label) entry in
-        `self._per_exchange_symbol_map` and returns `{coinalyze_sym: value}`.
-        Caller regroups by okx_symbol + exchange_label."""
-        if not self._per_exchange_symbol_map:
-            return {}
-        coinalyze_syms: list[str] = []
-        for _okx, venues in self._per_exchange_symbol_map.items():
-            coinalyze_syms.extend(venues.values())
-        if not coinalyze_syms:
-            return {}
-        q = {"symbols": ",".join(coinalyze_syms)}
-        if params:
-            q.update(params)
-        data = await self._request(path, q, cost=1)
-        if not data or not isinstance(data, list):
-            return {}
-        out: dict[str, float] = {}
-        for row in data:
-            try:
-                sym = row.get("symbol")
-                val = float(row.get("value", 0.0))
-            except (AttributeError, TypeError, ValueError):
-                continue
-            if sym:
-                out[sym] = val
-        return out
-
-    def _regroup_by_okx_symbol(
-        self, flat: dict[str, float],
-    ) -> dict[str, dict[str, float]]:
-        """Turn `{coinalyze_sym: value}` into `{okx_sym: {exchange_label: value}}`
-        using the per-exchange map. Absent exchanges are omitted."""
-        out: dict[str, dict[str, float]] = {}
-        for okx_sym, venues in self._per_exchange_symbol_map.items():
-            nested: dict[str, float] = {}
-            for label, cn_sym in venues.items():
-                if cn_sym in flat:
-                    nested[label] = flat[cn_sym]
-            if nested:
-                out[okx_sym] = nested
-        return out
-
-    async def fetch_per_exchange_oi_usd(self) -> dict[str, dict[str, float]]:
-        """Current OI (USD) per symbol × Binance/Bybit/OKX. 1 API call."""
-        flat = await self._batch_fetch_current_values(
-            "/open-interest", params={"convert_to_usd": "true"},
-        )
-        return self._regroup_by_okx_symbol(flat)
-
-    async def fetch_per_exchange_funding(
-        self,
-    ) -> dict[str, dict[str, float]]:
-        """Current funding rate per symbol × Binance/Bybit/OKX. 1 API call.
-        Values are raw decimals (0.0001 = 0.01%/8h)."""
-        flat = await self._batch_fetch_current_values("/funding-rate")
-        return self._regroup_by_okx_symbol(flat)
-
-    async def fetch_per_exchange_predicted_funding(
-        self,
-    ) -> dict[str, dict[str, float]]:
-        """Next-funding prediction per symbol × Binance/Bybit/OKX. 1 call."""
-        flat = await self._batch_fetch_current_values(
-            "/predicted-funding-rate",
-        )
-        return self._regroup_by_okx_symbol(flat)
 
     # ── History endpoints (nested: {symbol, history: [...]}) ──────────────
 
@@ -460,23 +357,14 @@ class CoinalyzeClient:
     # ── Aggregate snapshot ────────────────────────────────────────────────
 
     async def fetch_snapshot(self, okx_symbol: str) -> Optional[DerivativesSnapshot]:
-        """4 sequential per-symbol calls.
-
-        2026-04-24 — `fetch_predicted_funding` dropped from per-symbol
-        refresh to free ~5 calls/min from the 40/min Coinalyze budget.
-        It's a journal-only field (no runtime consumer) and the per-
-        exchange batch captures it for Binance/Bybit/OKX every ~5 cycles
-        — primary (Binance) value is refreshed there and written into
-        `state.funding_rate_predicted` by `_refresh_per_exchange_snapshot`.
-        Staleness between per-exchange fires: up to ~8-10 min. Predicted
-        funding updates only each ~8h cycle on exchanges, so this is
-        comfortably below the natural update cadence."""
+        """5 sequential per-symbol calls. Paralleling would blow the bucket."""
         cn_sym = self._symbol_map.get(okx_symbol)
         if not cn_sym:
             return None
 
         oi = await self.fetch_current_oi_usd(cn_sym)
         funding = await self.fetch_current_funding(cn_sym)
+        predicted = await self.fetch_predicted_funding(cn_sym)
         liq = await self.fetch_liquidation_history(cn_sym, "1hour", 1)
         ls = await self.fetch_long_short_ratio(cn_sym, "1hour")
 
@@ -484,10 +372,7 @@ class CoinalyzeClient:
             symbol=okx_symbol,
             ts_ms=int(time.time() * 1000),
             funding_rate_current=funding or 0.0,
-            # 2026-04-24 — populated by _refresh_per_exchange_snapshot
-            # (every ~5 cycles, Binance slot). 0.0 here = "use prior value
-            # from state" since _refresh_one no longer reassigns this field.
-            funding_rate_predicted=0.0,
+            funding_rate_predicted=predicted or 0.0,
             open_interest_usd=oi or 0.0,
             long_short_ratio=(ls or {}).get("ratio", 1.0),
             long_share=(ls or {}).get("long_share", 0.5),

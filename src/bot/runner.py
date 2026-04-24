@@ -392,12 +392,6 @@ def _derive_enrichment(
         "price_change_1h_pct_at_entry": None,
         "price_change_4h_pct_at_entry": None,
         "liq_heatmap_top_clusters": {},
-        # 2026-04-24 — per-exchange derivatives (Binance/Bybit/OKX). Dicts
-        # default empty; Pass 3 GBT reads {"binance": float, "bybit": float,
-        # "okx": float} for funding-spread + OI-share + cross-venue features.
-        "oi_per_exchange_usd_at_entry": {},
-        "funding_rate_per_exchange_at_entry": {},
-        "funding_rate_predicted_per_exchange_at_entry": {},
     }
     deriv = getattr(state, "derivatives", None)
     if deriv is not None:
@@ -415,17 +409,6 @@ def _derive_enrichment(
         out["long_liq_notional_1h_at_entry"] = getattr(deriv, "long_liq_notional_1h", None)
         out["short_liq_notional_1h_at_entry"] = getattr(deriv, "short_liq_notional_1h", None)
         out["ls_ratio_zscore_14d_at_entry"] = getattr(deriv, "ls_ratio_zscore_14d", None)
-        # 2026-04-24 — per-exchange derivatives dicts. `dict(... or {})`
-        # copies so downstream serialisation can't accidentally mutate cache.
-        out["oi_per_exchange_usd_at_entry"] = dict(
-            getattr(deriv, "oi_per_exchange_usd", None) or {},
-        )
-        out["funding_rate_per_exchange_at_entry"] = dict(
-            getattr(deriv, "funding_per_exchange", None) or {},
-        )
-        out["funding_rate_predicted_per_exchange_at_entry"] = dict(
-            getattr(deriv, "funding_predicted_per_exchange", None) or {},
-        )
     hm = getattr(state, "liquidity_heatmap", None)
     price = float(getattr(state, "current_price", 0.0) or 0.0)
     atr = float(getattr(state, "atr", 0.0) or 0.0)
@@ -1606,13 +1589,6 @@ class BotRunner:
             oscillator_raw_values=self._build_oscillator_raw_values(
                 symbol, state,
             ),
-            # 2026-04-24 — per-exchange derivatives (Binance/Bybit/OKX).
-            oi_per_exchange_usd_at_entry=enrichment.get(
-                "oi_per_exchange_usd_at_entry", {}),
-            funding_rate_per_exchange_at_entry=enrichment.get(
-                "funding_rate_per_exchange_at_entry", {}),
-            funding_rate_predicted_per_exchange_at_entry=enrichment.get(
-                "funding_rate_predicted_per_exchange_at_entry", {}),
         )
 
     def _is_ltf_reversal(self, ltf: LTFState, open_side: str, max_age: int) -> bool:
@@ -3191,13 +3167,6 @@ class BotRunner:
                 oscillator_raw_values=dict(
                     meta.oscillator_raw_values_at_placement or {}
                 ),
-                # 2026-04-24 — per-exchange derivatives (Binance/Bybit/OKX).
-                oi_per_exchange_usd_at_entry=enrichment.get(
-                    "oi_per_exchange_usd_at_entry", {}),
-                funding_rate_per_exchange_at_entry=enrichment.get(
-                    "funding_rate_per_exchange_at_entry", {}),
-                funding_rate_predicted_per_exchange_at_entry=enrichment.get(
-                    "funding_rate_predicted_per_exchange_at_entry", {}),
             )
         except Exception:
             logger.debug(

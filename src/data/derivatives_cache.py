@@ -61,18 +61,6 @@ class DerivativesState:
     liq_stream_healthy: bool = False
     coinalyze_snapshot_age_s: float = 9999.0
 
-    # 2026-04-24 — per-exchange derivatives snapshot (Binance/Bybit/OKX). The
-    # single-exchange fields above are the liquidity-ranked primary source
-    # (usually Binance); these dicts capture the same metrics across the 3
-    # venues the bot actually trades against. Journal-only (Pass 3 prep);
-    # the classifier and runtime scoring keep using the single-exchange
-    # values. Empty dict when `_per_exchange_symbol_map` is unpopulated
-    # (startup, credits exhausted) or when a specific venue doesn't host the
-    # symbol (DOGE on OKX, etc.).
-    oi_per_exchange_usd: dict = field(default_factory=dict)
-    funding_per_exchange: dict = field(default_factory=dict)
-    funding_predicted_per_exchange: dict = field(default_factory=dict)
-
 
 class DerivativesCache:
     def __init__(
@@ -100,20 +88,6 @@ class DerivativesCache:
         self._funding_history: dict[str, list[float]] = {s: [] for s in self.watched}
         self._ls_history: dict[str, list[float]] = {s: [] for s in self.watched}
         self._oi_refresh_counter: dict[str, int] = {s: 0 for s in self.watched}
-        # 2026-04-24 — per-exchange capture runs every Nth cycle, not every
-        # cycle. Per-symbol refresh already consumes ~25 Coinalyze calls/min
-        # at default refresh_interval_s=60; adding 3 extra batch calls each
-        # cycle sustained the 40/min burst limit and funding+predicted kept
-        # hitting 429. Every-3-cycles = once per ~3 min, plenty for journal-
-        # only capture + leaves a 2-cycle gap for the token bucket to refill.
-        self._per_exchange_cycle_counter: int = 0
-        # 2026-04-24 (iter 2) — cadence bumped 3 → 5 after observing that
-        # even 3-cycle spacing kept hitting 429 on funding batch. Root
-        # cause: Coinalyze's server-side rolling 60s counter stays saturated
-        # because per-symbol refresh's 25-call burst leaves no recovery
-        # window. 5-cycle cadence = ~7.5 min first fire, ~5 min steady
-        # state. Pass 3 tolerates this granularity (funding changes slow).
-        self._per_exchange_every_n_cycles: int = 5
         self._stop = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
 
@@ -168,24 +142,6 @@ class DerivativesCache:
                 except Exception as e:
                     logger.warning("deriv_refresh_failed symbol={} err={!r}",
                                    symbol, e)
-            # 2026-04-24 — per-exchange batch capture (Binance/Bybit/OKX
-            # OI + funding + predicted funding). Runs every Nth cycle (not
-            # every cycle) because per-symbol refresh already consumes ~25
-            # Coinalyze calls/min at refresh_interval_s=60; adding 3 batch
-            # calls each cycle sustained 40/min burst and funding kept 429.
-            # Every-3-cycles = once per ~3 min, 28-call cycles interleave
-            # with 25-call cycles so the token bucket breathes. Journal-
-            # only capture — 3-min granularity is plenty for Pass 3.
-            if not self._stop.is_set():
-                self._per_exchange_cycle_counter += 1
-                if (self._per_exchange_cycle_counter
-                        % self._per_exchange_every_n_cycles == 0):
-                    try:
-                        await self._refresh_per_exchange_snapshot()
-                    except Exception as e:
-                        logger.warning(
-                            "deriv_per_exchange_refresh_failed err={!r}", e,
-                        )
             try:
                 await asyncio.wait_for(
                     self._stop.wait(), timeout=self.refresh_interval_s,
@@ -213,16 +169,11 @@ class DerivativesCache:
         )
         state.liq_stream_healthy = self.liq_stream is not None
 
-        # 2) Coinalyze snapshot (4 API calls — predicted_funding dropped
-        #    2026-04-24 to free ~5 calls/min from the 40/min budget; now
-        #    owned by _refresh_per_exchange_snapshot from Binance slot).
+        # 2) Coinalyze snapshot (5 API calls).
         snap = await self.coinalyze.fetch_snapshot(symbol)
         if snap is not None:
             state.funding_rate_current = snap.funding_rate_current
-            # funding_rate_predicted intentionally NOT reassigned here — it
-            # holds the last per-exchange-refresh value. Reassigning to
-            # snap.funding_rate_predicted (now hardcoded 0.0) would wipe it
-            # every per-symbol cycle.
+            state.funding_rate_predicted = snap.funding_rate_predicted
             state.open_interest_usd = snap.open_interest_usd
             state.long_short_ratio = snap.long_short_ratio
             state.coinalyze_snapshot_age_s = 0.0
@@ -279,77 +230,6 @@ class DerivativesCache:
         state.regime = analysis.regime.value
 
         state.ts_ms = now_ms
-
-    async def _refresh_per_exchange_snapshot(self) -> None:
-        """2026-04-24 — fan out Binance/Bybit/OKX OI + funding + predicted
-        funding into each `DerivativesState`. Journal-only; runtime scoring
-        keeps reading the single-exchange fields. 3 API calls total per
-        refresh cycle (each covers all watched symbols via comma batching).
-        Each metric fails independently — a funding outage leaves the
-        OI-per-exchange dict populated and vice versa.
-
-        Inter-batch sleep (3.0s) spreads the 3 back-to-back calls across
-        ~6s so Coinalyze's server-side rate counter (40/min, with burst
-        detection stricter than the client-side token bucket) can refill
-        ~2 tokens between each call.
-
-        2026-04-24 (iter 2) — early-skip when the coinalyze client is in
-        its 429 pause window. Burning 3 doomed calls (OI→succeed, funding
-        →429→set pause, predicted→short-circuit None) wastes the budget
-        and produces partial data that misleads Pass 3 (OI only, no
-        funding). Better to skip entirely and retry next cadence cycle."""
-        _INTER_BATCH_SLEEP_S = 3.0
-        if self.coinalyze._rate_pause_until > time.monotonic():
-            remaining = self.coinalyze._rate_pause_until - time.monotonic()
-            logger.info(
-                "deriv_per_exchange_skipped_rate_paused remaining_s={:.1f}",
-                remaining,
-            )
-            return
-        try:
-            oi_map = await self.coinalyze.fetch_per_exchange_oi_usd()
-        except Exception as e:
-            logger.warning("deriv_per_exchange_oi_failed err={!r}", e)
-            oi_map = {}
-        await asyncio.sleep(_INTER_BATCH_SLEEP_S)
-        try:
-            fund_map = await self.coinalyze.fetch_per_exchange_funding()
-        except Exception as e:
-            logger.warning("deriv_per_exchange_funding_failed err={!r}", e)
-            fund_map = {}
-        await asyncio.sleep(_INTER_BATCH_SLEEP_S)
-        try:
-            pred_map = await self.coinalyze.fetch_per_exchange_predicted_funding()
-        except Exception as e:
-            logger.warning(
-                "deriv_per_exchange_predicted_funding_failed err={!r}", e,
-            )
-            pred_map = {}
-        for symbol in self.watched:
-            state = self._states[symbol]
-            state.oi_per_exchange_usd = dict(oi_map.get(symbol, {}))
-            state.funding_per_exchange = dict(fund_map.get(symbol, {}))
-            state.funding_predicted_per_exchange = dict(
-                pred_map.get(symbol, {}),
-            )
-            # 2026-04-24 — also refresh the single-exchange
-            # `funding_rate_predicted` (Binance slot, primary venue) here
-            # since per-symbol refresh no longer fetches it. Only update
-            # when we actually have fresh data — if pred_map is empty (429
-            # on that batch), keep the prior value rather than zeroing it.
-            pred_for_symbol = pred_map.get(symbol, {})
-            if "binance" in pred_for_symbol:
-                state.funding_rate_predicted = pred_for_symbol["binance"]
-        n_hits = sum(1 for s in self._states.values() if s.oi_per_exchange_usd)
-        if n_hits > 0:
-            logger.info(
-                "deriv_per_exchange_refreshed symbols_with_oi={} "
-                "symbols_with_funding={} symbols_with_predicted={}",
-                n_hits,
-                sum(1 for s in self._states.values() if s.funding_per_exchange),
-                sum(1 for s in self._states.values()
-                    if s.funding_predicted_per_exchange),
-            )
 
     # ── Query ─────────────────────────────────────────────────────────────
 

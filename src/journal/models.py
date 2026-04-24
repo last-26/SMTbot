@@ -211,20 +211,6 @@ class TradeRecord(BaseModel):
     # Default empty dict; richer target/magnet modelling in Pass 3 vs just
     # the nearest-above/nearest-below pair.
     liq_heatmap_top_clusters: dict = Field(default_factory=dict)
-    # 2026-04-24 — per-exchange derivatives snapshot (Binance/Bybit/OKX). Bot
-    # currently scores against ONE exchange per symbol (liquidity-ranked,
-    # usually Binance). These dicts capture the same metrics across the 3
-    # venues the bot actually trades against, so Pass 3 GBT can learn:
-    #   * funding spread (Binance +0.03% vs OKX −0.01% = crowded positioning)
-    #   * OI share drift (flow-of-money between venues)
-    #   * funding × OI divergence (late longs chasing → reversal setup)
-    # Shape: {"binance": float, "bybit": float, "okx": float}; missing
-    # exchanges omitted rather than zero-filled so Pass 3 can distinguish
-    # "unsupported market" from "actually flat". Journal-only — no runtime
-    # scoring reads these yet.
-    oi_per_exchange_usd_at_entry: dict = Field(default_factory=dict)
-    funding_rate_per_exchange_at_entry: dict = Field(default_factory=dict)
-    funding_rate_predicted_per_exchange_at_entry: dict = Field(default_factory=dict)
 
     @property
     def is_open(self) -> bool:
@@ -340,10 +326,6 @@ class RejectedSignal(BaseModel):
     price_change_1h_pct_at_entry: Optional[float] = None
     price_change_4h_pct_at_entry: Optional[float] = None
     liq_heatmap_top_clusters: dict = Field(default_factory=dict)
-    # 2026-04-24 — mirrors TradeRecord.* per-exchange derivatives snapshot.
-    oi_per_exchange_usd_at_entry: dict = Field(default_factory=dict)
-    funding_rate_per_exchange_at_entry: dict = Field(default_factory=dict)
-    funding_rate_predicted_per_exchange_at_entry: dict = Field(default_factory=dict)
 
 
 class WhaleTransferRecord(BaseModel):

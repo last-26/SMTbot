@@ -145,16 +145,7 @@ CREATE TABLE IF NOT EXISTS trades (
     -- `{"above": [{price, notional_usd, distance_atr}, ...],
     --   "below": [{...}, ...]}`.
     -- Default '{}' when heatmap missing or already-open HTF skip empties cache.
-    liq_heatmap_top_clusters_json    TEXT NOT NULL DEFAULT '{}',
-
-    -- 2026-04-24 — per-exchange derivatives snapshot for Binance/Bybit/OKX
-    -- (the 3 venues the bot actually trades against). Mirrors the single-
-    -- exchange OI/funding columns above with a {"binance": .., "bybit": ..,
-    -- "okx": ..} JSON dict per metric. Pass 3 GBT reads these for funding-
-    -- spread + OI-share signals. Default '{}' on pre-migration rows.
-    oi_per_exchange_usd_json_at_entry                    TEXT NOT NULL DEFAULT '{}',
-    funding_rate_per_exchange_json_at_entry              TEXT NOT NULL DEFAULT '{}',
-    funding_rate_predicted_per_exchange_json_at_entry    TEXT NOT NULL DEFAULT '{}'
+    liq_heatmap_top_clusters_json    TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_trades_outcome      ON trades(outcome);
@@ -230,13 +221,7 @@ CREATE TABLE IF NOT EXISTS rejected_signals (
     ls_ratio_zscore_14d_at_entry     REAL,
     price_change_1h_pct_at_entry     REAL,
     price_change_4h_pct_at_entry     REAL,
-    liq_heatmap_top_clusters_json    TEXT NOT NULL DEFAULT '{}',
-
-    -- 2026-04-24 — mirrors trades.* per-exchange derivatives snapshot for
-    -- Binance/Bybit/OKX. Journal-only.
-    oi_per_exchange_usd_json_at_entry                    TEXT NOT NULL DEFAULT '{}',
-    funding_rate_per_exchange_json_at_entry              TEXT NOT NULL DEFAULT '{}',
-    funding_rate_predicted_per_exchange_json_at_entry    TEXT NOT NULL DEFAULT '{}'
+    liq_heatmap_top_clusters_json    TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_rejected_symbol_ts  ON rejected_signals(symbol, signal_timestamp);
@@ -350,10 +335,6 @@ _COLUMNS = [
     "price_change_1h_pct_at_entry",
     "price_change_4h_pct_at_entry",
     "liq_heatmap_top_clusters_json",
-    # 2026-04-24 — per-exchange derivatives (Binance/Bybit/OKX).
-    "oi_per_exchange_usd_json_at_entry",
-    "funding_rate_per_exchange_json_at_entry",
-    "funding_rate_predicted_per_exchange_json_at_entry",
 ]
 
 
@@ -382,10 +363,6 @@ _REJECTED_COLUMNS = [
     "price_change_1h_pct_at_entry",
     "price_change_4h_pct_at_entry",
     "liq_heatmap_top_clusters_json",
-    # 2026-04-24 — per-exchange derivatives (Binance/Bybit/OKX).
-    "oi_per_exchange_usd_json_at_entry",
-    "funding_rate_per_exchange_json_at_entry",
-    "funding_rate_predicted_per_exchange_json_at_entry",
 ]
 
 
@@ -473,18 +450,25 @@ _MIGRATIONS = [
     "ALTER TABLE rejected_signals ADD COLUMN price_change_1h_pct_at_entry REAL",
     "ALTER TABLE rejected_signals ADD COLUMN price_change_4h_pct_at_entry REAL",
     "ALTER TABLE rejected_signals ADD COLUMN liq_heatmap_top_clusters_json TEXT NOT NULL DEFAULT '{}'",
-    # 2026-04-24 — per-exchange derivatives (Binance/Bybit/OKX) snapshot JSON
-    # per metric. Bot currently scores against ONE exchange per symbol
-    # (liquidity-ranked, usually Binance). These capture the same metrics
-    # across the 3 venues the bot actually trades against, unlocking
-    # funding-spread / OI-share / cross-venue divergence features for Pass 3.
-    # Default '{}' for legacy rows; empty dict on new rows when cache misses.
-    "ALTER TABLE trades ADD COLUMN oi_per_exchange_usd_json_at_entry TEXT NOT NULL DEFAULT '{}'",
-    "ALTER TABLE trades ADD COLUMN funding_rate_per_exchange_json_at_entry TEXT NOT NULL DEFAULT '{}'",
-    "ALTER TABLE trades ADD COLUMN funding_rate_predicted_per_exchange_json_at_entry TEXT NOT NULL DEFAULT '{}'",
-    "ALTER TABLE rejected_signals ADD COLUMN oi_per_exchange_usd_json_at_entry TEXT NOT NULL DEFAULT '{}'",
-    "ALTER TABLE rejected_signals ADD COLUMN funding_rate_per_exchange_json_at_entry TEXT NOT NULL DEFAULT '{}'",
-    "ALTER TABLE rejected_signals ADD COLUMN funding_rate_predicted_per_exchange_json_at_entry TEXT NOT NULL DEFAULT '{}'",
+    # 2026-04-24 (evening) — per-exchange derivatives JSON columns REMOVED.
+    # Tier A ADDs (trades + rejected_signals × 3 cols = 6 migrations) were
+    # rolled back after 4 iterations of chasing Coinalyze 429 rate-limits
+    # (free tier 40/min enforced server-side, even on /open-interest
+    # endpoint alone). Per-symbol refresh baseline at ~20 calls/cycle left
+    # no stable budget for 3 additional per-exchange batch calls. SQLite's
+    # DROP COLUMN requires 3.35+ and `ALTER TABLE ... DROP COLUMN` is
+    # idempotent-friendly when wrapped in _apply_migrations' try/except
+    # (IFEXISTS not supported for DROP COLUMN on trades/rejected_signals).
+    # Old data on fresh post-restart rows is all '{}' defaults, no real
+    # data lost. Drops below are harmless no-ops on DBs that never had
+    # these columns (the catch block in _apply_migrations swallows
+    # "no such column" errors, same as existing schema drift tolerance).
+    "ALTER TABLE trades DROP COLUMN oi_per_exchange_usd_json_at_entry",
+    "ALTER TABLE trades DROP COLUMN funding_rate_per_exchange_json_at_entry",
+    "ALTER TABLE trades DROP COLUMN funding_rate_predicted_per_exchange_json_at_entry",
+    "ALTER TABLE rejected_signals DROP COLUMN oi_per_exchange_usd_json_at_entry",
+    "ALTER TABLE rejected_signals DROP COLUMN funding_rate_per_exchange_json_at_entry",
+    "ALTER TABLE rejected_signals DROP COLUMN funding_rate_predicted_per_exchange_json_at_entry",
     # 2026-04-23 (night-late) — 4th + 5th venues added journal-only. Live probe vs.
     # `type:cex` aggregate showed named-entity coverage (CB+BN+BY) captured only
     # ~1-6% of the full CEX BTC netflow signal. Bitfinex (biggest single named
@@ -548,10 +532,6 @@ def _record_to_row(rec: TradeRecord) -> tuple:
         rec.price_change_1h_pct_at_entry,
         rec.price_change_4h_pct_at_entry,
         json.dumps(rec.liq_heatmap_top_clusters or {}),
-        # 2026-04-24 — per-exchange (Binance/Bybit/OKX) derivatives JSON.
-        json.dumps(rec.oi_per_exchange_usd_at_entry or {}),
-        json.dumps(rec.funding_rate_per_exchange_at_entry or {}),
-        json.dumps(rec.funding_rate_predicted_per_exchange_at_entry or {}),
     )
 
 
@@ -585,10 +565,6 @@ def _rejected_to_row(rec: RejectedSignal) -> tuple:
         rec.price_change_1h_pct_at_entry,
         rec.price_change_4h_pct_at_entry,
         json.dumps(rec.liq_heatmap_top_clusters or {}),
-        # 2026-04-24 — per-exchange (Binance/Bybit/OKX) derivatives JSON.
-        json.dumps(rec.oi_per_exchange_usd_at_entry or {}),
-        json.dumps(rec.funding_rate_per_exchange_at_entry or {}),
-        json.dumps(rec.funding_rate_predicted_per_exchange_at_entry or {}),
     )
 
 
@@ -640,13 +616,6 @@ def _row_to_rejected(row: aiosqlite.Row) -> RejectedSignal:
         price_change_1h_pct_at_entry=_safe_col(row, "price_change_1h_pct_at_entry"),
         price_change_4h_pct_at_entry=_safe_col(row, "price_change_4h_pct_at_entry"),
         liq_heatmap_top_clusters=_parse_liq_heatmap_clusters(row),
-        # 2026-04-24 — per-exchange derivatives (Binance/Bybit/OKX) JSON.
-        oi_per_exchange_usd_at_entry=_parse_per_exchange_dict(
-            row, "oi_per_exchange_usd_json_at_entry"),
-        funding_rate_per_exchange_at_entry=_parse_per_exchange_dict(
-            row, "funding_rate_per_exchange_json_at_entry"),
-        funding_rate_predicted_per_exchange_at_entry=_parse_per_exchange_dict(
-            row, "funding_rate_predicted_per_exchange_json_at_entry"),
     )
 
 
@@ -711,33 +680,6 @@ def _parse_pillar_scores(row: aiosqlite.Row) -> dict[str, float]:
     if not isinstance(parsed, dict):
         return {}
     # Coerce values to float where possible; drop non-numeric entries.
-    out: dict[str, float] = {}
-    for key, value in parsed.items():
-        try:
-            out[str(key)] = float(value)
-        except (TypeError, ValueError):
-            continue
-    return out
-
-
-def _parse_per_exchange_dict(
-    row: aiosqlite.Row, col_name: str,
-) -> dict[str, float]:
-    """Decode a per-exchange JSON dict column (2026-04-24). Same shape as
-    `_parse_pillar_scores` but parameterised by column name so the 3 per-
-    exchange JSON columns share one parser. Expected shape:
-    `{"binance": float, "bybit": float, "okx": float}` — any subset valid.
-    Missing column, NULL, malformed JSON, non-dict top-level, or non-numeric
-    values all decode to `{}` so legacy rows stay safe."""
-    raw = _safe_col(row, col_name)
-    if raw is None:
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except (TypeError, ValueError):
-        return {}
-    if not isinstance(parsed, dict):
-        return {}
     out: dict[str, float] = {}
     for key, value in parsed.items():
         try:
@@ -837,13 +779,6 @@ def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
         price_change_1h_pct_at_entry=_safe_col(row, "price_change_1h_pct_at_entry"),
         price_change_4h_pct_at_entry=_safe_col(row, "price_change_4h_pct_at_entry"),
         liq_heatmap_top_clusters=_parse_liq_heatmap_clusters(row),
-        # 2026-04-24 — per-exchange derivatives (Binance/Bybit/OKX) JSON.
-        oi_per_exchange_usd_at_entry=_parse_per_exchange_dict(
-            row, "oi_per_exchange_usd_json_at_entry"),
-        funding_rate_per_exchange_at_entry=_parse_per_exchange_dict(
-            row, "funding_rate_per_exchange_json_at_entry"),
-        funding_rate_predicted_per_exchange_at_entry=_parse_per_exchange_dict(
-            row, "funding_rate_predicted_per_exchange_json_at_entry"),
     )
 
 
@@ -965,10 +900,6 @@ class TradeJournal:
         price_change_1h_pct_at_entry: Optional[float] = None,
         price_change_4h_pct_at_entry: Optional[float] = None,
         liq_heatmap_top_clusters: Optional[dict] = None,
-        # 2026-04-24 — per-exchange derivatives (Binance/Bybit/OKX). Journal-only.
-        oi_per_exchange_usd_at_entry: Optional[dict] = None,
-        funding_rate_per_exchange_at_entry: Optional[dict] = None,
-        funding_rate_predicted_per_exchange_at_entry: Optional[dict] = None,
     ) -> TradeRecord:
         """Insert an OPEN row describing a freshly-placed trade.
 
@@ -1032,12 +963,6 @@ class TradeJournal:
             price_change_1h_pct_at_entry=price_change_1h_pct_at_entry,
             price_change_4h_pct_at_entry=price_change_4h_pct_at_entry,
             liq_heatmap_top_clusters=dict(liq_heatmap_top_clusters or {}),
-            # 2026-04-24 — per-exchange derivatives (Binance/Bybit/OKX).
-            oi_per_exchange_usd_at_entry=dict(oi_per_exchange_usd_at_entry or {}),
-            funding_rate_per_exchange_at_entry=dict(
-                funding_rate_per_exchange_at_entry or {}),
-            funding_rate_predicted_per_exchange_at_entry=dict(
-                funding_rate_predicted_per_exchange_at_entry or {}),
         )
         placeholders = ", ".join("?" * len(_COLUMNS))
         cols = ", ".join(_COLUMNS)
@@ -1186,10 +1111,6 @@ class TradeJournal:
         price_change_1h_pct_at_entry: Optional[float] = None,
         price_change_4h_pct_at_entry: Optional[float] = None,
         liq_heatmap_top_clusters: Optional[dict] = None,
-        # 2026-04-24 — per-exchange derivatives (Binance/Bybit/OKX).
-        oi_per_exchange_usd_at_entry: Optional[dict] = None,
-        funding_rate_per_exchange_at_entry: Optional[dict] = None,
-        funding_rate_predicted_per_exchange_at_entry: Optional[dict] = None,
     ) -> RejectedSignal:
         """Insert a single row into `rejected_signals`.
 
@@ -1243,12 +1164,6 @@ class TradeJournal:
             price_change_1h_pct_at_entry=price_change_1h_pct_at_entry,
             price_change_4h_pct_at_entry=price_change_4h_pct_at_entry,
             liq_heatmap_top_clusters=dict(liq_heatmap_top_clusters or {}),
-            # 2026-04-24 — per-exchange derivatives (Binance/Bybit/OKX).
-            oi_per_exchange_usd_at_entry=dict(oi_per_exchange_usd_at_entry or {}),
-            funding_rate_per_exchange_at_entry=dict(
-                funding_rate_per_exchange_at_entry or {}),
-            funding_rate_predicted_per_exchange_at_entry=dict(
-                funding_rate_predicted_per_exchange_at_entry or {}),
         )
         placeholders = ", ".join("?" * len(_REJECTED_COLUMNS))
         cols = ", ".join(_REJECTED_COLUMNS)
