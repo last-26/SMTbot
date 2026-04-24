@@ -262,17 +262,27 @@ class DerivativesCache:
         keeps reading the single-exchange fields. 3 API calls total per
         refresh cycle (each covers all watched symbols via comma batching).
         Each metric fails independently — a funding outage leaves the
-        OI-per-exchange dict populated and vice versa."""
+        OI-per-exchange dict populated and vice versa.
+
+        Inter-batch sleep (2.0s) spreads the 3 back-to-back calls across
+        ~4s so Coinalyze's server-side rate counter (40/min, with burst
+        detection stricter than the client-side token bucket) doesn't 429
+        on the 2nd/3rd call. Live post-restart log showed OI geçiyor,
+        funding+predicted sürekli 429; 2s spacing is enough for 1.33
+        tokens to refill server-side (0.667 tokens/sec)."""
+        _INTER_BATCH_SLEEP_S = 2.0
         try:
             oi_map = await self.coinalyze.fetch_per_exchange_oi_usd()
         except Exception as e:
             logger.warning("deriv_per_exchange_oi_failed err={!r}", e)
             oi_map = {}
+        await asyncio.sleep(_INTER_BATCH_SLEEP_S)
         try:
             fund_map = await self.coinalyze.fetch_per_exchange_funding()
         except Exception as e:
             logger.warning("deriv_per_exchange_funding_failed err={!r}", e)
             fund_map = {}
+        await asyncio.sleep(_INTER_BATCH_SLEEP_S)
         try:
             pred_map = await self.coinalyze.fetch_per_exchange_predicted_funding()
         except Exception as e:
