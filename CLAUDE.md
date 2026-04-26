@@ -1,28 +1,114 @@
 # CLAUDE.md — Crypto Futures Trading Bot
 
-AI-driven crypto-futures scalper on OKX. Zone-based limit entries, 5-pillar confluence, cross-asset + regime-aware vetoes, Arkham on-chain soft signals. Demo-runnable end-to-end; Pass 1 complete 2026-04-22 — restart-ready for Pass 2 uniform-feature dataset collection.
+AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT linear perps). Zone-based limit entries, 5-pillar confluence, cross-asset + regime-aware vetoes, Arkham on-chain soft signals. Demo-runnable end-to-end. Pass 1 complete 2026-04-22 on OKX; **venue migrated to Bybit on 2026-04-25** — fresh dataset collection restarts under `rl.clean_since=2026-04-25T21:45:00Z`.
 
-**Architectural principle:** Claude Code is the *orchestrator* (writes Pine, runs tuning, debugs). Runtime decisions are made by the Python bot, **not** Claude. TradingView = eyes, OKX = hands, Python = brain.
+**Architectural principle:** Claude Code is the *orchestrator* (writes Pine, runs tuning, debugs). Runtime decisions are made by the Python bot, **not** Claude. TradingView = eyes, Bybit = hands, Python = brain.
+
+**Internal symbol format note:** the codebase keeps the OKX-style symbol string `BTC-USDT-SWAP` as the canonical internal identifier across config, journal, runner state and tests. The Bybit boundary translation (`BTC-USDT-SWAP ↔ BTCUSDT`) lives inside `src/execution/bybit_client.py`. Old journal rows (Pass 1 + early Pass 2 from OKX) therefore string-match new rows on `inst_id`, and the symbol-keyed override dicts in YAML need no migration.
 
 ---
 
 ## Current state (snapshot)
 
 - **Strategy:** zone-based scalper. Confluence ≥ threshold → identify zone → post-only limit order at zone edge → wait N bars → fill | cancel.
-- **Pairs:** 5 OKX perps — `BTC / ETH / SOL / DOGE / BNB`. 5 concurrent slots on cross margin (all active, no queue).
+- **Pairs:** 5 Bybit USDT linear perps — `BTC / ETH / SOL / DOGE / XRP` (BNB swapped out for XRP on 2026-04-25 per operator preference; internal symbol format `BTC-USDT-SWAP` etc, translated at the Bybit boundary). 5 concurrent slots on UTA cross margin (collateral pool = USDT + USDC by USD value; BTC/ETH wallet stays out of collateral on demo per operator preference).
 - **Entry TF:** 3m. HTF context 15m, LTF confirmation 1m.
 - **Scoring:** 5 pillars (Market Structure, Liquidity, Money Flow, VWAP, Divergence) + hard gates (displacement, EMA momentum, VWAP, cross-asset opposition) + ADX regime-conditional weights. Confluence threshold `min_confluence_score=3.75` (Pass 1 Optuna tune, 2026-04-22). *Premium/discount gate and HTF TP/SR ceiling temporarily disabled 2026-04-19 — see changelog; re-evaluated as Pass 3 candidates.*
-- **Execution:** post-only limit → regular limit → market-at-edge fallback. Single-leg OCO SL/TP at hard **1:2 RR** (tightened 1:3→1:2 on 2026-04-21 eve; partial TP disabled 2026-04-19 late-night — see changelog; `move_sl_to_be_after_tp1` flag kept but inert while partial off). Dynamic TP revision re-anchors the runner OCO to `entry ± 2 × sl_distance` every cycle, floor at 1.0R. **MFE-triggered SL lock (Option A, 2026-04-20)**: once MFE ≥ 1.3R (scaled from 2R when RR cap tightened), the runner OCO's SL is pulled to entry (+fee buffer) so the remaining 0.7R of target is risk-free. One-shot per position. **Maker-TP resting limit (2026-04-20)**: post-only reduce-only limit sits at TP price alongside the OCO — captures wicks as maker, avoids market-trigger latency.
-- **Sizing:** fee-aware ceil on per-contract total cost so total realized SL loss (price + fee reserve) ≥ target_risk across every symbol (2026-04-19 late-night-2). Overshoot bounded by one per-contract step (< $3 per position). Operator override via `RISK_AMOUNT_USDT` env (2026-04-20) bypasses percent-mode sizing; 10%-of-balance safety ceiling. Per-symbol `min_sl_distance_pct_per_symbol` floors: BTC 0.004, ETH 0.008, SOL 0.010, DOGE 0.008, BNB 0.005 (reverted 2026-04-24 after the 2026-04-23 Pass 2 bump mechanically widened TPs at fixed 1:2 RR and collapsed post-bump WR 66.7%→22.2% across 9 trades — see changelog).
+- **Execution:** post-only limit → regular limit → market-at-edge fallback. **Position-attached TP/SL** at hard **1:2 RR** (Bybit V5: TP/SL fields on `/v5/order/create` for market entries, `/v5/position/trading-stop` for limit-fill attach + every subsequent SL/TP mutation). No separate algo orders to track — `journal.algo_ids` stays empty on Bybit-era rows. Mark-price triggers (`tpTriggerBy=slTriggerBy=MarkPrice`) for demo-wick immunity. Dynamic TP revision re-anchors TP to `entry ± 2 × sl_distance` every cycle, floor at 1.0R. **MFE-triggered SL lock (Option A, 2026-04-20)**: once MFE ≥ 1.3R, SL pulled to entry (+fee buffer); one-shot per position. **Maker-TP resting limit (2026-04-20)**: post-only reduce-only limit sits at TP price alongside the position-attached TP — captures wicks as maker, avoids trigger latency.
+- **Sizing:** fee-aware ceil on per-contract total cost so total realized SL loss (price + fee reserve) ≥ target_risk across every symbol. Overshoot bounded by one per-contract step (< $3 per position). Operator override via `RISK_AMOUNT_USDT` env bypasses percent-mode sizing; 10%-of-balance safety ceiling. Per-symbol `min_sl_distance_pct_per_symbol` floors: BTC 0.004, ETH 0.008, SOL 0.010, DOGE 0.008, BNB 0.005. Bybit boundary in `bybit_client.py` translates OKX-style integer `num_contracts` to base-coin `qty` via per-symbol `_OKX_CT_VAL` map (BTC 0.01, ETH 0.1, SOL 1, DOGE 1000, BNB 0.01); Bybit's `qtyStep` always cleanly divides the resulting qty (verified 2026-04-25 via `scripts/test_bybit_connection.py`).
 - **Journal:** async SQLite, schema includes `on_chain_context`, `demo_artifact`, `confluence_pillar_scores`, `oscillator_raw_values` (all JSON). Separate tables: `rejected_signals` (counter-factual outcome pegged), `on_chain_snapshots` (Arkham state mutation time-series), `whale_transfers` (raw WS events for Phase 9 directional learning). *Per-exchange derivatives capture attempted 2026-04-24 and reverted same day — Coinalyze free-tier 40/min ceiling can't sustain it alongside per-symbol baseline (25 calls/cycle).*
 - **On-chain (Arkham):** runtime soft signals only — daily bias ±15%, hourly stablecoin pulse +0.75 threshold penalty, altcoin-index +0.5 penalty on misaligned altcoin trades, **flow_alignment** 6-input directional score (stablecoin + BTC/ETH + Coinbase/Binance/Bybit 24h netflow; weights 0.25/0.25/0.15/0.15/0.10/0.10; default penalty 0.25), **per_symbol_cex_flow** binary penalty on misaligned symbol 1h volume (default 0.25, $5M floor). **Bitfinex + Kraken 24h netflow captured journal-only** (2026-04-23 night-late, 4th + 5th named venues — biggest single inflow / outflow in live probe vs. `type:cex` aggregate). **OKX 24h netflow captured journal-only** (2026-04-24, 6th venue — bot's own trading exchange, self-signal; 24h net ≈ 0 structurally but $58M max hourly |net|). None of 4/5/6 yet wired into `_flow_alignment_score` — Pass 3 decides weights. Whale HARD GATE removed 2026-04-22 — WS listener feeds `whale_transfers` journal for Pass 3 directional classification. Per-symbol token_volume fallback (2026-04-23): when Arkham `/token/volume/{id}` returns JSON `null` (confirmed for `solana`, `wrapped-solana`), `fetch_token_volume_last_hour` falls back to `/transfers/histogram` (flow=in + flow=out, last bucket) — zero coverage gap for the traded symbol set. **Netflow freeze fix (2026-04-23 night):** per-entity netflow rewritten from `/flow/entity/{entity}` (daily buckets, froze at UTC day close) to `/transfers/histogram?base=<entity>&granularity=1h&time_last=24h`; same fix for BTC/ETH aggregate. Daily-bundle refresh flipped from UTC-day gate to 5-min monotonic cadence (`on_chain.daily_snapshot_refresh_s: 300`) so `on_chain_snapshots` DB rows actually replace frozen values intraday. Credit-safe via v2 persistent WS streams + filter-fingerprint cache. All Arkham weights tuned in Pass 3.
 - **Pass 2 instrumentation:** every trade row now captures `confluence_pillar_scores` (factor name → weight dict) and `oscillator_raw_values` (per-TF dict with 1m/3m/15m OscillatorTableData numerics: wt1/wt2/rsi/rsi_mfi/stoch_k/d/momentum/divergence flags). Both sourced from existing runner TF-switch cache — zero extra TV latency.
-- **Tests:** 1063, all green. Demo-runnable end-to-end.
-- **Data cutoff (`rl.clean_since`):** `2026-04-22T20:33:24Z` — Pass 2 restart cut. Pre-restart DB (42 Pass 1 trades) archived as `data/trades.db.pass1_backup_2026-04-22T203324Z`. Fresh DB created on first bot startup; every new row post-restart carries uniform feature coverage.
+- **Tests:** ~1060, mostly green. Demo-runnable end-to-end. (Test count fluctuates with the migration: `test_okx_client.py` / `test_okx_enrichment.py` / `test_limit_entry.py` deleted as OKX-internal; `FakeBybitClient` in `conftest.py` keeps the OKX-era assertion vocabulary working via aliasing.)
+- **Data cutoff (`rl.clean_since`):** `2026-04-25T21:45:00Z` — **Bybit migration cut**. Pre-migration DB archived as `data/trades.db.pre_bybit_2026-04-25T214500Z` (4.6 MB; mixes OKX Pass 1 + Pass 2 trades plus the SL-floor-bump losing cluster). Pass 1 baseline before that: `data/trades.db.pass1_backup_2026-04-22T203324Z`. Fresh DB created on first Bybit bot startup; reporter / GBT tooling reads only post-cutoff rows.
 
 ---
 
 ## Changelog
+
+### 2026-04-26 — VWAP daily-reset blackout + pillar_scores forwarding bugfix
+
+Two paired changes triggered by a single morning chart-review session: operator noticed Pine VWAP (1m/3m/15m) "resets" at UTC 00:00 — bands collapse and re-anchor — and asked whether new entries are protected from the noisy ~10-30 min post-reset window. Same review surfaced that all 5 OPEN positions have empty `confluence_pillar_scores={}` despite populated `confluence_factors`, breaking Pass 2 instrumentation for zone-based entries.
+
+**Root cause #1 — VWAP daily reset:** `pine/smt_overlay.pine:154-158` anchors all three VWAPs on `timeframe.change("D")`, which fires at UTC 00:00. `ta.vwap(src, anchor, 1.0)` re-initialises stdev to ~0 at the anchor flip, so the ±1σ bands collapse onto the VWAP line for the first few bars and the `vwap_composite_alignment` soft pillar (weight 1.25) reads near-noise. Effect: a long at 00:03 UTC sees a VWAP that's anchored to one price and bands that are mathematically unstable; the same trade at 00:30 UTC sees a stable rolling distribution.
+
+**Fix — Time-based blackout window:**
+- New helper `in_vwap_reset_blackout(now, *, pre_minutes, post_minutes)` in [src/strategy/entry_signals.py](src/strategy/entry_signals.py) — pure function, returns True inside `[00:00 - pre_minutes, 00:00 + post_minutes)`. Naive `datetime` treated as UTC; aware `datetime` converted via `astimezone`. Both windows zero short-circuits to False (kill switch).
+- Wired into [src/bot/runner.py](src/bot/runner.py) `_run_one_symbol` as an early-return AFTER macro_event_blackout (same pattern: log + return, no rejected_signals row — operationally a planned outage, not a strategy reject).
+- Wired into [src/strategy/entry_signals.py](src/strategy/entry_signals.py) `evaluate_pending_invalidation_gates` as the FIRST gate (before `vwap_misaligned`) — resting pendings inside the blackout get cancelled with `reason=vwap_reset_blackout` so they don't fill into the unreliable just-reset VWAP. Order matters: `vwap_misaligned` itself reads the unstable VWAPs so it would mis-attribute the cancel reason.
+- Config: `analysis.vwap_reset_blackout_enabled: true`, `vwap_reset_blackout_window_pre_min: 5`, `vwap_reset_blackout_window_post_min: 15` in [config/default.yaml](config/default.yaml). Pydantic validators clamp pre/post to `[0, 60]`. 20-minute total downtime per day matches operator's "yeterli" sign-off.
+
+**Root cause #2 — `confluence_pillar_scores` dropped on zone-wrapped plans:** [src/strategy/setup_planner.py:560-581](src/strategy/setup_planner.py) `apply_zone_to_plan` builds a fresh `TradePlan` from the input plan, forwarding `confluence_factors` but NOT `confluence_pillar_scores`. The new plan defaults the field to `{}` (`field(default_factory=dict)`). Every zone-based entry — which is every entry the bot makes, since the strategy is zone-based — therefore stamps an empty dict into the journal. Audit on the 5 currently OPEN Bybit positions (entered 2026-04-25 21:38 → 2026-04-26 00:12 UTC) confirmed all 5 have `pillar_scores='{}'` while `factors` (the string list) is populated and `oscillator_raw_values` (1100+ char JSON) + `on_chain_context` (790+ char JSON) + per-symbol derivatives enrichment are all populated. The gap is specific to this one column.
+
+**Fix — One-line forwarding:**
+- Added `confluence_pillar_scores=dict(plan.confluence_pillar_scores)` to the `TradePlan(...)` construction in `apply_zone_to_plan`. Defensive copy (mutating the wrapped plan must not bleed back into the source).
+- Regression test `test_apply_zone_to_plan_preserves_confluence_pillar_scores` in [tests/test_setup_planner.py](tests/test_setup_planner.py) locks the contract: a plan with three pillar weights round-trips through `apply_zone_to_plan` with bit-exact equality, plus a defensive-copy assertion.
+
+**Pass 2 dataset caveat:** the 5 currently OPEN trades (and any closed trade post-Bybit-cut at 2026-04-25T21:45Z that pre-dates this commit) have empty `pillar_scores`. Pass 3 GBT/Optuna over per-pillar weights should treat `confluence_pillar_scores='{}'` as MISSING-by-bug (not "no factors fired") and either drop those rows from the per-pillar feature matrix or back-fill from `confluence_factors` using nominal `confluence_weights` from YAML at row entry time. The two are not equivalent (factor names lose the regime-conditional weight multipliers that ConfluenceScore.factors actually carried), but a back-fill is closer to the truth than the empty dict.
+
+**Reject vocabulary:** `vwap_reset_blackout` added to the unified reject_reason list (currently only emitted from the pending-invalidation path; the runner early-return is no-row-write by design, matching macro_event_blackout's pattern).
+
+**Cost:** zero API calls, zero latency. Both fixes are pure-function additions / one-line plumbing.
+
+**Tests:** +22 in `test_vwap_reset_blackout.py` (window edges, kill switch, asymmetric windows, naive/aware datetime handling, pending-eval integration, gate ordering, config validators) + 1 regression in `test_setup_planner.py`. Targeted suite (setup_planner + vwap_blackout + entry_signals + runner_zone_entry + oscillator_raw_values + journal_database) = 181/181 green.
+
+**Re-eval triggers:**
+1. **`pillar_scores` coverage on post-fix rows** — `SELECT COUNT(*) FROM trades WHERE entry_timestamp > '2026-04-26T<commit-ts>' AND length(confluence_pillar_scores) <= 2` should be 0. Non-zero = a 5th call site to `record_open` / `record_rejected_signal` exists that doesn't read from `plan.confluence_pillar_scores`.
+2. **Blackout fire rate** — per-day count of `vwap_reset_blackout` log lines in the runner. Expect 5 symbols × ~1 cycle/min × 20 min = ~100 NO_TRADE log emissions per day. Materially higher = clock skew or naive-datetime handling regression.
+3. **Pending-cancel attribution** — fraction of pending cancels with `reason=vwap_reset_blackout` should track ~1.4% of total cancels (20min/24h = 1.39%). Higher = pending limits clustering in the blackout window (zone-source bias toward late-day setups); lower = blackout firing on fewer pendings than expected.
+4. **Operator pendings holding through midnight** — if a pending placed at 23:50 UTC gets cancelled at 23:55 UTC (5 min into pre-window), confirm operator considers this acceptable; otherwise tighten `pre_min` to 0 and accept the 15-min post-only outage.
+
+### 2026-04-25 — OKX → Bybit V5 Demo migration (venue swap)
+
+Operator-driven full venue swap. OKX completely removed from the codebase; bot trades against Bybit V5 Demo (`https://api-demo.bybit.com`) under a UTA hedge-mode account. Decision drivers: cleaner demo wick behaviour at mark-price triggers, simpler API surface (TP/SL is a position property, not a separate algo), better long-term roadmap fit. No strategy / scoring changes — only the execution layer + config / docs / scripts touched.
+
+**Architectural shifts:**
+
+1. **TP/SL are now position-attached.** OKX placed an OCO algo as a separate order with its own `algoId`; Bybit treats `takeProfit` / `stopLoss` as fields on the position itself, set via `POST /v5/order/create` (market entry) or `POST /v5/position/trading-stop` (limit-fill attach + every subsequent mutation). Eliminates the entire OKX-era machinery: `place_oco_algo` / `cancel_algo` / `list_pending_algos` / `_verify_algo_gone` / `_cancel_surplus_ocos` / `_cancel_algos_best_effort` / `algo_ids[]` tracking. SL-to-BE, TP-revise, and MFE-lock all collapse to a single trading-stop call with no cancel+place dance and no "unprotected window" between cancel and place.
+
+2. **Hedge mode via `positionIdx=1/2`**, not OKX `posSide=long/short`. Set once at startup via `POST /v5/position/switch-mode {mode: 3, coin: USDT}`. Bot still speaks OKX's "long"/"short" vocabulary internally; `bybit_client._pos_idx()` translates at the boundary (long→1, short→2). Account-wide margin mode (UTA `REGULAR_MARGIN` ≈ cross) replaces OKX's per-call `tdMode=isolated/cross` — `RouterConfig.margin_mode` field is preserved but no longer forwarded to API calls.
+
+3. **Internal symbol format kept OKX-style** (`BTC-USDT-SWAP`). The Bybit boundary in `bybit_client.py` translates `_OKX_TO_BYBIT_SYMBOL["BTC-USDT-SWAP"] → "BTCUSDT"` on outgoing requests and `_BYBIT_TO_OKX_SYMBOL["BTCUSDT"] → "BTC-USDT-SWAP"` on incoming responses. Trade-off: 7-line lookup map vs. mass-rename of ~50 files (config keys, journal column values, test fixtures, runner literals, on-chain mapping). Old journal rows remain string-comparable to new ones.
+
+4. **Sizing math unchanged.** OKX's `num_contracts × ctVal × price` was preserved by hardcoding `_OKX_CT_VAL = {BTC=0.01, ETH=0.1, SOL=1, DOGE=1000, BNB=0.01}` in `bybit_client.py`; the boundary multiplies `num_contracts × ct_val` to produce Bybit's required base-coin `qty` string. Verified against Bybit's `qtyStep` filter: every symbol's contract size is an integer multiple of step (BTC ct_val 0.01 = 10 × step 0.001; DOGE 1000 = 1000 × step 1.0; etc).
+
+5. **Wallet reads UTA-aware.** `get_balance()` returns `totalAvailableBalance` (USD-aggregated, USDT+USDC pooled by USD value when both are toggled as collateral). `get_total_equity()` returns `totalMarginBalance` — the collateral pool that actually backs margin, NOT the wider `totalEquity` (which includes BTC/ETH wallet balances when those have "Used as Collateral" off). Sizing math therefore reflects the bot's true usable capital, not visual-wallet noise.
+
+6. **Demo CloudFront edge auto-pin.** Some ISPs (observed on TR-mobile / TR-fiber egress) silently drop TCP-443 SYNs to the `13.249.8.0/24` CloudFront range that `api-demo.bybit.com` sometimes resolves to. Mainnet uses a different distribution that routes fine, which made the issue look like a credentials problem. `BybitClient._maybe_pin_demo_dns()` now resolves the host at construction, probes each returned IP with a 2s TCP-443 connect, and pins the first reachable one to the requests session via a custom HTTPS adapter (TLS still validates against the real hostname via SNI). Falls back to a hardcoded shortlist of known-working edges when system DNS yields only blocked IPs.
+
+7. **Error-code hierarchy** kept identical (`InsufficientMargin`, `OrderRejected`, `LeverageSetError`, `AlgoOrderError`); class `OKXError` renamed to `BybitError` with Bybit retCodes:
+   - 110004/110007/110012 → `InsufficientMargin`
+   - 110001/110008/110010/170142/170213 → `_ORDER_GONE_CODES` (idempotent cancel)
+   - 170218 → `OrderRejected` (post-only would cross — triggers limit fallback)
+   - 110086/110087 → `LeverageSetError`
+   - 110021 → operator-visible (OI cap), not auto-handled
+
+**Code surface (files touched):**
+
+- New: [src/execution/bybit_client.py](src/execution/bybit_client.py) — full pybit V5 wrapper with boundary translation, DNS-pin, and AlgoResult/cancel_algo back-compat shims so journal models + old test fixtures stay valid.
+- Deleted: `src/execution/okx_client.py`, `tests/test_okx_client.py`, `tests/test_okx_enrichment.py`, `tests/test_limit_entry.py`, `scripts/test_okx_connection.py`, `scripts/cancel_orphans.py`.
+- Rewritten: [src/execution/order_router.py](src/execution/order_router.py) (no separate algo placement; market entry passes TP/SL on `place_order`; pending-fill path calls `set_position_tpsl`), [src/execution/position_monitor.py](src/execution/position_monitor.py) (SL-to-BE / TP-revise / SL-lock all simplified to single trading-stop calls), [src/execution/__init__.py](src/execution/__init__.py), [scripts/probe_open_orders.py](scripts/probe_open_orders.py), [scripts/test_bybit_connection.py](scripts/test_bybit_connection.py) (new smoke).
+- Updated: [src/execution/errors.py](src/execution/errors.py) (`BybitError`), [src/bot/config.py](src/bot/config.py) (`BybitConfigBlock`, `BYBIT_*` env loading), [src/bot/runner.py](src/bot/runner.py) (`bybit_client` field, ~15 call sites, `_cancel_surplus_ocos` neutered to no-op, `_cancel_orphan_pending_limits` rewired to `list_open_orders`), [src/data/tv_bridge.py](src/data/tv_bridge.py) (`OKX:` → `BYBIT:` in TV ticker), [config/default.yaml](config/default.yaml) (`bybit:` block, `clean_since` reset to 2026-04-25T21:45:00Z), [.env.example](.env.example) (`BYBIT_*`), [requirements.txt](requirements.txt) (`pybit>=5.7.0`, `python-okx` removed).
+
+**Verification (2026-04-25 21:42 local):**
+
+`python scripts/test_bybit_connection.py` against demo:
+- DNS-pin selected edge `3.168.236.5` (after switching to Google DNS + disabling GoodbyeDPI which was breaking TLS to the demo distribution).
+- Wallet: `totalAvailableBalance` = `totalMarginBalance` = `50,013.40 USDT` (matches operator's adjusted demo balance).
+- All 5 instrument specs returned cleanly with correct `qtyStep` / `maxLeverage`.
+- Mark prices fetched live (BTC $77,296 / ETH $2,311 / SOL $85.66 / DOGE $0.0977 / BNB $628.50).
+- No live positions, no resting orders (clean account, expected).
+
+**Pre-restart DB archive:** `data/trades.db.pre_bybit_2026-04-25T214500Z` (4.6 MB). Window from 2026-04-22 Pass 2 restart through 2026-04-25 had two known data-quality issues: (a) demo-wick artefact pollution (operator-flagged as a primary motivator for the venue swap), (b) the 2026-04-23 SL-floor-bump losing cluster (WR collapsed 66.7% → 22.2% before the 2026-04-24 revert). Both make that window unsuitable for Pass 3 tuning; cutting clean.
+
+**Re-eval triggers (post-Bybit, monitor over first 20 closed trades):**
+
+1. **DNS-pin success rate** — `bybit_demo_dns_pinned` log line on every restart should pick a reachable IP within 1 probe round (≤ 2s). If the helper logs `bybit_demo_dns_pin_failed` repeatedly, the hardcoded fallback list (`_DEMO_FALLBACK_IPS`) is stale; refresh from a working host.
+2. **TP/SL attachment latency** — for limit-fill entries, the `set_position_tpsl` call should land within 500ms of the fill event. Higher = Bybit-side queue or rate-limit; investigate.
+3. **trading-stop "lose binding relationship" warning** — Bybit warns that one-sided modify (BE move, TP revise, SL lock) unbinds the TP/SL pair. Functionally fine (both legs still work; position-close auto-cancels orphan), but if Bybit later changes that contract the bot would silently double-fire. Periodic spot-check via `probe_open_orders.py` after a TP1 event.
+4. **UTA collateral ratio** — `totalAvailableBalance / totalMarginBalance` should hover near 1.0 when no positions are open. If it drifts below 0.95 with no positions, a haircut policy or cross-margin loan is consuming collateral; investigate before Pass 3.
+5. **`get_total_equity` field robustness** — Bybit demo response has been seen to omit `totalMarginBalance` on rare empty-account states. Code falls back to `totalEquity`; if logs show `totalEquity` being read on a populated account (per-slot sizing would over-allocate), inspect.
+6. **Bybit demo 7-day order persistence** — Bybit auto-expires demo orders after 7 days. Doesn't affect bot logic (positions reconcile every restart), but if a long pending limit unexpectedly disappears between cycles, this is the cause.
 
 ### 2026-04-22 — Pass 1 restructure day (consolidated)
 
@@ -531,7 +617,7 @@ Design decisions baked into the current code. Git log (`git log --before=2026-04
 
 ## Prerequisites
 
-Node.js 18+, Python 3.11+ (actual 3.14), TradingView Desktop (subscription), OKX demo account, Claude Code CLI.
+Node.js 18+, Python 3.11+ (actual 3.14), TradingView Desktop (subscription), Bybit Demo Trading account, Claude Code CLI.
 
 ---
 
@@ -553,25 +639,25 @@ tv data labels/boxes/lines --filter --verbose
 tv pine set < script.pine              # load Pine
 tv pine compile / analyze / check
 tv screenshot
-tv symbol OKX:BTCUSDT.P
+tv symbol BYBIT:BTCUSDT.P
 tv timeframe 15
 ```
 
-### OKX Agent Trade Kit MCP
+### Bybit V5 Demo Trading
 
-```bash
-npm install -g okx-trade-mcp okx-trade-cli
-okx setup --client claude-code --profile demo --modules all
-```
+The bot calls Bybit's V5 REST API directly via the `pybit` Python SDK — there is no Bybit-specific MCP. Account requirements:
 
-Required OKX account mode (bot won't place a single order otherwise):
-1. Demo Trading → Settings → **Account mode = "Futures"** (`acctLv=2`). `acctLv=1` forces `net_mode` and rejects every call with `Parameter posSide error`.
-2. **Position mode = "Hedge" (Long/Short)** → `posMode=long_short_mode`.
-3. Verify via `get_account_config()`.
+1. Bybit mainnet account → switch to **Demo Trading** mode (top-left badge).
+2. Generate a separate API key from the Demo Trading "API" panel — these credentials are distinct from mainnet.
+3. **Account type:** UNIFIED (UTA). Cross margin enabled by default.
+4. **Position mode:** Hedge mode for USDT linear perps. Bot sets this once at startup via `POST /v5/position/switch-mode {category: linear, coin: USDT, mode: 3}`; idempotent if already enabled.
+5. **Collateral toggles:** keep USDT + USDC "Used as Collateral" ON, BTC / ETH (or any spot wallet asset) OFF — UTA pools collateral by USD value, the bot reads `totalMarginBalance` for sizing and over-allocates if non-trading wallet balance is included in the pool.
+6. **API key permissions:** Read + Trade only, never Withdrawal. IP whitelist recommended (90-day expiry without it, no expiry with).
+7. Smoke test: `python scripts/test_bybit_connection.py` — exercises wallet, instruments-info, mark price, positions, open orders.
 
-Demo API key: Read+Trade only, never withdrawal. Demo balance resets are UI-only.
+**Bybit naming:** USDT linear perp = `BTCUSDT` (Bybit-native). The bot keeps the OKX-style `BTC-USDT-SWAP` as its **internal** identifier and translates at the boundary inside `bybit_client.py`. TV ticker for charts = `BYBIT:BTCUSDT.P`.
 
-**OKX naming:** Perp = `BTC-USDT-SWAP`, Spot = `BTC-USDT`. TV ticker = `OKX:BTCUSDT.P`.
+**Demo endpoint quirk (TR ISP egress):** Some networks silently drop TCP-443 to specific CloudFront ranges that `api-demo.bybit.com` resolves to (observed: `13.249.8.0/24`). `BybitClient._maybe_pin_demo_dns()` probes each resolved IP at construction and pins a reachable edge to the requests session. If the bot logs `bybit_demo_dns_pin_failed`, switch system DNS to `8.8.8.8` / `1.1.1.1` and disable any DPI bypass tool (e.g. GoodbyeDPI, which fragments TLS in a way the demo distribution rejects).
 
 ---
 
@@ -597,7 +683,7 @@ Modules have docstrings; a tour for orientation:
 - `src/data/` — TV bridge, `MarketState` assembly, candle buffers, Binance liq WS, Coinalyze REST, economic calendar (Finnhub + FairEconomy), HTF cache, **Arkham client + WS listener + on-chain types**.
 - `src/analysis/` — Structure (MSS/BOS/CHoCH), FVG, OB, liquidity, ATR-scaled S/R, multi-TF confluence + regime-conditional weights + **daily-bias modifier**, derivatives regime, **ADX trend regime**, **EMA momentum veto**, **displacement / premium-discount** gates.
 - `src/strategy/` — R:R math, SL hierarchy, entry orchestration (+ **Arkham soft signals: daily-bias / stablecoin-pulse / altcoin-index / flow_alignment / per_symbol_cex_flow penalties**), **setup planner** (zone-based limit-order plans), cross-asset snapshot veto, risk manager.
-- `src/execution/` — python-okx wrapper (sync → `asyncio.to_thread`), order router (`place_limit_entry` / `cancel_pending_entry` / `place_reduce_only_limit` / market fallback), REST-poll position monitor with **PENDING** state + **MFE-lock + TP-revise + maker-TP tracking**, typed errors.
+- `src/execution/` — pybit V5 wrapper (sync → `asyncio.to_thread`) with OKX↔Bybit boundary translation, order router (`place_limit_entry` / `cancel_pending_entry` / `attach_algos` via trading-stop / `place_reduce_only_limit` / market fallback), REST-poll position monitor with **PENDING** state + **MFE-lock + TP-revise + maker-TP tracking** (all SL/TP mutations are single trading-stop calls), typed errors.
 - `src/journal/` — async SQLite, schema v3 trade records (+ `on_chain_context`, `demo_artifact`), `rejected_signals` + counter-factual stamps, `on_chain_snapshots` time-series, pure-function reporter.
 - `src/bot/` — YAML/env config, async outer loop (`BotRunner.run_once` — closes → snapshot → pending → per-symbol cycle), on-chain snapshot scheduler, CLI entry.
 
@@ -647,9 +733,9 @@ ADX (Wilder, 14) classifies `UNKNOWN / RANGING / WEAK_TREND / STRONG_TREND`. Und
 
 ## Configuration
 
-All config in `config/default.yaml` (self-documenting). Top-level sections: `bot`, `trading`, `circuit_breakers`, `analysis`, `execution`, `reentry`, `derivatives`, `economic_calendar`, `on_chain`, `okx`, `rl`.
+All config in `config/default.yaml` (self-documenting). Top-level sections: `bot`, `trading`, `circuit_breakers`, `analysis`, `execution`, `reentry`, `derivatives`, `economic_calendar`, `on_chain`, `bybit`, `rl`.
 
-**`.env` keys:** `OKX_API_KEY`, `OKX_API_SECRET`, `OKX_PASSPHRASE`, `OKX_DEMO_FLAG`, `COINALYZE_API_KEY`, `FINNHUB_API_KEY`, `ARKHAM_API_KEY`, `RISK_AMOUNT_USDT` (optional flat-$ override), `TV_MCP_PORT`, `LOG_LEVEL`.
+**`.env` keys:** `BYBIT_API_KEY`, `BYBIT_API_SECRET`, `BYBIT_DEMO` (1/0), `COINALYZE_API_KEY`, `FINNHUB_API_KEY`, `ARKHAM_API_KEY`, `RISK_AMOUNT_USDT` (optional flat-$ override), `TV_MCP_PORT`, `LOG_LEVEL`.
 
 **Reject reasons (unified):** `below_confluence`, `no_setup_zone`, `vwap_misaligned`, `ema_momentum_contra`, `cross_asset_opposition`, `session_filter`, `macro_event_blackout`, `crowded_skip`, `no_sl_source`, `zero_contracts`, `tp_too_tight`, `zone_timeout_cancel`, `pending_invalidated`, `pending_hard_gate_invalidated` (mid-pending hard-gate flip). Deprecated but kept in vocabulary for legacy rows: `whale_transfer_blackout` (gate removed 2026-04-22), `wrong_side_of_premium_discount`, `htf_tp_ceiling`, `insufficient_contracts_for_split` (flags disabled). Sub-floor SL distances are **widened**, not rejected. Every reject writes to `rejected_signals` with `on_chain_context` + `confluence_pillar_scores` + `oscillator_raw_values` JSON columns.
 
@@ -663,25 +749,25 @@ Things that aren't self-evident from the code. Inline comments cover the *what*;
 
 ### Sizing
 
-- **`_MARGIN_SAFETY=0.95` + `_LIQ_SAFETY_FACTOR=0.6`** (`rr_system.py`). Reserve 5% for fees/mark drift (else `sCode 51008`). Leverage capped at `floor(0.6/sl_pct)` so SL sits well inside liq distance.
-- **Risk vs margin split.** R comes off total equity; leverage/notional sized against per-slot free margin (`total_eq / max_concurrent_positions`). Log emits `risk_bal=` + `margin_bal=` separately — they're different by design.
-- **Per-symbol `ctVal`.** BTC `0.01`, ETH `0.1`, **SOL `1`**, DOGE `1000`, BNB `0.01`. `OKXClient.get_instrument_spec` primes `BotContext.contract_sizes`. Hardcoded YAML would 100× over-size SOL.
+- **`_MARGIN_SAFETY=0.95` + `_LIQ_SAFETY_FACTOR=0.6`** (`rr_system.py`). Reserve 5% for fees/mark drift (else Bybit `110004` insufficient-margin). Leverage capped at `floor(0.6/sl_pct)` so SL sits well inside liq distance.
+- **Risk vs margin split.** R comes off `totalMarginBalance` (UTA collateral pool); leverage/notional sized against per-slot free margin (`total_margin / max_concurrent_positions`). Log emits `risk_bal=` + `margin_bal=` separately — they're different by design. UTA pools USDT + USDC; if `totalEquity` were used instead, BTC/ETH wallet balances would inflate the slot.
+- **Per-symbol `ctVal`.** BTC `0.01`, ETH `0.1`, **SOL `1`**, DOGE `1000`, BNB `0.01`. Hardcoded in `bybit_client._OKX_CT_VAL`; `BybitClient.get_instrument_spec` returns these (NOT Bybit's `qtyStep`) for back-compat with OKX-era sizing math. The qty sent to Bybit is `num_contracts × ct_val`, which is always an integer multiple of `qtyStep`. Hardcoded YAML would 100× over-size SOL.
 - **Fee-aware sizing** (`fee_reserve_pct=0.001`). Sizing denominator widens to `sl_pct + fee_reserve_pct` so stop-out caps near $R *after* entry+exit taker fees. `risk_amount_usdt` stays gross for RL reward comparability.
 - **SL widening, not rejection.** Sub-floor SL distances widen to the per-symbol floor; notional auto-shrinks (`risk_amount / sl_pct`) so R stays constant.
 - **Flat-$ override beats percent mode.** `RISK_AMOUNT_USDT` env bypasses `balance × risk_pct`. Safety rail: override ≤ 10% of balance. Ceil-rounding on contracts makes realized SL loss ≥ target with ≤$3 overshoot.
 
 ### Execution
 
-- **PENDING is first-class.** A filled limit without PENDING tracking would race the confluence recompute and potentially place two OCOs.
-- **Two TP orders per position.** OCO has a market-on-trigger TP (fallback); a post-only reduce-only maker limit sits at the same TP price (primary). Either fills the position flat; the other gets swept. `clOrdId` prefix `smttp` distinguishes TP limits from entry limits (`smtbot`).
-- **MFE-triggered SL lock.** At MFE ≥ 2R, cancel+replace runner OCO with SL at entry+fee_buffer. One-shot flag prevents retry. Skipped if `be_already_moved=True` or `plan_sl_price=0.0` (rehydrate sentinel).
-- **Fee-buffered SL-to-BE** (`sl_be_offset_pct=0.001`). After TP1 fill the replacement OCO's SL sits a hair past entry on the profit side. *Inert while `partial_tp_enabled=false` — TP1 never fires.*
-- **SL-to-BE never spins.** Cancel and place are separate try-blocks. OKX `{51400,51401,51402}` on cancel = idempotent success. 3 cancel failures → give up + mark `be_already_moved=True`. Place failure after cancel = unprotected position, CRITICAL log, operator decides — **emergency market-close is not automated**.
+- **PENDING is first-class.** A filled limit without PENDING tracking would race the confluence recompute and potentially place duplicate trading-stop attachments.
+- **Two TP exits per position.** Position-attached TP (set via `/v5/order/create.takeProfit` for market entries or `/v5/position/trading-stop` for limit-fills) fires as market-on-trigger (fallback); a post-only reduce-only maker limit sits at the same TP price (primary). Either closes the position flat; the other becomes irrelevant when size→0. `orderLinkId` prefix `smttp` distinguishes TP limits from entry limits (`smtbot`).
+- **MFE-triggered SL lock.** At MFE ≥ 1.3R, single `set_position_tpsl(stop_loss=lock_px)` call mutates the position's SL to BE+fee_buffer. One-shot flag prevents retry. Skipped if `be_already_moved=True` or `plan_sl_price=0.0` (rehydrate sentinel).
+- **Fee-buffered SL-to-BE** (`sl_be_offset_pct=0.001`). After TP1 fill the new SL sits a hair past entry on the profit side. *Inert while `partial_tp_enabled=false` — TP1 never fires.*
+- **SL/TP mutations are atomic.** Bybit V5 trading-stop is a single REST call: success replaces the value on the position; failure leaves the existing TP/SL intact. No "unprotected window" between cancel and place (the OKX-era 3-step dance is gone). 3 consecutive failures → give up + mark `be_already_moved=True` to stop spin; old SL still protects.
 - **Threaded callback → main loop.** `PositionMonitor.poll()` runs in `asyncio.to_thread`. Callbacks use `asyncio.run_coroutine_threadsafe(coro, ctx.main_loop)`; `create_task` from worker thread raises `RuntimeError: no running event loop`.
-- **Close enrichment is non-optional.** `OKXClient.enrich_close_fill` queries `/account/positions-history` for real `realizedPnl`. Without it every close looks BREAKEVEN and breakers never trip.
+- **Close enrichment is non-optional.** `BybitClient.enrich_close_fill` queries `/v5/position/closed-pnl` for real `closedPnl` / `avgExitPrice` / `openFee+closeFee`. Without it every close looks BREAKEVEN and breakers never trip.
 - **In-memory register before DB.** `monitor.register_open` + `risk_mgr.register_trade_opened` happen *before* `journal.record_open` — a DB failure logs an orphan rather than losing a live position.
-- **Phantom-cancel resistance.** `poll_pending` + `cancel_pending` only pop the row on success or idempotent-gone. Transient cancel failures preserve row for next poll retry. No dropped-but-still-live orphans.
-- **Startup reconcile cancels resting limits + surplus OCOs.** `_pending` is empty at startup, so any live limit is orphan by construction. Surplus OCOs (more algos live than journal shows for a key) get canceled; OCOs for keys with no journal row are log-only (never auto-cancel a stop that might protect an un-tracked position).
+- **Phantom-cancel resistance.** `poll_pending` + `cancel_pending` only pop the row on success or idempotent-gone (Bybit codes `110001/110008/110010/170142/170213`). Transient cancel failures preserve row for next poll retry. No dropped-but-still-live orphans.
+- **Startup reconcile cancels resting limits.** `_pending` is empty at startup, so any live limit is orphan by construction; `_cancel_orphan_pending_limits` walks `list_open_orders()` and cancels them. The OKX-era `_cancel_surplus_ocos` is now a no-op (Bybit has no separate algo orders to orphan — TP/SL is part of the position).
 
 ### Data quality
 
@@ -708,11 +794,11 @@ Things that aren't self-evident from the code. Inline comments cover the *what*;
 
 ## Currency pair notes
 
-5 OKX perps — BTC / ETH / SOL / DOGE / BNB. BTC + ETH + BNB are market pillars (major-class book depth); SOL + DOGE are altcoins gated by the cross-asset veto. XRP pulled on 2026-04-19 (pm) after the attach-race incident; ADA pulled on 2026-04-19 (eve) after hitting OKX demo OI platform cap (`sCode 54031`). Their per-symbol override maps remain in YAML (harmless when not watched) so reinstating any of them is one-line once the underlying blocker clears.
+5 Bybit USDT linear perps — BTC / ETH / SOL / DOGE / XRP (post-2026-04-25). BTC + ETH are market pillars (major-class book depth); SOL + DOGE + XRP are altcoins gated by the cross-asset veto. BNB swapped out for XRP on 2026-04-25 (operator pref); BNB override maps remain in YAML (harmless when not watched), `_OKX_TO_BYBIT_SYMBOL` / `_OKX_CT_VAL` still carry both BNB and XRP rows so re-swapping either way is a one-line YAML change. ADA pulled on 2026-04-19 (eve, OKX-era) after hitting OKX demo OI platform cap; rows preserved for the same reason.
 
 `max_concurrent_positions=5` (every pair can hold a position simultaneously — no slot competition; confluence gate still picks setups, but cycle isn't queue-limited). Cross margin, `per_slot ≈ total_eq / 5 ≈ $1000` on a $5k demo. R stays 1% of total equity ($50), or flat via `RISK_AMOUNT_USDT` override.
 
-Cycle timing at 3m entry TF = 180s budget: typical 150–180s with 5 pairs (comfortable inside the budget after 7→5 rollback). DOGE + ADA (if reinstated) + XRP (if reinstated) leverage-capped at 30x; SOL/BNB inherit OKX 50x cap.
+Cycle timing at 3m entry TF = 180s budget: typical 150–180s with 5 pairs (comfortable inside the budget after 7→5 rollback). DOGE + XRP leverage-capped at 30x via `symbol_leverage_caps` (Bybit instrument allows 75x; operator-tightened for thin-book scalp safety on momentum-driven pairs). SOL inherits global cap = 50x; BTC/ETH = 100x (Bybit instrument max).
 
 Per-symbol overrides (YAML, ADA/XRP rows kept for easy reinstatement):
 - `swing_lookback_per_symbol`: DOGE=30 (thin 3m book; ADA/XRP=30 preserved).
@@ -720,7 +806,7 @@ Per-symbol overrides (YAML, ADA/XRP rows kept for easy reinstatement):
 - `session_filter_per_symbol`: SOL + DOGE=[london] only. BNB inherits global (london+new_york) as major.
 - `min_sl_distance_pct_per_symbol`: BTC 0.004, ETH 0.008 (bumped 2026-04-21 eve), SOL 0.010, DOGE 0.008, BNB 0.005.
 
-Adding a 6th+ pair: drop into `trading.symbols`, add `okx_to_tv_symbol()` parametrized test, add `derivatives.regime_per_symbol_overrides`, add `min_sl_distance_pct_per_symbol`, extend `affected_symbols_for` in `on_chain_types.py` for chain-native tokens, watch 20-30 cycles for `htf_settle_timeout` / `set_symbol_failed`. Coinalyze free tier supports ~8 pairs at refresh_interval_s=75s; Arkham at current cadence ≤6 pairs comfortable.
+Adding a 6th+ pair: drop into `trading.symbols`, add `okx_to_tv_symbol()` parametrized test, add `derivatives.regime_per_symbol_overrides`, add `min_sl_distance_pct_per_symbol`, **add an entry to `bybit_client._OKX_TO_BYBIT_SYMBOL` + `_OKX_CT_VAL`** (boundary translation + sizing), extend `affected_symbols_for` in `on_chain_types.py` for chain-native tokens, watch 20-30 cycles for `htf_settle_timeout` / `set_symbol_failed`. Coinalyze free tier supports ~8 pairs at refresh_interval_s=75s; Arkham at current cadence ≤6 pairs comfortable.
 
 ---
 
@@ -736,8 +822,9 @@ Adding a 6th+ pair: drop into `trading.symbols`, add `okx_to_tv_symbol()` parame
 # Auto-stop at Phase 8 data-collection gate
 .venv/Scripts/python.exe -m src.bot --config config/default.yaml --max-closed-trades 50
 
-# Live (after demo proven)
-OKX_DEMO_FLAG=0 .venv/Scripts/python.exe -m src.bot --config config/default.yaml
+# Live (after demo proven — set BYBIT_DEMO=0 in .env first AND construct
+# BybitClient with allow_live=True; the constructor refuses live by default)
+.venv/Scripts/python.exe -m src.bot --config config/default.yaml
 
 # Clear a tripped halt
 .venv/Scripts/python.exe -m src.bot --clear-halt --config config/default.yaml
@@ -748,7 +835,8 @@ OKX_DEMO_FLAG=0 .venv/Scripts/python.exe -m src.bot --config config/default.yaml
 .venv/Scripts/python.exe scripts/peg_rejected_outcomes.py --commit # stamp rejected hypothetical outcomes
 
 # Diagnostic probes (ad-hoc, read-only)
-.venv/Scripts/python.exe scripts/probe_open_orders.py              # OKX live positions + pending orders
+.venv/Scripts/python.exe scripts/test_bybit_connection.py          # Bybit demo: wallet, instruments, mark, positions, orders
+.venv/Scripts/python.exe scripts/probe_open_orders.py              # Bybit live positions + position-attached TP/SL + open orders
 .venv/Scripts/python.exe scripts/probe_arkham.py                   # Arkham API matrix check
 
 # Tests
@@ -810,10 +898,10 @@ Combined on a 42-trade dataset (`rl.clean_since=2026-04-19T19:55:00Z`):
 
 **Goal:** move from demo to live with survivable sizing, scale by performance.
 
-- **Live transition:** new OKX live account (sub-account recommended). Start `RISK_AMOUNT_USDT=$10-20`, `max_concurrent_positions=2`, cross margin, explicit notional cap.
+- **Live transition:** Bybit mainnet account (separate sub-account recommended), API key Read+Trade only with IP whitelist. Flip `BYBIT_DEMO=0` in `.env` AND construct `BybitClient(allow_live=True)` in the runner — both are required (constructor refuses live by default). Start `RISK_AMOUNT_USDT=$10-20`, `max_concurrent_positions=2`, UTA cross margin, explicit notional cap.
 - **Stability period:** 2 weeks / 30 live trades with no code changes. Compare live WR + avg R to demo baseline within ±5%.
 - **Scaling rules:** only after 100 live trades. Double `RISK_AMOUNT_USDT` only if 30-day rolling WR ≥ demo WR − 3% AND drawdown ≤ 15%. Asymmetric: halve on any 10-trade rolling WR < 30%.
-- **Monitoring:** journal-backed dashboard (pure-Python or Streamlit). Alert on: drawdown >20%, 5-loss streak, OKX 429, fill latency P95 >2s, daily realized PnL < -2R, Arkham credit usage >80%/month.
+- **Monitoring:** journal-backed dashboard (pure-Python or Streamlit). Alert on: drawdown >20%, 5-loss streak, Bybit `10006` rate-limit, fill latency P95 >2s, daily realized PnL < -2R, Arkham credit usage >80%/month.
 
 ### Phase 12 — Future enhancements (post-stable)
 
@@ -839,7 +927,7 @@ Candidates, **not commitments.** Re-evaluate after Phase 11 stability.
 - **Decision-making RL.** Structural decisions (5-pillar, hard gates, zone-based entry, per-symbol flow) stay fixed. Bayesian / RL are parameter tuners only.
 - **Claude Code as runtime decider.** Claude writes code and analyzes logs; it does not decide trades per candle.
 - **Sub-minute entry TFs (1m / 30s).** TV freshness-poll latency makes these unreliable. Infrastructure rewrite (direct exchange WS + in-process indicators) would be a different project.
-- **Leverage > 100x or non-cross margin modes.** Operator cap + OKX cap combine to forbid. Requires risk memo to revisit.
+- **Leverage > 100x or non-cross margin modes.** Operator cap + Bybit cap combine to forbid. Requires risk memo to revisit.
 
 ---
 
@@ -847,7 +935,7 @@ Candidates, **not commitments.** Re-evaluate after Phase 11 stability.
 
 **TradingView MCP:** unofficial, uses Electron debug interface, may break on TV updates → pin TV Desktop version. Data stays local.
 
-**OKX Agent Trade Kit:** official MIT-licensed. `--profile demo` first. Never enable withdrawal. Bind key to machine IP. Sub-account for live.
+**Bybit V5 API:** official `pybit` SDK. `demo=True` first; constructor refuses `demo=False` unless `allow_live=True` is passed explicitly. Never enable Withdrawal permission on the API key. IP whitelist strongly recommended (no expiry vs 90-day expiry). Sub-account for live. UTA hedge mode requires `mode=3` switch at startup (idempotent).
 
 **Arkham:** read-only API, no trade-path exposure. `ARKHAM_API_KEY` stored in `.env` only. Credit budget ~7k/month at current cadence (10k trial quota). Monitor dashboard for runaway usage; auto-disable at 95% is a safety net, not primary.
 

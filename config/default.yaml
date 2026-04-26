@@ -13,13 +13,12 @@ trading:
   # gecikmesi ~240s, (c) zone SL floor bypass. 7→5 per-slot margin'i +40%
   # açar ($714→$1000), cycle bütçesini 180s-üstü worst-case'den kurtarır,
   # attach race'i daraltır.
-  # 2026-04-19 (eve): ADA ↔ DOGE swap. ADA demo OI'da platform tavanına
-  # dayandı (sCode 54031 — "open interest reached platform's limit"),
-  # post-only + limit fallback her cycle reddedildi. DOGE/XRP override
-  # map'leri zaten YAML'da duruyordu, ADA yerine DOGE geri alındı. ADA
-  # override'ları (harmless) YAML'da bırakıldı, OI tavanı düşünce geri
-  # almak tek satır. Toplam kalan: BTC/ETH/SOL/DOGE/BNB.
-  symbols: [BTC-USDT-SWAP, ETH-USDT-SWAP, SOL-USDT-SWAP, DOGE-USDT-SWAP, BNB-USDT-SWAP]
+  # 2026-04-19 (eve, OKX-era): ADA ↔ DOGE swap. ADA demo OI'da platform
+  # tavanına dayandı (sCode 54031), her cycle reddedildi.
+  # 2026-04-25 (Bybit migration): BNB ↔ XRP swap. Operatör tercihi —
+  # XRP artık 5'inci aktif sembol; BNB override'ları (harmless) YAML'da
+  # bırakıldı, geri almak tek satır. Toplam kalan: BTC/ETH/SOL/DOGE/XRP.
+  symbols: [BTC-USDT-SWAP, ETH-USDT-SWAP, SOL-USDT-SWAP, DOGE-USDT-SWAP, XRP-USDT-SWAP]
   entry_timeframe: 3m
   htf_timeframe: 15m
   ltf_timeframe: 1m
@@ -353,9 +352,22 @@ analysis:
   vwap_zone_long_anchor: 0.7
   vwap_zone_short_anchor: 0.3
 
-okx:
-  base_url: https://www.okx.com
-  demo_flag: "1"
+  # 2026-04-26 — VWAP daily-reset blackout. Pine 3m/1m/15m VWAPs all
+  # anchor on the daily session change (UTC 00:00). For the first
+  # ~10-30 min after reset the ±1σ band is collapsed and
+  # `vwap_composite_alignment` reads near-noise → spurious soft-pillar
+  # weight. Time-based reject blocks new entries AND cancels resting
+  # pendings inside [-pre, +post] min around UTC midnight. Disable by
+  # flipping enabled to false (knob preserved for back-compat).
+  vwap_reset_blackout_enabled: true
+  vwap_reset_blackout_window_pre_min: 5
+  vwap_reset_blackout_window_post_min: 15
+
+bybit:
+  base_url: https://api-demo.bybit.com
+  demo: true
+  account_type: UNIFIED
+  category: linear
 
 journal:
   db_path: "data/trades.db"
@@ -640,14 +652,19 @@ on_chain:
   whale_blackout_duration_s: 600                   # State-activity window (informational flag only, not a gate)
   # Token slug whitelist on the WS stream — only transfers in these
   # tokens reach the listener. Drops gross label-lookup tax from
-  # noise tokens (XRP/ADA/MATIC etc.) that would never affect blackouts
+  # noise tokens (ADA/MATIC/LINK etc.) that would never affect blackouts
   # since `affected_symbols_for` returns empty for them. 2026-04-22.
+  # 2026-04-25 (Bybit migration): BNB swapped out for XRP in trading.symbols.
+  # Note: XRP is NOT added here — Arkham doesn't index XRPL per-token
+  # data (`/token/volume/{id}` rejects every XRP slug variant). XRP entries
+  # therefore lose only `per_symbol_cex_flow_penalty`; all other Arkham
+  # signals (daily_bias / stablecoin_pulse / altcoin_index /
+  # flow_alignment) still apply because they're symbol-agnostic.
   whale_tokens:
     - bitcoin
     - ethereum
     - solana
     - dogecoin
-    - binancecoin
     - tether
     - usd-coin
 
@@ -769,4 +786,23 @@ rl:
   # soft signals live, confluence_pillar_scores + oscillator_raw_values
   # 1m/3m/15m populated from first tick). Pass 2 reporter / GBT /
   # Optuna use this cut as the clean-window start.
-  clean_since: "2026-04-22T20:33:24Z"
+  # 2026-04-25 — Bybit V5 Demo migration cut. OKX exchange wholly
+  # dropped: python-okx removed, pybit added, all execution endpoints
+  # rewired against Bybit V5 (TP/SL position-attached via trading-stop
+  # instead of OKX OCO algos). Pass 2 trades.db archived as
+  # `data/trades.db.pre_bybit_2026-04-25T214500Z` — that window had
+  # both demo-wick artefact pollution and the SL-floor-bump losing
+  # cluster (see 2026-04-24 changelog).
+  # 2026-04-26 — fresh start cut. Migration day 22:08 → 26 00:29 was
+  # noisy: BNB→XRP swap mid-window, multiple pybit-exception fixes
+  # (110043 leverage idempotent, qty/price float-noise, Arkham XRP-
+  # token unsupported), 1 BTC LONG manually closed by operator. Pre-
+  # restart DB archived as
+  # `data/trades.db.fresh_start_2026-04-26T002930Z` (53 rejected_signals
+  # mixing BNB/XRP era + 1 OPEN BTC trade pre-fix). Fresh DB starts
+  # empty; every new row carries:
+  #   - Post-XRP-swap symbol set (BTC/ETH/SOL/DOGE/XRP)
+  #   - Post-fix qty/price quantization (no float noise rejections)
+  #   - Arkham per_symbol_cex_flow only on 4 symbols (XRP omitted)
+  #   - Idempotent leverage/mode/cancel handling
+  clean_since: "2026-04-26T00:29:30Z"

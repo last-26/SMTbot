@@ -1,13 +1,14 @@
 """Position polling → close-fill events.
 
 The OrderRouter places orders and walks away. The PositionMonitor watches
-OKX for the effect: entry fills, SL/TP hits, liquidations. It emits:
+Bybit for the effect: entry fills, SL/TP hits, liquidations. It emits:
 
   - on open→close transition: a CloseFill record, which the caller feeds
     into RiskManager.register_trade_closed().
-  - on partial TP1 fill (size shrinks but not to zero), it cancels the
-    remaining TP2 algo and places a new SL-at-breakeven OCO for the
-    surviving contracts (Madde E).
+  - on MFE / TP1 / dynamic-TP triggers: mutates the position-attached
+    TP/SL via /v5/position/trading-stop (single atomic call — no
+    cancel+place dance, since TP/SL is part of the position itself
+    on Bybit V5, not a separate algo order).
 
 No websocket — we REST-poll because the bot loop is already polling the
 TV MCP every N seconds. Adding a second concurrent connection isn't worth
@@ -25,26 +26,31 @@ from typing import Callable, Optional
 
 from loguru import logger
 
+from src.execution.bybit_client import BybitClient
 from src.execution.errors import OrderRejected
 from src.execution.models import CloseFill, PositionSnapshot, PositionState
-from src.execution.okx_client import OKXClient
 
 
 def _utc_now() -> datetime:
     return datetime.now(tz=timezone.utc)
 
-# OKX V5 error codes where cancel_algo_order can be treated as already-done:
-# 51400 = order does not exist, 51401 = already canceled, 51402 = already
-# filled. If the TP2 algo vanished (OCO cascade after TP1 fill, prior-poll
-# cancel whose place leg failed, operator manual cancel), the monitor's
-# cancel is a no-op — proceed to place the BE replacement instead of
-# spinning on the cancel every poll.
-_ALGO_GONE_CODES = frozenset({"51400", "51401", "51402"})
 
-# Backstop: if cancel keeps failing with an unknown code (e.g. malformed
-# OKX response with no sCode), stop after this many polls and surface the
-# position as unprotected. Prevents the retry-spin pathology even when
-# `_ALGO_GONE_CODES` doesn't match the actual error code.
+# Bybit V5 error codes where cancel_order can be treated as already-done:
+# 110001 = order does not exist, 110008 = order has been completed or
+# cancelled, 110010 = order has been cancelled, 170142/170213 = order
+# does not exist (variant codes for spot/linear). If a pending limit
+# vanished between polls (filled, prior-poll cancel raced, operator
+# manual cancel), we treat the cancel as idempotent success.
+_ORDER_GONE_CODES = frozenset({"110001", "110008", "110010", "170142", "170213"})
+
+# Legacy alias kept while the rest of the codebase migrates off the OKX-era
+# name. Both names point at the same set on Bybit.
+_ALGO_GONE_CODES = _ORDER_GONE_CODES
+
+# Backstop: if cancel keeps failing with an unknown code, stop after this
+# many polls and surface the position as unprotected. Prevents the
+# retry-spin pathology even when `_ORDER_GONE_CODES` doesn't match the
+# actual error code.
 _CANCEL_MAX_RETRIES = 3
 
 
@@ -115,8 +121,19 @@ class PendingEvent:
     avg_price: float = 0.0
 
 
+# Bybit V5 `orderStatus` values (CamelCase). We compare lowercased so the
+# reader is tolerant of any case mishaps in mocks / SDK quirks. Filled is
+# the only success terminal state; Cancelled / Rejected / Deactivated are
+# all terminal-cancel states that the runner should surface as such.
+# `canceled` (American spelling) and `mmp_canceled` are kept for
+# back-compat with OKX-era test fixtures that pre-date the migration —
+# the live Bybit API never emits these, but tests that haven't been
+# touched still work.
 _TERMINAL_FILLED = frozenset({"filled"})
-_TERMINAL_CANCELED = frozenset({"canceled", "mmp_canceled"})
+_TERMINAL_CANCELED = frozenset({
+    "cancelled", "rejected", "deactivated",
+    "canceled", "mmp_canceled",
+})
 
 
 class PositionMonitor:
@@ -124,7 +141,7 @@ class PositionMonitor:
 
     def __init__(
         self,
-        client: OKXClient,
+        client: BybitClient,
         *,
         margin_mode: str = "isolated",
         move_sl_to_be_enabled: bool = False,
@@ -199,23 +216,18 @@ class PositionMonitor:
                 # Tracked position no longer live → it closed.
                 fills.append(self._close_fill_from(tracked))
                 # Best-effort cancel the resting TP limit so it doesn't
-                # linger as an orphan when the OCO closed us first.
-                # Reduce-only keeps it inert even if the cancel races, but
-                # leaving resting orders behind trips the next startup's
-                # orphan-pending-limit sweep.
+                # linger as an orphan when the position closed via SL/TP
+                # first. Reduce-only keeps it inert even if the cancel
+                # races, but leaving resting orders behind trips the next
+                # startup's orphan-pending-limit sweep.
                 if tracked.tp_limit_order_id:
                     self._cancel_tp_limit_best_effort(
                         tracked.inst_id, tracked.tp_limit_order_id,
                     )
-                # 2026-04-23 — symmetric sweep for algo_ids. When the
-                # maker-TP fills first (or any other natural close path
-                # leaves the OCO unfired), the co-placed SL/TP algos
-                # stay live. Without this cancel they orphan on OKX's
-                # book until next startup reconcile.
-                if tracked.algo_ids:
-                    self._cancel_algos_best_effort(
-                        tracked.inst_id, list(tracked.algo_ids),
-                    )
+                # On Bybit V5 the position-attached TP/SL clears
+                # automatically when the position size hits zero — no
+                # algo-orphan sweep needed (compare the OKX-era
+                # `_cancel_algos_best_effort` call that lived here).
                 to_remove.append(key)
             else:
                 snap = live_snaps[key]
@@ -234,28 +246,20 @@ class PositionMonitor:
         self, t: _Tracked, snap: PositionSnapshot,
     ) -> None:
         """If the live size shrank (TP1 fill) and we haven't moved SL yet,
-        cancel TP2 and replace it with SL=entry on the remaining size.
+        update the position's SL to breakeven (+ fee buffer) on the
+        surviving contracts.
 
-        Failure handling (every branch exits without spin):
-
-        1. Cancel fails with `_ALGO_GONE_CODES` → treat as idempotent
-           success and proceed to place (handles OCO cascade, prior-poll
-           cancel whose place leg failed, operator manual cancel).
-        2. Cancel fails with an unknown code → increment
-           `cancel_retry_count`; next poll retries. After
-           `_CANCEL_MAX_RETRIES` attempts, give up and mark
-           `be_already_moved=True` so poll stops spinning — live TP2
-           algo state is then unknown, operator intervenes.
-        3. Place fails after cancel already landed → the surviving leg is
-           now *unprotected*. Mark `be_already_moved=True`, drop TP2
-           from `algo_ids`, log CRITICAL. Emergency market-close is
-           intentionally NOT automated — a winning TP1 runner without a
-           stop is better handled by a human than a blind exit."""
+        On Bybit V5 this is a single atomic /v5/position/trading-stop call
+        — there's no separate algo to cancel and replace. If the call
+        fails the position keeps its existing (pre-BE) SL, so there's no
+        "unprotected window" to worry about. We still cap retries to avoid
+        spin and log CRITICAL on a hard failure so operator can intervene.
+        """
         if not self.move_sl_to_be_enabled:
             return
         if t.be_already_moved:
             return
-        if t.initial_size <= 0 or len(t.algo_ids) < 2:
+        if t.initial_size <= 0:
             return
         # Only react when size strictly shrank AND something is still open.
         if snap.size >= t.initial_size or snap.size <= 0:
@@ -263,113 +267,46 @@ class PositionMonitor:
         if t.tp2_price is None:
             return
 
-        tp2_algo_id = t.algo_ids[1]
         sign = 1 if t.pos_side == "long" else -1
         be_price = t.entry_price + (t.entry_price * self.sl_be_offset_pct * sign)
 
-        # Step 1: cancel TP2 (tolerant of already-gone, but verify 51400 —
-        # OKX demo has been seen returning 51400 on a still-live algo,
-        # and placing a replacement then leaves TWO stops on the book).
-        cancel_succeeded_or_idempotent = False
         try:
-            self.client.cancel_algo(t.inst_id, tp2_algo_id)
-            cancel_succeeded_or_idempotent = True
-        except OrderRejected as exc:
-            if self._cancel_error_is_already_gone(exc):
-                if self._verify_algo_gone(t.inst_id, tp2_algo_id):
-                    logger.warning(
-                        "sl_to_be_tp2_already_gone inst={} side={} algo_id={} "
-                        "code={} verified=true — proceeding with BE placement",
-                        t.inst_id, t.pos_side, tp2_algo_id, exc.code,
-                    )
-                    cancel_succeeded_or_idempotent = True
-                else:
-                    t.cancel_retry_count += 1
-                    logger.warning(
-                        "sl_to_be_cancel_51400_but_still_live inst={} side={} "
-                        "algo_id={} — not placing replacement (avoid double-SL), "
-                        "retry next poll attempt={}/{}",
-                        t.inst_id, t.pos_side, tp2_algo_id,
-                        t.cancel_retry_count, _CANCEL_MAX_RETRIES,
-                    )
-            else:
-                t.cancel_retry_count += 1
-                logger.exception(
-                    "sl_to_be_cancel_retry_next_poll inst={} side={} code={} "
-                    "attempt={}/{}",
-                    t.inst_id, t.pos_side, exc.code,
-                    t.cancel_retry_count, _CANCEL_MAX_RETRIES,
-                )
-        except Exception:
+            self.client.set_position_tpsl(
+                inst_id=t.inst_id,
+                pos_side=t.pos_side,
+                stop_loss=be_price,
+                # Leave TP unchanged — this is SL-only.
+                trigger_px_type=self.algo_trigger_px_type,
+            )
+        except Exception as exc:
             t.cancel_retry_count += 1
-            logger.exception(
-                "sl_to_be_cancel_retry_next_poll inst={} side={} attempt={}/{}",
-                t.inst_id, t.pos_side,
+            code = getattr(exc, "code", None)
+            payload = getattr(exc, "payload", None)
+            logger.warning(
+                "sl_to_be_trading_stop_failed inst={} side={} be_price={} "
+                "err={!r} code={} payload={} attempt={}/{} — old SL still "
+                "protects, retry next poll",
+                t.inst_id, t.pos_side, be_price, exc, code, payload,
                 t.cancel_retry_count, _CANCEL_MAX_RETRIES,
             )
-
-        if not cancel_succeeded_or_idempotent:
             if t.cancel_retry_count >= _CANCEL_MAX_RETRIES:
-                # Backstop: we can't tell if the algo is truly gone or if
-                # OKX is returning malformed errors. Either way, stop
-                # spinning and surface the state. The TP2 algo *might*
-                # still be live on OKX — but after N failed cancels we
-                # can't confirm, and the original SL leg from the TP1
-                # OCO is already effected (state=effective, sz=partial),
-                # so the runner's real risk is that the live TP2 algo
-                # may still trigger on its own. Operator decides.
                 logger.critical(
-                    "sl_to_be_cancel_gave_up inst={} side={} algo_id={} "
-                    "after {} attempts — not moving SL to BE; live TP2 "
-                    "algo state unknown, manual intervention required",
-                    t.inst_id, t.pos_side, tp2_algo_id, t.cancel_retry_count,
+                    "sl_to_be_gave_up inst={} side={} after {} attempts — "
+                    "position retains pre-BE SL, manual intervention to "
+                    "tighten if desired",
+                    t.inst_id, t.pos_side, t.cancel_retry_count,
                 )
                 t.be_already_moved = True
             return
 
-        # Step 2: place the BE replacement. Cancel has already landed, so
-        # the surviving leg is unprotected until this returns.
-        try:
-            new_algo = self.client.place_oco_algo(
-                inst_id=t.inst_id, pos_side=t.pos_side,
-                size_contracts=int(snap.size),
-                sl_trigger_px=be_price,
-                tp_trigger_px=t.tp2_price,
-                td_mode=self.margin_mode,
-                trigger_px_type=self.algo_trigger_px_type,
-            )
-        except Exception as exc:
-            code = getattr(exc, "code", None)
-            payload = getattr(exc, "payload", None)
-            logger.critical(
-                "sl_to_be_place_failed_position_unprotected inst={} side={} "
-                "remaining_size={} be_price={} err={!r} code={} payload={} — "
-                "TP2 cancelled, replacement OCO rejected, manual intervention required",
-                t.inst_id, t.pos_side, snap.size, be_price, exc, code, payload,
-            )
-            # Prevent retry-spin: cancel already succeeded, so a retry
-            # would just "cancel a vanished algo" forever. Drop TP2 from
-            # algo_ids so the journal reflects that only TP1 remains.
-            t.algo_ids = [t.algo_ids[0]]
-            t.be_already_moved = True
-            if self._on_sl_moved is not None:
-                try:
-                    self._on_sl_moved(t.inst_id, t.pos_side, list(t.algo_ids))
-                except Exception:
-                    logger.exception("on_sl_moved_callback_failed")
-            return
-
-        t.algo_ids = [t.algo_ids[0], new_algo.algo_id]
         t.be_already_moved = True
-        # Keep dynamic-TP bookkeeping in sync: the runner OCO is now this
-        # replacement; revise_runner_tp will read sl_price + runner_size.
         t.sl_price = be_price
         t.runner_size = int(snap.size)
         logger.info(
-            "sl_moved_to_be_via_replace inst={} side={} remaining_size={} "
-            "be_price={} offset_pct={} new_algo={}",
+            "sl_moved_to_be inst={} side={} remaining_size={} "
+            "be_price={} offset_pct={}",
             t.inst_id, t.pos_side, snap.size,
-            be_price, self.sl_be_offset_pct, new_algo.algo_id,
+            be_price, self.sl_be_offset_pct,
         )
         if self._on_sl_moved is not None:
             try:
@@ -381,91 +318,50 @@ class PositionMonitor:
         self, inst_id: str, pos_side: str, new_tp: float,
         *, now: Optional[datetime] = None,
     ) -> bool:
-        """Cancel the runner OCO and place a replacement with `new_tp`.
+        """Update the position's TP via /v5/position/trading-stop.
 
-        Keeps the active SL untouched (`t.sl_price`, which is plan SL pre-BE
-        and the BE-adjusted price post-BE). Used by the dynamic-TP loop in
-        the runner: when live conditions move the 1:N target away from the
-        original placement, we re-OCO instead of leaving stale TP geometry
-        on the book. Returns True on success.
+        Keeps the active SL untouched (Bybit's trading-stop accepts each
+        leg independently — passing only `take_profit` leaves `stop_loss`
+        on the position alone). Used by the dynamic-TP loop in the runner:
+        when live conditions move the 1:N target away from the original
+        placement, we mutate the TP in place. Returns True on success.
 
-        Failure modes mirror `_detect_tp1_and_move_sl`:
-          * cancel returns idempotent-gone code → proceed to place.
-          * cancel returns hard error → abort, runner OCO untouched.
-          * place fails after cancel → CRITICAL log, runner UNPROTECTED,
-            algo_ids trimmed, returns False. No emergency market-close —
-            same operator-decides discipline as the BE replacement.
+        Failure mode: trading-stop call rejects → existing TP stays in
+        place, return False. The position never goes unprotected because
+        we never cancel before placing — Bybit handles the swap atomically.
         """
         key = (inst_id, pos_side)
         t = self._tracked.get(key)
-        if t is None or not t.algo_ids:
+        if t is None:
             return False
         if t.tp2_price is not None and abs(t.tp2_price - new_tp) < 1e-9:
             return False
         if t.runner_size <= 0:
             return False
 
-        runner_algo_id = t.algo_ids[-1]
-
         try:
-            self.client.cancel_algo(t.inst_id, runner_algo_id)
-        except OrderRejected as exc:
-            if not self._cancel_error_is_already_gone(exc):
-                logger.warning(
-                    "tp_revise_cancel_failed inst={} side={} algo_id={} "
-                    "code={} — abort, runner OCO untouched",
-                    t.inst_id, t.pos_side, runner_algo_id, exc.code,
-                )
-                return False
-            # Verify 51400 before placing — demo can lie about algo state.
-            if not self._verify_algo_gone(t.inst_id, runner_algo_id):
-                logger.warning(
-                    "tp_revise_cancel_51400_but_still_live inst={} side={} "
-                    "algo_id={} — abort to avoid double-OCO, try next cycle",
-                    t.inst_id, t.pos_side, runner_algo_id,
-                )
-                return False
-            logger.warning(
-                "tp_revise_runner_already_gone inst={} side={} algo_id={} "
-                "code={} verified=true — proceeding with replacement",
-                t.inst_id, t.pos_side, runner_algo_id, exc.code,
-            )
-        except Exception:
-            logger.exception(
-                "tp_revise_cancel_exception inst={} side={} algo_id={}",
-                t.inst_id, t.pos_side, runner_algo_id,
-            )
-            return False
-
-        try:
-            new_algo = self.client.place_oco_algo(
-                inst_id=t.inst_id, pos_side=t.pos_side,
-                size_contracts=int(t.runner_size),
-                sl_trigger_px=t.sl_price,
-                tp_trigger_px=new_tp,
-                td_mode=self.margin_mode,
+            self.client.set_position_tpsl(
+                inst_id=t.inst_id,
+                pos_side=t.pos_side,
+                take_profit=new_tp,
                 trigger_px_type=self.algo_trigger_px_type,
             )
         except Exception as exc:
             code = getattr(exc, "code", None)
             payload = getattr(exc, "payload", None)
-            logger.critical(
-                "tp_revise_place_failed_position_unprotected inst={} side={} "
-                "size={} sl={} new_tp={} err={!r} code={} payload={} — "
-                "runner unprotected, manual intervention",
-                t.inst_id, t.pos_side, t.runner_size, t.sl_price, new_tp,
-                exc, code, payload,
+            logger.warning(
+                "tp_revise_trading_stop_failed inst={} side={} new_tp={} "
+                "err={!r} code={} payload={} — existing TP still protects",
+                t.inst_id, t.pos_side, new_tp, exc, code, payload,
             )
-            t.algo_ids = t.algo_ids[:-1]
             return False
 
-        t.algo_ids = t.algo_ids[:-1] + [new_algo.algo_id]
         t.tp2_price = new_tp
         t.last_tp_revise_at = now or _utc_now()
-        # 2026-04-20 — if a resting TP limit was co-placed with the old OCO,
+        # 2026-04-20 — if a resting TP limit (maker-TP) was co-placed,
         # move it to the new TP price in lockstep. Leave stale on failure
         # rather than double-canceling: old limit still protects at the
-        # prior level; the new OCO's market-on-trigger is the safety net.
+        # prior level; the new trading-stop TP is the safety net.
         if t.tp_limit_order_id:
             old_tp_ord = t.tp_limit_order_id
             self._cancel_tp_limit_best_effort(t.inst_id, old_tp_ord)
@@ -474,8 +370,7 @@ class PositionMonitor:
                 new_tp_ord = self.client.place_reduce_only_limit(
                     inst_id=t.inst_id, pos_side=t.pos_side,
                     size_contracts=int(t.runner_size),
-                    px=new_tp, td_mode=self.margin_mode,
-                    post_only=True,
+                    px=new_tp, post_only=True,
                 )
                 t.tp_limit_order_id = new_tp_ord.order_id
                 logger.info(
@@ -487,18 +382,13 @@ class PositionMonitor:
             except Exception:
                 logger.exception(
                     "tp_limit_replace_failed inst={} side={} new_tp={} — "
-                    "OCO market-TP still protects, maker fill lost this cycle",
+                    "trading-stop TP still protects, maker fill lost this cycle",
                     t.inst_id, t.pos_side, new_tp,
                 )
         logger.info(
-            "tp_revised inst={} side={} new_tp={} sl={} new_algo={}",
-            t.inst_id, t.pos_side, new_tp, t.sl_price, new_algo.algo_id,
+            "tp_revised inst={} side={} new_tp={} sl={}",
+            t.inst_id, t.pos_side, new_tp, t.sl_price,
         )
-        # Persist the new runner algo id to the journal so a restart's rehydrate
-        # reads the *live* algo, not the pre-revise one. Without this, the next
-        # rehydrate reads a stale id and the next revise cancels a ghost while
-        # the actually-live replacement keeps running → orphan OCO on OKX.
-        # (2026-04-20 DOGE 2-OCO postmortem.)
         if self._on_sl_moved is not None:
             try:
                 self._on_sl_moved(t.inst_id, t.pos_side, list(t.algo_ids))
@@ -531,24 +421,23 @@ class PositionMonitor:
     def lock_sl_at(
         self, inst_id: str, pos_side: str, new_sl: float,
     ) -> bool:
-        """Cancel the runner OCO and place a replacement with `new_sl`
-        (keeping the current TP). Used by the MFE-lock gate in the runner:
-        once the trade is far enough in favor, the old SL below entry is
-        no longer protecting risk — it's protecting a loss that shouldn't
-        happen. This pulls the SL up to BE / profit-lock.
+        """Update the position's SL to `new_sl` (keeping current TP).
+
+        Used by the MFE-lock gate in the runner: once the trade is far
+        enough in favor, the old SL below entry is no longer protecting
+        risk — it's protecting a loss that shouldn't happen. This pulls
+        the SL up to BE / profit-lock via /v5/position/trading-stop.
 
         One-shot: `sl_lock_applied` is set to True on success so repeated
         MFE ticks can't re-trigger (subsequent tightening needs a real
         trail, out of scope here).
 
-        Failure modes mirror `revise_runner_tp`:
-          * cancel returns idempotent-gone code → proceed (verified).
-          * cancel returns hard error → abort, OCO untouched.
-          * place fails after cancel → CRITICAL log, UNPROTECTED, return False.
+        Failure mode: trading-stop call rejects → existing SL stays in
+        place, return False, set `sl_lock_applied=True` so we don't loop.
         """
         key = (inst_id, pos_side)
         t = self._tracked.get(key)
-        if t is None or not t.algo_ids:
+        if t is None:
             return False
         if t.sl_lock_applied:
             return False
@@ -557,78 +446,38 @@ class PositionMonitor:
         if t.tp2_price is None or t.tp2_price <= 0:
             return False
         # Guard against degenerate placements: new SL must still be on the
-        # protective side of entry. A long's new SL must be ≤ entry for
-        # "risk-free / locked-profit" to make sense; a short's new SL must
-        # be ≥ entry. Otherwise we'd be tightening into a worse-than-old
-        # stop, which defeats the point.
+        # protective side of TP. A long's new SL must be < TP for the lock
+        # to make sense; a short's new SL must be > TP. Otherwise we'd be
+        # tightening into a worse-than-old stop, which defeats the point.
         if t.pos_side == "long" and new_sl >= t.tp2_price:
             return False
         if t.pos_side == "short" and new_sl <= t.tp2_price:
             return False
 
-        runner_algo_id = t.algo_ids[-1]
-
         try:
-            self.client.cancel_algo(t.inst_id, runner_algo_id)
-        except OrderRejected as exc:
-            if not self._cancel_error_is_already_gone(exc):
-                logger.warning(
-                    "sl_lock_cancel_failed inst={} side={} algo_id={} "
-                    "code={} — abort, runner OCO untouched",
-                    t.inst_id, t.pos_side, runner_algo_id, exc.code,
-                )
-                return False
-            if not self._verify_algo_gone(t.inst_id, runner_algo_id):
-                logger.warning(
-                    "sl_lock_cancel_51400_but_still_live inst={} side={} "
-                    "algo_id={} — abort to avoid double-OCO, try next cycle",
-                    t.inst_id, t.pos_side, runner_algo_id,
-                )
-                return False
-            logger.warning(
-                "sl_lock_runner_already_gone inst={} side={} algo_id={} "
-                "code={} verified=true — proceeding with replacement",
-                t.inst_id, t.pos_side, runner_algo_id, exc.code,
-            )
-        except Exception:
-            logger.exception(
-                "sl_lock_cancel_exception inst={} side={} algo_id={}",
-                t.inst_id, t.pos_side, runner_algo_id,
-            )
-            return False
-
-        try:
-            new_algo = self.client.place_oco_algo(
-                inst_id=t.inst_id, pos_side=t.pos_side,
-                size_contracts=int(t.runner_size),
-                sl_trigger_px=new_sl,
-                tp_trigger_px=t.tp2_price,
-                td_mode=self.margin_mode,
+            self.client.set_position_tpsl(
+                inst_id=t.inst_id,
+                pos_side=t.pos_side,
+                stop_loss=new_sl,
                 trigger_px_type=self.algo_trigger_px_type,
             )
         except Exception as exc:
             code = getattr(exc, "code", None)
             payload = getattr(exc, "payload", None)
-            logger.critical(
-                "sl_lock_place_failed_position_unprotected inst={} side={} "
-                "size={} new_sl={} tp={} err={!r} code={} payload={} — "
-                "runner unprotected, manual intervention",
-                t.inst_id, t.pos_side, t.runner_size, new_sl, t.tp2_price,
-                exc, code, payload,
+            logger.warning(
+                "sl_lock_trading_stop_failed inst={} side={} new_sl={} "
+                "tp={} err={!r} code={} payload={} — existing SL still "
+                "protects, marking lock_applied to prevent retry-spin",
+                t.inst_id, t.pos_side, new_sl, t.tp2_price, exc, code, payload,
             )
-            t.algo_ids = t.algo_ids[:-1]
-            # Mark as applied so we don't loop on another failed cancel+place.
             t.sl_lock_applied = True
             return False
 
-        t.algo_ids = t.algo_ids[:-1] + [new_algo.algo_id]
         t.sl_price = new_sl
         t.sl_lock_applied = True
         logger.info(
-            "sl_locked_via_replace inst={} side={} size={} new_sl={} "
-            "tp={} new_algo={}",
+            "sl_locked inst={} side={} size={} new_sl={} tp={}",
             t.inst_id, t.pos_side, t.runner_size, new_sl, t.tp2_price,
-            new_algo.algo_id,
         )
         if self._on_sl_moved is not None:
             try:
@@ -639,84 +488,11 @@ class PositionMonitor:
 
     @staticmethod
     def _cancel_error_is_already_gone(exc: OrderRejected) -> bool:
-        # Known OKX "algo doesn't exist / already cancelled / already
-        # filled" codes. Anything else (including empty/None code —
-        # generally a wrapping issue, not a semantic 'gone' signal) falls
+        # Bybit "order doesn't exist / already cancelled / already filled"
+        # codes (110001/110008/110010/170142/170213). Anything else falls
         # through to the retry path, where the generic retry counter will
         # eventually give up if it truly cannot recover.
-        return exc.code in _ALGO_GONE_CODES
-
-    def _verify_algo_gone(self, inst_id: str, algo_id: str) -> bool:
-        """Double-check 51400 against the live pending-algos list.
-
-        OKX demo has been seen returning 51400 ("algo does not exist") on
-        a cancel while the algo is still on the book — placing a
-        replacement OCO then leaves TWO stops on the position, both of
-        which fire back-to-back at the next adverse wick. This helper
-        queries the live algos and only returns True when the specific
-        algoId is truly absent. Network / API failure returns False (be
-        conservative — do not proceed to place).
-        """
-        try:
-            pending = self.client.list_pending_algos(inst_id=inst_id)
-        except Exception:
-            logger.exception(
-                "algo_verify_list_failed inst={} algo_id={} — "
-                "treating as NOT-gone (conservative)",
-                inst_id, algo_id,
-            )
-            return False
-        for row in pending:
-            if str(row.get("algoId", "")) == str(algo_id):
-                return False
-        return True
-
-    def _cancel_algos_best_effort(
-        self, inst_id: str, algo_ids: list[str],
-    ) -> None:
-        """Cancel every algo in `algo_ids` on a natural close.
-
-        Background (2026-04-23 BTC orphan OCO postmortem): when the
-        maker-TP resting limit fills first, the position goes to zero,
-        but OKX does NOT auto-cancel the co-placed OCO's still-resting
-        SL/TP algos. Without this sweep the OCO lingers on the book
-        as an orphan until the next startup reconcile catches it —
-        leaving the account momentarily exposed to a double-trigger
-        if a wick hits the stale SL before the next boot.
-
-        Tolerates the same non-fatal paths as `_cancel_tp_limit_best_effort`:
-        already-filled / already-canceled codes are logged at debug,
-        everything else at warning. The resting algo becomes inert if
-        the cancel races (position is flat, reduce-only semantics), but
-        leaving it behind trips `_cancel_surplus_ocos` on next startup.
-        """
-        for algo_id in algo_ids:
-            if not algo_id:
-                continue
-            try:
-                self.client.cancel_algo(inst_id, algo_id)
-                logger.info(
-                    "close_sweep_algo_canceled inst={} algo={}",
-                    inst_id, algo_id,
-                )
-            except OrderRejected as exc:
-                if self._cancel_error_is_already_gone(exc):
-                    logger.debug(
-                        "close_sweep_algo_already_gone inst={} algo={} "
-                        "code={}",
-                        inst_id, algo_id, exc.code,
-                    )
-                else:
-                    logger.warning(
-                        "close_sweep_algo_cancel_failed inst={} algo={} "
-                        "code={} — will retry on next startup sweep",
-                        inst_id, algo_id, exc.code,
-                    )
-            except Exception:
-                logger.exception(
-                    "close_sweep_algo_cancel_exception inst={} algo={}",
-                    inst_id, algo_id,
-                )
+        return exc.code in _ORDER_GONE_CODES
 
     def _cancel_tp_limit_best_effort(self, inst_id: str, order_id: str) -> None:
         """Cancel a resting TP limit. Tolerates all non-fatal paths:
@@ -812,13 +588,12 @@ class PositionMonitor:
     def poll_pending(
         self, now: Optional[datetime] = None,
     ) -> list[PendingEvent]:
-        """Poll OKX for each tracked pending order and emit transitions.
+        """Poll Bybit for each tracked pending order and emit transitions.
 
         For each pending entry:
-          * OKX state `filled`            → FILLED event
-          * OKX state `canceled`/`mmp_canceled` → CANCELED (reason="external")
-          * Still `live`/`partially_filled` beyond `max_wait_s`
-              → cancel on OKX, CANCELED (reason="timeout")
+          * Bybit `orderStatus=Filled`                       → FILLED event
+          * `Cancelled` / `Rejected` / `Deactivated`         → CANCELED (reason="external")
+          * Still `New`/`PartiallyFilled` beyond `max_wait_s` → cancel on Bybit, CANCELED (reason="timeout")
           * Transient error fetching state → skip this poll, retry next
 
         Partial fills that age past max_wait_s are canceled but we still
@@ -839,9 +614,11 @@ class PositionMonitor:
                 )
                 continue
 
-            state = str(raw.get("state", "")).lower()
-            filled_sz = float(raw.get("accFillSz") or 0.0)
-            avg_px = float(raw.get("avgPx") or 0.0)
+            # Bybit V5: `orderStatus` field, CamelCase. Accept the OKX-era
+            # `state` field too so test mocks can transition gradually.
+            state = str(raw.get("orderStatus") or raw.get("state") or "").lower()
+            filled_sz = float(raw.get("cumExecQty") or raw.get("accFillSz") or 0.0)
+            avg_px = float(raw.get("avgPrice") or raw.get("avgPx") or 0.0)
 
             if state in _TERMINAL_FILLED:
                 events.append(PendingEvent(

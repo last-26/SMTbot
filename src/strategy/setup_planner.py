@@ -576,6 +576,7 @@ def apply_zone_to_plan(
         sl_source=f"zone_{zone.zone_source}",
         confluence_score=plan.confluence_score,
         confluence_factors=list(plan.confluence_factors),
+        confluence_pillar_scores=dict(plan.confluence_pillar_scores),
         reason=f"{plan.reason} | zone={zone.zone_source}",
         tp_ladder=ladder,
     )

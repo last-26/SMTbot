@@ -1,14 +1,14 @@
 """Shared fixtures + fakes for bot-runner integration tests.
 
-The runner is duck-typed: reader / router / monitor / okx_client are all
+The runner is duck-typed: reader / router / monitor / bybit_client are all
 interface-only. These fakes implement just enough surface for the runner
-to exercise its full decision tree without touching TV, OKX, or disk.
+to exercise its full decision tree without touching TV, Bybit, or disk.
 
 Constructors:
   - `make_plan(**overrides)`   — a TradePlan ready for the router
   - `make_report(**overrides)` — an ExecutionReport mirroring a successful place
   - `make_state()`             — a minimal MarketState (all defaults)
-  - `make_config()`            — a BotConfig with dummy OKX creds
+  - `make_config()`            — a BotConfig with dummy Bybit creds
   - `make_close_fill(...)`     — a CloseFill with non-zero pnl (post-enrichment)
 """
 
@@ -114,9 +114,10 @@ def make_config(**trading_overrides) -> BotConfig:
             "sr_zone_atr_mult": 0.5,
             "session_filter": ["london", "new_york"],
         },
-        "okx": {
-            "base_url": "https://www.okx.com", "demo_flag": "1",
-            "api_key": "k", "api_secret": "s", "passphrase": "p",
+        "bybit": {
+            "base_url": "https://api-demo.bybit.com", "demo": True,
+            "account_type": "UNIFIED", "category": "linear",
+            "api_key": "k", "api_secret": "s",
         },
         "journal": {"db_path": ":memory:"},
     }
@@ -208,9 +209,10 @@ class FakeMonitor:
         return True
 
 
-class FakeOKXClient:
-    """Surface the runner touches: enrich_close_fill, get_positions, get_balance,
-    cancel_algo, close_position (last two for defensive-close tests)."""
+class FakeBybitClient:
+    """Surface the runner touches: enrich_close_fill, get_positions,
+    get_balance, set_position_tpsl, close_position, plus a few back-compat
+    shims (cancel_algo) for tests written before the Bybit migration."""
 
     def __init__(self, positions: Optional[list[PositionSnapshot]] = None,
                  enrich_return: Optional[CloseFill] = None,
@@ -219,10 +221,14 @@ class FakeOKXClient:
         self.positions = positions or []
         self.enrich_return = enrich_return
         self.balance = balance
+        # Legacy name kept for back-compat with tests that asserted on it.
+        # On Bybit there's no separate cancel_algo; this is just a record.
         self.cancel_algo_calls: list[tuple[str, str]] = []
         self.close_position_calls: list[tuple[str, str]] = []
         self.tp_limits_placed: list[dict] = []
         self.tp_limit_place_raises = tp_limit_place_raises
+        self.set_position_tpsl_calls: list[dict] = []
+        self.list_open_orders_return: list[dict] = []
         self._next_tp_limit_id = 0
 
     def get_positions(self, inst_id: Optional[str] = None) -> list[PositionSnapshot]:
@@ -234,9 +240,32 @@ class FakeOKXClient:
     def get_balance(self, ccy: str = "USDT") -> float:
         return self.balance
 
+    def get_total_equity(self, ccy: str = "USDT") -> float:
+        return self.balance
+
     def cancel_algo(self, inst_id: str, algo_id: str) -> dict:
         self.cancel_algo_calls.append((inst_id, algo_id))
         return {}
+
+    def set_position_tpsl(
+        self, inst_id: str, pos_side: str,
+        take_profit: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+        tpsl_mode: str = "Full",
+        trigger_px_type: str = "mark",
+    ) -> dict:
+        self.set_position_tpsl_calls.append({
+            "inst_id": inst_id, "pos_side": pos_side,
+            "take_profit": take_profit, "stop_loss": stop_loss,
+            "tpsl_mode": tpsl_mode, "trigger_px_type": trigger_px_type,
+        })
+        return {}
+
+    def list_open_orders(
+        self, inst_id: Optional[str] = None,
+        order_filter: str = "Order",
+    ) -> list[dict]:
+        return list(self.list_open_orders_return)
 
     def close_position(self, inst_id: str, pos_side: str,
                        td_mode: str = "isolated") -> dict:
@@ -269,6 +298,11 @@ class FakeOKXClient:
         )
 
 
+# Legacy alias — many tests still import this name. Points at the same
+# class so old test code doesn't need to be touched.
+FakeOKXClient = FakeBybitClient
+
+
 # ── Composite helper ────────────────────────────────────────────────────────
 
 
@@ -289,18 +323,25 @@ def make_ctx():
         multi_tf = overrides.pop("multi_tf", None) or FakeMultiTF()
         router = overrides.pop("router", None) or FakeRouter()
         monitor = overrides.pop("monitor", None) or FakeMonitor()
-        okx_client = overrides.pop("okx_client", None) or FakeOKXClient()
+        # Accept either keyword for back-compat: tests written before the
+        # Bybit migration pass `okx_client=`; new tests pass `bybit_client=`.
+        bybit_client = (overrides.pop("bybit_client", None)
+                        or overrides.pop("okx_client", None)
+                        or FakeBybitClient())
         journal = overrides.pop("journal", None) or TradeJournal(":memory:")
         risk_mgr = overrides.pop("risk_mgr", None) or RiskManager(
             cfg.bot.starting_balance, cfg.breakers())
         ctx = BotContext(
             reader=reader, multi_tf=multi_tf, journal=journal,
             router=router, monitor=monitor, risk_mgr=risk_mgr,
-            okx_client=okx_client, config=cfg,
+            bybit_client=bybit_client, config=cfg,
         )
         fakes = SimpleNamespace(
             reader=reader, multi_tf=multi_tf, router=router,
-            monitor=monitor, okx_client=okx_client,
+            monitor=monitor,
+            # Both names point at the same instance so tests using either
+            # vocabulary keep working. New code should use `bybit_client`.
+            bybit_client=bybit_client, okx_client=bybit_client,
             journal=journal, risk_mgr=risk_mgr, config=cfg,
         )
         return ctx, fakes

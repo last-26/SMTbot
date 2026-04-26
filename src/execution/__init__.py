@@ -1,22 +1,23 @@
-"""Phase 4 — OKX execution layer.
+"""Phase 4 — Bybit execution layer.
 
 Public API:
-  - OKXClient, OKXCredentials — typed wrapper over python-okx
+  - BybitClient, BybitCredentials — typed wrapper over pybit
   - OrderRouter, RouterConfig — TradePlan → live orders
   - PositionMonitor — poll positions, emit CloseFill events
   - dry_run_report — build a fake ExecutionReport for paper trading
   - ExecutionReport, OrderResult, AlgoResult, PositionSnapshot, CloseFill
   - OrderStatus, PositionState
-  - ExecutionError, OKXError, OrderRejected, InsufficientMargin,
+  - ExecutionError, BybitError, OrderRejected, InsufficientMargin,
     LeverageSetError, AlgoOrderError
 """
 
+from src.execution.bybit_client import BybitClient, BybitCredentials
 from src.execution.errors import (
     AlgoOrderError,
+    BybitError,
     ExecutionError,
     InsufficientMargin,
     LeverageSetError,
-    OKXError,
     OrderRejected,
 )
 from src.execution.models import (
@@ -28,25 +29,25 @@ from src.execution.models import (
     PositionSnapshot,
     PositionState,
 )
-from src.execution.okx_client import OKXClient, OKXCredentials
 from src.execution.order_router import OrderRouter, RouterConfig, dry_run_report
-from src.execution.position_monitor import PositionMonitor
+from src.execution.position_monitor import PendingEvent, PositionMonitor
 
 __all__ = [
     "AlgoOrderError",
     "AlgoResult",
+    "BybitClient",
+    "BybitCredentials",
+    "BybitError",
     "CloseFill",
     "ExecutionError",
     "ExecutionReport",
     "InsufficientMargin",
     "LeverageSetError",
-    "OKXClient",
-    "OKXCredentials",
-    "OKXError",
     "OrderRejected",
     "OrderResult",
     "OrderRouter",
     "OrderStatus",
+    "PendingEvent",
     "PositionMonitor",
     "PositionSnapshot",
     "PositionState",

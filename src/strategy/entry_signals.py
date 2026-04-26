@@ -16,6 +16,7 @@ once per poll. If it returns None, we sit the bar out.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 from src.analysis.fvg import FVG
@@ -251,6 +252,43 @@ def select_sl_price(
 # Semantics (strict): bullish entry rejected when price < min(available VWAPs);
 # bearish when price > max(...). Missing (0.0) VWAPs are skipped. Requires at
 # least one VWAP to be present, otherwise no-op (fail-open — can't judge).
+
+
+def in_vwap_reset_blackout(
+    now: datetime,
+    *,
+    pre_minutes: int,
+    post_minutes: int,
+) -> bool:
+    """True when ``now`` falls inside the daily VWAP-reset blackout window.
+
+    Pine-side VWAPs (1m / 3m / 15m, all `ta.vwap()` derived) anchor on the
+    daily session change → reset at UTC 00:00. For the first ~10-30 min
+    after reset the ±1σ band is collapsed (stdev ≈ 0) and the
+    `vwap_composite_alignment` soft pillar reads near-noise.
+
+    Window is symmetric around UTC midnight:
+      [00:00 - pre_minutes, 00:00 + post_minutes)
+
+    Both ends are clamped to a single 60-min half so the window cannot
+    span a full day; the config validator enforces [0, 60] inputs.
+
+    A non-UTC datetime is converted to UTC before testing. Naive
+    datetimes are treated as already-UTC (matches `_utc_now()` helper
+    in the runner which always emits tz-aware UTC).
+    """
+    if pre_minutes <= 0 and post_minutes <= 0:
+        return False
+    if now.tzinfo is None:
+        utc_now = now.replace(tzinfo=timezone.utc)
+    else:
+        utc_now = now.astimezone(timezone.utc)
+    minutes_into_day = utc_now.hour * 60 + utc_now.minute
+    if minutes_into_day < post_minutes:
+        return True
+    if minutes_into_day >= (24 * 60 - pre_minutes):
+        return True
+    return False
 
 
 def _vwap_hard_veto(state: MarketState, direction: Direction, price: float) -> bool:
@@ -1213,6 +1251,10 @@ def evaluate_pending_invalidation_gates(
     ema_veto_enabled: bool = True,
     ema_veto_fast_period: int = 9,
     ema_veto_slow_period: int = 21,
+    now: Optional[datetime] = None,
+    vwap_reset_blackout_enabled: bool = False,
+    vwap_reset_blackout_pre_minutes: int = 0,
+    vwap_reset_blackout_post_minutes: int = 0,
 ) -> Optional[str]:
     """Re-evaluate the HARD veto gates against current state for a pending limit.
 
@@ -1238,7 +1280,25 @@ def evaluate_pending_invalidation_gates(
     2026-04-22 (gece): whale_transfer_blackout gate removed (paired with
     the new-entry path). flow_alignment is a SOFT signal, not evaluated
     here (it shifts confluence threshold; rescore disabled by design).
+
+    2026-04-26: vwap_reset_blackout added. Re-evaluates the time-based
+    UTC-midnight blackout on every poll so a pending placed at e.g.
+    23:50 with a 7-bar timeout window doesn't fill at 00:05 when the
+    fresh-session VWAP is unreliable. Pure time check; uses ``now`` if
+    supplied (test seam) else ``datetime.now(tz=utc)``.
     """
+    if vwap_reset_blackout_enabled and (
+        vwap_reset_blackout_pre_minutes > 0
+        or vwap_reset_blackout_post_minutes > 0
+    ):
+        ref = now if now is not None else datetime.now(tz=timezone.utc)
+        if in_vwap_reset_blackout(
+            ref,
+            pre_minutes=vwap_reset_blackout_pre_minutes,
+            post_minutes=vwap_reset_blackout_post_minutes,
+        ):
+            return "vwap_reset_blackout"
+
     if vwap_hard_veto_enabled and _vwap_hard_veto(state, direction, entry_price):
         return "vwap_misaligned"
 

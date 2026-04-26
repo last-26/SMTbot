@@ -110,16 +110,18 @@ def test_short_sees_fresh_bullish(make_ctx):
 # ── Defensive close action ──────────────────────────────────────────────────
 
 
-async def test_defensive_close_cancels_algos_and_closes_position(make_ctx):
+async def test_defensive_close_calls_close_position(make_ctx):
     ctx, fakes = make_ctx()
     _mark_open(ctx)
     runner = BotRunner(ctx)
     await runner._defensive_close("BTC-USDT-SWAP", "long", "ltf_reversal")
 
-    assert fakes.okx_client.cancel_algo_calls == [
-        ("BTC-USDT-SWAP", "ALG1"), ("BTC-USDT-SWAP", "ALG2"),
-    ]
-    assert fakes.okx_client.close_position_calls == [
+    # On Bybit V5 the position-attached TP/SL clears automatically when
+    # the position closes, so defensive_close goes straight to close_position
+    # without an algo cancel loop (compare the OKX-era cancel_algo calls
+    # this test used to assert on).
+    assert fakes.bybit_client.cancel_algo_calls == []
+    assert fakes.bybit_client.close_position_calls == [
         ("BTC-USDT-SWAP", "long"),
     ]
     assert ctx.pending_close_reasons[("BTC-USDT-SWAP", "long")] == \
@@ -132,11 +134,10 @@ async def test_defensive_close_idempotent_same_cycle(make_ctx):
     _mark_open(ctx)
     runner = BotRunner(ctx)
     await runner._defensive_close("BTC-USDT-SWAP", "long", "ltf_reversal")
-    # Second call should short-circuit: no extra cancels / close.
+    # Second call should short-circuit: no extra close.
     await runner._defensive_close("BTC-USDT-SWAP", "long", "ltf_reversal")
 
-    assert len(fakes.okx_client.cancel_algo_calls) == 2          # one pass only
-    assert len(fakes.okx_client.close_position_calls) == 1
+    assert len(fakes.bybit_client.close_position_calls) == 1
 
 
 # ── End-to-end wiring through _run_one_symbol ───────────────────────────────
@@ -164,7 +165,7 @@ async def test_long_bearish_ltf_fresh_signal_triggers_close(monkeypatch, make_ct
     async with ctx.journal:
         await runner._run_one_symbol("BTC-USDT-SWAP")
 
-    assert fakes.okx_client.close_position_calls == [
+    assert fakes.bybit_client.close_position_calls == [
         ("BTC-USDT-SWAP", "long"),
     ]
     assert ctx.pending_close_reasons[("BTC-USDT-SWAP", "long")] == \
@@ -186,7 +187,7 @@ async def test_min_holding_time_blocks_close(monkeypatch, make_ctx):
     async with ctx.journal:
         await runner._run_one_symbol("BTC-USDT-SWAP")
 
-    assert fakes.okx_client.close_position_calls == []
+    assert fakes.bybit_client.close_position_calls == []
 
 
 async def test_disabled_flag_never_closes(monkeypatch, make_ctx):
@@ -202,7 +203,7 @@ async def test_disabled_flag_never_closes(monkeypatch, make_ctx):
     async with ctx.journal:
         await runner._run_one_symbol("BTC-USDT-SWAP")
 
-    assert fakes.okx_client.close_position_calls == []
+    assert fakes.bybit_client.close_position_calls == []
     assert ctx.pending_close_reasons == {}
 
 
@@ -229,7 +230,7 @@ async def test_close_reason_journaled_via_handle_close(make_ctx):
         ctx.defensive_close_in_flight.add(("BTC-USDT-SWAP", "long"))
 
         enriched = make_close_fill(pnl_usdt=-5.0)
-        fakes.okx_client.enrich_return = enriched
+        fakes.bybit_client.enrich_return = enriched
         await runner._handle_close(enriched)
 
         fetched = await ctx.journal.get_trade(rec.trade_id)

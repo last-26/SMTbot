@@ -17,7 +17,7 @@ Shape of one tick (`run_once`):
 `from_config` wires production components; tests construct `BotContext`
 directly with fakes — the runner itself only depends on duck-typed
 interfaces (reader.read_market_state, router.place, monitor.poll,
-monitor.register_open, okx_client.enrich_close_fill / get_positions).
+monitor.register_open, bybit_client.enrich_close_fill / get_positions).
 """
 
 from __future__ import annotations
@@ -83,7 +83,7 @@ from src.execution.models import (
     OrderStatus,
     PositionState,
 )
-from src.execution.okx_client import OKXClient
+from src.execution.bybit_client import BybitClient
 from src.execution.order_router import OrderRouter, RouterConfig, dry_run_report
 from src.execution.position_monitor import PendingEvent, PositionMonitor
 from src.journal.database import TradeJournal
@@ -91,6 +91,7 @@ from src.journal.derivatives_journal import DerivativesJournal
 from src.strategy.entry_signals import (
     build_trade_plan_with_reason,
     evaluate_pending_invalidation_gates,
+    in_vwap_reset_blackout,
 )
 from src.strategy.risk_manager import RiskManager, TradeResult
 from src.strategy.setup_planner import (
@@ -495,7 +496,7 @@ class BotContext:
     router: Any                # `.place(plan, inst_id=None) -> ExecutionReport` (sync)
     monitor: Any               # `.register_open`, `.poll` (sync)
     risk_mgr: RiskManager
-    okx_client: Any            # `.enrich_close_fill`, `.get_positions`
+    bybit_client: Any          # `.enrich_close_fill`, `.get_positions`
     config: BotConfig
     bridge: Any = None         # `.set_symbol`, `.set_timeframe` (async) — optional in tests
     ltf_reader: Any = None     # LTFReader — optional (fakes skip it)
@@ -685,7 +686,7 @@ class BotRunner:
         reader = StructuredReader(bridge)
         ltf_reader = LTFReader(bridge, reader)
         multi_tf = MultiTFBuffer(bridge, max_size=cfg.analysis.candle_buffer_size)
-        client = OKXClient(cfg.to_okx_credentials())
+        client = BybitClient(cfg.to_bybit_credentials())
         router_cfg = RouterConfig(
             inst_id=cfg.primary_symbol(),
             margin_mode=cfg.execution.margin_mode,
@@ -747,7 +748,7 @@ class BotRunner:
         ctx = BotContext(
             reader=reader, multi_tf=multi_tf, journal=journal,
             router=router, monitor=monitor, risk_mgr=risk_mgr,
-            okx_client=client, config=cfg, bridge=bridge,
+            bybit_client=client, config=cfg, bridge=bridge,
             ltf_reader=ltf_reader,
             binance_public=binance_public,
         )
@@ -1204,6 +1205,10 @@ class BotRunner:
                     ema_veto_enabled=cfg.analysis.ema_veto_enabled,
                     ema_veto_fast_period=cfg.analysis.ema_veto_fast_period,
                     ema_veto_slow_period=cfg.analysis.ema_veto_slow_period,
+                    now=_utc_now(),
+                    vwap_reset_blackout_enabled=cfg.analysis.vwap_reset_blackout_enabled,
+                    vwap_reset_blackout_pre_minutes=cfg.analysis.vwap_reset_blackout_window_pre_min,
+                    vwap_reset_blackout_post_minutes=cfg.analysis.vwap_reset_blackout_window_post_min,
                 )
             except Exception:
                 logger.exception(
@@ -1619,23 +1624,12 @@ class BotRunner:
             return
         self.ctx.defensive_close_in_flight.add(key)
 
-        # Cancel any outstanding algos for this (inst, side) via the monitor's
-        # tracked state — best-effort, keep going on failure.
-        tracked = getattr(self.ctx.monitor, "_tracked", {}).get(key)
-        algo_ids = list(tracked.algo_ids) if tracked is not None else []
-        for algo_id in algo_ids:
-            try:
-                await asyncio.to_thread(
-                    self.ctx.okx_client.cancel_algo, symbol, algo_id,
-                )
-            except Exception:
-                logger.exception("defensive_cancel_algo_failed "
-                                 "symbol={} algo_id={}", symbol, algo_id)
-
+        # On Bybit V5 the position-attached TP/SL clears automatically when
+        # the position closes — no separate algo cancel needed (compare the
+        # OKX-era cancel_algo loop that used to live here).
         try:
             await asyncio.to_thread(
-                self.ctx.okx_client.close_position, symbol, side,
-                self.ctx.config.execution.margin_mode,
+                self.ctx.bybit_client.close_position, symbol, side,
             )
         except Exception:
             logger.exception("defensive_close_failed symbol={} side={}",
@@ -1738,6 +1732,26 @@ class BotRunner:
                     evt.source,
                 )
                 return
+
+        # 0b. VWAP daily-reset blackout — skip new entries inside the
+        # ±window around UTC 00:00. Pine 1m/3m/15m VWAPs all anchor on
+        # the daily session change, and the ±1σ band is collapsed for
+        # the first ~10-30 min of the new day. Open positions are
+        # untouched; resting pendings are re-checked in the pending-
+        # invalidation pass below. Cheap pure-time check.
+        if cfg.analysis.vwap_reset_blackout_enabled and in_vwap_reset_blackout(
+            _utc_now(),
+            pre_minutes=cfg.analysis.vwap_reset_blackout_window_pre_min,
+            post_minutes=cfg.analysis.vwap_reset_blackout_window_post_min,
+        ):
+            logger.info(
+                "symbol_decision symbol={} NO_TRADE reason=vwap_reset_blackout "
+                "pre_min={} post_min={}",
+                symbol,
+                cfg.analysis.vwap_reset_blackout_window_pre_min,
+                cfg.analysis.vwap_reset_blackout_window_post_min,
+            )
+            return
 
         # 1. Switch the TV chart to this symbol (production has a bridge;
         # tests pass bridge=None and the reader fake already knows the symbol).
@@ -1942,14 +1956,14 @@ class BotRunner:
         # coexist. sCode 51008 avoidance lives on the margin side.
         try:
             total_eq = await asyncio.to_thread(
-                self.ctx.okx_client.get_total_equity, "USDT"
+                self.ctx.bybit_client.get_total_equity, "USDT"
             )
         except Exception:
             logger.exception("total_eq_sync_failed_using_cached")
             total_eq = self.ctx.risk_mgr.current_balance
         try:
             okx_avail = await asyncio.to_thread(
-                self.ctx.okx_client.get_balance, "USDT"
+                self.ctx.bybit_client.get_balance, "USDT"
             )
         except Exception:
             logger.exception("balance_sync_failed_using_cached")
@@ -2310,8 +2324,26 @@ class BotRunner:
         )
         if self.clear_halt:
             self._apply_clear_halt()
+        # Bybit V5 prerequisite: hedge mode must be enabled for USDT linear
+        # before the bot places its first order with positionIdx=1/2 — the
+        # UTA default is one-way mode, which would reject every order with
+        # retCode 110017. Idempotent: re-applying when already-hedge returns
+        # 110025 which the client swallows. Best-effort: a transient failure
+        # at startup logs but does not abort — the next entry attempt will
+        # surface the underlying mode mismatch (and fail loudly) rather than
+        # hide it behind a startup exception.
+        try:
+            await asyncio.to_thread(
+                self.ctx.bybit_client.set_position_mode_hedge,
+            )
+            logger.info("bybit_position_mode_hedge_set category=linear coin=USDT")
+        except Exception:
+            logger.exception(
+                "bybit_position_mode_hedge_set_failed — continuing; first "
+                "entry will surface the underlying mode if still in one-way",
+            )
         # Reconcile BEFORE rehydrate: the orphan-pending-limit sweep wipes
-        # every resting limit on OKX (including any pre-restart TP limits),
+        # every resting limit on Bybit (including any pre-restart TP limits),
         # so we must let it run first — then rehydrate re-places fresh TP
         # limits for each tracked position as it rebuilds monitor state.
         await self._reconcile_orphans()
@@ -2361,7 +2393,7 @@ class BotRunner:
         for symbol in cfg.trading.symbols:
             try:
                 spec = await asyncio.to_thread(
-                    self.ctx.okx_client.get_instrument_spec, symbol)
+                    self.ctx.bybit_client.get_instrument_spec, symbol)
                 ct = float(spec.get("ct_val") or 0.0)
                 mx = int(spec.get("max_leverage") or 0)
                 self.ctx.contract_sizes[symbol] = ct if ct > 0 else ct_fallback
@@ -3019,7 +3051,7 @@ class BotRunner:
         ):
             try:
                 tp_limit_res = await asyncio.to_thread(
-                    self.ctx.okx_client.place_reduce_only_limit,
+                    self.ctx.bybit_client.place_reduce_only_limit,
                     ev.inst_id, ev.pos_side, int(runner_size),
                     float(plan.tp_price), cfg_exec.margin_mode, True, None,
                 )
@@ -3177,7 +3209,7 @@ class BotRunner:
     async def _handle_close(self, fill: CloseFill) -> None:
         try:
             enriched = await asyncio.to_thread(
-                self.ctx.okx_client.enrich_close_fill, fill)
+                self.ctx.bybit_client.enrich_close_fill, fill)
         except Exception:
             logger.exception("enrich_failed_using_raw_fill")
             enriched = fill
@@ -3375,7 +3407,7 @@ class BotRunner:
             ):
                 try:
                     tp_limit_res = await asyncio.to_thread(
-                        self.ctx.okx_client.place_reduce_only_limit,
+                        self.ctx.bybit_client.place_reduce_only_limit,
                         rec.symbol, pos_side, int(runner_size),
                         float(rec.tp_price), cfg_exec.margin_mode, True, None,
                     )
@@ -3431,7 +3463,7 @@ class BotRunner:
         Never auto-closes *positions* — that stays operator-decides.
         """
         try:
-            live = await asyncio.to_thread(self.ctx.okx_client.get_positions)
+            live = await asyncio.to_thread(self.ctx.bybit_client.get_positions)
         except Exception:
             logger.exception("reconcile_fetch_failed")
             return
@@ -3457,7 +3489,7 @@ class BotRunner:
         await self._cancel_surplus_ocos(journal_keys)
 
     async def _cancel_orphan_pending_limits(self) -> None:
-        """Cancel every resting limit order on OKX at startup.
+        """Cancel every resting limit order on Bybit at startup.
 
         The monitor's `_pending` dict is in-memory only and lost on
         restart, so any resting limit found here is untrackable — if it
@@ -3465,24 +3497,24 @@ class BotRunner:
         is born unprotected.
         """
         try:
-            resp = await asyncio.to_thread(
-                self.ctx.okx_client.trade.get_order_list, instType="SWAP",
+            rows = await asyncio.to_thread(
+                self.ctx.bybit_client.list_open_orders,
             )
         except Exception:
             logger.exception("orphan_pending_limits_scan_failed")
             return
-        for row in (resp.get("data") or []):
-            ord_id = row.get("ordId")
-            inst_id = row.get("instId")
+        for row in rows:
+            ord_id = row.get("orderId")
+            inst_id = row.get("symbol")
             if not ord_id or not inst_id:
                 continue
             try:
                 await asyncio.to_thread(
-                    self.ctx.okx_client.cancel_order, inst_id, ord_id,
+                    self.ctx.bybit_client.cancel_order, inst_id, ord_id,
                 )
                 logger.warning(
                     "orphan_pending_limit_canceled inst={} ord={} px={} sz={}",
-                    inst_id, ord_id, row.get("px"), row.get("sz"),
+                    inst_id, ord_id, row.get("price"), row.get("qty"),
                 )
             except Exception:
                 logger.exception(
@@ -3493,63 +3525,13 @@ class BotRunner:
     async def _cancel_surplus_ocos(
         self, journal_keys: set[tuple[str, str]],
     ) -> None:
-        """Cancel any OCO on OKX that isn't referenced by the journal's
-        `algo_ids` for a tracked (inst_id, pos_side).
+        """No-op on Bybit V5.
 
-        Surplus OCOs happen when a pre-restart revise/lock placed a
-        replacement whose new algoId was never persisted (bug class fixed
-        in `revise_runner_tp` 2026-04-20). Acts as a safety net even when
-        the primary fix regresses.
-
-        OCOs for keys with no journal row (`live_position_no_journal_row`)
-        are left alone — operator intervenes on those via log alert.
+        On OKX this method walked the live OCO algo list and cancelled
+        any algo not referenced by the journal's `algo_ids`. Bybit V5
+        attaches TP/SL to the position itself (no separate algo orders),
+        so there's nothing to orphan and nothing to sweep here. Method
+        kept for back-compat with `_reconcile_orphans` callers; can be
+        deleted in a follow-up cleanup.
         """
-        try:
-            okx_algos = await asyncio.to_thread(
-                self.ctx.okx_client.list_pending_algos, ord_type="oco",
-            )
-        except Exception:
-            logger.exception("surplus_oco_scan_failed")
-            return
-        try:
-            open_recs = await self.ctx.journal.list_open_trades()
-        except Exception:
-            logger.exception("surplus_oco_journal_read_failed")
-            return
-
-        tracked_by_key: dict[tuple[str, str], set[str]] = {}
-        for rec in open_recs:
-            pos_side = _direction_to_pos_side(rec.direction)
-            tracked_by_key.setdefault((rec.symbol, pos_side), set()).update(
-                str(x) for x in (rec.algo_ids or [])
-            )
-
-        for algo in okx_algos:
-            algo_id = str(algo.get("algoId") or "")
-            inst_id = str(algo.get("instId") or "")
-            pos_side = str(algo.get("posSide") or "")
-            if not algo_id or not inst_id or not pos_side:
-                continue
-            key = (inst_id, pos_side)
-            if key not in journal_keys:
-                logger.error(
-                    "orphan_oco_no_journal_row inst={} pos={} algo={}",
-                    inst_id, pos_side, algo_id,
-                )
-                continue
-            if algo_id in tracked_by_key.get(key, set()):
-                continue
-            try:
-                await asyncio.to_thread(
-                    self.ctx.okx_client.cancel_algo, inst_id, algo_id,
-                )
-                logger.warning(
-                    "surplus_oco_canceled inst={} pos={} algo={} sl={} tp={}",
-                    inst_id, pos_side, algo_id,
-                    algo.get("slTriggerPx"), algo.get("tpTriggerPx"),
-                )
-            except Exception:
-                logger.exception(
-                    "surplus_oco_cancel_failed inst={} pos={} algo={}",
-                    inst_id, pos_side, algo_id,
-                )
+        return

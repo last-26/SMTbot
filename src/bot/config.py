@@ -1,10 +1,10 @@
 """Typed bot configuration loaded from YAML + .env.
 
 YAML layout is kept 1:1 with `config/default.yaml` — top-level keys
-`bot`, `trading`, `circuit_breakers`, `analysis`, `okx`, `journal` map
-directly to Pydantic sections below. Secrets (`OKX_API_KEY/SECRET/PASSPHRASE`)
-are read from `.env`/environment and merged into the `okx` section before
-validation, so the YAML can live in git without leaking credentials.
+`bot`, `trading`, `circuit_breakers`, `analysis`, `bybit`, `journal` map
+directly to Pydantic sections below. Secrets (`BYBIT_API_KEY/SECRET`)
+are read from `.env`/environment and merged into the `bybit` section
+before validation, so the YAML can live in git without leaking credentials.
 
 `rl:` is tolerated at the top level but not parsed here — Phase 7 will own it.
 """
@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from src.data.models import Session
-from src.execution.okx_client import OKXCredentials
+from src.execution.bybit_client import BybitCredentials
 from src.strategy.risk_manager import CircuitBreakerConfig
 
 
@@ -250,6 +250,42 @@ class AnalysisConfig(BaseModel):
     vwap_zone_long_anchor: float = 0.7
     vwap_zone_short_anchor: float = 0.3
 
+    # 2026-04-26 — VWAP daily-reset blackout. Pine 3m VWAP uses
+    # `anchor=timeframe.change("D")` and 1m/15m use default session anchor;
+    # all three reset at UTC 00:00. For the first ~10-30 min after reset
+    # the ±1σ band is collapsed (stdev≈0) and `vwap_composite_alignment`
+    # picks up gibberish (close vs a near-noise VWAP value). Hard veto is
+    # off so no false reject, but the soft pillar contributes spurious
+    # weight. Time-based blackout rejects ALL new entry attempts AND
+    # cancels resting pendings inside [-pre, +post] minutes around UTC
+    # midnight. Reject reason: `vwap_reset_blackout` (early-skip; written
+    # to journal via `evaluate_pending_invalidation_gates` for pendings,
+    # logged-only for cycle entries to mirror the macro_event_blackout
+    # pattern). Disable by flipping enabled=False.
+    vwap_reset_blackout_enabled: bool = True
+    vwap_reset_blackout_window_pre_min: int = 5
+    vwap_reset_blackout_window_post_min: int = 15
+
+    @field_validator("vwap_reset_blackout_window_pre_min")
+    @classmethod
+    def _vwap_blackout_pre_nonneg(cls, v: int) -> int:
+        if v < 0 or v > 60:
+            raise ValueError(
+                f"vwap_reset_blackout_window_pre_min must be in [0, 60] "
+                f"(minutes before UTC 00:00); got {v}"
+            )
+        return v
+
+    @field_validator("vwap_reset_blackout_window_post_min")
+    @classmethod
+    def _vwap_blackout_post_nonneg(cls, v: int) -> int:
+        if v < 0 or v > 60:
+            raise ValueError(
+                f"vwap_reset_blackout_window_post_min must be in [0, 60] "
+                f"(minutes after UTC 00:00); got {v}"
+            )
+        return v
+
     @field_validator("vwap_zone_long_anchor")
     @classmethod
     def _long_anchor_on_upper_half(cls, v: float) -> float:
@@ -287,19 +323,21 @@ class AnalysisConfig(BaseModel):
         return v
 
 
-class OKXConfigBlock(BaseModel):
-    base_url: str = "https://www.okx.com"
-    demo_flag: str = "1"
+class BybitConfigBlock(BaseModel):
+    base_url: str = "https://api-demo.bybit.com"
+    demo: bool = True
+    account_type: str = "UNIFIED"
+    category: str = "linear"
     api_key: str
     api_secret: str
-    passphrase: str
 
-    def to_credentials(self) -> OKXCredentials:
-        return OKXCredentials(
+    def to_credentials(self) -> BybitCredentials:
+        return BybitCredentials(
             api_key=self.api_key,
             api_secret=self.api_secret,
-            passphrase=self.passphrase,
-            demo_flag=self.demo_flag,
+            demo=self.demo,
+            account_type=self.account_type,
+            category=self.category,
         )
 
 
@@ -609,7 +647,11 @@ class OnChainConfig(BaseModel):
     # `affected_symbols_for` returns empty tuple for unmapped tokens.
     # Bumped 2026-04-22 with the threshold change above.
     whale_tokens: list[str] = Field(default_factory=lambda: [
-        "bitcoin", "ethereum", "solana", "dogecoin", "binancecoin",
+        # XRP intentionally omitted: Arkham doesn't index XRPL per-token
+        # data (probed 2026-04-25, all XRP slug variants rejected). Adding
+        # it would just burn label-lookup quota on events that
+        # `affected_symbols_for` would silently drop.
+        "bitcoin", "ethereum", "solana", "dogecoin",
         "tether", "usd-coin",
     ])
 
@@ -813,7 +855,7 @@ class BotConfig(BaseModel):
     trading: TradingConfig
     circuit_breakers: CircuitBreakerSection = Field(default_factory=CircuitBreakerSection)
     analysis: AnalysisConfig
-    okx: OKXConfigBlock
+    bybit: BybitConfigBlock
     journal: JournalConfig = Field(default_factory=JournalConfig)
     reentry: ReentryConfig = Field(default_factory=ReentryConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
@@ -823,11 +865,11 @@ class BotConfig(BaseModel):
     on_chain: OnChainConfig = Field(default_factory=OnChainConfig)
     rl: RLConfig = Field(default_factory=RLConfig)
 
-    @field_validator("okx")
+    @field_validator("bybit")
     @classmethod
-    def _okx_non_empty(cls, v: OKXConfigBlock) -> OKXConfigBlock:
-        if not v.api_key or not v.api_secret or not v.passphrase:
-            raise ValueError("okx.api_key / api_secret / passphrase must be set "
+    def _bybit_non_empty(cls, v: BybitConfigBlock) -> BybitConfigBlock:
+        if not v.api_key or not v.api_secret:
+            raise ValueError("bybit.api_key / api_secret must be set "
                              "(populate .env or set env vars before load_config)")
         return v
 
@@ -908,19 +950,19 @@ class BotConfig(BaseModel):
         """First symbol — used by legacy call sites that still assume single-symbol."""
         return self.trading.symbols[0]
 
-    def to_okx_credentials(self) -> OKXCredentials:
-        return self.okx.to_credentials()
+    def to_bybit_credentials(self) -> BybitCredentials:
+        return self.bybit.to_credentials()
 
 
 # ── Loader ──────────────────────────────────────────────────────────────────
 
 
 def load_config(path: str | Path, *, env_path: Optional[str | Path] = None) -> BotConfig:
-    """Read YAML at `path`, merge OKX secrets from environment, validate.
+    """Read YAML at `path`, merge Bybit secrets from environment, validate.
 
     Env vars used (loaded via python-dotenv first if `env_path` exists):
-      - OKX_API_KEY, OKX_API_SECRET, OKX_PASSPHRASE (required)
-      - OKX_DEMO_FLAG                                (optional, defaults to "1")
+      - BYBIT_API_KEY, BYBIT_API_SECRET                (required)
+      - BYBIT_DEMO                                     (optional, "1"/"0", defaults to "1")
     """
     if env_path is None:
         env_path = Path(__file__).resolve().parents[2] / ".env"
@@ -930,17 +972,18 @@ def load_config(path: str | Path, *, env_path: Optional[str | Path] = None) -> B
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
 
-    okx_section = dict(raw.get("okx") or {})
-    okx_section.setdefault("api_key", os.environ.get("OKX_API_KEY", ""))
-    okx_section.setdefault("api_secret", os.environ.get("OKX_API_SECRET", ""))
-    okx_section.setdefault("passphrase", os.environ.get("OKX_PASSPHRASE", ""))
-    okx_section["demo_flag"] = os.environ.get(
-        "OKX_DEMO_FLAG", okx_section.get("demo_flag", "1"))
-    raw["okx"] = okx_section
+    bybit_section = dict(raw.get("bybit") or {})
+    bybit_section.setdefault("api_key", os.environ.get("BYBIT_API_KEY", ""))
+    bybit_section.setdefault("api_secret", os.environ.get("BYBIT_API_SECRET", ""))
+    # BYBIT_DEMO is "1"/"0" string in env; convert to bool for the config block.
+    env_demo = os.environ.get("BYBIT_DEMO")
+    if env_demo is not None:
+        bybit_section["demo"] = env_demo.strip() not in ("0", "false", "False", "")
+    raw["bybit"] = bybit_section
 
     # Macro event blackout — pull FINNHUB_API_KEY from env into the section
     # so the YAML never has to carry the secret. YAML can still pre-set it
-    # for tests; env wins (matches OKX behavior above).
+    # for tests; env wins (matches the Bybit-block behavior above).
     cal_section = dict(raw.get("economic_calendar") or {})
     env_finnhub = os.environ.get("FINNHUB_API_KEY", "")
     if env_finnhub:

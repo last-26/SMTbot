@@ -599,6 +599,46 @@ def test_apply_zone_to_plan_copies_ladder_from_zone():
     assert new_plan.tp_ladder == [(105.0, 0.6), (108.0, 0.4)]
 
 
+def test_apply_zone_to_plan_preserves_confluence_pillar_scores():
+    """Pass 2 instrumentation: zone-wrapped plan must keep the per-pillar
+    weight dict so journal.record_open / record_rejected_signal stamps it.
+
+    Pre-fix: setup_planner re-built the TradePlan and forwarded
+    `confluence_factors` only — `confluence_pillar_scores` defaulted to {}
+    on every zone-based entry, leaving Pass 2/3 GBT/Optuna without the
+    per-pillar magnitude feature. All 5 OPEN positions at 2026-04-26 had
+    empty `pillar_scores` despite populated `factors`.
+    """
+    plan = _plan()
+    object.__setattr__(plan, "confluence_pillar_scores", {
+        "mss_alignment": 1.0,
+        "money_flow_alignment": 0.85,
+        "vwap_composite_alignment": 1.25,
+    })
+    object.__setattr__(plan, "confluence_factors", [
+        "mss_alignment", "money_flow_alignment", "vwap_composite_alignment",
+    ])
+    zone = ZoneSetup(
+        direction=Direction.BULLISH,
+        entry_zone=(99.0, 99.5),
+        trigger_type="zone_touch",
+        sl_beyond_zone=98.5,
+        tp_primary=105.0,
+        max_wait_bars=10,
+        zone_source="vwap_retest",
+        tp_ladder=((105.0, 1.0),),
+    )
+    new_plan = apply_zone_to_plan(plan, zone, contract_size=0.01)
+    assert new_plan.confluence_pillar_scores == {
+        "mss_alignment": 1.0,
+        "money_flow_alignment": 0.85,
+        "vwap_composite_alignment": 1.25,
+    }
+    # Defensive copy — mutating the new plan must not bleed into the source.
+    new_plan.confluence_pillar_scores["new_key"] = 0.5
+    assert "new_key" not in plan.confluence_pillar_scores
+
+
 def test_apply_zone_to_plan_defaults_ladder_to_primary_when_empty():
     zone = ZoneSetup(
         direction=Direction.BULLISH,

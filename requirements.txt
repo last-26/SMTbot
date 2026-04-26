@@ -9,8 +9,8 @@ aiosqlite>=0.20
 # HTTP
 httpx>=0.27
 
-# OKX
-python-okx>=0.4.0
+# Bybit
+pybit>=5.7.0
 websockets>=12.0
 
 # Data analysis

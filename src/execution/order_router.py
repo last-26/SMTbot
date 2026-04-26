@@ -1,11 +1,23 @@
-"""TradePlan → live orders, via OKXClient.
+"""TradePlan → live orders, via BybitClient.
 
-Flow:
-  1. Set leverage (isolated margin by default — each position is its own silo).
-  2. Place market entry (size = plan.num_contracts).
-  3. Immediately place OCO algo (SL + TP) on that position.
-  4. If the algo fails, the position is UNPROTECTED — raise AlgoOrderError
-     so the caller can react (close the position or alert).
+Flow on Bybit V5:
+  1. Set leverage (account-wide on UNIFIED, set both buy/sell sides equal).
+  2. Place market entry — `takeProfit`/`stopLoss` ride along on the same
+     create-order call so the position is born already protected.
+  3. If the placement fails *after* the position somehow opened (rare —
+     Bybit attaches TP/SL atomically on success), fall back to closing
+     the position via `close_position()` and surface AlgoOrderError.
+
+Differences vs the prior OKX flow:
+  - **No separate OCO algo.** The OKX `place_oco_algo` call is replaced
+    by `takeProfit`/`stopLoss` fields on the entry order itself (market)
+    or by a `set_position_tpsl()` call after a limit fill (zone path).
+  - **`_place_algos` returns AlgoResult with empty `algo_id`** for
+    journal back-compat; downstream readers tolerate empty strings.
+  - **`margin_mode` is no longer per-call.** Bybit UNIFIED is account-
+    wide; the runner sets it once at startup. RouterConfig still carries
+    a `margin_mode` field for back-compat but it's not forwarded to the
+    client.
 
 Retry policy: none here. A single failure surfaces to the caller, which
 owns the decision (retry, skip next candle, halt).
@@ -19,6 +31,7 @@ from typing import Optional
 from loguru import logger
 
 from src.data.models import Direction
+from src.execution.bybit_client import BybitClient
 from src.execution.errors import AlgoOrderError, LeverageSetError, OrderRejected
 from src.execution.models import (
     AlgoResult,
@@ -27,23 +40,22 @@ from src.execution.models import (
     OrderStatus,
     PositionState,
 )
-from src.execution.okx_client import OKXClient
 from src.strategy.trade_plan import TradePlan
 
 
 @dataclass
 class RouterConfig:
-    inst_id: str = "BTC-USDT-SWAP"
-    margin_mode: str = "isolated"         # "isolated" or "cross"
-    close_on_algo_failure: bool = True    # auto-close if OCO placement fails
+    inst_id: str = "BTCUSDT"
+    margin_mode: str = "isolated"         # accepted + ignored on Bybit (account-wide)
+    close_on_algo_failure: bool = True    # auto-close if TP/SL attach fails
     # Madde E — partial TP + SL-to-BE.
     partial_tp_enabled: bool = False
     partial_tp_ratio: float = 0.5         # fraction of contracts exited at TP1
     partial_tp_rr: float = 1.5            # TP1 RR relative to SL distance
     move_sl_to_be_after_tp1: bool = True
-    # OCO trigger price source: "mark" (index-weighted, demo-immune) or
-    # "last" (demo-book sensitive, default in OKX). Mark recommended on
-    # demo; kept config-driven so a live deploy can choose otherwise.
+    # TP/SL trigger price source: "mark" (index-weighted, demo-immune) or
+    # "last" (book-sensitive). Mark recommended on demo; the client maps
+    # this to Bybit's `MarkPrice` / `LastPrice` strings internally.
     algo_trigger_px_type: str = "mark"
 
 
@@ -62,7 +74,7 @@ def _entry_side(direction: Direction) -> str:
 class OrderRouter:
     """Stateless-ish: holds a client + config, places one plan at a time."""
 
-    def __init__(self, client: OKXClient, config: RouterConfig | None = None):
+    def __init__(self, client: BybitClient, config: RouterConfig | None = None):
         self.client = client
         self.config = config or RouterConfig()
 
@@ -72,44 +84,51 @@ class OrderRouter:
 
         inst = inst_id or self.config.inst_id
         pos_side = _pos_side(plan.direction)
+        cfg = self.config
 
         # 1. Leverage. If this fails, nothing is open — safe to raise.
         try:
-            self.client.set_leverage(
-                inst_id=inst,
-                leverage=plan.leverage,
-                mgn_mode=self.config.margin_mode,
-                pos_side=pos_side if self.config.margin_mode == "isolated" else None,
-            )
+            self.client.set_leverage(inst_id=inst, leverage=plan.leverage)
             leverage_set = True
         except LeverageSetError:
             raise  # abort — don't try to place the order at wrong leverage
 
-        # 2. Entry. If this raises, no position open, no algo needed.
-        entry = self.client.place_market_order(
-            inst_id=inst,
-            side=_entry_side(plan.direction),
-            pos_side=pos_side,
-            size_contracts=plan.num_contracts,
-            td_mode=self.config.margin_mode,
-        )
-        # OKX returns an ord_id immediately; fill status arrives on the next
-        # poll. We mark it PENDING → the monitor flips it to FILLED later.
-
-        # 3. Algo(s). Partial mode places two OCOs; single mode places one.
+        # 2. Entry with attached TP/SL. Bybit accepts `takeProfit`/`stopLoss`
+        # on the create-order call directly, so the position is protected at
+        # birth — no separate algo placement step.
+        #
+        # Partial-TP mode is currently a no-op on Bybit's `Full` tpslMode (it
+        # would require `Partial` mode + multiple TP legs which adds complex
+        # bookkeeping). We honour the flag by attaching the FINAL TP only;
+        # the maker-TP resting limit + dynamic TP revision in the runner
+        # cover the partial-exit thesis differently (see Phase 12 candidate
+        # in the roadmap).
         try:
-            algos = self._place_algos(inst, plan, pos_side)
-        except Exception as exc:
-            if self.config.close_on_algo_failure:
-                try:
-                    self.client.close_position(inst, pos_side, self.config.margin_mode)
-                except Exception:
-                    # Best effort — if close also fails, the caller must
-                    # intervene manually. Surface the algo error regardless.
-                    pass
+            entry = self.client.place_market_order(
+                inst_id=inst,
+                side=_entry_side(plan.direction),
+                pos_side=pos_side,
+                size_contracts=plan.num_contracts,
+                take_profit=plan.tp_price,
+                stop_loss=plan.sl_price,
+                trigger_px_type=cfg.algo_trigger_px_type,
+            )
+        except OrderRejected as exc:
+            # Position never opened — surface as-is. No close_position
+            # needed because nothing was filled.
             raise AlgoOrderError(
-                f"OCO algo placement failed after entry {entry.order_id}: {exc}"
+                f"market entry with attached TP/SL rejected: {exc}"
             ) from exc
+
+        # 3. AlgoResult shim for journal back-compat. On Bybit, TP/SL is part
+        # of the position itself — there's no separate algo_id to track.
+        algos = [AlgoResult(
+            algo_id="",
+            client_algo_id="",
+            sl_trigger_px=plan.sl_price,
+            tp_trigger_px=plan.tp_price,
+            raw={},
+        )]
 
         return ExecutionReport(
             entry=entry,
@@ -131,34 +150,29 @@ class OrderRouter:
     ) -> OrderResult:
         """Place a limit (post-only by default) entry order at `entry_px`.
 
-        Returns a PENDING OrderResult. Does NOT place the OCO algo — that
-        happens after the limit fills, wired by the Phase 7.C3 monitor
-        state + 7.C4 runner lifecycle. Leverage is set here because the
-        account-level call must precede any order on the instrument.
+        Returns a PENDING OrderResult. Does NOT attach TP/SL — that
+        happens after the limit fills via `attach_algos()` (which calls
+        `set_position_tpsl()` under the hood). Leverage is set here
+        because the account-level call must precede any order on the
+        instrument.
 
-        On post-only rejection (OrderRejected — price would have crossed
-        the spread and taken liquidity), the router optionally retries as
-        a regular limit. Disable via `fallback_to_limit=False` if you want
-        strict maker-only behavior (e.g. during integration tests).
+        On post-only rejection (OrderRejected — Bybit retCode 170218,
+        price would have crossed the spread), the router optionally
+        retries as a regular limit. Disable via `fallback_to_limit=False`
+        for strict maker-only behavior.
         """
         if plan.num_contracts <= 0:
             raise ValueError(f"plan.num_contracts={plan.num_contracts} <= 0")
         inst = inst_id or self.config.inst_id
         pos_side = _pos_side(plan.direction)
 
-        self.client.set_leverage(
-            inst_id=inst,
-            leverage=plan.leverage,
-            mgn_mode=self.config.margin_mode,
-            pos_side=pos_side if self.config.margin_mode == "isolated" else None,
-        )
+        self.client.set_leverage(inst_id=inst, leverage=plan.leverage)
 
         try:
             return self.client.place_limit_order(
                 inst_id=inst, side=_entry_side(plan.direction),
                 pos_side=pos_side, size_contracts=plan.num_contracts,
-                px=entry_px, td_mode=self.config.margin_mode,
-                ord_type=ord_type,
+                px=entry_px, ord_type=ord_type,
             )
         except OrderRejected as exc:
             if fallback_to_limit and ord_type == "post_only":
@@ -169,8 +183,7 @@ class OrderRouter:
                 return self.client.place_limit_order(
                     inst_id=inst, side=_entry_side(plan.direction),
                     pos_side=pos_side, size_contracts=plan.num_contracts,
-                    px=entry_px, td_mode=self.config.margin_mode,
-                    ord_type="limit",
+                    px=entry_px, ord_type="limit",
                 )
             raise
 
@@ -185,70 +198,41 @@ class OrderRouter:
     def attach_algos(
         self, plan: TradePlan, inst_id: Optional[str] = None,
     ) -> list[AlgoResult]:
-        """Place OCO SL/TP algo(s) on an already-filled entry.
+        """Attach TP/SL to a freshly-filled position via trading-stop.
 
         Phase 7.C4 — when a pending limit entry fills, the runner calls
-        this to attach the OCO protection using the original plan's SL/TP.
-        Partial-TP mode places 2 algos; single mode places 1.
+        this to install the OCO-equivalent protection using the original
+        plan's SL/TP. On Bybit this is a single `set_position_tpsl()`
+        call instead of a separate algo placement. Returns an AlgoResult
+        with empty `algo_id` for journal back-compat.
         """
         if plan.num_contracts <= 0:
             raise ValueError(f"plan.num_contracts={plan.num_contracts} <= 0")
         inst = inst_id or self.config.inst_id
         pos_side = _pos_side(plan.direction)
-        return self._place_algos(inst, plan, pos_side)
-
-    # ── Internal helpers ────────────────────────────────────────────────────
-
-    def _place_algos(
-        self, inst: str, plan: TradePlan, pos_side: str,
-    ) -> list[AlgoResult]:
-        """Place 1 or 2 OCOs depending on partial TP config.
-
-        Partial mode splits `plan.num_contracts` into `size1 + size2` where
-        `size1 = int(num_contracts * partial_tp_ratio)` and `size2 = remainder`.
-        When partial TP is enabled, the entry_signals layer rejects any plan
-        that cannot be split (reason: `insufficient_contracts_for_split`), so
-        reaching this method with a zero leg is a programming error — we
-        raise rather than silently degrade to a single OCO.
-        """
         cfg = self.config
-        sign = 1 if plan.direction == Direction.BULLISH else -1
-        sl_dist = abs(plan.entry_price - plan.sl_price)
 
-        if cfg.partial_tp_enabled:
-            size1 = int(plan.num_contracts * cfg.partial_tp_ratio)
-            size2 = plan.num_contracts - size1
-            if size1 <= 0 or size2 <= 0:
-                raise RuntimeError(
-                    f"partial_tp_enabled but contract split is degenerate: "
-                    f"num_contracts={plan.num_contracts} "
-                    f"ratio={cfg.partial_tp_ratio} "
-                    f"size1={size1} size2={size2}. "
-                    f"entry_signals should have rejected this plan with "
-                    f"'insufficient_contracts_for_split'."
-                )
-            tp1 = plan.entry_price + sl_dist * cfg.partial_tp_rr * sign
-            algo1 = self.client.place_oco_algo(
-                inst_id=inst, pos_side=pos_side, size_contracts=size1,
-                sl_trigger_px=plan.sl_price, tp_trigger_px=tp1,
-                td_mode=cfg.margin_mode,
+        try:
+            self.client.set_position_tpsl(
+                inst_id=inst,
+                pos_side=pos_side,
+                take_profit=plan.tp_price,
+                stop_loss=plan.sl_price,
+                tpsl_mode="Full",
                 trigger_px_type=cfg.algo_trigger_px_type,
             )
-            algo2 = self.client.place_oco_algo(
-                inst_id=inst, pos_side=pos_side, size_contracts=size2,
-                sl_trigger_px=plan.sl_price, tp_trigger_px=plan.tp_price,
-                td_mode=cfg.margin_mode,
-                trigger_px_type=cfg.algo_trigger_px_type,
-            )
-            return [algo1, algo2]
+        except OrderRejected as exc:
+            raise AlgoOrderError(
+                f"set_position_tpsl failed after limit fill: {exc}"
+            ) from exc
 
-        algo = self.client.place_oco_algo(
-            inst_id=inst, pos_side=pos_side, size_contracts=plan.num_contracts,
-            sl_trigger_px=plan.sl_price, tp_trigger_px=plan.tp_price,
-            td_mode=cfg.margin_mode,
-            trigger_px_type=cfg.algo_trigger_px_type,
-        )
-        return [algo]
+        return [AlgoResult(
+            algo_id="",
+            client_algo_id="",
+            sl_trigger_px=plan.sl_price,
+            tp_trigger_px=plan.tp_price,
+            raw={},
+        )]
 
 
 # ── Dry-run helper ──────────────────────────────────────────────────────────

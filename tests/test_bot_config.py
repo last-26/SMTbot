@@ -31,10 +31,10 @@ def _valid_raw() -> dict:
             "sr_zone_atr_mult": 0.5,
             "session_filter": ["london", "new_york"],
         },
-        "okx": {
-            "base_url": "https://www.okx.com",
-            "demo_flag": "1",
-            "api_key": "k", "api_secret": "s", "passphrase": "p",
+        "bybit": {
+            "base_url": "https://api-demo.bybit.com",
+            "demo": True, "account_type": "UNIFIED", "category": "linear",
+            "api_key": "k", "api_secret": "s",
         },
         "journal": {"db_path": "data/trades.db"},
         # rl is tolerated but ignored
@@ -44,15 +44,14 @@ def _valid_raw() -> dict:
 
 def test_load_config_from_yaml_and_env(tmp_path, monkeypatch):
     raw = _valid_raw()
-    # YAML-only okx section (no secrets); env must fill them
-    del raw["okx"]["api_key"]; del raw["okx"]["api_secret"]; del raw["okx"]["passphrase"]
+    # YAML-only bybit section (no secrets); env must fill them
+    del raw["bybit"]["api_key"]; del raw["bybit"]["api_secret"]
     cfg_path = tmp_path / "cfg.yaml"
     cfg_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
 
-    monkeypatch.setenv("OKX_API_KEY", "env_key")
-    monkeypatch.setenv("OKX_API_SECRET", "env_sec")
-    monkeypatch.setenv("OKX_PASSPHRASE", "env_pass")
-    monkeypatch.setenv("OKX_DEMO_FLAG", "1")
+    monkeypatch.setenv("BYBIT_API_KEY", "env_key")
+    monkeypatch.setenv("BYBIT_API_SECRET", "env_sec")
+    monkeypatch.setenv("BYBIT_DEMO", "1")
 
     # Force env_path to an empty file so python-dotenv doesn't override monkeypatch
     empty_env = tmp_path / ".env"
@@ -60,20 +59,20 @@ def test_load_config_from_yaml_and_env(tmp_path, monkeypatch):
 
     cfg = load_config(cfg_path, env_path=empty_env)
     assert isinstance(cfg, BotConfig)
-    assert cfg.okx.api_key == "env_key"
-    assert cfg.okx.demo_flag == "1"
+    assert cfg.bybit.api_key == "env_key"
+    assert cfg.bybit.demo is True
     # Legacy `trading.symbol:` form is coerced into `symbols=[symbol]`.
     assert cfg.trading.symbols == ["BTC-USDT-SWAP"]
     assert cfg.primary_symbol() == "BTC-USDT-SWAP"
 
 
-def test_missing_okx_credentials_raises(tmp_path, monkeypatch):
+def test_missing_bybit_credentials_raises(tmp_path, monkeypatch):
     raw = _valid_raw()
-    del raw["okx"]["api_key"]; del raw["okx"]["api_secret"]; del raw["okx"]["passphrase"]
+    del raw["bybit"]["api_key"]; del raw["bybit"]["api_secret"]
     cfg_path = tmp_path / "cfg.yaml"
     cfg_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
 
-    for v in ("OKX_API_KEY", "OKX_API_SECRET", "OKX_PASSPHRASE"):
+    for v in ("BYBIT_API_KEY", "BYBIT_API_SECRET"):
         monkeypatch.delenv(v, raising=False)
 
     empty_env = tmp_path / ".env"

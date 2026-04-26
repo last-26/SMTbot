@@ -1,8 +1,9 @@
 """Execution-layer exceptions.
 
-We wrap the heterogenous errors the OKX SDK returns (dict responses with
-code/msg, HTTP errors, network errors) into a small, typed hierarchy so
-callers — the bot loop and the router itself — can react sensibly.
+We wrap the heterogenous errors the Bybit SDK returns (dict responses
+with retCode/retMsg, HTTP errors, network errors) into a small, typed
+hierarchy so callers — the bot loop and the router itself — can react
+sensibly.
 """
 
 from __future__ import annotations
@@ -19,8 +20,8 @@ class ExecutionError(Exception):
         self.payload = payload or {}
 
 
-class OKXError(ExecutionError):
-    """OKX API returned a non-zero `code` in its response envelope."""
+class BybitError(ExecutionError):
+    """Bybit API returned a non-zero `retCode` in its response envelope."""
 
 
 class LeverageSetError(ExecutionError):
@@ -28,16 +29,19 @@ class LeverageSetError(ExecutionError):
 
 
 class OrderRejected(ExecutionError):
-    """Entry or algo order was rejected by the exchange."""
+    """Entry or position-attached TP/SL order was rejected by the exchange."""
 
 
 class InsufficientMargin(OrderRejected):
-    """OKX margin check failed (code 51008 / 51020 etc.)."""
+    """Bybit margin check failed (retCode 110004 / 110007 / 110012)."""
 
 
 class AlgoOrderError(ExecutionError):
-    """OCO SL/TP algo order failed after entry was filled.
+    """TP/SL attachment failed after entry was filled.
 
-    This is the most dangerous failure mode — position is OPEN with no
-    protection. The router raises this and the caller must react.
+    On Bybit V5 TP/SL is part of the position itself (set via
+    /v5/position/trading-stop after a limit fills, or attached at
+    create-order time for market entries). When this attachment fails
+    the position is OPEN with no protection — the most dangerous
+    failure mode. The router raises this and the caller must react.
     """

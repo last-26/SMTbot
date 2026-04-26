@@ -62,7 +62,7 @@ except ImportError:  # pragma: no cover
 
 
 _SYMBOLS = ("BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP",
-            "DOGE-USDT-SWAP", "BNB-USDT-SWAP")
+            "DOGE-USDT-SWAP", "XRP-USDT-SWAP")
 
 
 # ── CLI / config plumbing (mirrors factor_audit.py) ─────────────────────────

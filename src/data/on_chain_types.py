@@ -13,16 +13,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
-# All five bot-traded OKX perps. Stablecoin whale events shock the whole
-# market (USDT/USDC moving in size → possible CEX buy/sell pressure
-# across every quote-currency pair) while chain-native whale moves only
-# affect their own symbol.
+# All five bot-traded perps (OKX-style internal symbol format kept after
+# the 2026-04-25 Bybit migration; bybit_client.py translates at the API
+# boundary). Stablecoin whale events shock the whole market (USDT/USDC
+# moving in size → possible CEX buy/sell pressure across every quote-
+# currency pair) while chain-native whale moves only affect their own
+# symbol.
 _ALL_SYMBOLS: tuple[str, ...] = (
     "BTC-USDT-SWAP",
     "ETH-USDT-SWAP",
     "SOL-USDT-SWAP",
     "DOGE-USDT-SWAP",
-    "BNB-USDT-SWAP",
+    "XRP-USDT-SWAP",
 )
 
 
@@ -105,12 +107,21 @@ class WhaleEvent:
 
 
 def affected_symbols_for(token_id: str) -> tuple[str, ...]:
-    """Map an Arkham token identifier to the OKX perps it shocks.
+    """Map an Arkham token identifier to the perps it shocks.
 
     Stablecoin moves (tether, usd-coin) shock every listed perp; chain-
-    native moves collapse to just the matching OKX symbol. Unknown
+    native moves collapse to just the matching symbol. Unknown
     token_ids return () — the listener logs but does not raise so a
     new token appearing mid-run degrades silently.
+
+    The `binancecoin/bnb` branch was retired on the 2026-04-25 Bybit
+    migration when XRP replaced BNB in the watched set; reinstate it
+    if BNB is ever swapped back into `trading.symbols`. No `ripple/xrp`
+    branch on purpose — Arkham doesn't index XRPL in either the
+    `/token/volume/{id}` REST endpoint or the whale-transfer WS stream
+    (probed 2026-04-25, all slug variants rejected as
+    `token not supported`). Whale events for XRP simply never arrive,
+    so the fan-in branch would be dead code.
     """
     t = token_id.lower()
     if t in ("tether", "usd-coin", "usdt", "usdc"):
@@ -123,21 +134,29 @@ def affected_symbols_for(token_id: str) -> tuple[str, ...]:
         return ("SOL-USDT-SWAP",)
     if t in ("dogecoin", "doge"):
         return ("DOGE-USDT-SWAP",)
-    if t in ("binancecoin", "binance-coin", "bnb"):
-        return ("BNB-USDT-SWAP",)
     return ()
 
 
-# 2026-04-22 — reverse mapping: OKX perp symbol → Arkham token slug
+# 2026-04-22 — reverse mapping: OKX-style perp symbol → Arkham token slug
 # (CoinGecko-style id). Used by the runner's `/token/volume/{id}` fetch
-# pipeline. Adding a new symbol requires extending BOTH this dict AND
+# pipeline (per-symbol 1h CEX flow → `per_symbol_cex_flow_penalty`).
+# Adding a new symbol requires extending BOTH this dict AND
 # `affected_symbols_for` above for the chain-native fan-in/out.
+#
+# **XRP intentionally absent** (2026-04-25 BNB↔XRP swap): Arkham's
+# `/token/volume/{id}` endpoint returns `token not supported` for every
+# XRP slug variant (xrp / ripple / XRP / xrp-classic / xrpl). XRPL isn't
+# indexed in their per-token volume surface — likely because they focus
+# on EVM + Bitcoin + Solana. XRP entries therefore lose the
+# `per_symbol_cex_flow_penalty` soft signal but keep every other
+# Arkham-driven gate (daily_bias modifier, stablecoin_pulse_penalty,
+# altcoin_index_penalty, flow_alignment_penalty — none of which are
+# per-symbol). Reinstate this entry if Arkham adds XRP support later.
 WATCHED_SYMBOL_TO_TOKEN_ID: dict[str, str] = {
     "BTC-USDT-SWAP": "bitcoin",
     "ETH-USDT-SWAP": "ethereum",
     "SOL-USDT-SWAP": "solana",
     "DOGE-USDT-SWAP": "dogecoin",
-    "BNB-USDT-SWAP": "binancecoin",
 }
 
 
