@@ -2880,6 +2880,38 @@ class BotRunner:
                         value = None
                     target_dict[venue] = value
             self.ctx.last_per_venue_per_asset_ts = time.monotonic()
+            # Patch the cached snapshot so the next `_maybe_record_on_chain_snapshot`
+            # tick (every cycle ≈ 30s) fingerprint-mutates and writes a journal row
+            # WITH the freshly-populated per-asset JSON. Without this patch the
+            # snapshot would only pick the dicts up at the next daily-bundle
+            # iteration (5min cadence), so the dashboard 24h slice would stay
+            # empty for ~5min after every restart. Mirrors the pulse +
+            # token-volume refresh patch pattern.
+            prev = self.ctx.on_chain_snapshot
+            if prev is not None:
+                self.ctx.on_chain_snapshot = OnChainSnapshot(
+                    daily_macro_bias=prev.daily_macro_bias,
+                    stablecoin_pulse_1h_usd=prev.stablecoin_pulse_1h_usd,
+                    cex_btc_netflow_24h_usd=prev.cex_btc_netflow_24h_usd,
+                    cex_eth_netflow_24h_usd=prev.cex_eth_netflow_24h_usd,
+                    coinbase_asia_skew_usd=prev.coinbase_asia_skew_usd,
+                    bnb_self_flow_24h_usd=prev.bnb_self_flow_24h_usd,
+                    cex_coinbase_netflow_24h_usd=prev.cex_coinbase_netflow_24h_usd,
+                    cex_binance_netflow_24h_usd=prev.cex_binance_netflow_24h_usd,
+                    cex_bybit_netflow_24h_usd=prev.cex_bybit_netflow_24h_usd,
+                    cex_bitfinex_netflow_24h_usd=prev.cex_bitfinex_netflow_24h_usd,
+                    cex_kraken_netflow_24h_usd=prev.cex_kraken_netflow_24h_usd,
+                    cex_okx_netflow_24h_usd=prev.cex_okx_netflow_24h_usd,
+                    cex_per_venue_btc_netflow_24h_usd_json=_dump_per_venue_dict(
+                        self.ctx.cex_per_venue_btc_netflow_24h_usd),
+                    cex_per_venue_eth_netflow_24h_usd_json=_dump_per_venue_dict(
+                        self.ctx.cex_per_venue_eth_netflow_24h_usd),
+                    cex_per_venue_stables_netflow_24h_usd_json=_dump_per_venue_dict(
+                        self.ctx.cex_per_venue_stables_netflow_24h_usd),
+                    token_volume_1h_net_usd_json=prev.token_volume_1h_net_usd_json,
+                    snapshot_age_s=prev.snapshot_age_s,
+                    stale_threshold_s=prev.stale_threshold_s,
+                )
             logger.info(
                 "arkham_per_venue_per_asset_refresh_finished "
                 "btc_venues={} eth_venues={} stables_venues={}",
