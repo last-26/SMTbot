@@ -26,6 +26,60 @@ AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT lin
 
 ## Changelog
 
+### 2026-04-27 — `position_snapshots.vwap_3m_distance_atr_now` writer fix (F4)
+
+Pre-fix audit showed 737/737 (100%) NULL on this column despite the
+writer plumbing being intact and the schema column existing. Root cause:
+the writer computed `band_mid = (vwap_3m_upper + vwap_3m_lower) / 2`
+and required BOTH band fields > 0. Pine emits `na ("—" → 0.0)` for the
+±1σ band right after the UTC 00:00 daily VWAP reset (session-stdev too
+young — same root cause as the 2026-04-26 vwap_reset_blackout
+post-window). Effectively the band was rarely simultaneously populated
+when the cadence-gated write fired, so every cycle hit the
+"both bands > 0" guard and emitted None.
+
+**Fix:** primary path is now the centerline `signal_table.vwap_3m`,
+which is populated reliably whenever the bot is in a 3m TF pass (used
+by zone builder, setup planner, and the entry-signal hard gates).
+Semantically `band_mid == centerline`, so the formula is identical
+when both are available. Band-midpoint path is preserved as a redundant
+secondary in case `vwap_3m` itself is somehow unset.
+
+```
+vwap_3m_dist_atr = None
+if atr > 0 and vwap_3m > 0:
+    vwap_3m_dist_atr = (mark_price - vwap_3m) / atr
+elif atr > 0 and upper > 0 and lower > 0:
+    vwap_3m_dist_atr = (mark_price - (upper + lower) / 2) / atr
+```
+
+**Tests:** 2 new tests in [tests/test_runner_position_snapshots.py](tests/test_runner_position_snapshots.py)
+locking the centerline-primary path AND the band-mid fallback. Full
+suite 9/9 green.
+
+**Pre-fix rows:** 737/737 NULL — values are NOT reconstructible without
+re-running the writer with the historical mark/vwap/atr cache, which
+isn't preserved. Pre-fix snapshots stay NULL; new snapshots from this
+commit forward will be populated.
+
+**Files touched:** [src/bot/runner.py](src/bot/runner.py)
+(`_maybe_write_position_snapshots` ~10 lines) + 2 new tests.
+
+**Re-eval triggers:**
+1. **Coverage on new rows** — `vwap_3m_distance_atr_now IS NOT NULL`
+   should be ~100% on `position_snapshots` rows post-commit (cold-start
+   gap excepted: first cycle for a symbol after restart will lack the
+   `last_market_state_per_symbol` entry until that symbol's first
+   per-symbol cycle completes).
+2. **Distribution sanity** — values should land in roughly `[-3.0,
+   +3.0]` for a 3m chart on liquid pairs (extreme excursions register
+   as multi-ATR moves but rarely > 3σ in calm tape). Outliers > 5
+   suggest atr is being read undersized.
+3. **Band-fallback fire rate** — log line counter for fallback path
+   firing should be ~zero in steady state. Non-zero = `vwap_3m`
+   centerline going NULL where bands aren't (highly unlikely; would
+   indicate Pine truncation or `_parse_leading_float` regression).
+
 ### 2026-04-27 — Zone metadata + `close_reason` plumbing (F3)
 
 `trades.setup_zone_source` / `zone_wait_bars` / `zone_fill_latency_bars`

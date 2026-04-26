@@ -2628,11 +2628,26 @@ class BotRunner:
                 except Exception:
                     osc_3m_json = {}
                 atr = mstate.atr or 0.0
-                upper = mstate.signal_table.vwap_3m_upper
-                lower = mstate.signal_table.vwap_3m_lower
-                if atr > 0 and upper > 0 and lower > 0:
-                    band_mid = (upper + lower) / 2.0
-                    vwap_3m_dist_atr = (snap.mark_price - band_mid) / atr
+                # 2026-04-27 (F4) — primary is the VWAP centerline distance:
+                # `signal_table.vwap_3m` is populated reliably whenever the
+                # bot is in 3m TF pass (used by zone builder + setup
+                # planner). The ±1σ band fields go NULL ("—" → 0.0) for
+                # the first few bars after Pine's daily VWAP reset (UTC
+                # 00:00) when session-stdev is still too young, which
+                # accounts for the 713/713 NULL pre-fix coverage. We keep
+                # the band-midpoint path as a redundant secondary in case
+                # `vwap_3m` itself is somehow unset; semantically band_mid
+                # == centerline, so the result is identical when both are
+                # available.
+                vwap_3m = mstate.signal_table.vwap_3m
+                if atr > 0 and vwap_3m > 0:
+                    vwap_3m_dist_atr = (snap.mark_price - vwap_3m) / atr
+                else:
+                    upper = mstate.signal_table.vwap_3m_upper
+                    lower = mstate.signal_table.vwap_3m_lower
+                    if atr > 0 and upper > 0 and lower > 0:
+                        band_mid = (upper + lower) / 2.0
+                        vwap_3m_dist_atr = (snap.mark_price - band_mid) / atr
             try:
                 await self.ctx.journal.record_position_snapshot(
                     trade_id=trade_id,

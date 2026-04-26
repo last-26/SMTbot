@@ -9,7 +9,12 @@ from typing import Optional
 
 import pytest
 
+from datetime import datetime, timezone
+
 from src.bot.runner import BotRunner
+from src.data.models import (
+    Direction, MarketState, OscillatorTableData, Session, SignalTableData,
+)
 from src.execution.models import PositionSnapshot
 
 
@@ -162,6 +167,83 @@ async def test_skips_when_plan_sl_price_unset(make_ctx):
     await runner._maybe_write_position_snapshots([snap])
     rows = await ctx.journal.get_position_snapshots("trade-abc")
     assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_writes_vwap_3m_distance_atr_from_centerline(make_ctx):
+    """2026-04-27 (F4) — vwap_3m_distance_atr_now must be computed from
+    `signal_table.vwap_3m` (centerline) when present, since the ±1σ band
+    fields go NULL right after Pine's UTC daily VWAP reset and were
+    leaving 713/713 NULL pre-fix. Lock the formula:
+    `(mark - vwap_3m) / atr` and assert non-NULL on a populated cache.
+    """
+    ctx, fakes = make_ctx()
+    await ctx.journal.connect()
+    runner = BotRunner(ctx)
+    snap = _snap(mark=67_300.0)
+    fakes.monitor.queued_live_snaps = [snap]
+    fakes.monitor.tracked_overrides[("BTC-USDT-SWAP", "long")] = _StubTracked()
+    ctx.open_trade_ids[("BTC-USDT-SWAP", "long")] = "trade-abc"
+
+    # Populate the per-symbol cache with a state that has VWAP centerline
+    # but NO band (band collapse — primary failure mode this fix targets).
+    ctx.last_market_state_per_symbol["BTC-USDT-SWAP"] = MarketState(
+        symbol="BTC-USDT-SWAP",
+        timeframe="3m",
+        timestamp=datetime(2026, 4, 27, 1, tzinfo=timezone.utc),
+        signal_table=SignalTableData(
+            price=67_300.0,
+            atr_14=120.0,
+            session=Session.LONDON,
+            trend_htf=Direction.BULLISH,
+            vwap_3m=66_900.0,
+            vwap_3m_upper=0.0,  # band fields collapsed (post-reset)
+            vwap_3m_lower=0.0,
+        ),
+        oscillator=OscillatorTableData(),
+    )
+
+    await runner._maybe_write_position_snapshots([snap])
+    rows = await ctx.journal.get_position_snapshots("trade-abc")
+    assert len(rows) == 1
+    # (67_300 - 66_900) / 120 = 3.333...
+    assert rows[0].vwap_3m_distance_atr_now == pytest.approx(400.0 / 120.0)
+
+
+@pytest.mark.asyncio
+async def test_vwap_distance_falls_back_to_band_mid_when_centerline_zero(make_ctx):
+    """Edge case: vwap_3m centerline missing but ±1σ bands populated —
+    derive band_mid as fallback so we still emit a non-NULL distance."""
+    ctx, fakes = make_ctx()
+    await ctx.journal.connect()
+    runner = BotRunner(ctx)
+    snap = _snap(mark=67_300.0)
+    fakes.monitor.queued_live_snaps = [snap]
+    fakes.monitor.tracked_overrides[("BTC-USDT-SWAP", "long")] = _StubTracked()
+    ctx.open_trade_ids[("BTC-USDT-SWAP", "long")] = "trade-abc"
+
+    ctx.last_market_state_per_symbol["BTC-USDT-SWAP"] = MarketState(
+        symbol="BTC-USDT-SWAP",
+        timeframe="3m",
+        timestamp=datetime(2026, 4, 27, 1, tzinfo=timezone.utc),
+        signal_table=SignalTableData(
+            price=67_300.0,
+            atr_14=120.0,
+            session=Session.LONDON,
+            trend_htf=Direction.BULLISH,
+            vwap_3m=0.0,           # centerline missing
+            vwap_3m_upper=67_000.0,
+            vwap_3m_lower=66_800.0,
+        ),
+        oscillator=OscillatorTableData(),
+    )
+
+    await runner._maybe_write_position_snapshots([snap])
+    rows = await ctx.journal.get_position_snapshots("trade-abc")
+    assert len(rows) == 1
+    # band_mid = (67_000 + 66_800) / 2 = 66_900
+    # (67_300 - 66_900) / 120 = 3.333...
+    assert rows[0].vwap_3m_distance_atr_now == pytest.approx(400.0 / 120.0)
 
 
 @pytest.mark.asyncio
