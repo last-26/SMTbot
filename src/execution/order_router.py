@@ -8,8 +8,8 @@ Flow on Bybit V5:
      Bybit attaches TP/SL atomically on success), fall back to closing
      the position via `close_position()` and surface AlgoOrderError.
 
-Differences vs the prior OKX flow:
-  - **No separate OCO algo.** The OKX `place_oco_algo` call is replaced
+Differences vs the pre-migration flow:
+  - **No separate OCO algo.** The pre-migration `place_oco_algo` call is replaced
     by `takeProfit`/`stopLoss` fields on the entry order itself (market)
     or by a `set_position_tpsl()` call after a limit fill (zone path).
   - **`_place_algos` returns AlgoResult with empty `algo_id`** for

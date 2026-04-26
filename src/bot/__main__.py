@@ -1,6 +1,6 @@
 """CLI entrypoint: `python -m src.bot --config config/default.yaml [--dry-run] [--once]`.
 
-  --dry-run           : swap OrderRouter for dry_run_report; no OKX orders placed.
+  --dry-run           : swap OrderRouter for dry_run_report; no Bybit orders placed.
   --once              : run exactly one tick and exit (smoke test for the wiring).
   --max-closed-trades : stop after N WIN/LOSS/BREAKEVEN rows hit the journal.
   --derivatives-only  : bypass the entry/exit pipeline; run liq-stream + cache
@@ -54,7 +54,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--config", default="config/default.yaml",
                    help="Path to bot config YAML (default: config/default.yaml)")
     p.add_argument("--dry-run", action="store_true",
-                   help="Use dry_run_report instead of placing real OKX orders")
+                   help="Use dry_run_report instead of placing real Bybit orders")
     p.add_argument("--once", action="store_true",
                    help="Run exactly one tick and exit (smoke test)")
     p.add_argument("--max-closed-trades", type=int, default=None,

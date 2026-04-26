@@ -1,8 +1,8 @@
 """TradePlan: the fully-sized, risk-bounded trade the execution layer will place.
 
 A TradePlan is the output of the strategy engine and the input to the
-execution layer (Phase 4). It contains every number the OKX client needs
-to place an entry order plus an OCO SL/TP algo order, along with the
+execution layer (Phase 4). It contains every number the exchange client needs
+to place an entry order plus its position-attached TP/SL, along with the
 accounting fields that go into the trade journal (Phase 5).
 
 Produced by:
@@ -32,7 +32,7 @@ class TradePlan:
     position_size_usdt: float     # notional exposure
     leverage: int                 # rounded, clamped to [1, max_leverage]
     required_leverage: float      # pre-cap, for diagnostics
-    num_contracts: int            # OKX integer contracts (BTC-USDT-SWAP → 0.01 BTC each)
+    num_contracts: int            # Integer contracts (internal canonical: BTC-USDT-SWAP → 0.01 BTC each)
 
     risk_amount_usdt: float       # actual USDT at risk on SL hit (notional * sl_pct)
     max_risk_usdt: float          # USDT risk target before any capping

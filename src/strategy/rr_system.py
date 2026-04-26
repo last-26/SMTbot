@@ -5,7 +5,7 @@ Given an entry, stop-loss, account balance, and risk budget, compute:
   - position size (USDT notional) so that SL hit = fixed USDT risk
   - required leverage to reach that notional
   - clamp leverage to an account-wide maximum (shrinks notional if needed)
-  - round notional to an integer number of OKX contracts
+  - round notional to an integer number of contracts
 
 Design rules (CLAUDE.md):
   - USDT risk per trade stays constant; leverage is dynamic, never fixed.
@@ -22,7 +22,8 @@ Design rules (CLAUDE.md):
     symbols and all cycles, immune to unrealized-drawdown balance shimmer
     from concurrent open positions. Safety rail: override ≤ 10% of
     account_balance (mirrors the existing `risk_pct <= 0.1` ceiling).
-  - OKX BTC-USDT-SWAP: 1 contract = 0.01 BTC notional. Integer contracts only.
+  - Internal contract convention: BTC-USDT-SWAP = 0.01 BTC, ETH = 0.1, SOL = 1,
+    DOGE = 1000. Integer contracts only.
 
 This module is pure: no I/O, no async, safe to import from anywhere.
 """
@@ -36,8 +37,8 @@ from src.data.models import Direction
 from src.strategy.trade_plan import TradePlan
 
 # Keep a little balance free for fees + mark-price fluctuations between
-# set_leverage and place_order. OKX rejects with sCode 51008 when initial
-# margin + buffer > available balance.
+# set_leverage and place_order. Bybit rejects with insufficient-margin
+# (110004/110007/110012) when initial margin + buffer > available balance.
 _MARGIN_SAFETY = 0.95
 
 # When picking leverage we want to MINIMIZE initial margin so multiple
@@ -111,15 +112,15 @@ def calculate_trade_plan(
         risk_pct: fraction of `account_balance` to risk (0.01 = 1%).
         rr_ratio: TP distance / SL distance.
         max_leverage: hard cap on leverage (from circuit breakers).
-        contract_size: BTC per OKX contract (BTC-USDT-SWAP = 0.01).
+        contract_size: BTC per contract (BTC-USDT-SWAP = 0.01).
         margin_balance: USDT actually available to post as initial margin for
             this trade. When omitted, falls back to `account_balance`. Split
             out so R is sized off total equity while notional/leverage still
-            respect the live free-margin ceiling (sCode 51008 avoidance).
+            respect the live free-margin ceiling (Bybit insufficient-margin avoidance).
         fee_reserve_pct: round-trip taker fee + slippage reserve added to
             sl_pct when computing notional, so the stop-out loss stays inside
             the risk budget *after* fees. Set to 2 × taker_pct (≈0.001) for
-            OKX demo taker orders. 0 disables (legacy behavior).
+            Bybit demo taker orders. 0 disables (legacy behavior).
         risk_amount_usdt_override: operator-set flat $R. When provided (and
             > 0), bypasses `account_balance × risk_pct` and uses this number
             as max_risk directly. None = legacy percent mode. Safety rail:
@@ -181,8 +182,8 @@ def calculate_trade_plan(
     required_leverage = ideal_notional / effective_margin
 
     # Hard ceiling on notional: leverage cap AND margin safety buffer. Without
-    # the buffer, a fully-leveraged order leaves OKX no room for fees and gets
-    # rejected with sCode 51008.
+    # the buffer, a fully-leveraged order leaves Bybit no room for fees and
+    # gets rejected with insufficient-margin (110004/110007/110012).
     max_notional = effective_margin * max_leverage * _MARGIN_SAFETY
     if ideal_notional > max_notional:
         notional = max_notional
@@ -192,7 +193,8 @@ def calculate_trade_plan(
         capped = False
 
     # Leverage floor — margin (= notional / leverage) must fit inside
-    # effective_margin × _MARGIN_SAFETY. Below this OKX rejects with 51008.
+    # effective_margin × _MARGIN_SAFETY. Below this Bybit rejects with
+    # insufficient-margin (110004/110007/110012).
     min_lev_for_margin = max(
         1, math.ceil(notional / (effective_margin * _MARGIN_SAFETY))
     )
@@ -208,7 +210,8 @@ def calculate_trade_plan(
     leverage = min(max_leverage, liq_safe_leverage)
     leverage = max(leverage, min_lev_for_margin, 1)
 
-    # Integer OKX contracts. Operator contract (2026-04-19, post-partial-TP-off):
+    # Integer contracts (per internal canonical convention). Operator contract
+    # (2026-04-19, post-partial-TP-off):
     # each position must realize AT LEAST max_risk_usdt at SL (and rr_ratio ×
     # that at TP), regardless of per-symbol ctVal/entry quantization. Ceil on
     # per-contract TOTAL cost (price + fee reserve) so realized loss ≈

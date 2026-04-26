@@ -350,7 +350,7 @@ class WhaleTransferRecord(BaseModel):
     from_entity: Optional[str] = None
     to_entity: Optional[str] = None
     tx_hash: Optional[str] = None
-    # JSON list of OKX perp symbols affected (stablecoin events fan out
+    # JSON list of internal-format perp symbols affected (stablecoin events fan out
     # to every watched symbol; chain-native collapses to one). Mirrors
     # `affected_symbols_for()` output at event time.
     affected_symbols: list[str] = Field(default_factory=list)

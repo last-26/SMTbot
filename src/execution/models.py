@@ -1,6 +1,6 @@
 """Execution-layer records.
 
-These records cross the boundary from the OKX API (untyped dicts) into
+These records cross the boundary from the Bybit API (untyped dicts) into
 the bot's typed world. They're intentionally minimal — only what the
 router, monitor, and journal need.
 """
@@ -34,7 +34,7 @@ class PositionState(str, Enum):
 
 @dataclass
 class OrderResult:
-    """Outcome of a single OKX order placement call."""
+    """Outcome of a single Bybit order placement call."""
     order_id: str
     client_order_id: str
     status: OrderStatus
@@ -46,7 +46,11 @@ class OrderResult:
 
 @dataclass
 class AlgoResult:
-    """Outcome of an OCO SL/TP algo order placement."""
+    """Outcome of a TP/SL placement. On Bybit V5, TP/SL is attached
+    directly to the position rather than placed as a separate algo order;
+    this record's `algo_id` is therefore an empty string for Bybit-era
+    rows. Field name kept for journal back-compat with pre-migration rows.
+    """
     algo_id: str
     client_algo_id: str
     sl_trigger_px: float
@@ -84,7 +88,7 @@ class ExecutionReport:
 
 @dataclass
 class PositionSnapshot:
-    """A single poll of an open position from OKX."""
+    """A single poll of an open position from Bybit."""
     inst_id: str
     pos_side: str                 # "long" / "short"
     size: float                   # contracts; 0 when closed

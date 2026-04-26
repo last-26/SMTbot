@@ -11,7 +11,7 @@ Prerequisites:
   2. Pine Scripts loaded on chart:
      - SMT Master Overlay (pine/smt_overlay.pine) — chart overlay
      - SMT Master Oscillator (pine/smt_oscillator.pine) — lower pane
-  3. Chart showing OKX:BTCUSDT.P (or any symbol for testing)
+  3. Chart showing BYBIT:BTCUSDT.P (or any symbol for testing)
 """
 
 import argparse

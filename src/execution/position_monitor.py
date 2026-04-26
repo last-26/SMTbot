@@ -75,7 +75,7 @@ class _Tracked:
     # move, which destroys the original risk distance — dynamic TP revision
     # needs the plan SL to compute `entry + target_rr × plan_sl_distance`,
     # else post-BE sl_distance collapses to the BE offset (~0.1%) and the
-    # 1:N target becomes unreachably close to mark (OKX rejects as 51277).
+    # 1:N target becomes unreachably close to mark (Bybit rejects with 110012).
     plan_sl_price: float = 0.0
     # 2026-04-20 — MFE-triggered SL lock (Option A). One-shot flag: once the
     # position has crossed sl_lock_mfe_r in favor and the runner OCO has
@@ -134,9 +134,8 @@ class PendingEvent:
 # the only success terminal state; Cancelled / Rejected / Deactivated are
 # all terminal-cancel states that the runner should surface as such.
 # `canceled` (American spelling) and `mmp_canceled` are kept for
-# back-compat with OKX-era test fixtures that pre-date the migration —
-# the live Bybit API never emits these, but tests that haven't been
-# touched still work.
+# back-compat with pre-migration test fixtures — the live Bybit API
+# never emits these, but tests that haven't been touched still work.
 _TERMINAL_FILLED = frozenset({"filled"})
 _TERMINAL_CANCELED = frozenset({
     "cancelled", "rejected", "deactivated",
@@ -711,7 +710,8 @@ class PositionMonitor:
                 self.client.cancel_order(p.inst_id, p.order_id)
                 cancel_landed = True
             except OrderRejected as exc:
-                # 51400/1/2: order already gone. Treat as success.
+                # Bybit "order gone" codes (110001/110008/110010/170142/
+                # 170213): treat cancel as success.
                 if self._cancel_error_is_already_gone(exc):
                     cancel_landed = True
                 else:
@@ -728,12 +728,13 @@ class PositionMonitor:
                 )
 
             if not cancel_landed:
-                # OKX rejected the cancel with a non-idempotent error (e.g.
-                # sCode 50001 service-unavailable) or the call raised a
-                # generic exception. Previously we emitted CANCELED and
-                # dropped tracking — the order stayed live on OKX as a
-                # phantom resting limit that could later fill into an
-                # unprotected position. Keep the row; next poll retries.
+                # The exchange rejected the cancel with a non-idempotent
+                # error (e.g. transient service-unavailable) or the call
+                # raised a generic exception. Previously we emitted CANCELED
+                # and dropped tracking — the order stayed live on the
+                # exchange as a phantom resting limit that could later fill
+                # into an unprotected position. Keep the row; next poll
+                # retries.
                 continue
 
             # If something filled before the cancel landed, surface it as
@@ -762,12 +763,12 @@ class PositionMonitor:
         """Caller-driven cancel (e.g. runner detects zone invalidation).
 
         Returns the CANCELED event on success, or None if no pending row
-        existed for that (inst_id, pos_side). Idempotent OKX errors
-        (51400/1/2) are treated as success — the order is gone either way.
-        Transient / non-idempotent errors (e.g. sCode 50001) re-raise to
-        the caller; the pending row is kept so the caller can retry. If
-        we silently popped on transient failure, the order could remain
-        live on OKX as a phantom orphan (see 2026-04-20 changelog).
+        existed for that (inst_id, pos_side). Idempotent "order gone"
+        errors are treated as success — the order is gone either way.
+        Transient / non-idempotent errors re-raise to the caller; the
+        pending row is kept so the caller can retry. If we silently
+        popped on transient failure, the order could remain live on the
+        exchange as a phantom orphan (see 2026-04-20 changelog).
         """
         key = (inst_id, pos_side)
         p = self._pending.get(key)
