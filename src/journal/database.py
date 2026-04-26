@@ -272,7 +272,15 @@ CREATE TABLE IF NOT EXISTS on_chain_snapshots (
     -- this captures the venue's own flow. 24h net ≈ 0 structurally
     -- (turnover ~$1.86B but balanced in/out, max hourly |net| $58M).
     -- Journal-only; Pass 3 decides whether a 1h-window OKX slot adds value.
-    cex_okx_netflow_24h_usd         REAL
+    cex_okx_netflow_24h_usd         REAL,
+    -- 2026-04-26 — per-venue × per-asset 24h netflow (BTC / ETH / stables).
+    -- JSON dict keyed by entity slug (coinbase/binance/bybit/bitfinex/kraken/
+    -- okx) → signed USD float. Adding a 7th venue won't require schema
+    -- migration. Powers the dashboard's per-venue per-asset chart; not yet
+    -- wired into any runtime scoring (Pass 3 candidate).
+    cex_per_venue_btc_netflow_24h_usd_json     TEXT,
+    cex_per_venue_eth_netflow_24h_usd_json     TEXT,
+    cex_per_venue_stables_netflow_24h_usd_json TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_on_chain_snap_captured_at ON on_chain_snapshots(captured_at);
@@ -552,6 +560,13 @@ _MIGRATIONS = [
     # 2026-04-24 — 6th venue: OKX (bot's own trading exchange). Journal-only;
     # 24h net ≈ 0 by design but captured for parity + Pass 3 exploration.
     "ALTER TABLE on_chain_snapshots ADD COLUMN cex_okx_netflow_24h_usd REAL",
+    # 2026-04-26 — per-venue × per-asset 24h netflow (BTC / ETH / stables).
+    # JSON dicts keyed by entity slug. Powers the dashboard's per-venue
+    # per-asset chart; not yet wired into runtime scoring (Pass 3 candidate).
+    # Adding a 7th venue won't trigger a migration.
+    "ALTER TABLE on_chain_snapshots ADD COLUMN cex_per_venue_btc_netflow_24h_usd_json TEXT",
+    "ALTER TABLE on_chain_snapshots ADD COLUMN cex_per_venue_eth_netflow_24h_usd_json TEXT",
+    "ALTER TABLE on_chain_snapshots ADD COLUMN cex_per_venue_stables_netflow_24h_usd_json TEXT",
     # 2026-04-26 — position_snapshots intra-trade time-series for RL trajectory
     # data. Idempotent CREATE on existing DBs (CREATE TABLE IF NOT EXISTS already
     # in _SCHEMA; explicit migration here lets the indexes land too on bases
@@ -1361,6 +1376,9 @@ class TradeJournal:
         cex_bitfinex_netflow_24h_usd: Optional[float] = None,
         cex_kraken_netflow_24h_usd: Optional[float] = None,
         cex_okx_netflow_24h_usd: Optional[float] = None,
+        cex_per_venue_btc_netflow_24h_usd_json: Optional[str] = None,
+        cex_per_venue_eth_netflow_24h_usd_json: Optional[str] = None,
+        cex_per_venue_stables_netflow_24h_usd_json: Optional[str] = None,
     ) -> int:
         """Append one row to `on_chain_snapshots` — time-series of Arkham state.
 
@@ -1377,6 +1395,10 @@ class TradeJournal:
         _flow_alignment_score still reads the original 6 inputs.
         2026-04-24 — added OKX as 6th venue (bot's own exchange). Self-signal;
         24h net ≈ 0 by design (balanced turnover) but captured for parity.
+        2026-04-26 — added 3 JSON dict TEXT columns for per-venue × per-asset
+        breakdown (BTC / ETH / stables). Each is a dict keyed by entity slug;
+        adding a 7th venue won't trigger a migration. Powers the dashboard's
+        per-venue per-asset chart; not yet wired into runtime scoring.
         """
         conn = self._require_conn()
         cur = await conn.execute(
@@ -1398,8 +1420,11 @@ class TradeJournal:
                    token_volume_1h_net_usd_json,
                    cex_bitfinex_netflow_24h_usd,
                    cex_kraken_netflow_24h_usd,
-                   cex_okx_netflow_24h_usd
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   cex_okx_netflow_24h_usd,
+                   cex_per_venue_btc_netflow_24h_usd_json,
+                   cex_per_venue_eth_netflow_24h_usd_json,
+                   cex_per_venue_stables_netflow_24h_usd_json
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 _iso(captured_at),
                 daily_macro_bias,
@@ -1419,6 +1444,9 @@ class TradeJournal:
                 cex_bitfinex_netflow_24h_usd,
                 cex_kraken_netflow_24h_usd,
                 cex_okx_netflow_24h_usd,
+                cex_per_venue_btc_netflow_24h_usd_json,
+                cex_per_venue_eth_netflow_24h_usd_json,
+                cex_per_venue_stables_netflow_24h_usd_json,
             ),
         )
         await conn.commit()
