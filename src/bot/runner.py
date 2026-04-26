@@ -2,8 +2,8 @@
 
 Shape of one tick (`run_once`):
   1. Fetch MarketState + recent candles from the TV bridge.
-  2. Drain closed-position fills from PositionMonitor → enrich PnL via OKX
-     positions-history → record_close in journal → update RiskManager.
+  2. Drain closed-position fills from PositionMonitor → enrich PnL via Bybit
+     closed-pnl → record_close in journal → update RiskManager.
   3. If any position is already open on our symbol, skip open-attempts
      this tick (symbol-level dedup — `SignalTableData.last_bar` isn't a
      parsed field, so we can't do bar-level dedup without a data-layer
@@ -542,10 +542,11 @@ class BotContext:
     coinalyze_client: Any = None           # CoinalyzeClient (Madde 2)
     # Macro event blackout — opt-in via EconomicCalendarConfig.enabled
     economic_calendar: Any = None          # EconomicCalendarService
-    # OKX per-symbol ctVal (underlying per contract). BTC=0.01, ETH=0.1, SOL=1.
-    # Populated at bootstrap; one hardcoded value for all symbols trips 51008.
+    # Per-symbol ctVal (underlying per contract, internal canonical convention).
+    # BTC=0.01, ETH=0.1, SOL=1, DOGE=1000. Populated at bootstrap; one hardcoded
+    # value for all symbols trips Bybit insufficient-margin (110004).
     contract_sizes: dict[str, float] = field(default_factory=dict)
-    # Per-symbol OKX max leverage (BTC/ETH=100, SOL=50). Above this trips 59102.
+    # Per-symbol Bybit max leverage (BTC/ETH=100, SOL=50). Above this trips 110086.
     max_leverage_per_symbol: dict[str, int] = field(default_factory=dict)
     # Phase 7.A6 — cross-asset pillar bias snapshot. Updated each cycle from
     # BTC-USDT-SWAP and ETH-USDT-SWAP EMA stacks; consulted before altcoin
@@ -1134,7 +1135,8 @@ class BotRunner:
             # Drain pending events between symbols so a fill during this cycle
             # attaches its OCO within seconds rather than waiting for the next
             # run_once tick (~180-240s). Minimises the fill → attach race that
-            # causes sCode 51277 / "(no message)" on tight-SL zone entries.
+            # causes Bybit insufficient-margin / order-rejected (110012) on
+            # tight-SL zone entries.
             try:
                 await self._process_pending()
             except Exception:
@@ -1317,7 +1319,7 @@ class BotRunner:
             return
         # Use plan_sl_price (immutable, the SL at fill time) for ratio math —
         # after SL-to-BE the mutable sl_price collapses to ~0.1% of entry,
-        # which produces a near-entry new_tp that OKX rejects as 51277.
+        # which produces a near-entry new_tp that Bybit rejects (110012).
         # plan_sl_price == 0.0 means "unknown" (post-BE rehydrate): skip.
         plan_sl = float(snap.get("plan_sl_price") or 0.0)
         entry = float(snap.get("entry_price") or 0.0)
@@ -1539,7 +1541,7 @@ class BotRunner:
         snapshot's JSON dict.
 
         Snapshot stores `token_volume_1h_net_usd_json` as a JSON string
-        keyed by OKX perp symbol (e.g. "BTC-USDT-SWAP") with the most-recent-
+        keyed by internal-format perp symbol (e.g. "BTC-USDT-SWAP") with the most-recent-
         hour `inUSD - outUSD` as float value. Returns None when:
           * on_chain snapshot is absent (master off, or pre-first-refresh)
           * JSON column missing / unparseable (legacy row or fetch failure)
@@ -1661,7 +1663,7 @@ class BotRunner:
 
         # On Bybit V5 the position-attached TP/SL clears automatically when
         # the position closes — no separate algo cancel needed (compare the
-        # OKX-era cancel_algo loop that used to live here).
+        # pre-migration cancel_algo loop that used to live here).
         try:
             await asyncio.to_thread(
                 self.ctx.bybit_client.close_position, symbol, side,
@@ -1993,8 +1995,9 @@ class BotRunner:
         # equity so drawdowns scale R naturally but locked margin in other
         # positions doesn't shrink it. Margin-fit (notional/leverage ceiling)
         # uses the smaller of per-slot fair-share and live `availEq` so the
-        # order still fits on OKX right now and multiple concurrent positions
-        # coexist. sCode 51008 avoidance lives on the margin side.
+        # order still fits on Bybit right now and multiple concurrent positions
+        # coexist. Bybit insufficient-margin (110004) avoidance lives on the
+        # margin side.
         try:
             total_eq = await asyncio.to_thread(
                 self.ctx.bybit_client.get_total_equity, "USDT"
@@ -2014,6 +2017,36 @@ class BotRunner:
         risk_balance = min(total_eq, self.ctx.risk_mgr.current_balance)
         margin_balance = min(per_slot, okx_avail)
         sizing_balance = margin_balance  # retained for logging/back-compat
+
+        # 2026-04-26 — auto-R mode. Resolve the per-trade $R override in
+        # priority order:
+        #   1. Operator env / YAML `risk_amount_usdt` (escape hatch)
+        #   2. `auto_risk_pct_of_wallet > 0` → realized_wallet × pct
+        #   3. None → rr_system falls back to `balance × risk_per_trade_pct`
+        # Realized wallet (UPL excluded) keeps R from inflating during a
+        # winning streak or shrinking during open-position drawdowns. The
+        # probe failure path falls through to (3) so a single Bybit blip
+        # doesn't halt sizing.
+        risk_amount_override: Optional[float] = cfg.trading.risk_amount_usdt
+        if (risk_amount_override is None
+                and cfg.trading.auto_risk_pct_of_wallet > 0):
+            try:
+                wallet_realized = await asyncio.to_thread(
+                    self.ctx.bybit_client.get_wallet_balance_realized, "USDT"
+                )
+            except Exception:
+                logger.exception("wallet_realized_sync_failed_using_total_eq")
+                wallet_realized = total_eq
+            if wallet_realized > 0:
+                risk_amount_override = (
+                    wallet_realized * cfg.trading.auto_risk_pct_of_wallet
+                )
+                logger.info(
+                    "auto_risk_resolved wallet_realized={:.2f} pct={:.4f} R={:.2f}",
+                    wallet_realized,
+                    cfg.trading.auto_risk_pct_of_wallet,
+                    risk_amount_override,
+                )
 
         # Phase 7.D3 — classify trend regime on the entry-TF closed buffer.
         # Used both as a scoring input (conditional factor weights) and as a
@@ -2046,7 +2079,7 @@ class BotRunner:
                 contract_size=self.ctx.contract_sizes.get(
                     symbol, cfg.trading.contract_size),
                 margin_balance=margin_balance,
-                risk_amount_usdt_override=cfg.trading.risk_amount_usdt,
+                risk_amount_usdt_override=risk_amount_override,
                 swing_lookback=cfg.swing_lookback_for(symbol),
                 allowed_sessions=cfg.allowed_sessions_for(symbol) or None,
                 htf_sr_zones=self.ctx.htf_sr_cache.get(symbol),
@@ -2425,7 +2458,7 @@ class BotRunner:
         )
 
     async def _load_contract_sizes(self) -> None:
-        """Pre-fetch OKX ctVal + max leverage for every configured symbol.
+        """Pre-fetch ctVal + max leverage from Bybit instrument-info for every configured symbol.
         Falls back to YAML defaults on error so the bot still runs; logs
         the failure so the operator sees it."""
         cfg = self.ctx.config
@@ -3258,11 +3291,11 @@ class BotRunner:
 
         fill_px = ev.avg_price if ev.avg_price > 0 else plan.entry_price
 
-        # Pre-attach SL-crossed guard. OKX rejects place_algo_order with
-        # sCode 51277 / "(no message)" when the trigger price is already
-        # on the wrong side of mark — and without this check the position
-        # stays open UNPROTECTED. If mark has already breached plan.sl_price,
-        # skip the attach and best-effort close immediately.
+        # Pre-attach SL-crossed guard. Bybit rejects trading-stop attach
+        # (110012) when the trigger price is already on the wrong side of
+        # mark — and without this check the position stays open UNPROTECTED.
+        # If mark has already breached plan.sl_price, skip the attach and
+        # best-effort close immediately.
         try:
             mark_px = await asyncio.to_thread(
                 self.ctx.client.get_mark_price, ev.inst_id,
@@ -3670,7 +3703,7 @@ class BotRunner:
             # plan_sl_price is lost post-BE on restart (journal only stores the
             # current SL). Pre-BE: current SL == plan SL. Post-BE: pass 0 →
             # dynamic TP revision no-ops for this position (safer than reviving
-            # with a near-zero sl_distance that OKX rejects).
+            # with a near-zero sl_distance that Bybit rejects).
             plan_sl = 0.0 if rec.sl_moved_to_be else rec.sl_price
             # 2026-04-20 — TP-limit is in-memory only; `_cancel_orphan_pending_limits`
             # wipes every resting limit at startup, so any TP limit we placed
@@ -3719,7 +3752,7 @@ class BotRunner:
             # replay already paired every recorded open with its close.
 
     async def _reconcile_orphans(self) -> None:
-        """Reconcile OKX state against the journal at startup.
+        """Reconcile Bybit state against the journal at startup.
 
         Three passes:
 
@@ -3728,7 +3761,7 @@ class BotRunner:
            live position is gone.
         2. Orphan resting limit orders — CANCEL. The monitor's in-memory
            `_pending` dict is empty at startup, so any live pending limit
-           on OKX at this moment cannot be tracked by this process; if it
+           on Bybit at this moment cannot be tracked by this process; if it
            filled we'd get an untracked (= unprotected) position. Safer to
            cancel now than to discover it as an orphan later.
         3. Surplus OCOs — CANCEL those not referenced by the journal's

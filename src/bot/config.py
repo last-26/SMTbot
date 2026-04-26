@@ -44,20 +44,29 @@ class TradingConfig(BaseModel):
     # Operator-set absolute USDT risk per trade. When populated (either via
     # YAML `trading.risk_amount_usdt` or the `RISK_AMOUNT_USDT` env var),
     # bypasses the `balance × risk_per_trade_pct` sizing path and uses this
-    # number directly as max_risk. Null/absent = legacy percent mode.
-    # Operator-controlled: pin $R to a flat number (e.g. 50) regardless of
-    # unrealized drawdown on other open positions. Safety rail enforces
-    # override ≤ 10% of account_balance inside `calculate_trade_plan`.
+    # number directly as max_risk. Null/absent = auto mode (see below).
+    # Operator-controlled escape hatch: pin $R to a flat number regardless
+    # of bankroll movement. Safety rail enforces override ≤ 10% of
+    # account_balance inside `calculate_trade_plan`.
     risk_amount_usdt: Optional[float] = None
+    # 2026-04-26 — auto-R mode. When `risk_amount_usdt` is null AND this
+    # value is > 0, every trade sizes R = realized_wallet_balance × pct
+    # at entry time. "realized" = Bybit V5 `totalWalletBalance` (UPL
+    # EXCLUDED) so R doesn't inflate during a winning streak or shrink
+    # during an open-position drawdown. The fresh probe runs once per
+    # cycle in the runner; if the probe fails the runner falls back to
+    # the env override (if set) or `current_balance × risk_per_trade_pct`.
+    # 0.0 = disabled (use legacy percent mode against `risk_per_trade_pct`).
+    auto_risk_pct_of_wallet: float = 0.0
     max_leverage: int
     default_rr_ratio: float
     min_rr_ratio: float
     max_concurrent_positions: int
     contract_size: float = 0.01                   # BTC-USDT-SWAP lot size
-    # Operator-side per-symbol leverage caps — applied on top of OKX's
+    # Operator-side per-symbol leverage caps — applied on top of Bybit's
     # instrument-level cap (fetched at startup). The effective ceiling is
-    # min(trading.max_leverage, okx_instrument_cap, symbol_leverage_caps[sym]).
-    # Useful when e.g. ETH's OKX cap is 100x but demo wicks make anything
+    # min(trading.max_leverage, bybit_instrument_cap, symbol_leverage_caps[sym]).
+    # Useful when e.g. ETH's Bybit cap is 100x but demo wicks make anything
     # above 30x unsafe. Unlisted symbols fall back to the global max.
     symbol_leverage_caps: dict[str, int] = Field(default_factory=dict)
     # Phase 6.9 B3 — per-symbol swing_lookback override for SL sourcing.
@@ -69,7 +78,7 @@ class TradingConfig(BaseModel):
     # Round-trip taker reserve added to SL % when sizing notional, so a
     # stop-out stays inside the USDT risk budget AFTER paying entry + exit
     # taker fees. 0 = off (price-only sizing, back-compat for tests); runtime
-    # YAML sets ~0.001 (≈ 2× OKX demo taker 0.05%). TP price is unchanged —
+    # YAML sets ~0.001 (≈ 2× Bybit demo taker 0.055%). TP price is unchanged —
     # fee compensation comes from size, not from widening TP.
     fee_reserve_pct: float = 0.0
     symbol_settle_seconds: float = 4.0            # wait after set_symbol (Madde A/B)
@@ -106,7 +115,20 @@ class TradingConfig(BaseModel):
         if v is not None and v <= 0:
             raise ValueError(
                 "trading.risk_amount_usdt must be > 0 when set "
-                "(use null/absent to fall back to percent mode)"
+                "(use null/absent to fall back to auto / percent mode)"
+            )
+        return v
+
+    @field_validator("auto_risk_pct_of_wallet")
+    @classmethod
+    def _auto_risk_pct_in_range(cls, v: float) -> float:
+        # 0 = disabled. Upper cap mirrors the rr_system safety ceiling
+        # (override ≤ 10% of balance) so a misconfigured 0.5 can't
+        # silently size a half-bankroll position.
+        if not (0.0 <= v <= 0.1):
+            raise ValueError(
+                f"trading.auto_risk_pct_of_wallet must be in [0.0, 0.1] "
+                f"(0 = disabled, 0.02 = 2% of realized wallet); got {v}"
             )
         return v
 
@@ -465,13 +487,14 @@ class ExecutionConfig(BaseModel):
     sl_lock_mfe_r: float = 1.3
     sl_lock_at_r: float = 0.0
 
-    # OKX OCO trigger-price source. "mark" = index-weighted price across
-    # the major real exchanges (Binance / Bybit / Coinbase). "last" = last
-    # trade on the OKX book (default in OKX SDK). Mark is strongly
-    # preferred on demo: demo-only wicks have no counterpart on the index
-    # and so can't fire mark-based triggers, preventing stop-hunt artefacts
-    # from poisoning the RL dataset. Kept configurable so a live deploy
-    # can pick "last" if it wants book-native triggering.
+    # Position-attached TP/SL trigger-price source. "mark" = index-weighted
+    # price across the major real exchanges (Binance / Bybit / Coinbase /
+    # OKX). "last" = last trade on the Bybit book (default in Bybit V5).
+    # Mark is strongly preferred on demo: demo-only wicks have no
+    # counterpart on the index and so can't fire mark-based triggers,
+    # preventing stop-hunt artefacts from poisoning the RL dataset. Kept
+    # configurable so a live deploy can pick "last" if it wants
+    # book-native triggering.
     algo_trigger_px_type: str = "mark"
 
     # 2026-04-20 — resting TP limit alongside OCO. Trigger-market TP (OCO

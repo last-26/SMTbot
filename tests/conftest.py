@@ -253,6 +253,11 @@ class FakeBybitClient:
     def get_total_equity(self, ccy: str = "USDT") -> float:
         return self.balance
 
+    def get_wallet_balance_realized(self, ccy: str = "USDT") -> float:
+        # Tests overriding `balance` get the same value back; UPL-aware
+        # behaviour is exercised in the bybit_client raw-response tests.
+        return self.balance
+
     def cancel_algo(self, inst_id: str, algo_id: str) -> dict:
         self.cancel_algo_calls.append((inst_id, algo_id))
         return {}

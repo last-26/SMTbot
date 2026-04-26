@@ -529,6 +529,63 @@ class BybitClient:
             or 0.0
         )
 
+    def get_wallet_balance_realized(self, ccy: str = "USDT") -> float:
+        """USD value of the realized cash position — UPL EXCLUDED.
+
+        Used by the auto-R sizer (`trading.auto_risk_pct_of_wallet`) so
+        that per-trade R floats with the operator's true cash bankroll
+        rather than with `totalMarginBalance` (which already includes
+        unrealized PnL on every open position via mark-to-market).
+        Excluding UPL prevents R from inflating during a winning streak
+        and over-sizing into the next trade, or from compressing on a
+        drawdown such that recovery R falls below the operator's intent.
+
+        Reads `totalWalletBalance` from the account-level totals — Bybit
+        V5's documented "Wallet Balance excluding open position UPL"
+        field on UNIFIED accounts. Falls back to summing per-coin
+        `walletBalance × usdValue / equity` across the `coin[]` array
+        when the account-level field is missing on a demo response.
+        Final fallback returns 0.0 so the caller treats it as a probe
+        failure (skip-trade or env override).
+        """
+        resp = self.session.get_wallet_balance(
+            accountType=self.account_type, coin=ccy,
+        )
+        result = _check(resp, "get_wallet_balance")
+        rows = result.get("list") or []
+        if not rows:
+            return 0.0
+        row = rows[0]
+        # Primary: account-level totalWalletBalance (UPL-excluded by Bybit
+        # spec). Present on every populated UNIFIED response observed in
+        # the wild as of 2026-04-26.
+        total_wallet = row.get("totalWalletBalance")
+        if total_wallet:
+            try:
+                return float(total_wallet)
+            except (TypeError, ValueError):
+                pass
+        # Fallback: sum per-coin walletBalance × spot multiplier. For USDT
+        # / USDC `walletBalance` and `usdValue` are 1:1; for other
+        # collateral coins we approximate via usdValue × walletBalance /
+        # max(equity, walletBalance) so any bundled UPL drops out.
+        total_usd = 0.0
+        for coin_row in row.get("coin") or []:
+            try:
+                wallet_bal = float(coin_row.get("walletBalance") or 0.0)
+                usd_value = float(coin_row.get("usdValue") or 0.0)
+                equity = float(coin_row.get("equity") or wallet_bal)
+            except (TypeError, ValueError):
+                continue
+            if wallet_bal <= 0 or usd_value <= 0:
+                continue
+            # When equity ≈ wallet (no UPL on this coin) usd_value is
+            # already the correct realized USD. When equity > wallet
+            # (UPL present), prorate by wallet/equity to strip UPL.
+            ratio = wallet_bal / equity if equity > 0 else 1.0
+            total_usd += usd_value * min(ratio, 1.0)
+        return total_usd
+
     def set_position_mode_hedge(self, settle_coin: str = "USDT") -> dict:
         """Idempotent one-shot at startup: hedge mode for all USDT linear.
 

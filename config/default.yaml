@@ -22,20 +22,25 @@ trading:
   entry_timeframe: 3m
   htf_timeframe: 15m
   ltf_timeframe: 1m
-  risk_per_trade_pct: 1.0   # 1% of balance ≈ 1R. With partial_tp 50/50 at 1.5R/4.5R, weighted max reward = 0.5×1.5 + 0.5×4.5 = 3.0R ⇒ effective 1:3 on full-win. Break-even winrate ≈ 25%.
-  # Operator-set absolute $R override (2026-04-20). When set, bypasses
-  # `balance × risk_per_trade_pct` and uses this flat USDT number directly
-  # as max_risk — every position sizes to the same $R regardless of
-  # unrealized drawdown on concurrent open positions. Null = legacy percent
-  # mode. Env var `RISK_AMOUNT_USDT` wins over this YAML value; set either
-  # one for operator-visible $R constancy. Safety rail: override ≤ 10% of
-  # account_balance (mirrors the risk_pct ≤ 0.1 ceiling in rr_system). Bump
-  # manually as balance grows (demo $5k → $50; live $10k → $50/$100 per
-  # your own ramp plan).
+  risk_per_trade_pct: 1.0   # legacy percent-mode fallback (used only when both auto and override are off).
+  # Operator-set absolute $R override (escape hatch). When set, bypasses
+  # auto mode + percent mode and uses this flat USDT number directly as
+  # max_risk. Null = let auto / percent mode decide. Env var
+  # `RISK_AMOUNT_USDT` wins over this YAML value (kept commented in
+  # .env.example as a manual escape hatch). Safety rail: override ≤ 10%
+  # of account_balance (rr_system enforces).
   risk_amount_usdt: null
+  # 2026-04-26 — auto-R mode. When `risk_amount_usdt` is null AND this is
+  # > 0, every trade sizes R = realized_wallet_balance × pct, freshly
+  # probed at entry time. "realized" reads Bybit V5 `totalWalletBalance`
+  # which EXCLUDES unrealized PnL — so R doesn't drift with open-position
+  # mark-to-market. 0.02 = 2%; per-slot exposure across 5 concurrent
+  # positions = max 10% theoretical drawdown (each slot risks 2%).
+  # Probe failure → fallback to env override or percent mode.
+  auto_risk_pct_of_wallet: 0.02
   # Round-trip taker reserve baked into sizing: `effective_sl_pct = sl_pct +
   # fee_reserve_pct`, shrinks notional so a stop-out caps near the nominal $R
-  # AFTER paying entry + exit taker fees. 0.001 = 2× OKX demo taker (0.05%).
+  # AFTER paying entry + exit taker fees. 0.001 = ~2× Bybit demo taker (0.055%).
   # TP stays at `sl_dist × rr_ratio` — fee compensation via size, not TP width.
   fee_reserve_pct: 0.001
   max_leverage: 75
@@ -61,11 +66,11 @@ trading:
   min_rr_ratio: 1.5
   max_concurrent_positions: 5
   contract_size: 0.01
-  # Operator-side per-symbol leverage caps (on top of OKX instrument caps).
-  # Effective ceiling = min(trading.max_leverage, okx_cap, symbol_cap).
+  # Operator-side per-symbol leverage caps (on top of Bybit instrument caps).
+  # Effective ceiling = min(trading.max_leverage, bybit_cap, symbol_cap).
   # ETH demo wicks burn high-leverage positions even when SL discipline holds,
   # so cap it at 30x regardless of the global 75x. BTC stays wide (tighter
-  # liq behavior, deeper book). SOL inherits the OKX 50x cap automatically.
+  # liq behavior, deeper book). SOL inherits the Bybit 50x cap automatically.
   # DOGE + XRP capped at 30x — momentum-driven pairs have sharp 3m wicks
   # that blow high-leverage positions even when SL structure holds.
   symbol_leverage_caps:
@@ -73,7 +78,7 @@ trading:
     DOGE-USDT-SWAP: 30
     XRP-USDT-SWAP: 30
     ADA-USDT-SWAP: 30   # thin-book alt, DOGE/XRP pattern
-    # BNB uncapped — major-class, inherits OKX instrument cap
+    # BNB uncapped — major-class, inherits Bybit instrument cap
   # Phase 6.9 B3 — per-symbol swing_lookback override for SL sourcing. Thin-
   # book pairs (DOGE/XRP) need a wider lookback window before fallback swing
   # SL kicks in — 18 `no_sl_source` rejects over 35 trades traced to here.
@@ -497,9 +502,10 @@ execution:
   sl_lock_mfe_r: 1.3
   sl_lock_at_r: 0.0
 
-  # 2026-04-19 — OCO trigger price source. "mark" uses OKX's index-weighted
-  # mark price (Binance + Bybit + Coinbase VWAP), "last" uses the OKX book's
-  # last trade. On demo the book has no real-market counterpart, so
+  # 2026-04-19 — Position-attached TP/SL trigger price source. "mark" uses
+  # Bybit's index-weighted mark price (Binance + Bybit + Coinbase + OKX
+  # VWAP), "last" uses the Bybit book's last trade. On demo the book has
+  # no real-market counterpart, so
   # demo-only wicks trigger `last`-based stops and poison the RL dataset
   # with artefact outcomes. Mark is index-computed from real exchanges →
   # immune to demo wicks. Keep "mark" for demo + live unless a specific
@@ -720,7 +726,7 @@ on_chain:
   # symbol (selling setup), OUT is BULLISH (cold wallet / DEX accumulation).
   # Misaligned direction on the traded symbol pays additive threshold bump.
   # Data source: Arkham `/token/volume/{id}?granularity=1h` most-recent
-  # bucket's `inUSD - outUSD` per watched OKX perp. Promoted to runtime
+  # bucket's `inUSD - outUSD` per watched perp (internal-format symbol). Promoted to runtime
   # alongside per-entity netflow expansion.
   per_symbol_cex_flow_enabled: true
   per_symbol_cex_flow_penalty: 0.25                # same conservative default as flow_alignment
