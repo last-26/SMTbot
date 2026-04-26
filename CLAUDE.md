@@ -26,6 +26,61 @@ AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT lin
 
 ## Changelog
 
+### 2026-04-27 — `rejected_signals` derivatives enrichment plumbing (F1)
+
+DB audit (2026-04-27, 9-trade Bybit dataset) showed the long-acknowledged
+2026-04-24 changelog gap was still live: every `rejected_signals` row had
+NULL on the 9 derivatives-cache fields plus `liq_heatmap_top_clusters_json`
+(132/132 post-clean rows, 181/181 by audit re-run after 47 new rejects).
+`trades` table writers had been forwarding these since 2026-04-23 evening,
+but both reject paths in `runner.py` (the eager `_record_reject` for
+synchronous rejects and the pending-cancel `record_rejected_signal` call
+in `_handle_canceled_pending`) only forwarded the original 11 enrichment
+fields — the post-2026-04-23 additions were computed by `_derive_enrichment`
+but discarded before reaching the journal.
+
+**Fix:** both call sites now thread the 10 missing kwargs from the
+existing `enrichment` dict:
+- `open_interest_usd_at_entry`, `oi_change_1h_pct_at_entry`
+- `funding_rate_current_at_entry`, `funding_rate_predicted_at_entry`
+- `long_liq_notional_1h_at_entry`, `short_liq_notional_1h_at_entry`
+- `ls_ratio_zscore_14d_at_entry`
+- `price_change_1h_pct_at_entry`, `price_change_4h_pct_at_entry`
+- `liq_heatmap_top_clusters` (was `'{}'` empty in 181/181 rows)
+
+Pending-cancel path stays `candles=None` by design (CLAUDE.md "pending-fill
+paths stay candles=None") so `price_change_*_pct` columns will be NULL on
+cancel rows — matches the trades-side asymmetry.
+
+**Historical row caveat:** the 181 pre-fix rows (post-clean_since)
+still carry NULL on these columns. Pass 3 GBT can either drop those rows
+from features that depend on derivatives, or back-fill from
+`derivatives_snapshots` joined on `(symbol, signal_timestamp)` within a
+±90s window — `derivatives_snapshots` cadence is 76.9s so a tight join
+window will resolve. Back-fill script is a separate follow-up; this
+commit only stops the bleeding for new rows.
+
+**Tests:** new `test_record_reject_forwards_derivatives_enrichment` in
+[tests/test_rejected_signal_recording.py](tests/test_rejected_signal_recording.py)
+seeds a `DerivativesState` on the input `MarketState` and asserts all 7
+numeric fields round-trip through the journal. Full suite (4/4
+rejected_signal tests + 30/30 journal_database + 23/23 derive_enrichment)
+green.
+
+**Files touched:** [src/bot/runner.py](src/bot/runner.py) only — 2 call
+sites, ~26 lines added.
+
+**Re-eval triggers:**
+1. **Fresh-row coverage** — `SELECT COUNT(*) FROM rejected_signals WHERE
+   signal_timestamp > '2026-04-27T<commit-ts>' AND
+   open_interest_usd_at_entry IS NULL` should approach 0% in steady
+   state. Non-zero = `state.derivatives` is None at reject time, which
+   means a Coinalyze cache miss — separate concern.
+2. **Pending-cancel `price_change_*` NULL rate** stays at ~100% (by
+   design); if it drops without a `candles` plumbing change, that
+   means `_derive_enrichment` started receiving candles from somewhere
+   unexpected — investigate.
+
 ### 2026-04-26 (late-late-night, +4) — OKX residue cleanup (9-phase atomic sweep)
 
 Operator-driven post-migration audit. The 2026-04-25 OKX → Bybit V5

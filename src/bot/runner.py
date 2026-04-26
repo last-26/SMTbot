@@ -1631,6 +1631,27 @@ class BotRunner:
             oscillator_raw_values=self._build_oscillator_raw_values(
                 symbol, state,
             ),
+            # 2026-04-27 — derivatives + heatmap enrichment forwarding.
+            # Gap acknowledged in 2026-04-24 changelog; until now the
+            # `_derive_enrichment` output's 2026-04-23 fields landed only on
+            # `trades` rows, never `rejected_signals`. Pass 3 counter-factual
+            # GBT was missing OI / funding / liq notional / LS z-score / 1h
+            # 4h price-change / heatmap top clusters on every reject. With
+            # this forwarding all 132 historical rows (post-clean_since)
+            # remain NULL — only new rejects from this commit forward will
+            # be enriched. A back-fill script can replay these fields from
+            # `derivatives_snapshots` joined on signal_timestamp if Pass 3
+            # finds the gap material.
+            open_interest_usd_at_entry=enrichment["open_interest_usd_at_entry"],
+            oi_change_1h_pct_at_entry=enrichment["oi_change_1h_pct_at_entry"],
+            funding_rate_current_at_entry=enrichment["funding_rate_current_at_entry"],
+            funding_rate_predicted_at_entry=enrichment["funding_rate_predicted_at_entry"],
+            long_liq_notional_1h_at_entry=enrichment["long_liq_notional_1h_at_entry"],
+            short_liq_notional_1h_at_entry=enrichment["short_liq_notional_1h_at_entry"],
+            ls_ratio_zscore_14d_at_entry=enrichment["ls_ratio_zscore_14d_at_entry"],
+            price_change_1h_pct_at_entry=enrichment["price_change_1h_pct_at_entry"],
+            price_change_4h_pct_at_entry=enrichment["price_change_4h_pct_at_entry"],
+            liq_heatmap_top_clusters=enrichment["liq_heatmap_top_clusters"],
         )
 
     def _is_ltf_reversal(self, ltf: LTFState, open_side: str, max_age: int) -> bool:
@@ -3510,6 +3531,23 @@ class BotRunner:
                 oscillator_raw_values=dict(
                     meta.oscillator_raw_values_at_placement or {}
                 ),
+                # 2026-04-27 — derivatives + heatmap enrichment forwarding,
+                # parity with the `_record_reject` path. Note: candles is
+                # not threaded here (`_derive_enrichment(state)` above ran
+                # without candles) so price_change_1h/4h_pct will be NULL
+                # on cancel rows by design — pending-fill paths don't
+                # stash a placement-time candle buffer (CLAUDE.md
+                # "pending-fill paths stay candles=None").
+                open_interest_usd_at_entry=enrichment["open_interest_usd_at_entry"],
+                oi_change_1h_pct_at_entry=enrichment["oi_change_1h_pct_at_entry"],
+                funding_rate_current_at_entry=enrichment["funding_rate_current_at_entry"],
+                funding_rate_predicted_at_entry=enrichment["funding_rate_predicted_at_entry"],
+                long_liq_notional_1h_at_entry=enrichment["long_liq_notional_1h_at_entry"],
+                short_liq_notional_1h_at_entry=enrichment["short_liq_notional_1h_at_entry"],
+                ls_ratio_zscore_14d_at_entry=enrichment["ls_ratio_zscore_14d_at_entry"],
+                price_change_1h_pct_at_entry=enrichment["price_change_1h_pct_at_entry"],
+                price_change_4h_pct_at_entry=enrichment["price_change_4h_pct_at_entry"],
+                liq_heatmap_top_clusters=enrichment["liq_heatmap_top_clusters"],
             )
         except Exception:
             logger.debug(

@@ -107,6 +107,52 @@ async def test_record_reject_captures_pillar_bias_for_cross_asset_rejects(make_c
     assert rows[0].pillar_eth_bias == "BULLISH"
 
 
+async def test_record_reject_forwards_derivatives_enrichment(make_ctx):
+    """2026-04-27 plumbing fix — `_record_reject` must thread the
+    derivatives + heatmap fields from `_derive_enrichment` into the
+    journal row. Pre-fix every reject had NULL OI / funding / liq /
+    LS-zscore (CLAUDE.md 2026-04-24 acknowledged gap, 132/132 NULL on
+    post-clean rows). Lock the contract: a reject driven from a state
+    that carries DerivativesState lands the row with non-NULL fields.
+    """
+    from src.data.derivatives_cache import DerivativesState
+
+    ctx, _ = make_ctx()
+    await ctx.journal.connect()
+    runner = BotRunner(ctx)
+
+    state = _state_with_price(67_000.0, 120.0)
+    state.derivatives = DerivativesState(
+        symbol="BTC-USDT-SWAP",
+        ts_ms=1700_000_000_000,
+        open_interest_usd=2_500_000_000.0,
+        oi_change_1h_pct=0.012,
+        funding_rate_current=0.00015,
+        funding_rate_predicted=0.00012,
+        long_liq_notional_1h=42_000.0,
+        short_liq_notional_1h=18_000.0,
+        ls_ratio_zscore_14d=-0.85,
+    )
+    conf = _conf(1.5, ["recent_sweep"], Direction.BULLISH)
+
+    await runner._record_reject(
+        symbol="BTC-USDT-SWAP",
+        reject_reason="below_confluence",
+        state=state,
+        conf=conf,
+    )
+
+    rows = await ctx.journal.list_rejected_signals()
+    r = rows[0]
+    assert r.open_interest_usd_at_entry == 2_500_000_000.0
+    assert r.oi_change_1h_pct_at_entry == pytest.approx(0.012)
+    assert r.funding_rate_current_at_entry == pytest.approx(0.00015)
+    assert r.funding_rate_predicted_at_entry == pytest.approx(0.00012)
+    assert r.long_liq_notional_1h_at_entry == 42_000.0
+    assert r.short_liq_notional_1h_at_entry == 18_000.0
+    assert r.ls_ratio_zscore_14d_at_entry == pytest.approx(-0.85)
+
+
 async def test_record_reject_pillar_bias_none_when_stale(make_ctx):
     """Stale pillar > max_age_s must NOT be stamped — else auditor can't
     distinguish 'fresh veto' from 'pillar data went stale' rejects."""
