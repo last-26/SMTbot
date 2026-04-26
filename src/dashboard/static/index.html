@@ -1,0 +1,974 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SMTbot — trade dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #07090d;
+    --bg-grad-1: #0a0e15;
+    --bg-grad-2: #07090d;
+    --panel: #0e1218;
+    --panel-2: #141a23;
+    --panel-3: #1a212c;
+    --border: #1d2532;
+    --border-soft: #161c25;
+    --text: #e3e8ef;
+    --text-2: #b1bbc8;
+    --muted: #6b7686;
+    --accent: #5ec1ff;
+    --accent-2: #7c8cff;
+    --green: #3fd690;
+    --green-glow: rgba(63, 214, 144, 0.18);
+    --red: #ff5d6c;
+    --red-glow: rgba(255, 93, 108, 0.18);
+    --amber: #ffba49;
+    --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background:
+      radial-gradient(1100px 600px at 20% -10%, rgba(124, 140, 255, 0.05), transparent 60%),
+      radial-gradient(900px 500px at 100% 0%, rgba(94, 193, 255, 0.04), transparent 60%),
+      var(--bg);
+    color: var(--text);
+    font: 13px/1.5 "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    font-feature-settings: "ss01", "cv11";
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* ── Header ─────────────────────────────────────────────────────────── */
+  header {
+    position: sticky; top: 0; z-index: 50;
+    background: linear-gradient(180deg, rgba(7,9,13,0.95) 0%, rgba(7,9,13,0.85) 100%);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 22px;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; }
+  .brand-mark {
+    width: 22px; height: 22px; border-radius: 6px;
+    background: linear-gradient(135deg, #5ec1ff 0%, #7c8cff 100%);
+    box-shadow: 0 0 14px rgba(94, 193, 255, 0.4);
+    position: relative;
+  }
+  .brand-mark::after {
+    content: "";
+    position: absolute; inset: 4px;
+    border-radius: 3px;
+    background: var(--bg);
+  }
+  header h1 {
+    margin: 0; font-size: 13px; font-weight: 600; letter-spacing: .4px;
+    text-transform: uppercase;
+  }
+  header h1 .small {
+    color: var(--muted); font-weight: 400; margin-left: 10px;
+    font-family: var(--mono); text-transform: none;
+    font-size: 11px;
+  }
+  header .status {
+    display: flex; gap: 18px; align-items: center;
+    color: var(--muted); font-size: 11px; font-family: var(--mono);
+  }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 10px var(--green);
+    animation: pulse 2s ease-in-out infinite;
+  }
+  .dot.err { background: var(--red); box-shadow: 0 0 10px var(--red); }
+  .dot.warn { background: var(--amber); box-shadow: 0 0 10px var(--amber); }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.55; }
+  }
+
+  main { padding: 18px 22px 80px; max-width: 1700px; margin: 0 auto; }
+  section { margin-bottom: 22px; }
+  section > h2 {
+    margin: 0 0 10px;
+    font-size: 11px; font-weight: 600; letter-spacing: 1.2px; text-transform: uppercase;
+    color: var(--muted);
+    display: flex; align-items: center; gap: 8px;
+  }
+  section > h2::before {
+    content: "";
+    width: 3px; height: 12px;
+    background: linear-gradient(180deg, var(--accent), var(--accent-2));
+    border-radius: 2px;
+  }
+  .panel {
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.012) 0%, transparent 50%),
+      var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset, 0 8px 24px rgba(0,0,0,0.3);
+  }
+  .panel.padded-tight { padding: 12px 14px; }
+
+  /* ── KPI tiles ───────────────────────────────────────────────────────── */
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+  .kpi {
+    background: linear-gradient(180deg, rgba(255,255,255,0.015) 0%, transparent 60%), var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+    position: relative;
+    overflow: hidden;
+    transition: border-color .2s ease, transform .2s ease;
+  }
+  .kpi::before {
+    content: "";
+    position: absolute; top: 0; left: 0; right: 0; height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(94,193,255,0.5), transparent);
+    opacity: .4;
+  }
+  .kpi:hover { border-color: rgba(94, 193, 255, 0.3); }
+  .kpi .label {
+    font-size: 10px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 1px;
+    font-weight: 500;
+  }
+  .kpi .value {
+    font-family: var(--mono);
+    font-size: 22px; font-weight: 600; margin-top: 6px;
+    letter-spacing: -0.5px;
+    font-variant-numeric: tabular-nums;
+  }
+  .kpi .sub {
+    font-size: 11px; color: var(--muted); margin-top: 3px;
+    font-family: var(--mono); font-variant-numeric: tabular-nums;
+  }
+  .kpi.pos .value { color: var(--green); text-shadow: 0 0 18px var(--green-glow); }
+  .kpi.neg .value { color: var(--red); text-shadow: 0 0 18px var(--red-glow); }
+
+  /* ── Tables ──────────────────────────────────────────────────────────── */
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td {
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border-soft);
+    white-space: nowrap;
+    vertical-align: middle;
+  }
+  th {
+    color: var(--muted); font-weight: 600; text-transform: uppercase;
+    font-size: 10px; letter-spacing: 1px;
+    background: var(--panel-2);
+    position: sticky; top: 0;
+    text-align: left;
+  }
+  th.num, td.num {
+    text-align: right;
+    font-family: var(--mono); font-variant-numeric: tabular-nums;
+  }
+  td { color: var(--text-2); }
+  td strong { color: var(--text); font-weight: 600; }
+  tr:hover td { background: rgba(94, 193, 255, 0.04); }
+  td.pos { color: var(--green); }
+  td.neg { color: var(--red); }
+  td.dim { color: var(--muted); }
+  .scroll-x { overflow-x: auto; }
+  .scroll-y { max-height: 420px; overflow-y: auto; }
+  /* Fancy scrollbar */
+  .scroll-y::-webkit-scrollbar, .scroll-x::-webkit-scrollbar { height: 8px; width: 8px; }
+  .scroll-y::-webkit-scrollbar-track, .scroll-x::-webkit-scrollbar-track { background: transparent; }
+  .scroll-y::-webkit-scrollbar-thumb, .scroll-x::-webkit-scrollbar-thumb {
+    background: var(--panel-3); border-radius: 4px;
+  }
+  .scroll-y::-webkit-scrollbar-thumb:hover, .scroll-x::-webkit-scrollbar-thumb:hover {
+    background: var(--border);
+  }
+
+  /* Layout grids */
+  .row-2 { display: grid; grid-template-columns: 2fr 1fr; gap: 14px; align-items: stretch; }
+  @media (max-width: 1100px) { .row-2 { grid-template-columns: 1fr; } }
+  .row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; align-items: stretch; }
+  @media (max-width: 1100px) { .row-3 { grid-template-columns: 1fr; } }
+  .row-3-equal > .panel { display: flex; flex-direction: column; }
+
+  /* On-chain card */
+  .grid-kv {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 6px 16px; font-size: 12px;
+    align-items: center;
+  }
+  .grid-kv .k { color: var(--muted); font-size: 11px; }
+  .grid-kv .v {
+    text-align: right;
+    font-family: var(--mono); font-variant-numeric: tabular-nums;
+    font-size: 12px;
+  }
+
+  /* Pills */
+  .pill {
+    display: inline-block;
+    padding: 3px 9px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .6px;
+    background: var(--panel-3);
+    border: 1px solid var(--border);
+    color: var(--text-2);
+  }
+  .pill.long {
+    background: linear-gradient(180deg, rgba(63,214,144,0.18), rgba(63,214,144,0.06));
+    color: var(--green);
+    border-color: rgba(63, 214, 144, 0.4);
+    text-shadow: 0 0 8px rgba(63, 214, 144, 0.3);
+  }
+  .pill.short {
+    background: linear-gradient(180deg, rgba(255,93,108,0.18), rgba(255,93,108,0.06));
+    color: var(--red);
+    border-color: rgba(255, 93, 108, 0.4);
+    text-shadow: 0 0 8px rgba(255, 93, 108, 0.3);
+  }
+  .pill.win, .pill.tp {
+    background: linear-gradient(180deg, rgba(63,214,144,0.18), rgba(63,214,144,0.06));
+    color: var(--green); border-color: rgba(63, 214, 144, 0.4);
+  }
+  .pill.loss, .pill.sl {
+    background: linear-gradient(180deg, rgba(255,93,108,0.18), rgba(255,93,108,0.06));
+    color: var(--red); border-color: rgba(255, 93, 108, 0.4);
+  }
+  .pill.be {
+    background: linear-gradient(180deg, rgba(255,186,73,0.18), rgba(255,186,73,0.06));
+    color: var(--amber); border-color: rgba(255, 186, 73, 0.4);
+  }
+
+  /* Charts */
+  .chart-wrap { position: relative; height: 280px; }
+  .chart-wrap-sm { position: relative; height: 180px; }
+
+  .chart-card {
+    background: linear-gradient(180deg, rgba(255,255,255,0.012) 0%, transparent 60%), var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+    display: flex; flex-direction: column;
+  }
+  .chart-card-head {
+    display: flex; justify-content: space-between; align-items: baseline;
+    margin-bottom: 6px;
+  }
+  .chart-card-title {
+    font-size: 11px; font-weight: 600; letter-spacing: 1px;
+    text-transform: uppercase; color: var(--muted);
+  }
+  .chart-card-value {
+    font-family: var(--mono);
+    font-size: 14px; font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .chart-card-sub {
+    font-size: 10px; color: var(--muted);
+    font-family: var(--mono);
+    margin-top: 2px;
+  }
+
+  .empty {
+    color: var(--muted); font-style: italic;
+    padding: 18px; text-align: center; font-size: 12px;
+  }
+
+  /* Reject histogram bars */
+  .bar-row {
+    display: grid;
+    grid-template-columns: minmax(140px, 200px) 1fr 50px;
+    gap: 10px; align-items: center;
+    padding: 4px 0;
+  }
+  .bar-row .name {
+    color: var(--text-2); font-size: 11px;
+    overflow: hidden; text-overflow: ellipsis;
+    font-family: var(--mono);
+  }
+  .bar {
+    height: 16px; background: var(--panel-3);
+    border-radius: 3px; position: relative; overflow: hidden;
+  }
+  .bar > .fill {
+    position: absolute; top: 0; left: 0; bottom: 0;
+    background: linear-gradient(90deg, rgba(94,193,255,0.55), rgba(124,140,255,0.55));
+    box-shadow: 0 0 12px rgba(94, 193, 255, 0.25);
+    border-radius: 3px;
+  }
+  .bar-row .count {
+    text-align: right;
+    font-family: var(--mono); font-variant-numeric: tabular-nums;
+    font-size: 11px; color: var(--text-2);
+  }
+
+  /* Onchain card layout — fill height, scroll inner */
+  .onchain-panel { display: flex; flex-direction: column; min-height: 0; }
+  .onchain-panel > .grid-kv { flex: 1; }
+
+  /* h2 align with sub-heading inside panel */
+  .panel-h2 {
+    margin: 0 0 10px;
+    font-size: 11px; font-weight: 600; letter-spacing: 1.2px;
+    text-transform: uppercase; color: var(--muted);
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <div class="brand-mark"></div>
+    <h1>SMTbot Trade Dashboard <span class="small" id="window-info"></span></h1>
+  </div>
+  <div class="status">
+    <span><span class="dot" id="status-dot"></span> <span id="status-text">connecting…</span></span>
+    <span id="last-update">–</span>
+  </div>
+</header>
+
+<main>
+
+  <!-- KPI tiles -->
+  <section>
+    <div class="kpis" id="kpis"></div>
+  </section>
+
+  <!-- Open positions -->
+  <section>
+    <h2>Open positions <span id="open-count" style="color:var(--muted); text-transform: none; letter-spacing: 0; font-weight: 400; font-family: var(--mono); margin-left: 4px;"></span></h2>
+    <div class="panel scroll-x padded-tight">
+      <table id="open-table">
+        <thead>
+          <tr>
+            <th>Symbol</th><th>Dir</th><th>Entry ts</th>
+            <th class="num">Entry px</th><th class="num">Mark</th>
+            <th class="num">UPnL $</th><th class="num">UPnL R</th>
+            <th class="num">MFE R</th><th class="num">MAE R</th>
+            <th class="num">SL</th><th class="num">TP</th>
+            <th>BE</th><th>Lock</th>
+            <th class="num">Conf</th><th>Setup</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Equity curve + reject reasons -->
+  <section>
+    <div class="row-2">
+      <div class="panel">
+        <h2 class="panel-h2">Equity curve (cumulative R)</h2>
+        <div class="chart-wrap"><canvas id="equity-chart"></canvas></div>
+      </div>
+      <div class="panel">
+        <h2 class="panel-h2">Reject reasons</h2>
+        <div id="reject-hist"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 24h on-chain charts: BTC / ETH / Stablecoin -->
+  <section>
+    <h2>On-chain · last 24h</h2>
+    <div class="row-3">
+      <div class="chart-card">
+        <div class="chart-card-head">
+          <div>
+            <div class="chart-card-title">BTC netflow · 24h rolling</div>
+            <div class="chart-card-sub" id="btc-flow-sub">—</div>
+          </div>
+          <div class="chart-card-value" id="btc-flow-latest">—</div>
+        </div>
+        <div class="chart-wrap-sm"><canvas id="btc-flow-chart"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-card-head">
+          <div>
+            <div class="chart-card-title">ETH netflow · 24h rolling</div>
+            <div class="chart-card-sub" id="eth-flow-sub">—</div>
+          </div>
+          <div class="chart-card-value" id="eth-flow-latest">—</div>
+        </div>
+        <div class="chart-wrap-sm"><canvas id="eth-flow-chart"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-card-head">
+          <div>
+            <div class="chart-card-title">Stablecoin pulse · 1h</div>
+            <div class="chart-card-sub" id="stb-flow-sub">—</div>
+          </div>
+          <div class="chart-card-value" id="stb-flow-latest">—</div>
+        </div>
+        <div class="chart-wrap-sm"><canvas id="stb-flow-chart"></canvas></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Closed trades -->
+  <section>
+    <h2>Closed trades · most recent 50</h2>
+    <div class="panel scroll-x scroll-y padded-tight">
+      <table id="closed-table">
+        <thead>
+          <tr>
+            <th>Exit ts</th><th>Symbol</th><th>Dir</th><th>Outcome</th>
+            <th class="num">Entry</th><th class="num">Exit</th>
+            <th class="num">R</th><th class="num">$ PnL</th><th class="num">Fees</th>
+            <th class="num">Hold (m)</th><th>Regime</th><th class="num">Conf</th>
+            <th>Setup</th><th>Close reason</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Breakdowns (per-symbol, per-regime, on-chain card) -->
+  <section>
+    <div class="row-3 row-3-equal">
+      <div class="panel scroll-x">
+        <h2 class="panel-h2">Per-symbol</h2>
+        <table id="bysym-table">
+          <thead><tr><th>Symbol</th><th class="num">N</th><th class="num">WR</th><th class="num">Avg R</th><th class="num">Exp R</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="panel scroll-x">
+        <h2 class="panel-h2">Per-regime</h2>
+        <table id="byregime-table">
+          <thead><tr><th>Regime</th><th class="num">N</th><th class="num">WR</th><th class="num">Avg R</th><th class="num">Exp R</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="panel onchain-panel">
+        <h2 class="panel-h2">Latest on-chain snapshot</h2>
+        <div id="onchain-card" class="grid-kv"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Rejected signals -->
+  <section>
+    <h2>Rejected signals · most recent 50</h2>
+    <div class="panel scroll-x scroll-y padded-tight">
+      <table id="rejected-table">
+        <thead>
+          <tr>
+            <th>Signal ts</th><th>Symbol</th><th>Dir</th><th>Reject reason</th>
+            <th class="num">Conf</th><th class="num">Price</th>
+            <th>Hypo outcome</th><th class="num">→TP bars</th><th class="num">→SL bars</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Whale transfers -->
+  <section>
+    <h2>Whale transfers · most recent 25</h2>
+    <div class="panel scroll-x scroll-y padded-tight">
+      <table id="whale-table">
+        <thead>
+          <tr>
+            <th>Captured</th><th>Token</th><th class="num">USD</th>
+            <th>From</th><th>To</th><th>Affects</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+</main>
+
+<script>
+"use strict";
+
+const POLL_MS = 5000;
+
+// ── tiny formatters ─────────────────────────────────────────────────────────
+const fmtNum = (x, dp = 2) => (x === null || x === undefined || Number.isNaN(x))
+  ? "—" : Number(x).toFixed(dp);
+const fmtPct = (x) => (x === null || x === undefined) ? "—" : (Number(x) * 100).toFixed(2) + "%";
+const fmtUsd = (x, dp = 2) => (x === null || x === undefined) ? "—" : "$" + Number(x).toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp });
+const fmtR  = (x) => (x === null || x === undefined) ? "—" : (Number(x) >= 0 ? "+" : "") + Number(x).toFixed(2) + "R";
+const fmtFlowM = (x) => {
+  if (x === null || x === undefined) return "—";
+  const n = Number(x);
+  const abs = Math.abs(n);
+  const sign = n >= 0 ? "+" : "−";
+  if (abs >= 1e9) return `${sign}$${(abs / 1e9).toFixed(2)}B`;
+  if (abs >= 1e6) return `${sign}$${(abs / 1e6).toFixed(2)}M`;
+  if (abs >= 1e3) return `${sign}$${(abs / 1e3).toFixed(2)}K`;
+  return `${sign}$${abs.toFixed(0)}`;
+};
+const fmtTs = (s) => {
+  if (!s) return "—";
+  const d = new Date(s);
+  if (Number.isNaN(d.getTime())) return s;
+  return d.toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z").slice(0, 19) + "Z";
+};
+const fmtTsShort = (s) => {
+  if (!s) return "—";
+  const d = new Date(s);
+  if (Number.isNaN(d.getTime())) return s;
+  return d.toISOString().slice(5, 16).replace("T", " ");
+};
+const fmtTsHM = (s) => {
+  if (!s) return "—";
+  const d = new Date(s);
+  if (Number.isNaN(d.getTime())) return s;
+  return d.toISOString().slice(11, 16);
+};
+const numSign = (x) => x > 0 ? "pos" : (x < 0 ? "neg" : "");
+
+// Direction → pill class. Direction enum is BULLISH / BEARISH / RANGING / UNDEFINED.
+function dirPillClass(dir) {
+  const d = (dir || "").toString().toUpperCase();
+  if (d === "BULLISH" || d === "LONG") return "long";
+  if (d === "BEARISH" || d === "SHORT") return "short";
+  return "";
+}
+
+function priceCell(x, dp = 4) {
+  if (x === null || x === undefined) return "—";
+  const n = Number(x);
+  if (Math.abs(n) >= 1000) return n.toFixed(2);
+  if (Math.abs(n) >= 1)    return n.toFixed(dp);
+  return n.toFixed(6);
+}
+
+// ── DOM refs ────────────────────────────────────────────────────────────────
+const $ = (sel) => document.querySelector(sel);
+const statusDot = $("#status-dot");
+const statusText = $("#status-text");
+const lastUpdate = $("#last-update");
+const windowInfo = $("#window-info");
+
+let equityChart = null;
+const flowCharts = { btc: null, eth: null, stb: null };
+
+// ── render ─────────────────────────────────────────────────────────────────
+function setStatus(state, msg) {
+  statusDot.classList.remove("err", "warn");
+  if (state === "err") statusDot.classList.add("err");
+  if (state === "warn") statusDot.classList.add("warn");
+  statusText.textContent = msg;
+}
+
+function renderKpis(s, counts, openCount, wallet) {
+  const k = $("#kpis");
+  if (!s) { k.innerHTML = '<div class="empty">no closed trades yet</div>'; return; }
+  const tile = (label, value, sub, cls = "") =>
+    `<div class="kpi ${cls}"><div class="label">${label}</div><div class="value">${value}</div>${sub ? `<div class="sub">${sub}</div>` : ""}</div>`;
+  const netR = (s.expectancy_r || 0) * (s.num_trades || 0);
+  const wrCls = (s.win_rate >= 0.45) ? "pos" : ((s.win_rate < 0.33) ? "neg" : "");
+
+  // Wallet tile: prefer real Bybit margin_balance, fall back to journal sim.
+  let walletTile;
+  if (wallet) {
+    const tag = wallet.demo ? "demo" : "live";
+    walletTile = tile(
+      `Wallet (${tag})`,
+      fmtUsd(wallet.margin_balance_usd, 2),
+      `available ${fmtUsd(wallet.available_usd, 2)}`,
+    );
+  } else {
+    const dollar = (s.ending_balance - s.starting_balance);
+    walletTile = tile(
+      "Equity (sim)",
+      fmtUsd(s.ending_balance, 2),
+      `from ${fmtUsd(s.starting_balance, 0)}`,
+      numSign(dollar),
+    );
+  }
+  k.innerHTML = [
+    tile("Closed trades", s.num_trades, `W ${s.num_wins} / L ${s.num_losses}`),
+    tile("Win rate", fmtPct(s.win_rate), `expectancy ${fmtR(s.expectancy_r)}`, wrCls),
+    tile("Net R", fmtR(netR), `avg ${fmtR(s.avg_r)}`, numSign(netR)),
+    tile("Profit factor", s.profit_factor === Infinity ? "∞" : fmtNum(s.profit_factor, 2)),
+    tile("Max drawdown", fmtPct(s.max_drawdown_pct / 100), fmtUsd(-s.max_drawdown_usdt, 2)),
+    tile("Sharpe (R)", fmtNum(s.sharpe_r, 2), `Calmar ${fmtNum(s.calmar, 2)}`),
+    walletTile,
+    tile("Open positions", openCount, `${counts.rejected_total} rejects logged`),
+  ].join("");
+}
+
+function renderOpen(open) {
+  const body = $("#open-table tbody");
+  $("#open-count").textContent = open.length ? `(${open.length})` : "";
+  if (!open.length) { body.innerHTML = '<tr><td colspan="15" class="empty">no open positions</td></tr>'; return; }
+  body.innerHTML = open.map(({ trade: t, latest_snapshot: l }) => {
+    const dirCls = dirPillClass(t.direction);
+    const upnlCls = l ? numSign(l.unrealized_pnl_usdt) : "";
+    const upnlRCls = l ? numSign(l.unrealized_pnl_r) : "";
+    return `<tr>
+      <td><strong>${t.symbol}</strong></td>
+      <td><span class="pill ${dirCls}">${t.direction}</span></td>
+      <td class="dim">${fmtTsShort(t.entry_timestamp)}</td>
+      <td class="num">${priceCell(t.entry_price)}</td>
+      <td class="num">${l ? priceCell(l.mark_price) : "—"}</td>
+      <td class="num ${upnlCls}">${l ? fmtUsd(l.unrealized_pnl_usdt) : "—"}</td>
+      <td class="num ${upnlRCls}">${l ? fmtR(l.unrealized_pnl_r) : "—"}</td>
+      <td class="num pos">${l ? fmtR(l.mfe_r_so_far) : "—"}</td>
+      <td class="num neg">${l ? fmtR(l.mae_r_so_far) : "—"}</td>
+      <td class="num">${l ? priceCell(l.current_sl_price) : priceCell(t.sl_price)}</td>
+      <td class="num">${l ? priceCell(l.current_tp_price) : priceCell(t.tp_price)}</td>
+      <td>${(l && l.sl_to_be_moved) || t.sl_moved_to_be ? "✓" : ""}</td>
+      <td>${l && l.mfe_lock_applied ? "✓" : ""}</td>
+      <td class="num">${fmtNum(t.confluence_score, 2)}</td>
+      <td class="dim">${t.setup_zone_source || "—"}</td>
+    </tr>`;
+  }).join("");
+}
+
+const CHART_FONT = { family: "JetBrains Mono", size: 10 };
+const GRID_COLOR = "rgba(255,255,255,0.04)";
+const TICK_COLOR = "#6b7686";
+
+function renderEquityChart(points) {
+  const ctx = document.getElementById("equity-chart").getContext("2d");
+  const labels = points.map(p => fmtTsShort(p.exit_ts));
+  const data = points.map(p => p.cum_r);
+  if (equityChart) {
+    equityChart.data.labels = labels;
+    equityChart.data.datasets[0].data = data;
+    equityChart.update("none");
+    return;
+  }
+  // Gradient fill
+  const grad = ctx.createLinearGradient(0, 0, 0, 280);
+  grad.addColorStop(0, "rgba(94, 193, 255, 0.35)");
+  grad.addColorStop(1, "rgba(94, 193, 255, 0)");
+  equityChart = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels,
+      datasets: [{
+        label: "Cumulative R",
+        data,
+        borderColor: "#5ec1ff",
+        backgroundColor: grad,
+        fill: true,
+        tension: 0.25,
+        pointRadius: 0,
+        pointHoverRadius: 4,
+        pointHoverBackgroundColor: "#5ec1ff",
+        borderWidth: 2,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          mode: "index", intersect: false,
+          backgroundColor: "rgba(14,18,24,0.95)",
+          borderColor: "rgba(94,193,255,0.3)",
+          borderWidth: 1,
+          titleFont: CHART_FONT,
+          bodyFont: CHART_FONT,
+          padding: 10,
+        },
+      },
+      scales: {
+        x: { ticks: { color: TICK_COLOR, font: CHART_FONT, maxTicksLimit: 8 }, grid: { color: GRID_COLOR, drawBorder: false } },
+        y: { ticks: { color: TICK_COLOR, font: CHART_FONT }, grid: { color: GRID_COLOR, drawBorder: false } },
+      },
+      interaction: { mode: "nearest", axis: "x", intersect: false },
+    },
+  });
+}
+
+// Generic flow-line chart (BTC / ETH / stablecoin). Color reflects direction
+// of latest value (positive = inflow = green; negative = outflow = red).
+function renderFlowChart(canvasId, key, series, latestEl, subEl) {
+  const points = (series || []).filter(p => p.v !== null && p.v !== undefined);
+  const ctx = document.getElementById(canvasId).getContext("2d");
+
+  const latestVal = points.length ? points[points.length - 1].v : null;
+  const minVal = points.length ? Math.min(...points.map(p => p.v)) : null;
+  const maxVal = points.length ? Math.max(...points.map(p => p.v)) : null;
+  const isPos = latestVal !== null && latestVal >= 0;
+  const lineColor = latestVal === null ? "#6b7686" : (isPos ? "#3fd690" : "#ff5d6c");
+  const fillTop  = latestVal === null ? "rgba(107,118,134,0.2)" : (isPos ? "rgba(63,214,144,0.28)" : "rgba(255,93,108,0.28)");
+
+  if (latestEl) {
+    latestEl.textContent = fmtFlowM(latestVal);
+    latestEl.style.color = lineColor;
+  }
+  if (subEl) {
+    if (points.length === 0) {
+      subEl.textContent = "no data";
+    } else if (points.length === 1) {
+      subEl.textContent = `${points.length} sample · ${fmtTsHM(points[0].ts)}Z`;
+    } else {
+      subEl.textContent = `${points.length} samples · range ${fmtFlowM(minVal)} → ${fmtFlowM(maxVal)}`;
+    }
+  }
+
+  const labels = points.map(p => fmtTsHM(p.ts));
+  const data = points.map(p => p.v);
+
+  const grad = ctx.createLinearGradient(0, 0, 0, 180);
+  grad.addColorStop(0, fillTop);
+  grad.addColorStop(1, "rgba(0,0,0,0)");
+
+  if (flowCharts[key]) {
+    const c = flowCharts[key];
+    c.data.labels = labels;
+    c.data.datasets[0].data = data;
+    c.data.datasets[0].borderColor = lineColor;
+    c.data.datasets[0].backgroundColor = grad;
+    c.update("none");
+    return;
+  }
+
+  flowCharts[key] = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels,
+      datasets: [{
+        data,
+        borderColor: lineColor,
+        backgroundColor: grad,
+        fill: true,
+        tension: 0.3,
+        pointRadius: 0,
+        pointHoverRadius: 3,
+        borderWidth: 1.8,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          mode: "index", intersect: false,
+          backgroundColor: "rgba(14,18,24,0.95)",
+          borderColor: "rgba(94,193,255,0.3)",
+          borderWidth: 1,
+          titleFont: CHART_FONT,
+          bodyFont: CHART_FONT,
+          padding: 8,
+          callbacks: {
+            label: (ctx) => fmtFlowM(ctx.parsed.y),
+          },
+        },
+      },
+      scales: {
+        x: {
+          ticks: { color: TICK_COLOR, font: CHART_FONT, maxTicksLimit: 6 },
+          grid: { color: GRID_COLOR, drawBorder: false },
+        },
+        y: {
+          ticks: {
+            color: TICK_COLOR, font: CHART_FONT,
+            callback: (v) => fmtFlowM(v),
+          },
+          grid: { color: GRID_COLOR, drawBorder: false },
+        },
+      },
+      interaction: { mode: "nearest", axis: "x", intersect: false },
+    },
+  });
+}
+
+function renderClosed(rows) {
+  const body = $("#closed-table tbody");
+  if (!rows.length) { body.innerHTML = '<tr><td colspan="14" class="empty">no closed trades yet</td></tr>'; return; }
+  body.innerHTML = rows.map(t => {
+    const dirCls = dirPillClass(t.direction);
+    const outcome = (t.outcome || "").toLowerCase();
+    const outcomeCls = outcome === "win" ? "win" : (outcome === "loss" ? "loss" : "be");
+    const rCls = numSign(t.pnl_r);
+    const pnlCls = numSign(t.pnl_usdt);
+    let holdMin = "—";
+    if (t.entry_timestamp && t.exit_timestamp) {
+      const ms = new Date(t.exit_timestamp) - new Date(t.entry_timestamp);
+      if (!Number.isNaN(ms)) holdMin = (ms / 60000).toFixed(0);
+    }
+    return `<tr>
+      <td class="dim">${fmtTsShort(t.exit_timestamp)}</td>
+      <td><strong>${t.symbol}</strong></td>
+      <td><span class="pill ${dirCls}">${t.direction}</span></td>
+      <td><span class="pill ${outcomeCls}">${t.outcome}</span></td>
+      <td class="num">${priceCell(t.entry_price)}</td>
+      <td class="num">${priceCell(t.exit_price)}</td>
+      <td class="num ${rCls}">${fmtR(t.pnl_r)}</td>
+      <td class="num ${pnlCls}">${fmtUsd(t.pnl_usdt)}</td>
+      <td class="num dim">${fmtUsd(t.fees_usdt)}</td>
+      <td class="num">${holdMin}</td>
+      <td class="dim">${t.trend_regime_at_entry || t.regime_at_entry || "—"}</td>
+      <td class="num">${fmtNum(t.confluence_score, 2)}</td>
+      <td class="dim">${t.setup_zone_source || "—"}</td>
+      <td class="dim">${t.close_reason || "—"}</td>
+    </tr>`;
+  }).join("");
+}
+
+function renderBreakdownTable(tableSel, dictMap) {
+  const body = document.querySelector(tableSel + " tbody");
+  const entries = Object.entries(dictMap || {})
+    .sort((a, b) => (b[1].num_trades || 0) - (a[1].num_trades || 0));
+  if (!entries.length) { body.innerHTML = '<tr><td colspan="5" class="empty">—</td></tr>'; return; }
+  body.innerHTML = entries.map(([key, v]) => `
+    <tr>
+      <td><strong>${key}</strong></td>
+      <td class="num">${v.num_trades}</td>
+      <td class="num">${fmtPct(v.win_rate)}</td>
+      <td class="num ${numSign(v.avg_r)}">${fmtR(v.avg_r)}</td>
+      <td class="num ${numSign(v.expectancy_r)}">${fmtR(v.expectancy_r)}</td>
+    </tr>
+  `).join("");
+}
+
+function renderRejected(rows) {
+  const body = $("#rejected-table tbody");
+  if (!rows.length) { body.innerHTML = '<tr><td colspan="9" class="empty">no rejected signals in window</td></tr>'; return; }
+  body.innerHTML = rows.map(r => {
+    const dirCls = dirPillClass(r.direction);
+    let hypoCls = "dim";
+    if (r.hypothetical_outcome === "WIN") hypoCls = "pos";
+    else if (r.hypothetical_outcome === "LOSS") hypoCls = "neg";
+    return `<tr>
+      <td class="dim">${fmtTsShort(r.signal_timestamp)}</td>
+      <td><strong>${r.symbol}</strong></td>
+      <td><span class="pill ${dirCls}">${r.direction}</span></td>
+      <td>${r.reject_reason}</td>
+      <td class="num">${fmtNum(r.confluence_score, 2)}</td>
+      <td class="num">${priceCell(r.price)}</td>
+      <td class="${hypoCls}">${r.hypothetical_outcome || "—"}</td>
+      <td class="num dim">${r.hypothetical_bars_to_tp ?? "—"}</td>
+      <td class="num dim">${r.hypothetical_bars_to_sl ?? "—"}</td>
+    </tr>`;
+  }).join("");
+}
+
+function renderRejectHistogram(counts) {
+  const el = $("#reject-hist");
+  const entries = Object.entries(counts || {}).sort((a, b) => b[1] - a[1]);
+  if (!entries.length) { el.innerHTML = '<div class="empty">—</div>'; return; }
+  const max = entries[0][1];
+  el.innerHTML = entries.map(([k, v]) => `
+    <div class="bar-row">
+      <div class="name">${k}</div>
+      <div class="bar"><div class="fill" style="width: ${Math.max(2, (v / max) * 100)}%"></div></div>
+      <div class="count">${v}</div>
+    </div>
+  `).join("");
+}
+
+function renderOnChain(snap) {
+  const el = $("#onchain-card");
+  if (!snap) { el.innerHTML = '<div class="empty">no snapshot</div>'; return; }
+  const flowCls = (x) => (x === null || x === undefined) ? "dim" : numSign(x);
+  const ageS = snap.snapshot_age_s;
+  const freshClass = snap.fresh ? "pos" : "neg";
+  const rows = [
+    ["Captured", fmtTs(snap.captured_at), "dim"],
+    ["Daily macro bias", snap.daily_macro_bias || "—", ""],
+    ["Stablecoin pulse 1h", fmtFlowM(snap.stablecoin_pulse_1h_usd), flowCls(snap.stablecoin_pulse_1h_usd)],
+    ["Altcoin index", fmtNum(snap.altcoin_index, 1), ""],
+    ["Snapshot age (s)", ageS == null ? "—" : ageS, ""],
+    ["Fresh", snap.fresh ? "yes" : "no", freshClass],
+    ["Whale blackout", snap.whale_blackout_active ? "active" : "off", snap.whale_blackout_active ? "neg" : "dim"],
+    ["BTC 24h netflow", fmtFlowM(snap.cex_btc_netflow_24h_usd), flowCls(snap.cex_btc_netflow_24h_usd)],
+    ["ETH 24h netflow", fmtFlowM(snap.cex_eth_netflow_24h_usd), flowCls(snap.cex_eth_netflow_24h_usd)],
+    ["Coinbase 24h", fmtFlowM(snap.cex_coinbase_netflow_24h_usd), flowCls(snap.cex_coinbase_netflow_24h_usd)],
+    ["Binance 24h", fmtFlowM(snap.cex_binance_netflow_24h_usd), flowCls(snap.cex_binance_netflow_24h_usd)],
+    ["Bybit 24h", fmtFlowM(snap.cex_bybit_netflow_24h_usd), flowCls(snap.cex_bybit_netflow_24h_usd)],
+    ["Bitfinex 24h", fmtFlowM(snap.cex_bitfinex_netflow_24h_usd), flowCls(snap.cex_bitfinex_netflow_24h_usd)],
+    ["Kraken 24h", fmtFlowM(snap.cex_kraken_netflow_24h_usd), flowCls(snap.cex_kraken_netflow_24h_usd)],
+    ["OKX 24h", fmtFlowM(snap.cex_okx_netflow_24h_usd), flowCls(snap.cex_okx_netflow_24h_usd)],
+  ];
+  el.innerHTML = rows.map(([k, v, cls]) => `<div class="k">${k}</div><div class="v ${cls || ""}">${v}</div>`).join("");
+}
+
+function renderWhales(rows) {
+  const body = $("#whale-table tbody");
+  if (!rows.length) { body.innerHTML = '<tr><td colspan="6" class="empty">no whale transfers in window</td></tr>'; return; }
+  body.innerHTML = rows.map(w => `
+    <tr>
+      <td class="dim">${fmtTsShort(w.captured_at)}</td>
+      <td><strong>${w.token}</strong></td>
+      <td class="num">${fmtUsd(w.usd_value, 0)}</td>
+      <td class="dim">${w.from_entity || "—"}</td>
+      <td class="dim">${w.to_entity || "—"}</td>
+      <td class="dim">${(w.affected_symbols || []).join(", ") || "—"}</td>
+    </tr>
+  `).join("");
+}
+
+function renderAll(payload) {
+  const s = payload.summary || {};
+  const counts = payload.counts || {};
+  const onchainSeries = payload.on_chain_series_24h || {};
+  renderKpis(s, counts, (payload.open_positions || []).length, payload.wallet);
+  renderOpen(payload.open_positions || []);
+  renderEquityChart(payload.equity_curve || []);
+  renderFlowChart("btc-flow-chart", "btc", onchainSeries.btc_netflow_24h, $("#btc-flow-latest"), $("#btc-flow-sub"));
+  renderFlowChart("eth-flow-chart", "eth", onchainSeries.eth_netflow_24h, $("#eth-flow-latest"), $("#eth-flow-sub"));
+  renderFlowChart("stb-flow-chart", "stb", onchainSeries.stablecoin_pulse_1h, $("#stb-flow-latest"), $("#stb-flow-sub"));
+  renderClosed(payload.closed_trades_recent || []);
+  renderBreakdownTable("#bysym-table", s.win_rate_by_symbol || {});
+  renderBreakdownTable("#byregime-table", s.regime_breakdown || {});
+  renderRejected(payload.rejected_recent || []);
+  renderRejectHistogram(payload.reject_reason_counts || {});
+  renderOnChain(payload.on_chain_latest);
+  renderWhales(payload.whale_transfers_recent || []);
+
+  if (payload.clean_since) {
+    windowInfo.textContent = `since ${payload.clean_since.replace("T", " ").slice(0, 16)}Z`;
+  } else {
+    windowInfo.textContent = "all-time";
+  }
+}
+
+// ── poll loop ──────────────────────────────────────────────────────────────
+async function tick() {
+  try {
+    const r = await fetch("/api/state", { cache: "no-store" });
+    if (!r.ok) {
+      const txt = await r.text();
+      setStatus("err", `HTTP ${r.status}`);
+      console.error("state fetch failed:", txt);
+      return;
+    }
+    const payload = await r.json();
+    if (payload.error) {
+      setStatus("err", payload.error);
+      return;
+    }
+    renderAll(payload);
+    const now = new Date();
+    lastUpdate.textContent = "updated " + now.toISOString().slice(11, 19) + "Z";
+    setStatus("ok", "live");
+  } catch (e) {
+    console.error(e);
+    setStatus("err", e.message || String(e));
+  }
+}
+
+tick();
+setInterval(tick, POLL_MS);
+</script>
+
+</body>
+</html>
