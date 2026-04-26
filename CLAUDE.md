@@ -26,6 +26,46 @@ AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT lin
 
 ## Changelog
 
+### 2026-04-27 — XRP `/token/volume` re-probe documented as no-op (F5)
+
+DB audit flagged `token_volume_1h_net_usd_json` with no XRP key on the
+latest snapshot — confirming the 2026-04-25 finding that Arkham doesn't
+index XRPL. Re-probed all 6 slug variants with the BOTH the primary
+`/token/volume/{id}` endpoint AND the 2026-04-23 histogram-fallback
+path (in case the fallback could rescue XRP even though primary can't).
+
+Result table:
+| slug          | /token/volume/{id} | /transfers/histogram (fallback) |
+|---------------|---|---|
+| ripple        | 400 "token not supported" | 400 "bad filter" |
+| xrp           | 400 "token not supported" | 400 "bad filter" |
+| xrpl          | 400 "token not supported" | 400 "bad filter" |
+| xrp-classic   | **200 with 100% zero buckets** (stale listing) | 500 internal |
+| xrp-token     | 400 "token not supported" | 400 "bad filter" |
+| xrp-ledger    | 400 "token not supported" | 400 "bad filter" |
+
+`xrp-classic` returning HTTP 200 was the only variant worth verifying
+— the response is a 24-bucket array of `{inUSD:0, outUSD:0,
+inValue:0, outValue:0}` rows, i.e. the slug exists in the registry
+but Arkham hasn't indexed any flow against it. Likely a stale
+"XRP Classic" listing distinct from XRPL itself.
+
+Updated [src/data/on_chain_types.py](src/data/on_chain_types.py)
+inline comment with the probe results so the next audit doesn't
+re-run the same tests. Decision unchanged: **XRP intentionally
+absent** from `WATCHED_SYMBOL_TO_TOKEN_ID`. Recheck quarterly or when
+Arkham announces XRPL chain support.
+
+**Operational impact:** XRP positions (1 of 9 in the current dataset
+— the pre-clean 21:43:53 OPEN trade) lose the
+`per_symbol_cex_flow_penalty` soft signal but retain every other
+Arkham gate (daily_bias modifier, stablecoin_pulse_penalty,
+altcoin_index_penalty, flow_alignment_penalty — none of these are
+per-symbol). No code change needed.
+
+**Files touched:** [src/data/on_chain_types.py](src/data/on_chain_types.py)
+only — comment update.
+
 ### 2026-04-27 — `position_snapshots.vwap_3m_distance_atr_now` writer fix (F4)
 
 Pre-fix audit showed 737/737 (100%) NULL on this column despite the

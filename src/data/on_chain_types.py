@@ -162,6 +162,21 @@ def affected_symbols_for(token_id: str) -> tuple[str, ...]:
 # Arkham-driven gate (daily_bias modifier, stablecoin_pulse_penalty,
 # altcoin_index_penalty, flow_alignment_penalty — none of which are
 # per-symbol). Reinstate this entry if Arkham adds XRP support later.
+#
+# 2026-04-27 F5 re-probe (after the 2026-04-23 histogram fallback was
+# added — i.e. checking whether the v2 histogram path could rescue XRP
+# even though /token/volume can't): all 6 slug variants tested
+# (ripple, xrp, xrpl, xrp-classic, xrp-token, xrp-ledger) — none yield
+# usable data:
+#   - /token/volume/{id} → HTTP 400 "token not supported" for 5 of 6
+#   - /token/volume/xrp-classic → HTTP 200 but 100% zero buckets (a
+#     stale/inactive listing, not actual XRPL data)
+#   - /transfers/histogram?base=type:cex&tokens={id} → HTTP 400 "bad
+#     filter: insufficient criteria" for all variants (slug not in
+#     their indexed registry).
+# Decision: keep XRP out of the map. Recheck quarterly or when Arkham
+# announces XRPL chain support — currently their indexed chains are
+# Ethereum + Bitcoin + Solana + a handful of EVM L2s.
 WATCHED_SYMBOL_TO_TOKEN_ID: dict[str, str] = {
     "BTC-USDT-SWAP": "bitcoin",
     "ETH-USDT-SWAP": "ethereum",
