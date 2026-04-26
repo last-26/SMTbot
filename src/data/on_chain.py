@@ -935,6 +935,44 @@ async def fetch_entity_netflow_24h(
     return total_in - total_out
 
 
+async def fetch_entity_per_asset_netflow_24h(
+    client: "ArkhamClient",
+    entity: str,
+    token_ids: list[str],
+    *,
+    rate_pause_s: float = 1.1,
+) -> Optional[float]:
+    """Rolling 24h net flow (USD) for a SINGLE entity × token-set combo.
+
+    Same shape as `fetch_entity_netflow_24h` but with a `tokens=` filter so
+    the histogram aggregates only the requested asset class. Used by the
+    dashboard's per-venue × per-asset breakdown (BTC / ETH / stables per
+    venue). Token IDs follow Arkham's pricing-id slugs:
+      * BTC      → ["bitcoin"]
+      * ETH      → ["ethereum"]
+      * stables  → ["tether", "usd-coin"]
+
+    Cost: 2 `/transfers/histogram` calls per (entity, token-set) per
+    invocation, same rate-limit cushion as `fetch_entity_netflow_24h`.
+    """
+    inflow = await client.get_transfers_histogram(
+        base=entity, tokens=token_ids, flow="in",
+        time_last="24h", granularity="1h",
+    )
+    await asyncio.sleep(rate_pause_s)
+    outflow = await client.get_transfers_histogram(
+        base=entity, tokens=token_ids, flow="out",
+        time_last="24h", granularity="1h",
+    )
+    if inflow is None or outflow is None:
+        return None
+    total_in = sum(float(b.get("usd") or 0) for b in inflow
+                   if isinstance(b, dict))
+    total_out = sum(float(b.get("usd") or 0) for b in outflow
+                    if isinstance(b, dict))
+    return total_in - total_out
+
+
 # ── 2026-04-22: per-token hourly volume (probe confirmed granularity=1h) ───
 
 

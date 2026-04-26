@@ -74,6 +74,16 @@ class OnChainSnapshot:
     # Pass 3 will decide whether to add a 1h-windowed OKX slot separately.
     # Not wired into `_flow_alignment_score`.
     cex_okx_netflow_24h_usd: Optional[float] = None
+    # 2026-04-26 — per-venue × per-asset 24h netflow (BTC / ETH / stables).
+    # Dict keyed by entity slug ("coinbase", "binance", "bybit", "bitfinex",
+    # "kraken", "okx") → signed USD float (in - out). Adding a 7th venue
+    # won't require schema migration. Refreshed in a background task so
+    # the trade cycle never waits on the 36 histogram calls this requires.
+    # Powers the dashboard's per-venue per-asset chart; not yet wired into
+    # any runtime scoring (Pass 3 candidate).
+    cex_per_venue_btc_netflow_24h_usd_json: Optional[str] = None
+    cex_per_venue_eth_netflow_24h_usd_json: Optional[str] = None
+    cex_per_venue_stables_netflow_24h_usd_json: Optional[str] = None
     # 2026-04-22 — per-symbol most-recent-hour net CEX flow (USD) via
     # `/token/volume/{id}?granularity=1h`. JSON dict keyed by OKX symbol;
     # adding a 6th symbol won't require schema migration. Initially
