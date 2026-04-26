@@ -11,7 +11,7 @@ Goals:
     async. Routers call these inside `asyncio.to_thread(...)` to stay
     non-blocking without re-implementing the SDK.
 
-Bybit V5 architectural notes (vs the prior OKX wrapper):
+Bybit V5 architectural notes (vs the pre-migration wrapper):
   - **TP/SL is a property of the position**, attached at order placement
     via `takeProfit`/`stopLoss` fields on POST /v5/order/create OR
     mutated post-fill via POST /v5/position/trading-stop. There is NO
@@ -24,7 +24,7 @@ Bybit V5 architectural notes (vs the prior OKX wrapper):
     symbol string now.
   - **Position mode** is hedge (`mode=3`) set once at startup; each
     position carries a `positionIdx` (1=long, 2=short) instead of
-    OKX's `posSide`.
+    the pre-migration `posSide`.
   - **Account type** is UNIFIED. Margin mode is account-wide
     (REGULAR_MARGIN ≈ cross), not per-call `tdMode`.
 
@@ -72,7 +72,7 @@ _ORDER_REJECTED_CODES = frozenset({
     "170218",   # LIMIT-MAKER order rejected (post-only would take liquidity)
 })
 
-# OKX trigger-px-type → Bybit equivalent. The strategy/config layer still
+# Internal trigger-px-type → Bybit equivalent. The strategy/config layer still
 # speaks the old vocabulary (`mark` / `last`) for back-compat.
 _TRIGGER_PX_TYPE = {
     "mark": "MarkPrice",
@@ -176,11 +176,14 @@ def _install_dns_pin(session: Any, host: str, ip: str) -> None:
     session.mount(f"https://{host}", _PinnedAdapter())
 
 
-# Internal symbol format stays OKX-style (`BTC-USDT-SWAP`) across the runner,
-# config, journal and tests — that's what every existing call site, YAML key
-# and journal row already uses. We translate to Bybit-native (`BTCUSDT`) at
-# the API boundary so the rest of the codebase doesn't need to know.
-_OKX_TO_BYBIT_SYMBOL = {
+# Internal canonical symbol format (`BTC-USDT-SWAP`) is the single string
+# every runner / config / journal / test site uses. We translate to
+# Bybit-native (`BTCUSDT`) at the API boundary so the rest of the codebase
+# doesn't need to know which exchange backs it. The format originated with
+# the OKX-era execution layer; it survived the 2026-04-25 migration as
+# canonical because mass-renaming ~50 files + journal rows would dwarf the
+# value of the rename.
+_INTERNAL_TO_BYBIT_SYMBOL = {
     "BTC-USDT-SWAP": "BTCUSDT",
     "ETH-USDT-SWAP": "ETHUSDT",
     "SOL-USDT-SWAP": "SOLUSDT",
@@ -190,12 +193,13 @@ _OKX_TO_BYBIT_SYMBOL = {
     "ADA-USDT-SWAP": "ADAUSDT",
 }
 
-# OKX-era contract-value-per-contract. Sizing math in `rr_system.py` works
-# in integer "num_contracts" units against these multipliers (e.g. 10 BTC
+# Per-symbol contract-value-per-contract (carried over from the
+# pre-migration sizing convention). Sizing math in `rr_system.py` works in
+# integer "num_contracts" units against these multipliers (e.g. 10 BTC
 # contracts × 0.01 = 0.1 BTC). Bybit linear takes qty in base coin, so we
-# multiply at the boundary. Hardcoded because operator's symbol set is
+# multiply at the boundary. Hardcoded because the operator's symbol set is
 # fixed; if a 6th pair gets added, extend this map.
-_OKX_CT_VAL = {
+_INTERNAL_CT_VAL = {
     "BTC-USDT-SWAP": 0.01,
     "ETH-USDT-SWAP": 0.1,
     "SOL-USDT-SWAP": 1.0,
@@ -206,25 +210,25 @@ _OKX_CT_VAL = {
 }
 
 
-_BYBIT_TO_OKX_SYMBOL = {v: k for k, v in _OKX_TO_BYBIT_SYMBOL.items()}
+_BYBIT_TO_INTERNAL_SYMBOL = {v: k for k, v in _INTERNAL_TO_BYBIT_SYMBOL.items()}
 
 
 def _to_bybit_symbol(inst_id: str) -> str:
-    """OKX-format `BTC-USDT-SWAP` → Bybit-format `BTCUSDT`.
+    """Internal `BTC-USDT-SWAP` → Bybit-native `BTCUSDT`.
 
     Idempotent for already-Bybit symbols (test fixtures may pass either
     format). Falls back to the input string when the symbol isn't in the
     map — Bybit will reject with a clear retCode if it's malformed.
     """
-    if inst_id in _OKX_TO_BYBIT_SYMBOL:
-        return _OKX_TO_BYBIT_SYMBOL[inst_id]
+    if inst_id in _INTERNAL_TO_BYBIT_SYMBOL:
+        return _INTERNAL_TO_BYBIT_SYMBOL[inst_id]
     return inst_id
 
 
 def _from_bybit_symbol(symbol: str) -> str:
-    """Bybit-format `BTCUSDT` → OKX-format `BTC-USDT-SWAP` for journal /
+    """Bybit-native `BTCUSDT` → internal `BTC-USDT-SWAP` for journal /
     dict-key consistency with old rows."""
-    return _BYBIT_TO_OKX_SYMBOL.get(symbol, symbol)
+    return _BYBIT_TO_INTERNAL_SYMBOL.get(symbol, symbol)
 
 
 def _strip_decimal_zeros(d: Decimal) -> str:
@@ -240,7 +244,7 @@ def _strip_decimal_zeros(d: Decimal) -> str:
 
 
 def _qty_in_base(inst_id: str, size_contracts: float, qty_step: float = 0.0) -> str:
-    """num_contracts (OKX-style integer) → qty in base coin (Bybit string).
+    """num_contracts (internal-format integer) → qty in base coin (Bybit string).
 
     Decimal arithmetic prevents the IEEE-754 noise that `214 × 0.1`
     produces in float (`21.400000000000002`); Bybit rejects such qty as
@@ -251,7 +255,7 @@ def _qty_in_base(inst_id: str, size_contracts: float, qty_step: float = 0.0) -> 
     Returns "0" for unmapped symbols so a missing entry surfaces as a
     Bybit-side rejection rather than a silent miscalc.
     """
-    ct_val_f = _OKX_CT_VAL.get(inst_id, 0.0)
+    ct_val_f = _INTERNAL_CT_VAL.get(inst_id, 0.0)
     if ct_val_f <= 0:
         return "0"
     qty = Decimal(str(size_contracts)) * Decimal(str(ct_val_f))
@@ -348,7 +352,7 @@ def _pybit_ret_code(exc: Exception) -> Optional[str]:
 
 
 def _pos_idx(pos_side: str) -> int:
-    """OKX `pos_side` → Bybit `positionIdx`.
+    """Internal `pos_side` ("long" / "short") → Bybit `positionIdx` (1 / 2).
 
     `positionIdx` identifies the POSITION (1=long, 2=short) — not the order
     side. Closing a long is still positionIdx=1 with side='Sell'.
@@ -449,8 +453,8 @@ class BybitClient:
         """Call POST /v5/position/set-leverage for both sides simultaneously.
 
         Bybit takes `buyLeverage` and `sellLeverage` separately; we set them
-        equal to match the OKX single-leverage semantics. Extra kwargs are
-        accepted and ignored for back-compat with OKX call sites that pass
+        equal to match the pre-migration single-leverage semantics. Extra kwargs are
+        accepted and ignored for back-compat with pre-migration call sites that pass
         `mgn_mode=` / `pos_side=`.
 
         **Idempotent on 110043** ("leverage not modified") — pybit raises
@@ -484,7 +488,7 @@ class BybitClient:
         Bybit UNIFIED accounts pool every collateral-toggled asset by USD
         value (USDT + USDC most commonly). `totalAvailableBalance` is the
         account-level USD figure already aggregated across them — the
-        equivalent of OKX's `availEq`. The `coin=` filter only narrows
+        equivalent of the pre-migration `availEq`. The `coin=` filter only narrows
         the per-coin breakdown returned in `list[].coin[]`; the
         account-level totals stay the same.
         """
@@ -612,7 +616,7 @@ class BybitClient:
     def set_margin_mode(self, mode: str = "REGULAR_MARGIN") -> dict:
         """Set UNIFIED account margin mode (cross-margin parity = REGULAR_MARGIN).
 
-        OKX's per-call `tdMode=cross/isolated` has no Bybit equivalent on
+        The pre-migration per-call `tdMode=cross/isolated` has no Bybit equivalent on
         UNIFIED — margin mode is account-wide. Idempotent: a no-op when the
         mode is already set returns retCode 0.
         """
@@ -635,21 +639,23 @@ class BybitClient:
         return float(rows[0].get("markPrice") or 0.0)
 
     def get_contract_size(self, inst_id: str) -> float:
-        """Per-contract base-coin multiplier (OKX-era `ctVal` semantics).
+        """Per-contract base-coin multiplier (internal canonical convention,
+        carried over from the pre-migration sizing layer).
 
-        We preserve the OKX convention so the existing sizing math in
-        `rr_system.py` keeps working without rewrites: BTC=0.01,
-        ETH=0.1, SOL=1, DOGE=1000, BNB=0.01. The Bybit `qtyStep` filter
-        is also fetched (in `get_instrument_spec`) but isn't returned
-        from this back-compat method.
+        The existing sizing math in `rr_system.py` works in integer
+        "num_contracts" units against these multipliers without rewrites:
+        BTC=0.01, ETH=0.1, SOL=1, DOGE=1000, BNB=0.01. The Bybit `qtyStep`
+        filter is also fetched (in `get_instrument_spec`) but isn't
+        returned from this back-compat method.
         """
-        return float(_OKX_CT_VAL.get(inst_id, 0.0))
+        return float(_INTERNAL_CT_VAL.get(inst_id, 0.0))
 
     def get_instrument_spec(self, inst_id: str) -> dict:
         """Return per-symbol filters for sizing + leverage-cap math.
 
         Returns `{ct_val, max_leverage, qty_step, min_qty, max_qty,
-        tick_size}`. `ct_val` is the hardcoded OKX-era multiplier so
+        tick_size}`. `ct_val` is the hardcoded internal canonical
+        multiplier (carried over from the pre-migration sizing layer) so
         sizing math works unchanged; the rest comes from Bybit's
         `instruments-info` so leverage caps + qty quantum reflect the
         actual venue.
@@ -659,7 +665,7 @@ class BybitClient:
         )
         result = _check(resp, "get_instruments_info")
         rows = result.get("list") or []
-        ct_val = float(_OKX_CT_VAL.get(inst_id, 0.0))
+        ct_val = float(_INTERNAL_CT_VAL.get(inst_id, 0.0))
         if not rows:
             spec = {
                 "ct_val": ct_val,
@@ -695,7 +701,7 @@ class BybitClient:
     def place_market_order(
         self,
         inst_id: str,
-        side: str,                 # "buy" / "sell" (OKX-vocab) or "Buy"/"Sell"
+        side: str,                 # "buy" / "sell" (internal vocab) or "Buy"/"Sell"
         pos_side: str,             # "long" / "short"
         size_contracts: float,
         td_mode: str = "isolated", # accepted + ignored (account-wide on Bybit)
@@ -872,7 +878,7 @@ class BybitClient:
             kwargs["settleCoin"] = "USDT"
         resp = self.session.get_open_orders(**kwargs)
         result = _check(resp, "list_open_orders")
-        # Translate `symbol` field back to OKX format so downstream callers
+        # Translate `symbol` field back to internal canonical format so downstream callers
         # (orphan-pending-limit sweep) get the same dict-key vocabulary they
         # used pre-migration.
         rows: list[dict] = []
@@ -927,7 +933,7 @@ class BybitClient:
         trigger_px_type: str = "mark",
     ) -> dict:
         """POST /v5/position/trading-stop — set or modify TP/SL on an open
-        position. Replaces the OKX OCO algo placement + cancel+replace dance.
+        position. Replaces the pre-migration OCO algo placement + cancel+replace dance.
 
         Pass `take_profit=0.0` or `stop_loss=0.0` to clear that leg
         independently. Per Bybit docs, modifying one side "loses the
@@ -1005,7 +1011,7 @@ class BybitClient:
     def cancel_algo(self, inst_id: str, algo_id: str) -> dict:
         """Back-compat shim: clear both legs of TP/SL on the position.
 
-        OKX-era code paths that called `cancel_algo` to remove an OCO
+        pre-migration code paths that called `cancel_algo` to remove an OCO
         before re-placing now clear the position's TP+SL via trading-stop.
         Caller passes `algo_id` (ignored — TP/SL is identified by symbol +
         positionIdx, not a separate algo ID).
@@ -1022,7 +1028,7 @@ class BybitClient:
         """Back-compat shim: Bybit has no separate algo-list endpoint
         because TP/SL is part of the position. Reads `/v5/position/list`
         and returns rows where `takeProfit` or `stopLoss` is set, in a
-        shape that loosely matches the OKX algo row (algoId="", instId,
+        shape that loosely matches the pre-migration algo row (algoId="", instId,
         slTriggerPx, tpTriggerPx, posSide).
 
         Used only by the orphan-OCO startup sweep; on Bybit there are no
@@ -1070,7 +1076,7 @@ class BybitClient:
             if snap.size <= 0:
                 continue
             cl_ord_id = f"smtflat{uuid.uuid4().hex[:19]}"
-            # snap.size is already in OKX-contract units (we converted it in
+            # snap.size is already in internal-format contract units (we converted it in
             # `get_positions`); flip back to base coin for the Bybit qty,
             # quantized to the symbol's qtyStep so we never send float noise.
             resp = self.session.place_order(
@@ -1102,7 +1108,7 @@ class BybitClient:
             sym = row.get("symbol")
             if not sym:
                 continue
-            okx_sym = _from_bybit_symbol(sym)
+            internal_sym = _from_bybit_symbol(sym)
             size_base = float(row.get("size") or 0.0)
             pos_idx = int(row.get("positionIdx") or 0)
             if pos_idx == 1:
@@ -1113,13 +1119,14 @@ class BybitClient:
                 # one-way mode: derive from `side`
                 side = (row.get("side") or "").lower()
                 pos_side = "long" if side == "buy" else "short" if side == "sell" else ""
-            # Bybit's `size` is in base coin; flip back to OKX-contract units
-            # so the rest of the codebase (monitor, sizing math, journal)
-            # works in the integer-contracts vocabulary it was written in.
-            ct_val = float(_OKX_CT_VAL.get(okx_sym, 0.0))
+            # Bybit's `size` is in base coin; flip back to internal-format
+            # contract units so the rest of the codebase (monitor, sizing
+            # math, journal) works in the integer-contracts vocabulary it
+            # was written in.
+            ct_val = float(_INTERNAL_CT_VAL.get(internal_sym, 0.0))
             size_contracts = size_base / ct_val if ct_val > 0 else size_base
             snapshots.append(PositionSnapshot(
-                inst_id=okx_sym,
+                inst_id=internal_sym,
                 pos_side=pos_side,
                 size=size_contracts,
                 entry_price=float(row.get("avgPrice") or 0.0),
@@ -1185,7 +1192,7 @@ class BybitClient:
         exit_price = float(row.get("avgExitPrice") or fill.exit_price)
         pnl = float(row.get("closedPnl") or fill.pnl_usdt)
         # Bybit splits open + close fees as positive numbers; the bot's
-        # convention (inherited from OKX) is signed (negative = paid out).
+        # convention (carried over from the pre-migration layer) is signed (negative = paid out).
         # Sum and negate to maintain semantics.
         open_fee = float(row.get("openFee") or 0.0)
         close_fee = float(row.get("closeFee") or 0.0)
@@ -1209,7 +1216,7 @@ class BybitClient:
 
 
 def _normalize_side(side: str) -> str:
-    """Accept OKX-vocab ('buy'/'sell') and Bybit-vocab ('Buy'/'Sell')."""
+    """Accept internal vocab ('buy'/'sell') and Bybit-vocab ('Buy'/'Sell')."""
     s = side.strip()
     if s.lower() == "buy":
         return "Buy"
