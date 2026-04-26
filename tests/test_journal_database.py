@@ -289,6 +289,24 @@ async def test_schema_v2_round_trip_preserves_new_fields():
         assert fetched.funding_z_6h is None
 
 
+async def test_record_open_persists_zone_metadata_when_provided():
+    """2026-04-27 (F3) — runner's pending-fill path forwards zone source +
+    wait/latency. Lock the contract: when supplied, record_open round-trips
+    them; when omitted, they stay None (back-compat)."""
+    async with TradeJournal(":memory:") as j:
+        rec = await j.record_open(
+            _plan(), _report(), symbol="BTC-USDT-SWAP",
+            signal_timestamp=datetime(2026, 4, 16, tzinfo=UTC),
+            setup_zone_source="vwap_retest",
+            zone_wait_bars=7,
+            zone_fill_latency_bars=3,
+        )
+        fetched = await j.get_trade(rec.trade_id)
+        assert fetched.setup_zone_source == "vwap_retest"
+        assert fetched.zone_wait_bars == 7
+        assert fetched.zone_fill_latency_bars == 3
+
+
 # ── record_rejected_signal ──────────────────────────────────────────────────
 
 

@@ -1011,6 +1011,18 @@ class TradeJournal:
         price_change_1h_pct_at_entry: Optional[float] = None,
         price_change_4h_pct_at_entry: Optional[float] = None,
         liq_heatmap_top_clusters: Optional[dict] = None,
+        # 2026-04-27 (F3) — zone metadata plumbing. Schema columns existed
+        # since the zone-based pivot but the runner's pending-fill path
+        # never forwarded them, leaving 9/9 NULL on the Bybit dataset.
+        # `setup_zone_source` is one of the ZoneSource Literal values
+        # ("vwap_retest" / "ema21_pullback" / "fvg_entry" / ...);
+        # `zone_wait_bars` is the static `max_wait_bars` from ZoneSetup;
+        # `zone_fill_latency_bars` is round((fill_ts - placed_ts).total_s
+        # / 60 / entry_tf_minutes) — never exceeds zone_wait_bars by
+        # construction (timeout cancels the limit at that boundary).
+        setup_zone_source: Optional[str] = None,
+        zone_wait_bars: Optional[int] = None,
+        zone_fill_latency_bars: Optional[int] = None,
     ) -> TradeRecord:
         """Insert an OPEN row describing a freshly-placed trade.
 
@@ -1074,6 +1086,9 @@ class TradeJournal:
             price_change_1h_pct_at_entry=price_change_1h_pct_at_entry,
             price_change_4h_pct_at_entry=price_change_4h_pct_at_entry,
             liq_heatmap_top_clusters=dict(liq_heatmap_top_clusters or {}),
+            setup_zone_source=setup_zone_source,
+            zone_wait_bars=zone_wait_bars,
+            zone_fill_latency_bars=zone_fill_latency_bars,
         )
         placeholders = ", ".join("?" * len(_COLUMNS))
         cols = ", ".join(_COLUMNS)

@@ -157,6 +157,46 @@ def _timeframe_to_minutes(tf: str) -> int:
         return 3
 
 
+def _zone_fill_latency_bars(
+    *,
+    placed_at: datetime,
+    fill_at: datetime,
+    entry_tf_minutes: int,
+    max_wait_bars: int,
+) -> int:
+    """Bars between pending placement and fill, clamped to [0, max_wait_bars].
+
+    Computed from wall-clock minutes / entry-TF minutes — a bar-aligned
+    counter would need timeline state per pending which the runner does
+    not track. Result rounds to nearest int. Bounded above because the
+    pending-cancel timer fires AT max_wait_bars, so a fill cannot be
+    later by construction; clamp guards against clock skew or
+    timeframe-config mismatch.
+    """
+    if entry_tf_minutes <= 0:
+        return 0
+    delta_s = max(0.0, (fill_at - placed_at).total_seconds())
+    bars = int(round(delta_s / 60.0 / entry_tf_minutes))
+    return max(0, min(bars, max_wait_bars))
+
+
+def _infer_close_reason(pnl_usdt: Optional[float]) -> Optional[str]:
+    """Approximate close reason from realized PnL when no explicit reason
+    was set by a defensive-close path. Bot's natural close paths are
+    SL hit (negative PnL) and TP hit (positive PnL); breakeven is rare
+    but possible (SL pulled to BE then triggered). Returns None when
+    pnl_usdt is None so `record_close`'s COALESCE preserves any
+    pre-existing close_reason on the row.
+    """
+    if pnl_usdt is None:
+        return None
+    if pnl_usdt > 0:
+        return "tp_hit"
+    if pnl_usdt < 0:
+        return "sl_hit"
+    return "breakeven"
+
+
 def _tf_seconds(tf: str) -> int:
     """Convert a TV timeframe string to seconds (e.g. '3m' → 180, '4H' → 14400)."""
     raw = tf.strip()
@@ -3447,6 +3487,22 @@ class BotRunner:
                 oscillator_raw_values=dict(
                     meta.oscillator_raw_values_at_placement or {}
                 ),
+                # 2026-04-27 (F3) — zone metadata forwarding. Pre-fix the
+                # 9 Bybit-era trades all had setup_zone_source / wait_bars
+                # / fill_latency NULL despite being zone-based entries.
+                # `zone_fill_latency_bars` is computed from wall-clock time
+                # between placement and fill, divided by entry_tf_minutes.
+                # Bounded above by zone.max_wait_bars (timeout cancels at
+                # that boundary so the limit never sits longer).
+                setup_zone_source=str(meta.zone.zone_source),
+                zone_wait_bars=int(meta.zone.max_wait_bars),
+                zone_fill_latency_bars=_zone_fill_latency_bars(
+                    placed_at=meta.placed_at,
+                    fill_at=_utc_now(),
+                    entry_tf_minutes=_timeframe_to_minutes(
+                        cfg.trading.entry_timeframe),
+                    max_wait_bars=int(meta.zone.max_wait_bars),
+                ),
                 **_derive_enrichment(state),
             )
             self.ctx.open_trade_ids[key] = rec.trade_id
@@ -3567,6 +3623,14 @@ class BotRunner:
         trade_id = self.ctx.open_trade_ids.pop(key, None)
         # Madde F — carry close_reason set by the defensive-close path.
         close_reason = self.ctx.pending_close_reasons.pop(key, None)
+        # 2026-04-27 (F3) — natural close (SL/TP hit) has no explicit
+        # reason set by the runner. Pre-fix this left close_reason NULL
+        # on every Bybit-era row (9/9 NULL on the 6-closed dataset).
+        # Infer from realized PnL sign so Pass 3 can segment closes by
+        # reason without parsing the loss/gain magnitude separately.
+        # Defensive-close reasons take precedence (already popped above).
+        if close_reason is None:
+            close_reason = _infer_close_reason(enriched.pnl_usdt)
         self.ctx.defensive_close_in_flight.discard(key)
         self.ctx.open_trade_opened_at.pop(key, None)
 

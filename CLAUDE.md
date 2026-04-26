@@ -26,6 +26,81 @@ AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT lin
 
 ## Changelog
 
+### 2026-04-27 — Zone metadata + `close_reason` plumbing (F3)
+
+`trades.setup_zone_source` / `zone_wait_bars` / `zone_fill_latency_bars`
+all read 9/9 NULL on the Bybit dataset audit despite every trade being a
+zone-based limit entry — the schema columns existed since the
+zone-pivot but the runner's pending-fill path never threaded them into
+`record_open`. Same shape on `close_reason` (9/9 NULL): `record_close`
+already accepted a `close_reason` kwarg and used `COALESCE` so the
+column would update when set, but the runner only set it on
+defensive-close paths (`EARLY_CLOSE_LTF_REVERSAL`); natural SL/TP hits
+left it None and the column stayed empty.
+
+**Fixes (one commit, 4 columns):**
+
+1. `record_open` signature gained 3 kwargs: `setup_zone_source` (one of
+   the `ZoneSource` Literal values), `zone_wait_bars` (static
+   `max_wait_bars` from `ZoneSetup`), `zone_fill_latency_bars` (rounded
+   wall-clock minutes between placement and fill, divided by
+   `entry_tf_minutes`, clamped to `[0, max_wait_bars]`).
+2. New helper `_zone_fill_latency_bars` in [src/bot/runner.py](src/bot/runner.py)
+   — bar-aligned counter would need per-pending timeline state which
+   the runner does not track; wall-clock approximation is bounded above
+   by the cancel-timer boundary.
+3. Pending-fill `record_open` call site (line ~3431) forwards all 3
+   from `meta.zone` + `meta.placed_at` + `_utc_now()`.
+4. New helper `_infer_close_reason` in [src/bot/runner.py](src/bot/runner.py)
+   — maps `pnl_usdt > 0 → "tp_hit"`, `< 0 → "sl_hit"`, `== 0 →
+   "breakeven"`, `None → None`. Returns None on missing PnL so
+   `record_close`'s COALESCE preserves any pre-existing reason from a
+   defensive-close path.
+5. `_handle_close` falls back to `_infer_close_reason(enriched.pnl_usdt)`
+   when `pending_close_reasons[key]` is unset. Defensive-close reasons
+   (`EARLY_CLOSE_LTF_REVERSAL` etc) take precedence (popped first).
+
+Pre-fix rows stay NULL on these 4 columns; the values are reconstructible
+from `reason` (which encodes zone source) + `(exit_timestamp -
+entry_timestamp)/entry_tf_minutes` (latency) + `pnl_usdt` sign
+(close reason). A back-fill SQL is left as a separate small task; this
+commit only stops the bleeding for new rows.
+
+**Granularity caveat:** `_infer_close_reason` collapses all positive-PnL
+exits into `tp_hit` even though the position has two TP exit lanes
+(market-on-trigger + maker reduce-only limit). Pass 3 GBT can still
+segment by sign. A future enhancement could thread a fill-source
+attribute from the position monitor for `tp_hit_market` vs
+`tp_hit_maker_limit` distinction; not necessary for the current data
+quality baseline.
+
+**Tests:** new `test_record_open_persists_zone_metadata_when_provided` in
+[tests/test_journal_database.py](tests/test_journal_database.py) +
+inline smoke tests for `_zone_fill_latency_bars` + `_infer_close_reason`.
+Full suite (31/31 journal_database + 8/8 runner_position_snapshots)
+green.
+
+**Files touched:** [src/journal/database.py](src/journal/database.py)
+(record_open signature + TradeRecord field assignment),
+[src/bot/runner.py](src/bot/runner.py) (2 helpers + pending-fill plumbing
++ `_handle_close` inference fallback), [tests/test_journal_database.py](tests/test_journal_database.py)
+(round-trip test).
+
+**Re-eval triggers:**
+1. **Fresh-row coverage** — `SELECT COUNT(*) FROM trades WHERE
+   entry_timestamp > '2026-04-27T<commit-ts>' AND setup_zone_source IS
+   NULL` should be 0% in steady state. Non-zero = market-entry path
+   re-activating without zone metadata (currently impossible: every
+   trade goes through pending-fill).
+2. **Latency clamp hits** — `zone_fill_latency_bars == zone_wait_bars`
+   on >5% of rows means the cancel timer fires concurrently with the
+   fill (race) — investigate the cancel-on-timeout ordering.
+3. **`close_reason='breakeven'` rate** — at hard 1:2 RR with the
+   2026-04-20 MFE-lock-at-1.3R behavior, breakeven closes should be
+   rare (<5% of closes — the SL pulls to BE+fee_buffer so a stop-out
+   at BE counts as "breakeven" not "sl_hit"). Higher rate → MFE-lock
+   firing too aggressively.
+
 ### 2026-04-27 — `rejected_signals` derivatives enrichment plumbing (F1)
 
 DB audit (2026-04-27, 9-trade Bybit dataset) showed the long-acknowledged
