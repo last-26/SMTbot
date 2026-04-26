@@ -121,9 +121,9 @@ def test_cache_refresh_sets_state_regime(monkeypatch):
             }
 
     class FakeCoinalyze:
-        async def fetch_snapshot(self, okx_symbol):
+        async def fetch_snapshot(self, internal_symbol):
             return DerivativesSnapshot(
-                symbol=okx_symbol, ts_ms=0,
+                symbol=internal_symbol, ts_ms=0,
                 funding_rate_current=0.01,
                 open_interest_usd=500_000.0,
                 long_short_ratio=1.1,

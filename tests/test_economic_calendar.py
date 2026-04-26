@@ -546,9 +546,9 @@ def test_config_loads_economic_calendar_section_from_env(monkeypatch, tmp_path):
     }
     yaml_path = tmp_path / "config.yaml"
     yaml_path.write_text(yaml.safe_dump(cfg_yaml))
-    monkeypatch.setenv("OKX_API_KEY", "x")
-    monkeypatch.setenv("OKX_API_SECRET", "y")
-    monkeypatch.setenv("OKX_PASSPHRASE", "z")
+    monkeypatch.setenv("BYBIT_API_KEY", "x")
+    monkeypatch.setenv("BYBIT_API_SECRET", "y")
+    monkeypatch.setenv("BYBIT_DEMO", "1")
     monkeypatch.setenv("FINNHUB_API_KEY", "from-env-key")
 
     from src.bot.config import load_config

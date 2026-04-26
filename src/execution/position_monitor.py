@@ -588,7 +588,7 @@ class PositionMonitor:
             )
 
     def _close_fill_from(self, t: _Tracked) -> CloseFill:
-        # At close time, OKX has already removed the position row. Best we
+        # At close time, Bybit has already removed the position row. Best we
         # can do without a trade-history lookup is mark exit_price=0 and
         # pnl_usdt=0 and let the caller enrich via `get_fills` or the
         # journal (Phase 5) when it comes online.
@@ -672,7 +672,7 @@ class PositionMonitor:
                 )
                 continue
 
-            # Bybit V5: `orderStatus` field, CamelCase. Accept the OKX-era
+            # Bybit V5: `orderStatus` field, CamelCase. Accept the pre-migration
             # `state` field too so test mocks can transition gradually.
             state = str(raw.get("orderStatus") or raw.get("state") or "").lower()
             filled_sz = float(raw.get("cumExecQty") or raw.get("accFillSz") or 0.0)

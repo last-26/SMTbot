@@ -1,7 +1,7 @@
 """Phase 7.C3 — PENDING state lifecycle in PositionMonitor.
 
 The monitor tracks pending limit entries alongside open positions. Each
-poll asks OKX for the current order state and emits one `PendingEvent`
+poll asks the exchange for the current order state and emits one `PendingEvent`
 per transition:
   - filled                          → FILLED (reason="fill")
   - canceled / mmp_canceled         → CANCELED (reason="external")
@@ -24,8 +24,8 @@ from src.execution.position_monitor import PositionMonitor
 UTC = timezone.utc
 
 
-class _FakeOKX:
-    """Matches the subset of OKXClient that PositionMonitor consumes."""
+class _FakeBybit:
+    """Matches the subset of BybitClient that PositionMonitor consumes."""
 
     def __init__(self):
         self.order_states: dict[str, dict] = {}     # order_id → dict
@@ -53,7 +53,7 @@ class _FakeOKX:
 
 
 def _mk(monitor_kwargs: Optional[dict] = None):
-    fake = _FakeOKX()
+    fake = _FakeBybit()
     monitor = PositionMonitor(fake, **(monitor_kwargs or {}))
     return monitor, fake
 
@@ -136,7 +136,7 @@ def test_poll_pending_mmp_canceled_treated_as_external_cancel():
 
 
 def test_poll_pending_times_out_and_cancels():
-    """Live order older than max_wait_s → OKX cancel + CANCELED event."""
+    """Live order older than max_wait_s → the exchange cancel + CANCELED event."""
     monitor, fake = _mk()
     old = datetime.now(UTC) - timedelta(seconds=300)
     _register(monitor, max_wait_s=60.0, placed_at=old)
@@ -233,7 +233,7 @@ def test_cancel_pending_emits_event_and_clears_row():
     assert monitor.pending_count == 0
 
 
-def test_cancel_pending_idempotent_when_okx_reports_gone():
+def test_cancel_pending_idempotent_when_exchange_reports_gone():
     monitor, fake = _mk()
     _register(monitor)
     fake.cancel_raises = OrderRejected("gone", code="51400", payload={})
@@ -245,10 +245,10 @@ def test_cancel_pending_idempotent_when_okx_reports_gone():
 
 # ── Regression: 2026-04-20 phantom-cancel bug ──────────────────────────────
 #
-# OKX sCode 50001 ("service temporarily unavailable") hit the cancel path
+# the exchange sCode 50001 ("service temporarily unavailable") hit the cancel path
 # during a transient outage. The monitor previously logged the failure and
 # emitted CANCELED anyway — dropping tracking while the order stayed live
-# on OKX as a phantom orphan. When the next cycle placed a new limit at a
+# on the exchange as a phantom orphan. When the next cycle placed a new limit at a
 # similar price, the account ended up with two resting longs on the same
 # symbol that could fill into unprotected positions.
 #
@@ -301,7 +301,7 @@ def test_poll_pending_retries_cancel_on_next_poll_after_transient_failure():
     assert events1 == []
     assert monitor.pending_count == 1
 
-    # Second poll: OKX recovered.
+    # Second poll: the exchange recovered.
     fake.cancel_raises = None
     events2 = monitor.poll_pending()
     assert len(events2) == 1

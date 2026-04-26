@@ -167,7 +167,7 @@ def test_full_close_does_not_trigger_sl_move():
     # Size dropped all the way to 0 → it's a CloseFill, not a partial.
     # SL-to-BE replacement must NOT fire (no placement on a dead position);
     # the 2026-04-23 close-sweep DOES cancel any still-resting algos so
-    # they don't orphan on OKX's book.
+    # they don't orphan on the exchange's book.
     client = _FakeClient(positions=[])                       # nothing live
     monitor = PositionMonitor(client, move_sl_to_be_enabled=True)
     monitor.register_open(
@@ -242,7 +242,7 @@ def test_be_offset_zero_preserves_exact_entry_behavior():
 
 def test_cancel_with_algo_gone_code_proceeds_to_place():
     # If TP2 was already cancelled externally (e.g. by a prior poll whose
-    # place leg failed), OKX returns code 51400. Cancel should be treated
+    # place leg failed), the exchange returns code 51400. Cancel should be treated
     # as idempotent and the BE OCO placed anyway, so the position is no
     # longer unprotected.
     client = _FakeClient(

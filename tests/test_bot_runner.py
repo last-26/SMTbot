@@ -455,7 +455,7 @@ class FakeBybitClientWithPending(FakeBybitClient):
 
 async def test_reconcile_cancels_every_resting_pending_limit(make_ctx):
     """The monitor's in-memory _pending is empty at startup, so any resting
-    limit on OKX can't be tracked — reconcile must cancel them so they
+    limit on the exchange can't be tracked — reconcile must cancel them so they
     can't fill into an untracked (unprotected) position."""
     # Need Optional import for the helper class
     client = FakeBybitClientWithPending(

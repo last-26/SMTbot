@@ -112,7 +112,7 @@ def _valid_raw() -> dict:
                      "swing_lookback": 20, "sr_min_touches": 3,
                      "sr_zone_atr_mult": 0.5,
                      "session_filter": ["london", "new_york"]},
-        "okx": {"api_key": "k", "api_secret": "s", "passphrase": "p"},
+        "bybit": {"api_key": "k", "api_secret": "s", "demo": True},
         "journal": {"db_path": ":memory:"},
     }
 

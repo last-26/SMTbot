@@ -1,4 +1,4 @@
-"""Tests for src.execution.order_router — TradePlan → OKX flow."""
+"""Tests for src.execution.order_router — TradePlan → Bybit flow."""
 
 from __future__ import annotations
 

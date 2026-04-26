@@ -648,7 +648,7 @@ class BotContext:
 
 class _DryRunRouter:
     """Stand-in router for --dry-run: mirrors OrderRouter surface (`place`,
-    `place_limit_entry`, `attach_algos`) without touching OKX. Keeps the
+    `place_limit_entry`, `attach_algos`) without touching the exchange. Keeps the
     zone-entry path runnable in --dry-run --once smoke tests."""
 
     def __init__(self, config: RouterConfig):

@@ -118,7 +118,7 @@ async def test_defensive_close_calls_close_position(make_ctx):
 
     # On Bybit V5 the position-attached TP/SL clears automatically when
     # the position closes, so defensive_close goes straight to close_position
-    # without an algo cancel loop (compare the OKX-era cancel_algo calls
+    # without an algo cancel loop (compare the pre-migration cancel_algo calls
     # this test used to assert on).
     assert fakes.bybit_client.cancel_algo_calls == []
     assert fakes.bybit_client.close_position_calls == [

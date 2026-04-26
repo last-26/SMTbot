@@ -113,7 +113,7 @@ async def test_max_concurrent_positions_caps_entries(monkeypatch, make_ctx):
 
 async def test_symbol_leverage_caps_reduce_planner_ceiling(monkeypatch, make_ctx):
     """`trading.symbol_leverage_caps[sym]` is merged with the global cap and
-    the OKX-fetched per-instrument cap — builder receives the minimum.
+    the Bybit-fetched per-instrument cap — builder receives the minimum.
     """
     captured: dict[str, int] = {}
 
@@ -136,7 +136,7 @@ async def test_symbol_leverage_caps_reduce_planner_ceiling(monkeypatch, make_ctx
     bridge = _RecordingBridge()
     ctx, fakes = make_ctx(config=cfg)
     ctx.bridge = bridge
-    # Simulate OKX-fetched per-instrument caps (BTC=100, ETH=100 — both loose).
+    # Simulate Bybit-fetched per-instrument caps (BTC=100, ETH=100 — both loose).
     ctx.max_leverage_per_symbol = {"BTC-USDT-SWAP": 100, "ETH-USDT-SWAP": 100}
 
     runner = BotRunner(ctx)
@@ -146,9 +146,9 @@ async def test_symbol_leverage_caps_reduce_planner_ceiling(monkeypatch, make_ctx
     values = captured.get("values", [])
     # Each symbol should get one planner call. Cap order follows symbol order.
     assert len(values) >= 2
-    # BTC: min(75 global, 100 okx, 75 fallback dict-default) = 75
+    # BTC: min(75 global, 100 bybit, 75 fallback dict-default) = 75
     assert values[0] == 75
-    # ETH: min(75 global, 100 okx, 30 yaml cap) = 30
+    # ETH: min(75 global, 100 bybit, 30 yaml cap) = 30
     assert values[1] == 30
 
 

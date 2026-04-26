@@ -68,7 +68,7 @@ def test_poll_emits_fill_when_position_disappears():
 
 
 def test_poll_updates_cached_entry_price_on_partial_fill():
-    """If OKX reports a better avg entry (e.g. after a partial fill that
+    """If the exchange reports a better avg entry (e.g. after a partial fill that
     completes), the monitor should track the live value."""
     client = FakeClient()
     mon = PositionMonitor(client)
@@ -212,7 +212,7 @@ def test_revise_runner_tp_returns_false_when_position_unknown():
 
 
 def test_revise_runner_tp_treats_idempotent_cancel_code_as_success():
-    """Cancel returning OKX's 'algo already gone' codes is not an abort —
+    """Cancel returning the exchange's 'algo already gone' codes is not an abort —
     the replacement OCO must still go up."""
     client = FakeRevisableClient(
         cancel_raises=OrderRejected("algo gone", code="51400"),
@@ -434,7 +434,7 @@ def test_revise_runner_tp_invokes_on_sl_moved_with_new_algo_ids():
     replaces the runner OCO successfully, the in-memory algo_ids change and
     the journal must be updated too — otherwise a restart rehydrates the
     pre-revise algoId, the next revise cancels a ghost, and the actually-
-    live replacement becomes an orphan OCO on OKX."""
+    live replacement becomes an orphan OCO on the exchange."""
     client = FakeRevisableClient(next_algo_id="JOURNALED_REVISE")
     captured: list[tuple[str, str, list[str]]] = []
 
@@ -475,7 +475,7 @@ def test_revise_runner_tp_does_not_invoke_callback_on_place_failure():
 
 def test_revise_runner_tp_swallows_on_sl_moved_exception():
     """Journal write failures must not break the revise contract — the
-    revise itself succeeded on OKX, we just can't persist. Logs the
+    revise itself succeeded on the exchange, we just can't persist. Logs the
     exception and returns True so the caller doesn't re-attempt the
     OCO cancel+replace on the next cycle."""
     client = FakeRevisableClient(next_algo_id="JOURNALED_REVISE")
@@ -652,7 +652,7 @@ def test_lock_sl_at_leaves_tp_limit_untouched():
 def test_poll_close_sweeps_algo_ids():
     """When a tracked position closes (maker-TP filled, OCO still resting),
     poll() should cancel every algo in `tracked.algo_ids` so nothing
-    orphans on OKX's book until the next startup reconcile."""
+    orphans on the exchange's book until the next startup reconcile."""
     client = FakeRevisableClient()
     mon = PositionMonitor(client, margin_mode="cross")
     client.snapshots = [_snap()]

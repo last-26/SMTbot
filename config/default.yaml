@@ -503,9 +503,9 @@ execution:
   sl_lock_at_r: 0.0
 
   # 2026-04-19 — Position-attached TP/SL trigger price source. "mark" uses
-  # Bybit's index-weighted mark price (Binance + Bybit + Coinbase + OKX
-  # VWAP), "last" uses the Bybit book's last trade. On demo the book has
-  # no real-market counterpart, so
+  # Bybit's index-weighted mark price (cross-exchange VWAP across the
+  # major real-market venues), "last" uses the Bybit book's last trade.
+  # On demo the book has no real-market counterpart, so
   # demo-only wicks trigger `last`-based stops and poison the RL dataset
   # with artefact outcomes. Mark is index-computed from real exchanges →
   # immune to demo wicks. Keep "mark" for demo + live unless a specific

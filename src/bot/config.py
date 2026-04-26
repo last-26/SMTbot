@@ -488,8 +488,8 @@ class ExecutionConfig(BaseModel):
     sl_lock_at_r: float = 0.0
 
     # Position-attached TP/SL trigger-price source. "mark" = index-weighted
-    # price across the major real exchanges (Binance / Bybit / Coinbase /
-    # OKX). "last" = last trade on the Bybit book (default in Bybit V5).
+    # price across the major real-market venues (cross-exchange VWAP).
+    # "last" = last trade on the Bybit book (default in Bybit V5).
     # Mark is strongly preferred on demo: demo-only wicks have no
     # counterpart on the index and so can't fire mark-based triggers,
     # preventing stop-hunt artefacts from poisoning the RL dataset. Kept
@@ -516,7 +516,7 @@ class ExecutionConfig(BaseModel):
     # sits outside the real-market [low, high] band. Non-destructive: the
     # trade still persists, but downstream reporting/RL can filter.
     # `artefact_check_tolerance_pct` widens the band to tolerate routine
-    # OKX-vs-Binance microstructure skew without flagging it as artefact.
+    # exchange-vs-Binance microstructure skew without flagging it as artefact.
     artefact_check_enabled: bool = True
     artefact_check_timeout_s: float = 5.0
     artefact_check_tolerance_pct: float = 0.0005   # 5 bps

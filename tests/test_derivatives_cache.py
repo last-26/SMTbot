@@ -48,8 +48,8 @@ class FakeCoinalyze:
     async def ensure_symbol_map(self, watched: list[str]) -> None:
         self.ensure_called += 1
 
-    def coinalyze_symbol(self, okx_symbol: str) -> str | None:
-        return self._symbol_map.get(okx_symbol, f"{okx_symbol}.FAKE")
+    def coinalyze_symbol(self, internal_symbol: str) -> str | None:
+        return self._symbol_map.get(internal_symbol, f"{internal_symbol}.FAKE")
 
     async def fetch_funding_history_series(self, cn_sym, interval, lookback_hours):
         return list(self._funding_hist)
@@ -57,7 +57,7 @@ class FakeCoinalyze:
     async def fetch_ls_ratio_history_series(self, cn_sym, interval, lookback_hours):
         return list(self._ls_hist)
 
-    async def fetch_snapshot(self, okx_symbol: str):
+    async def fetch_snapshot(self, internal_symbol: str):
         self.snapshot_calls += 1
         return self._snapshot
 
