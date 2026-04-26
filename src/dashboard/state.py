@@ -155,30 +155,45 @@ def _equity_points(closed: list[TradeRecord], starting_balance: float) -> list[d
     return points
 
 
+_WALLET_CACHE: dict = {"ts": 0.0, "data": None}
+_WALLET_TTL_S = 60.0
+
+
+def _build_bybit_client(bybit_cfg: dict):
+    from src.execution.bybit_client import BybitClient, BybitCredentials
+    creds = BybitCredentials(
+        api_key=bybit_cfg["api_key"],
+        api_secret=bybit_cfg["api_secret"],
+        demo=bool(bybit_cfg.get("demo", True)),
+        account_type=bybit_cfg.get("account_type", "UNIFIED"),
+        category=bybit_cfg.get("category", "linear"),
+    )
+    return BybitClient(creds, allow_live=not creds.demo), creds
+
+
 async def fetch_wallet(bybit_cfg: Optional[dict]) -> Optional[dict]:
-    """Probe Bybit for live wallet balance. Returns None on any failure
-    (missing creds, network error, demo edge unreachable) — dashboard
-    degrades to the simulated journal balance.
+    """Probe Bybit for live wallet balance with a 60s TTL cache.
+
+    Wallet doesn't change between cycles unless an order fills, so polling
+    once a minute is plenty. Returns None on any failure (missing creds,
+    network error, demo edge unreachable) — dashboard degrades to the
+    simulated journal balance.
 
     Runs in a thread because `pybit` is sync and we don't want to block
     the FastAPI event loop on the network round-trip.
     """
     if not bybit_cfg:
         return None
+    now = asyncio.get_event_loop().time()
+    if _WALLET_CACHE["data"] is not None and now - _WALLET_CACHE["ts"] < _WALLET_TTL_S:
+        return _WALLET_CACHE["data"]
     try:
-        from src.execution.bybit_client import BybitClient, BybitCredentials
+        from src.execution.bybit_client import BybitClient  # noqa: F401
     except Exception:
         return None
 
     def _probe() -> dict:
-        creds = BybitCredentials(
-            api_key=bybit_cfg["api_key"],
-            api_secret=bybit_cfg["api_secret"],
-            demo=bool(bybit_cfg.get("demo", True)),
-            account_type=bybit_cfg.get("account_type", "UNIFIED"),
-            category=bybit_cfg.get("category", "linear"),
-        )
-        client = BybitClient(creds, allow_live=not creds.demo)
+        client, creds = _build_bybit_client(bybit_cfg)
         return {
             "available_usd": float(client.get_balance("USDT")),
             "margin_balance_usd": float(client.get_total_equity("USDT")),
@@ -186,7 +201,51 @@ async def fetch_wallet(bybit_cfg: Optional[dict]) -> Optional[dict]:
         }
 
     try:
-        return await asyncio.wait_for(asyncio.to_thread(_probe), timeout=8.0)
+        data = await asyncio.wait_for(asyncio.to_thread(_probe), timeout=8.0)
+    except Exception:
+        return _WALLET_CACHE["data"]  # serve stale on transient failure
+    _WALLET_CACHE["ts"] = now
+    _WALLET_CACHE["data"] = data
+    return data
+
+
+async def fetch_live_positions(bybit_cfg: Optional[dict]) -> Optional[list[dict]]:
+    """Live snapshot of every USDT-linear position on Bybit. Returns a list of
+    {inst_id, pos_side, mark_price, entry_price, unrealized_pnl_usd, size,
+    leverage} keyed for frontend merge against the journal's open trades.
+
+    No cache — operator wants live UPnL ticking every 5s. Position endpoint
+    sits in its own rate-limit bucket on Bybit V5; 1 call / 5s is comfortable.
+    Returns None on any failure so the frontend falls back to the journal's
+    last `position_snapshots` row.
+    """
+    if not bybit_cfg:
+        return None
+    try:
+        from src.execution.bybit_client import BybitClient  # noqa: F401
+    except Exception:
+        return None
+
+    def _probe() -> list[dict]:
+        client, _creds = _build_bybit_client(bybit_cfg)
+        snaps = client.get_positions()
+        out: list[dict] = []
+        for s in snaps:
+            if not s.size or float(s.size) <= 0:
+                continue
+            out.append({
+                "inst_id": s.inst_id,
+                "pos_side": s.pos_side,
+                "size": float(s.size),
+                "entry_price": float(s.entry_price),
+                "mark_price": float(s.mark_price),
+                "unrealized_pnl_usd": float(s.unrealized_pnl),
+                "leverage": int(s.leverage),
+            })
+        return out
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_probe), timeout=6.0)
     except Exception:
         return None
 
@@ -207,6 +266,7 @@ async def build_dashboard_state(
     """
     on_chain_24h_since = datetime.now(tz=timezone.utc) - timedelta(hours=24)
     wallet_task = asyncio.create_task(fetch_wallet(bybit_cfg))
+    live_positions_task = asyncio.create_task(fetch_live_positions(bybit_cfg))
 
     async with ReadOnlyJournal(db_path) as j:
         closed = await j.list_closed_trades(since=clean_since)
@@ -244,7 +304,11 @@ async def build_dashboard_state(
         on_chain_latest = _normalize_on_chain_row(on_chain_latest)
 
     on_chain_series = _build_on_chain_series(on_chain_24h)
+    on_chain_candles = _build_exchange_candles_24h(on_chain_24h)
+    on_chain_per_asset = _build_per_venue_per_asset_series_24h(on_chain_24h)
+    on_chain_aggregate_per_asset = _build_aggregate_per_asset_series_24h(on_chain_24h)
     wallet = await wallet_task
+    live_positions = await live_positions_task
 
     return {
         "generated_at": datetime.now(tz=timezone.utc).isoformat(),
@@ -258,8 +322,12 @@ async def build_dashboard_state(
         "reject_reason_counts": dict(reject_counts.most_common()),
         "on_chain_latest": on_chain_latest,
         "on_chain_series_24h": on_chain_series,
+        "on_chain_candles_24h": on_chain_candles,
+        "on_chain_per_venue_per_asset_24h": on_chain_per_asset,
+        "on_chain_aggregate_per_asset_24h": on_chain_aggregate_per_asset,
         "whale_transfers_recent": whale_recent,
         "wallet": wallet,
+        "live_positions": live_positions,
         "counts": {
             "closed_total": len(closed),
             "open_total": len(open_trades),
@@ -296,7 +364,163 @@ def _build_on_chain_series(rows: list[dict]) -> dict:
     return series
 
 
-_JSON_DICT_KEYS = ("token_volume_1h_net_usd_json",)
+_EXCHANGE_NETFLOW_FIELDS: tuple[tuple[str, str], ...] = (
+    ("coinbase", "cex_coinbase_netflow_24h_usd"),
+    ("binance", "cex_binance_netflow_24h_usd"),
+    ("bybit", "cex_bybit_netflow_24h_usd"),
+    ("bitfinex", "cex_bitfinex_netflow_24h_usd"),
+    ("kraken", "cex_kraken_netflow_24h_usd"),
+    ("okx", "cex_okx_netflow_24h_usd"),
+)
+
+
+def _build_exchange_candles_24h(rows: list[dict]) -> dict:
+    """Bucket on_chain_snapshots into 96 \u00d7 15min OHLC candles per named CEX.
+
+    The underlying value is `cex_<venue>_netflow_24h_usd` \u2014 a *rolling 24h*
+    aggregate sampled every \u22485 min by the writer. So each candle's OHLC
+    represents how that rolling sum drifted within the 15-min slot:
+      open  = first sample's value, close = last sample's value,
+      high  = max sample, low = min sample.
+    Empty slots emit `null` so the frontend can render a gap while keeping
+    a stable 24h X-axis (96 evenly-spaced slots, ending at the current
+    UTC quarter-hour). Color (frontend): green if close > open
+    (rolling-sum trending up = inflow accelerating), red otherwise.
+    """
+    end_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    end_ms = (end_ms // (15 * 60 * 1000)) * (15 * 60 * 1000)
+    slot_ms = 15 * 60 * 1000
+
+    parsed: list[tuple[int, dict]] = []
+    for r in rows or []:
+        ts = r.get("captured_at")
+        if not ts:
+            continue
+        try:
+            t = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=timezone.utc)
+            parsed.append((int(t.timestamp() * 1000), r))
+        except (TypeError, ValueError):
+            continue
+    parsed.sort(key=lambda p: p[0])
+
+    out: dict[str, list[dict]] = {label: [] for label, _ in _EXCHANGE_NETFLOW_FIELDS}
+    for i in range(96):
+        start = end_ms - (95 - i) * slot_ms
+        end = start + slot_ms
+        bucket = [(ms, row) for ms, row in parsed if start <= ms < end]
+        ts_iso = datetime.fromtimestamp(start / 1000, tz=timezone.utc).isoformat()
+        for label, field in _EXCHANGE_NETFLOW_FIELDS:
+            vals = [float(row[field]) for _, row in bucket
+                    if row.get(field) is not None]
+            if not vals:
+                out[label].append({"ts": ts_iso, "o": None, "h": None,
+                                    "l": None, "c": None})
+                continue
+            out[label].append({
+                "ts": ts_iso,
+                "o": vals[0],
+                "h": max(vals),
+                "l": min(vals),
+                "c": vals[-1],
+            })
+    return out
+
+
+_JSON_DICT_KEYS = (
+    "token_volume_1h_net_usd_json",
+    "cex_per_venue_btc_netflow_24h_usd_json",
+    "cex_per_venue_eth_netflow_24h_usd_json",
+    "cex_per_venue_stables_netflow_24h_usd_json",
+)
+
+
+_PER_ASSET_FIELD_MAP: tuple[tuple[str, str], ...] = (
+    ("btc",     "cex_per_venue_btc_netflow_24h_usd_json"),
+    ("eth",     "cex_per_venue_eth_netflow_24h_usd_json"),
+    ("stables", "cex_per_venue_stables_netflow_24h_usd_json"),
+)
+
+
+def _build_per_venue_per_asset_series_24h(rows: list[dict]) -> dict:
+    """Slice on_chain_snapshots rows into per-venue × per-asset 24h series.
+
+    Returns ``{venue: {asset: [{ts, v}, ...]}}`` where venue ∈
+    coinbase/binance/bybit/bitfinex/kraken/okx and asset ∈ btc/eth/stables.
+    Source columns are JSON-encoded dicts ``{venue: signed_usd_float}``
+    written by the runner's background fetcher; this function unrolls them
+    into per-venue arrays so each card can render 3 independent lines.
+
+    Pre-feature rows (where the JSON columns are NULL) silently contribute
+    nothing — the array stays empty for that timestamp + venue + asset.
+    """
+    import json as _json
+    out: dict[str, dict[str, list[dict]]] = {
+        venue: {"btc": [], "eth": [], "stables": []}
+        for venue, _ in _EXCHANGE_NETFLOW_FIELDS
+    }
+    for r in rows or []:
+        ts = r.get("captured_at")
+        if not ts:
+            continue
+        for asset_key, field in _PER_ASSET_FIELD_MAP:
+            raw = r.get(field)
+            if not isinstance(raw, str) or not raw:
+                continue
+            try:
+                d = _json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(d, dict):
+                continue
+            for venue, _ in _EXCHANGE_NETFLOW_FIELDS:
+                v = d.get(venue)
+                if v is None:
+                    continue
+                try:
+                    out[venue][asset_key].append({"ts": ts, "v": float(v)})
+                except (TypeError, ValueError):
+                    continue
+    return out
+
+
+def _build_aggregate_per_asset_series_24h(rows: list[dict]) -> dict:
+    """Sum per-venue × per-asset values across all 6 venues per timestamp.
+
+    Frontend renders this as the "Total netflow per asset" panel below the
+    6-card grid. A timestamp contributes only if at least one venue has
+    a value for that asset (so the line stays empty during pre-feature
+    rows where the JSON columns are NULL).
+    """
+    import json as _json
+    out: dict[str, list[dict]] = {"btc": [], "eth": [], "stables": []}
+    for r in rows or []:
+        ts = r.get("captured_at")
+        if not ts:
+            continue
+        for asset_key, field in _PER_ASSET_FIELD_MAP:
+            raw = r.get(field)
+            if not isinstance(raw, str) or not raw:
+                continue
+            try:
+                d = _json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(d, dict):
+                continue
+            total: Optional[float] = None
+            for venue, _ in _EXCHANGE_NETFLOW_FIELDS:
+                v = d.get(venue)
+                if v is None:
+                    continue
+                try:
+                    total = (total or 0.0) + float(v)
+                except (TypeError, ValueError):
+                    continue
+            if total is not None:
+                out[asset_key].append({"ts": ts, "v": total})
+    return out
 
 
 def _normalize_on_chain_row(row: dict) -> dict:
