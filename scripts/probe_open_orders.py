@@ -50,25 +50,38 @@ def main() -> int:
               f"entry={p.entry_price:<12} mark={p.mark_price:<12} "
               f"upl={p.unrealized_pnl:+.2f} lev={p.leverage}x")
 
-    # Position-attached TP/SL pair (visible in /v5/position/list, not a
-    # separate order). We re-query via list_pending_algos which on Bybit
-    # is a back-compat shim that surfaces TP/SL from positions.
+    # Position-attached TP/SL: read from the raw /v5/position/list response.
+    # On Bybit V5 TP/SL is a property of the position itself (not a separate
+    # algo order), so we surface it alongside the position rather than as a
+    # separate "algos" listing.
     print()
     print("=" * 78)
     print("POSITION-ATTACHED TP/SL  (Bybit V5: part of position, not a separate algo)")
     print("=" * 78)
     try:
-        tpsl_rows = client.list_pending_algos()
+        raw_resp = client.session.get_positions(
+            category=client.category, settleCoin="USDT",
+        )
+        rows = (raw_resp or {}).get("result", {}).get("list", []) or []
     except Exception as exc:
+        rows = []
         print(f"  list failed: {exc!r}")
-    else:
-        if not tpsl_rows:
-            print("  (none)")
-        for row in tpsl_rows:
-            print(f"  inst={row.get('instId'):<18} "
-                  f"posSide={row.get('posSide'):<5} "
-                  f"slTrig={row.get('slTriggerPx'):<12} "
-                  f"tpTrig={row.get('tpTriggerPx'):<12}")
+    if not rows:
+        print("  (none)")
+    for row in rows:
+        sym_bybit = row.get("symbol", "")
+        size = float(row.get("size") or 0.0)
+        if size == 0:
+            continue
+        sl = row.get("stopLoss") or "-"
+        tp = row.get("takeProfit") or "-"
+        pos_idx = int(row.get("positionIdx") or 0)
+        side = "long" if pos_idx == 1 else "short" if pos_idx == 2 else (
+            row.get("side", "?").lower())
+        print(f"  inst={sym_bybit:<14} "
+              f"posSide={side:<5} "
+              f"slTrig={str(sl):<12} "
+              f"tpTrig={str(tp):<12}")
 
     print()
     print("=" * 78)

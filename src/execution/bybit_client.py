@@ -15,9 +15,10 @@ Bybit V5 architectural notes (vs the pre-migration wrapper):
   - **TP/SL is a property of the position**, attached at order placement
     via `takeProfit`/`stopLoss` fields on POST /v5/order/create OR
     mutated post-fill via POST /v5/position/trading-stop. There is NO
-    separate algo order to cancel/replace. The old `place_oco_algo` /
-    `cancel_algo` / `list_pending_algos` surface is replaced by a single
-    `set_position_tpsl()` method.
+    separate algo order to cancel/replace. The pre-migration
+    `place_oco_algo` / `cancel_algo` / `list_pending_algos` surface
+    was replaced by a single `set_position_tpsl()` method (the back-compat
+    shims were removed in the 2026-04-26 OKX cleanup, Phase 7).
   - **Symbol format** is `BTCUSDT` (linear perp). Internally we still
     call the parameter `inst_id` to keep journal column names + dataclass
     field names stable across the migration; the value is just a Bybit
@@ -973,91 +974,6 @@ class BybitClient:
                 return {}
             raise
         return _check(resp, "set_trading_stop")
-
-    def place_oco_algo(
-        self,
-        inst_id: str,
-        pos_side: str,
-        size_contracts: float,
-        sl_trigger_px: float,
-        tp_trigger_px: float,
-        td_mode: str = "isolated",
-        client_algo_id: Optional[str] = None,
-        trigger_px_type: str = "mark",
-    ) -> AlgoResult:
-        """Back-compat shim: route OCO calls through `set_position_tpsl`.
-
-        Returns an AlgoResult with `algo_id=""` so callers that record the
-        algo id end up with an empty string — the journal column stays in
-        place but holds no separate-order ID (TP/SL is now part of the
-        position itself, not a separate order).
-        """
-        self.set_position_tpsl(
-            inst_id=inst_id,
-            pos_side=pos_side,
-            take_profit=tp_trigger_px,
-            stop_loss=sl_trigger_px,
-            tpsl_mode="Full",
-            trigger_px_type=trigger_px_type,
-        )
-        return AlgoResult(
-            algo_id="",
-            client_algo_id=client_algo_id or "",
-            sl_trigger_px=sl_trigger_px,
-            tp_trigger_px=tp_trigger_px,
-            raw={},
-        )
-
-    def cancel_algo(self, inst_id: str, algo_id: str) -> dict:
-        """Back-compat shim: clear both legs of TP/SL on the position.
-
-        pre-migration code paths that called `cancel_algo` to remove an OCO
-        before re-placing now clear the position's TP+SL via trading-stop.
-        Caller passes `algo_id` (ignored — TP/SL is identified by symbol +
-        positionIdx, not a separate algo ID).
-        """
-        # algo_id is ignored on Bybit — TP/SL is symbol+side keyed. To honor
-        # cancel intent we'd need pos_side, which the legacy signature doesn't
-        # carry; surface as a no-op success for back-compat. New code paths
-        # call `set_position_tpsl(stop_loss=0.0, take_profit=0.0)` directly.
-        return {}
-
-    def list_pending_algos(
-        self, inst_id: Optional[str] = None, ord_type: str = "oco",
-    ) -> list[dict]:
-        """Back-compat shim: Bybit has no separate algo-list endpoint
-        because TP/SL is part of the position. Reads `/v5/position/list`
-        and returns rows where `takeProfit` or `stopLoss` is set, in a
-        shape that loosely matches the pre-migration algo row (algoId="", instId,
-        slTriggerPx, tpTriggerPx, posSide).
-
-        Used only by the orphan-OCO startup sweep; on Bybit there are no
-        orphan algos to cancel, so this is informational only."""
-        kwargs: dict[str, Any] = {"category": self.category}
-        if inst_id:
-            kwargs["symbol"] = _to_bybit_symbol(inst_id)
-        else:
-            kwargs["settleCoin"] = "USDT"
-        try:
-            resp = self.session.get_positions(**kwargs)
-        except Exception as exc:
-            raise BybitError(f"list_pending_algos: {exc}") from exc
-        result = _check(resp, "list_pending_algos")
-        out: list[dict] = []
-        for row in result.get("list") or []:
-            tp = row.get("takeProfit")
-            sl = row.get("stopLoss")
-            if not tp and not sl:
-                continue
-            pos_idx = int(row.get("positionIdx") or 0)
-            out.append({
-                "algoId": "",
-                "instId": _from_bybit_symbol(row.get("symbol", "")),
-                "posSide": "long" if pos_idx == 1 else "short" if pos_idx == 2 else "",
-                "slTriggerPx": str(sl or ""),
-                "tpTriggerPx": str(tp or ""),
-            })
-        return out
 
     def close_position(
         self, inst_id: str, pos_side: str, td_mode: str = "isolated",
