@@ -26,7 +26,7 @@ AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT lin
 
 ## Changelog
 
-### 2026-04-26 (late-late-night, +4) — OKX residue cleanup (8-phase atomic sweep)
+### 2026-04-26 (late-late-night, +4) — OKX residue cleanup (9-phase atomic sweep)
 
 Operator-driven post-migration audit. The 2026-04-25 OKX → Bybit V5
 execution-layer rewrite was a single-day swap that left adjacent
@@ -119,11 +119,27 @@ DB sorun olmasın"):**
     (preserves diagnostic output, no shim needed).
   - `AlgoResult` data class kept — `order_router` still composes
     empty-`algo_id` records to populate the legacy journal column.
-- **Phase 8** (this commit): final CLAUDE.md sync — this changelog
+- **Phase 8** (commit 36c972e): final CLAUDE.md sync — this changelog
   entry plus reflecting the Phase 4-7 renames in the architectural
   notes section ("Internal symbol format kept OKX-style" → "Internal
   canonical symbol format"; map names; helper names; "Adding a 6th+
   pair" instructions).
+- **Phase 9** (commit 5616a82): marginal text-only sweep across the 15
+  files that the main 8-phase pass left with residual OKX strings in
+  comments / docstrings / test fixtures. Notable: `tests/test_altcoin_index_penalty.py`
+  config fixture `"okx": {api_key, api_secret, passphrase}` rewritten
+  to `"bybit": {api_key, api_secret, demo}` — that test moved
+  FAIL → PASS (it had been on the leftover-failure list).
+  `tests/test_pending_monitor.py` mock class `_FakeOKX` → `_FakeBybit`
+  (collection-time rename so the test module imports cleanly).
+  `tests/test_economic_calendar.py` env-var monkeypatch
+  `OKX_API_KEY/SECRET/PASSPHRASE` → `BYBIT_API_KEY/SECRET/DEMO`,
+  mirroring the Phase 2 fix in `test_bot_config.py`. After this pass
+  every remaining "OKX" / "okx" string in non-doc files is one of:
+  (a) the 6th CEX netflow venue (`cex_okx_netflow_24h_usd`, dashboard
+  tile, `affected_symbols_for` venue tuple, dict key `"okx"`),
+  (b) a cleanup-changelog meta-reference, or (c) the symbol literals
+  `BTC-USDT-SWAP` etc. (intentionally kept canonical).
 
 **What was deliberately NOT changed (out of scope):**
 
