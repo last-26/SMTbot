@@ -1755,6 +1755,73 @@ function _altIndexHint(v) {
   return "neutral band";
 }
 
+// Mirror of strategy/entry_signals.py::_flow_alignment_score so the macro
+// panel can show the composite without backend plumbing. Range [-1, +1].
+// Stables IN to CEX = bullish (natural sign); BTC/ETH/per-entity OUT = bullish (inverted sign).
+function _computeFlowAlignment(snap, noiseFloor) {
+  if (!snap) return null;
+  const floor = noiseFloor || 1_000_000;
+  const sgn = (x) => {
+    if (x === null || x === undefined) return 0;
+    if (Math.abs(x) < floor) return 0;
+    return x > 0 ? 1 : -1;
+  };
+  const stable = sgn(snap.stablecoin_pulse_1h_usd);
+  const btc = -sgn(snap.cex_btc_netflow_24h_usd);
+  const eth = -sgn(snap.cex_eth_netflow_24h_usd);
+  const cb = -sgn(snap.cex_coinbase_netflow_24h_usd);
+  const bn = -sgn(snap.cex_binance_netflow_24h_usd);
+  const by = -sgn(snap.cex_bybit_netflow_24h_usd);
+  // If all 6 inputs are 0 (no data), return null instead of 0 to render "—".
+  if (stable === 0 && btc === 0 && eth === 0 && cb === 0 && bn === 0 && by === 0) {
+    const allMissing = [
+      snap.stablecoin_pulse_1h_usd, snap.cex_btc_netflow_24h_usd,
+      snap.cex_eth_netflow_24h_usd, snap.cex_coinbase_netflow_24h_usd,
+      snap.cex_binance_netflow_24h_usd, snap.cex_bybit_netflow_24h_usd,
+    ].every(v => v === null || v === undefined);
+    if (allMissing) return null;
+  }
+  const score = 0.25 * stable + 0.25 * btc + 0.15 * eth + 0.15 * cb + 0.10 * bn + 0.10 * by;
+  return Math.max(-1, Math.min(1, score));
+}
+
+function _flowAlignmentTone(score) {
+  if (score === null || score === undefined) return "";
+  if (score >= 0.25) return "pos";
+  if (score <= -0.25) return "neg";
+  return "amber";
+}
+
+function _flowAlignmentLabel(score) {
+  if (score === null || score === undefined) return "no data";
+  if (score >= 0.5) return "strong bullish";
+  if (score >= 0.25) return "bullish lean";
+  if (score <= -0.5) return "strong bearish";
+  if (score <= -0.25) return "bearish lean";
+  return "neutral / mixed";
+}
+
+// Pick the venue with the most inflow (max positive) and the most outflow
+// (min negative) across the 6 named CEX entities on the latest snapshot.
+function _topVenueFlow(snap, direction) {
+  if (!snap) return null;
+  const venues = [
+    { id: "coinbase", label: "Coinbase", v: snap.cex_coinbase_netflow_24h_usd },
+    { id: "binance",  label: "Binance",  v: snap.cex_binance_netflow_24h_usd },
+    { id: "bybit",    label: "Bybit",    v: snap.cex_bybit_netflow_24h_usd },
+    { id: "bitfinex", label: "Bitfinex", v: snap.cex_bitfinex_netflow_24h_usd },
+    { id: "kraken",   label: "Kraken",   v: snap.cex_kraken_netflow_24h_usd },
+    { id: "okx",      label: "OKX",      v: snap.cex_okx_netflow_24h_usd },
+  ].filter(x => x.v !== null && x.v !== undefined);
+  if (!venues.length) return null;
+  if (direction === "in") {
+    venues.sort((a, b) => b.v - a.v);
+    return venues[0].v > 0 ? venues[0] : null;
+  }
+  venues.sort((a, b) => a.v - b.v);
+  return venues[0].v < 0 ? venues[0] : null;
+}
+
 function renderMacroPanel(rootSel, snap, series) {
   const root = document.querySelector(rootSel);
   if (!root) return;
@@ -1828,6 +1895,42 @@ function renderMacroPanel(rootSel, snap, series) {
         ? `age ${snap.snapshot_age_s}s · ${snap.fresh ? "fresh" : "stale"}`
         : "no snapshot yet",
     },
+    (() => {
+      const score = _computeFlowAlignment(snap);
+      return {
+        id: "flowalign",
+        label: "Flow alignment",
+        pill: "6-input",
+        value: score,
+        fmt: (v) => v === null || v === undefined ? "—" : (v >= 0 ? "+" : "") + fmtNum(v, 2),
+        tone: _flowAlignmentTone(score),
+        sub: _flowAlignmentLabel(score),
+      };
+    })(),
+    (() => {
+      const top = _topVenueFlow(snap, "in");
+      return {
+        id: "topin",
+        label: "Top CEX inflow",
+        pill: "24h",
+        value: top ? top.v : null,
+        fmt: fmtFlowM,
+        tone: top ? "neg" : "",
+        sub: top ? `${top.label} · most bearish venue` : "no positive inflow",
+      };
+    })(),
+    (() => {
+      const top = _topVenueFlow(snap, "out");
+      return {
+        id: "topout",
+        label: "Top CEX outflow",
+        pill: "24h",
+        value: top ? top.v : null,
+        fmt: fmtFlowM,
+        tone: top ? "pos" : "",
+        sub: top ? `${top.label} · most bullish venue` : "no negative outflow",
+      };
+    })(),
   ];
 
   root.innerHTML = tiles.map(t => `

@@ -151,6 +151,25 @@ UI-only polish pass on [src/dashboard/static/index.html](src/dashboard/static/in
 2. **Bybit demo wallet rate-limit** — wallet endpoint has its own quota separate from order/position. 2 calls × 2/min = 240/h. If `bybit_demo_dns_pin_failed` or wallet tile NULL rate spikes, half the cadence.
 3. **Operator session timezone correctness** — daylight-saving doesn't apply to TR (fixed UTC+3 since 2016). If TR ever re-introduces DST, `TZ_OFFSET_MIN` becomes a function of the date.
 
+### 2026-04-26 (late-late-night, +1) — Macro panel: flow_alignment + top venue tiles
+
+Pure presentation-layer extension to the macro pulse panel. Three new tiles surface Arkham fields already present in `on_chain_latest` payload — zero backend changes.
+
+- **Flow alignment** — composite [-1, +1] computed in JS from the 6-input formula mirrored from `strategy/entry_signals.py::_flow_alignment_score` (stables 0.25 + BTC 0.25 + ETH 0.15 + Coinbase 0.15 + Binance 0.10 + Bybit 0.10). Same noise-floor semantics ($1M default → 0). Tone: pos ≥+0.25 / neg ≤-0.25 / amber otherwise. Sub-line: "strong bullish / bullish lean / neutral / bearish lean / strong bearish". Not pulled from `trades.on_chain_flow_alignment_now` (that column lives on trade rows, not snapshots) — recomputing on the dashboard side keeps the macro panel self-contained on `on_chain_latest`.
+- **Top CEX inflow** — picks max-positive of the 6 named venues (Coinbase / Binance / Bybit / Bitfinex / Kraken / OKX) on the latest snapshot. Tile colour `neg` (inflow = bearish bias). Sub: "<Venue> · most bearish venue". Hidden ("no positive inflow") if all 6 are non-positive.
+- **Top CEX outflow** — picks min-negative. Tile `pos` (outflow = bullish). Sub: "<Venue> · most bullish venue".
+
+Macro grid `repeat(3, 1fr)` already accommodates 9 tiles (3x3) with no CSS change. `fmtFlowM` handles signed M/B/K formatting unchanged.
+
+**Coinalyze derivatives NOT added.** `DerivativesState` (per-symbol funding, OI 1h%, LS-ratio z) lives only on the bot side; surfacing requires a `state.py` payload extension. Deferred — the operator's question was "useful additions" and this commit covers the immediate Arkham wins; Coinalyze tiles are a separate plumbing pass.
+
+**Files touched:** `src/dashboard/static/index.html` only — 3 new helpers (`_computeFlowAlignment`, `_flowAlignmentTone`, `_flowAlignmentLabel`, `_topVenueFlow`) + 3 IIFE tile entries appended to the `tiles` array in `renderMacroPanel`.
+
+**Re-eval triggers:**
+1. **Flow alignment NULL rate** — should match the underlying snapshot field coverage. If `on_chain_latest` has all 6 fields populated (post-2026-04-23 freeze fix this is normal) but tile shows "—", `_computeFlowAlignment` is mis-keyed.
+2. **Top venue tile flicker** — if Coinbase / Binance keep flipping inflow→outflow rank between polls, the 24h rolling values are oscillating near zero; consider a hysteresis or magnitude floor before claiming a "winner".
+3. **Score divergence vs runtime** — periodic spot check: snapshot `on_chain_flow_alignment_now` from a recent `trades` row should equal dashboard tile within 0.05 (different snapshot, slight time skew). Larger gap = formula or weight drift.
+
 ### 2026-04-26 (night) — Read-only single-page dashboard + demo balance reset
 
 Two paired changes triggered by the operator wanting to inspect live trade
