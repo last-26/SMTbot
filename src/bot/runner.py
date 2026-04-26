@@ -89,6 +89,7 @@ from src.execution.position_monitor import PendingEvent, PositionMonitor
 from src.journal.database import TradeJournal
 from src.journal.derivatives_journal import DerivativesJournal
 from src.strategy.entry_signals import (
+    _flow_alignment_score,
     build_trade_plan_with_reason,
     evaluate_pending_invalidation_gates,
     in_vwap_reset_blackout,
@@ -605,6 +606,15 @@ class BotContext:
     # (token_volume_refresh_s, default 3600). Journal-only.
     token_volume_1h_net_usd_json: Optional[str] = None
     last_token_volume_ts: float = 0.0
+    # 2026-04-26 — per-symbol MarketState cache (entry-TF MarketState only).
+    # Populated at the END of each per-symbol cycle so the intra-trade
+    # position-snapshot writer can read oscillator + VWAP-band drift outside
+    # the per-symbol cycle. Stale on first cycle for each symbol post-restart;
+    # the writer treats absence as None and stamps NULL on the row.
+    last_market_state_per_symbol: dict[str, MarketState] = field(default_factory=dict)
+    # Monotonic ts of last position-snapshot batch write. Cadence-gated by
+    # `journal.position_snapshot_cadence_s` (default 300s). 0.0 = never.
+    last_position_snapshot_ts: float = 0.0
 
 
 # ── Runner ──────────────────────────────────────────────────────────────────
@@ -1853,6 +1863,12 @@ class BotRunner:
         # them — the attachment is for journal write consistency only.
         state.on_chain = self.ctx.on_chain_snapshot
         state.whale_blackout = self.ctx.whale_blackout_state
+        # 2026-04-26 — cache entry-TF MarketState for the intra-trade
+        # position-snapshot writer. Read by `_maybe_write_position_snapshots`
+        # (called from `_process_closes`) without needing a fresh TF switch.
+        # Cached AFTER on_chain/whale attachment so the snapshot row's
+        # oscillator + VWAP fields match this cycle's downstream consumers.
+        self.ctx.last_market_state_per_symbol[symbol] = state
         buf = self.ctx.multi_tf.get_buffer(tf_key)
         # 100 candles is enough for EMA55 seeding in the zone builder's
         # ema21_pullback source; legacy confluence consumers only read the tail.
@@ -2413,12 +2429,123 @@ class BotRunner:
 
     async def _process_closes(self) -> None:
         try:
-            fills = await asyncio.to_thread(self.ctx.monitor.poll)
+            fills, live_snaps = await asyncio.to_thread(self.ctx.monitor.poll)
         except Exception:
             logger.exception("monitor_poll_failed")
             return
         for fill in fills:
             await self._handle_close(fill)
+        # 2026-04-26 — cadence-gated intra-trade journal snapshot writer.
+        # Reads `live_snaps` from the same poll above (no extra Bybit call).
+        # No-op when feature disabled or cadence not yet elapsed.
+        await self._maybe_write_position_snapshots(live_snaps)
+
+    async def _maybe_write_position_snapshots(
+        self, live_snaps: list,
+    ) -> None:
+        """Cadence-gated intra-trade journal writer for RL trajectory data.
+
+        For every OPEN position present in `live_snaps`, writes one row to
+        `position_snapshots` capturing live mark/PnL, running MFE/MAE in R,
+        active SL/TP, lifecycle flags, and drift fields for derivatives /
+        on-chain / oscillator / VWAP. All inputs are read from cached state
+        (BotContext + monitor._Tracked + per-symbol MarketState cache) —
+        zero extra Bybit / TV / Arkham / Coinalyze calls.
+
+        Cadence is bumped once per WRITE WINDOW after the loop, so all
+        positions in a tick land on the same captured_at and the next
+        window opens cadence_s seconds later.
+        """
+        cfg = self.ctx.config.journal
+        if not cfg.position_snapshot_enabled:
+            return
+        now_mono = time.monotonic()
+        if now_mono - self.ctx.last_position_snapshot_ts < cfg.position_snapshot_cadence_s:
+            return
+        if not live_snaps:
+            return
+        snap_arkham = self.ctx.on_chain_snapshot
+        deriv_cache = self.ctx.derivatives_cache
+        captured_at = _utc_now()
+        wrote_any = False
+        for snap in live_snaps:
+            tracked = self.ctx.monitor.get_tracked(snap.inst_id, snap.pos_side)
+            if tracked is None or tracked.plan_sl_price <= 0:
+                continue
+            trade_id = self.ctx.open_trade_ids.get((snap.inst_id, snap.pos_side))
+            if not trade_id:
+                continue
+            sl_dist = abs(tracked.entry_price - tracked.plan_sl_price)
+            if sl_dist <= 0:
+                continue
+            sign = 1.0 if snap.pos_side == "long" else -1.0
+            r_now = sign * (snap.mark_price - tracked.entry_price) / sl_dist
+            deriv = deriv_cache.get(snap.inst_id) if deriv_cache is not None else None
+            funding_now = oi_now = ls_now = long_liq_now = short_liq_now = None
+            if deriv is not None:
+                funding_now = float(deriv.funding_rate_current)
+                oi_now = float(deriv.open_interest_usd) if deriv.open_interest_usd else None
+                ls_now = float(deriv.long_short_ratio) if deriv.long_short_ratio else None
+                long_liq_now = float(deriv.long_liq_notional_1h) if deriv.long_liq_notional_1h else None
+                short_liq_now = float(deriv.short_liq_notional_1h) if deriv.short_liq_notional_1h else None
+            btc_netflow_now = stable_pulse_now = flow_align_now = None
+            if snap_arkham is not None:
+                btc_netflow_now = snap_arkham.cex_btc_netflow_24h_usd
+                stable_pulse_now = snap_arkham.stablecoin_pulse_1h_usd
+                flow_align_now = _flow_alignment_score(
+                    stablecoin_pulse_1h_usd=snap_arkham.stablecoin_pulse_1h_usd,
+                    btc_netflow_24h_usd=snap_arkham.cex_btc_netflow_24h_usd,
+                    eth_netflow_24h_usd=snap_arkham.cex_eth_netflow_24h_usd,
+                    coinbase_netflow_24h_usd=snap_arkham.cex_coinbase_netflow_24h_usd,
+                    binance_netflow_24h_usd=snap_arkham.cex_binance_netflow_24h_usd,
+                    bybit_netflow_24h_usd=snap_arkham.cex_bybit_netflow_24h_usd,
+                )
+            mstate = self.ctx.last_market_state_per_symbol.get(snap.inst_id)
+            osc_3m_json: dict = {}
+            vwap_3m_dist_atr = None
+            if mstate is not None:
+                try:
+                    osc_3m_json = mstate.oscillator.model_dump()
+                except Exception:
+                    osc_3m_json = {}
+                atr = mstate.atr or 0.0
+                upper = mstate.signal_table.vwap_3m_upper
+                lower = mstate.signal_table.vwap_3m_lower
+                if atr > 0 and upper > 0 and lower > 0:
+                    band_mid = (upper + lower) / 2.0
+                    vwap_3m_dist_atr = (snap.mark_price - band_mid) / atr
+            try:
+                await self.ctx.journal.record_position_snapshot(
+                    trade_id=trade_id,
+                    captured_at=captured_at,
+                    mark_price=float(snap.mark_price),
+                    unrealized_pnl_usdt=float(snap.unrealized_pnl),
+                    unrealized_pnl_r=float(r_now),
+                    mfe_r_so_far=float(tracked.mfe_r_high),
+                    mae_r_so_far=float(tracked.mae_r_low),
+                    current_sl_price=float(tracked.sl_price or tracked.plan_sl_price),
+                    current_tp_price=float(tracked.tp2_price) if tracked.tp2_price else None,
+                    sl_to_be_moved=bool(tracked.be_already_moved),
+                    mfe_lock_applied=bool(tracked.sl_lock_applied),
+                    derivatives_funding_now=funding_now,
+                    derivatives_oi_now_usd=oi_now,
+                    derivatives_ls_ratio_now=ls_now,
+                    derivatives_long_liq_1h_now=long_liq_now,
+                    derivatives_short_liq_1h_now=short_liq_now,
+                    on_chain_btc_netflow_now_usd=btc_netflow_now,
+                    on_chain_stablecoin_pulse_now=stable_pulse_now,
+                    on_chain_flow_alignment_now=flow_align_now,
+                    oscillator_3m_now_json=osc_3m_json,
+                    vwap_3m_distance_atr_now=vwap_3m_dist_atr,
+                )
+                wrote_any = True
+            except Exception:
+                logger.exception(
+                    "position_snapshot_write_failed inst={} side={}",
+                    snap.inst_id, snap.pos_side,
+                )
+        if wrote_any:
+            self.ctx.last_position_snapshot_ts = now_mono
 
     # ── Arkham on-chain snapshot scheduler (Phase B) ────────────────────────
 

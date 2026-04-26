@@ -82,7 +82,7 @@ def test_tp1_fill_triggers_sl_to_be():
         algo_ids=["ALG1", "ALG2"], tp2_price=105.0,
     )
 
-    fills = monitor.poll()
+    fills, _ = monitor.poll()
     assert fills == []
     # TP2 algo was cancelled, new algo placed with SL=entry on 5 contracts
     assert client.cancelled == [("BTC-USDT-SWAP", "ALG2")]
@@ -174,7 +174,7 @@ def test_full_close_does_not_trigger_sl_move():
         "BTC-USDT-SWAP", "long", 10.0, 100.0,
         algo_ids=["ALG1", "ALG2"], tp2_price=105.0,
     )
-    fills = monitor.poll()
+    fills, _ = monitor.poll()
     assert len(fills) == 1
     assert isinstance(fills[0], CloseFill)
     # No replacement OCO placed (the key contract of SL-to-BE on a

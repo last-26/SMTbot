@@ -371,6 +371,12 @@ bybit:
 
 journal:
   db_path: "data/trades.db"
+  # Intra-trade snapshot writer for RL trajectory analysis. Captures live
+  # mark/PnL + running MFE/MAE in R + active SL/TP + lifecycle flags +
+  # derivatives/on-chain/oscillator drift every cadence_s seconds for every
+  # OPEN position. Reuses cached state — zero extra Bybit / TV calls.
+  position_snapshot_enabled: true
+  position_snapshot_cadence_s: 300       # 5 min; validator clamps [60, 3600]
 
 reentry:
   min_bars_after_close: 3             # cooldown in bars of entry_timeframe

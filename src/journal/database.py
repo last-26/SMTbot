@@ -30,6 +30,7 @@ import aiosqlite
 from src.data.models import Direction
 from src.execution.models import CloseFill, ExecutionReport
 from src.journal.models import (
+    PositionSnapshotRecord,
     RejectedSignal,
     TradeOutcome,
     TradeRecord,
@@ -297,6 +298,59 @@ CREATE TABLE IF NOT EXISTS whale_transfers (
 
 CREATE INDEX IF NOT EXISTS idx_whale_transfers_captured_at ON whale_transfers(captured_at);
 CREATE INDEX IF NOT EXISTS idx_whale_transfers_token       ON whale_transfers(token);
+
+-- 2026-04-26 — position_snapshots intra-trade time-series.
+-- One row per OPEN position per `journal.position_snapshot_cadence_s`
+-- (default 300s) with live mark/PnL + running MFE/MAE in R + current
+-- SL/TP + lifecycle flags + drift fields for derivatives + on-chain +
+-- 3m oscillator + VWAP-band distance. Joined back to `trades.trade_id`
+-- at read time (soft FK; same pattern as on_chain_snapshots).
+-- Cost-free: live mark/PnL come from the `get_positions` payload the
+-- monitor already polls every 5s; drift fields read from BotContext
+-- caches (no extra Bybit, no extra TV switch).
+CREATE TABLE IF NOT EXISTS position_snapshots (
+    id                              INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id                        TEXT NOT NULL,
+    captured_at                     TEXT NOT NULL,
+
+    -- Live position state (Bybit get_positions response).
+    mark_price                      REAL NOT NULL,
+    unrealized_pnl_usdt             REAL NOT NULL,
+    unrealized_pnl_r                REAL NOT NULL,
+
+    -- Running excursion (tracked on every 5s poll, not just on snapshot
+    -- write — peaks aren't missed between cadence ticks).
+    mfe_r_so_far                    REAL NOT NULL,
+    mae_r_so_far                    REAL NOT NULL,
+
+    -- Active SL/TP and lifecycle flags (from monitor._Tracked).
+    current_sl_price                REAL NOT NULL,
+    current_tp_price                REAL,
+    sl_to_be_moved                  INTEGER NOT NULL DEFAULT 0,
+    mfe_lock_applied                INTEGER NOT NULL DEFAULT 0,
+
+    -- Derivatives drift (from BotContext.derivatives_cache, may be NULL
+    -- if Coinalyze fetch failed or symbol map cold).
+    derivatives_funding_now         REAL,
+    derivatives_oi_now_usd          REAL,
+    derivatives_ls_ratio_now        REAL,
+    derivatives_long_liq_1h_now     REAL,
+    derivatives_short_liq_1h_now    REAL,
+
+    -- On-chain drift (from BotContext.on_chain_snapshot, may be NULL
+    -- if Arkham snapshot stale / disabled).
+    on_chain_btc_netflow_now_usd    REAL,
+    on_chain_stablecoin_pulse_now   REAL,
+    on_chain_flow_alignment_now     REAL,
+
+    -- Oscillator + VWAP drift (from BotContext.last_market_state_per_symbol,
+    -- NULL on first cycle for that symbol post-restart).
+    oscillator_3m_now_json          TEXT,
+    vwap_3m_distance_atr_now        REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_position_snapshots_trade_id    ON position_snapshots(trade_id);
+CREATE INDEX IF NOT EXISTS idx_position_snapshots_captured_at ON position_snapshots(captured_at);
 """
 
 
@@ -363,6 +417,23 @@ _REJECTED_COLUMNS = [
     "price_change_1h_pct_at_entry",
     "price_change_4h_pct_at_entry",
     "liq_heatmap_top_clusters_json",
+]
+
+
+# 2026-04-26 — Column order for INSERT into position_snapshots.
+# Mirrors `_SCHEMA` table layout (excluding the AUTOINCREMENT `id`).
+_POSITION_SNAPSHOT_COLUMNS = [
+    "trade_id", "captured_at",
+    "mark_price", "unrealized_pnl_usdt", "unrealized_pnl_r",
+    "mfe_r_so_far", "mae_r_so_far",
+    "current_sl_price", "current_tp_price",
+    "sl_to_be_moved", "mfe_lock_applied",
+    "derivatives_funding_now", "derivatives_oi_now_usd",
+    "derivatives_ls_ratio_now",
+    "derivatives_long_liq_1h_now", "derivatives_short_liq_1h_now",
+    "on_chain_btc_netflow_now_usd", "on_chain_stablecoin_pulse_now",
+    "on_chain_flow_alignment_now",
+    "oscillator_3m_now_json", "vwap_3m_distance_atr_now",
 ]
 
 
@@ -481,6 +552,31 @@ _MIGRATIONS = [
     # 2026-04-24 — 6th venue: OKX (bot's own trading exchange). Journal-only;
     # 24h net ≈ 0 by design but captured for parity + Pass 3 exploration.
     "ALTER TABLE on_chain_snapshots ADD COLUMN cex_okx_netflow_24h_usd REAL",
+    # 2026-04-26 — position_snapshots intra-trade time-series for RL trajectory
+    # data. Idempotent CREATE on existing DBs (CREATE TABLE IF NOT EXISTS already
+    # in _SCHEMA; explicit migration here lets the indexes land too on bases
+    # where _SCHEMA was applied before this commit). Each statement wrapped in
+    # the OperationalError swallow loop in connect() so re-running is a no-op.
+    "CREATE TABLE IF NOT EXISTS position_snapshots ("
+    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+    "trade_id TEXT NOT NULL, captured_at TEXT NOT NULL, "
+    "mark_price REAL NOT NULL, unrealized_pnl_usdt REAL NOT NULL, "
+    "unrealized_pnl_r REAL NOT NULL, "
+    "mfe_r_so_far REAL NOT NULL, mae_r_so_far REAL NOT NULL, "
+    "current_sl_price REAL NOT NULL, current_tp_price REAL, "
+    "sl_to_be_moved INTEGER NOT NULL DEFAULT 0, "
+    "mfe_lock_applied INTEGER NOT NULL DEFAULT 0, "
+    "derivatives_funding_now REAL, derivatives_oi_now_usd REAL, "
+    "derivatives_ls_ratio_now REAL, "
+    "derivatives_long_liq_1h_now REAL, derivatives_short_liq_1h_now REAL, "
+    "on_chain_btc_netflow_now_usd REAL, on_chain_stablecoin_pulse_now REAL, "
+    "on_chain_flow_alignment_now REAL, "
+    "oscillator_3m_now_json TEXT, vwap_3m_distance_atr_now REAL"
+    ")",
+    "CREATE INDEX IF NOT EXISTS idx_position_snapshots_trade_id "
+    "ON position_snapshots(trade_id)",
+    "CREATE INDEX IF NOT EXISTS idx_position_snapshots_captured_at "
+    "ON position_snapshots(captured_at)",
 ]
 
 
@@ -1437,6 +1533,135 @@ class TradeJournal:
                 to_entity=r["to_entity"],
                 tx_hash=r["tx_hash"],
                 affected_symbols=[str(s) for s in parsed_symbols],
+            ))
+        return out
+
+    async def record_position_snapshot(
+        self,
+        *,
+        trade_id: str,
+        captured_at: datetime,
+        mark_price: float,
+        unrealized_pnl_usdt: float,
+        unrealized_pnl_r: float,
+        mfe_r_so_far: float,
+        mae_r_so_far: float,
+        current_sl_price: float,
+        current_tp_price: Optional[float] = None,
+        sl_to_be_moved: bool = False,
+        mfe_lock_applied: bool = False,
+        derivatives_funding_now: Optional[float] = None,
+        derivatives_oi_now_usd: Optional[float] = None,
+        derivatives_ls_ratio_now: Optional[float] = None,
+        derivatives_long_liq_1h_now: Optional[float] = None,
+        derivatives_short_liq_1h_now: Optional[float] = None,
+        on_chain_btc_netflow_now_usd: Optional[float] = None,
+        on_chain_stablecoin_pulse_now: Optional[float] = None,
+        on_chain_flow_alignment_now: Optional[float] = None,
+        oscillator_3m_now_json: Optional[dict] = None,
+        vwap_3m_distance_atr_now: Optional[float] = None,
+    ) -> int:
+        """Append one row to `position_snapshots` — intra-trade time-series.
+
+        Cadence-gated by the runner (`_maybe_write_position_snapshots`); this
+        method is a dumb writer. Returns the new row id; the runner's batch
+        loop ignores it.
+
+        Drift fields default to None so unit tests can write the bare minimum.
+        Production caller passes everything it has from
+        `BotContext.{derivatives_cache, on_chain_snapshot,
+        last_market_state_per_symbol}` and lets None propagate when the
+        relevant cache is cold.
+        """
+        conn = self._require_conn()
+        cur = await conn.execute(
+            """INSERT INTO position_snapshots (
+                   trade_id, captured_at,
+                   mark_price, unrealized_pnl_usdt, unrealized_pnl_r,
+                   mfe_r_so_far, mae_r_so_far,
+                   current_sl_price, current_tp_price,
+                   sl_to_be_moved, mfe_lock_applied,
+                   derivatives_funding_now, derivatives_oi_now_usd,
+                   derivatives_ls_ratio_now,
+                   derivatives_long_liq_1h_now, derivatives_short_liq_1h_now,
+                   on_chain_btc_netflow_now_usd, on_chain_stablecoin_pulse_now,
+                   on_chain_flow_alignment_now,
+                   oscillator_3m_now_json, vwap_3m_distance_atr_now
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                trade_id,
+                _iso(captured_at),
+                float(mark_price),
+                float(unrealized_pnl_usdt),
+                float(unrealized_pnl_r),
+                float(mfe_r_so_far),
+                float(mae_r_so_far),
+                float(current_sl_price),
+                (None if current_tp_price is None else float(current_tp_price)),
+                int(bool(sl_to_be_moved)),
+                int(bool(mfe_lock_applied)),
+                derivatives_funding_now,
+                derivatives_oi_now_usd,
+                derivatives_ls_ratio_now,
+                derivatives_long_liq_1h_now,
+                derivatives_short_liq_1h_now,
+                on_chain_btc_netflow_now_usd,
+                on_chain_stablecoin_pulse_now,
+                on_chain_flow_alignment_now,
+                (None if oscillator_3m_now_json is None
+                 else json.dumps(oscillator_3m_now_json)),
+                vwap_3m_distance_atr_now,
+            ),
+        )
+        await conn.commit()
+        return int(cur.lastrowid or 0)
+
+    async def get_position_snapshots(
+        self, trade_id: str,
+    ) -> list[PositionSnapshotRecord]:
+        """Read all snapshots for one trade ordered by capture time.
+
+        JSON `oscillator_3m_now_json` parses to dict (empty on missing /
+        malformed). Optional drift columns surface as None when NULL.
+        """
+        conn = self._require_conn()
+        async with conn.execute(
+            "SELECT * FROM position_snapshots "
+            "WHERE trade_id = ? ORDER BY captured_at ASC, id ASC",
+            (trade_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        out: list[PositionSnapshotRecord] = []
+        for r in rows:
+            raw_osc = r["oscillator_3m_now_json"]
+            try:
+                parsed_osc = json.loads(raw_osc) if raw_osc else {}
+                if not isinstance(parsed_osc, dict):
+                    parsed_osc = {}
+            except (TypeError, ValueError):
+                parsed_osc = {}
+            out.append(PositionSnapshotRecord(
+                trade_id=r["trade_id"],
+                captured_at=_parse_iso(r["captured_at"]),
+                mark_price=r["mark_price"],
+                unrealized_pnl_usdt=r["unrealized_pnl_usdt"],
+                unrealized_pnl_r=r["unrealized_pnl_r"],
+                mfe_r_so_far=r["mfe_r_so_far"],
+                mae_r_so_far=r["mae_r_so_far"],
+                current_sl_price=r["current_sl_price"],
+                current_tp_price=r["current_tp_price"],
+                sl_to_be_moved=bool(r["sl_to_be_moved"]),
+                mfe_lock_applied=bool(r["mfe_lock_applied"]),
+                derivatives_funding_now=r["derivatives_funding_now"],
+                derivatives_oi_now_usd=r["derivatives_oi_now_usd"],
+                derivatives_ls_ratio_now=r["derivatives_ls_ratio_now"],
+                derivatives_long_liq_1h_now=r["derivatives_long_liq_1h_now"],
+                derivatives_short_liq_1h_now=r["derivatives_short_liq_1h_now"],
+                on_chain_btc_netflow_now_usd=r["on_chain_btc_netflow_now_usd"],
+                on_chain_stablecoin_pulse_now=r["on_chain_stablecoin_pulse_now"],
+                on_chain_flow_alignment_now=r["on_chain_flow_alignment_now"],
+                oscillator_3m_now_json=parsed_osc,
+                vwap_3m_distance_atr_now=r["vwap_3m_distance_atr_now"],
             ))
         return out
 

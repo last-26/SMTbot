@@ -174,6 +174,11 @@ class FakeMonitor:
         self.registered: list[tuple[str, str, float, float]] = []
         self.register_extras: list[dict] = []
         self.queued_fills: list[CloseFill] = []
+        # 2026-04-26 — runner.poll() now returns (fills, live_snaps).
+        # Tests that need the live-snap path push PositionSnapshot rows here;
+        # default empty preserves existing test contracts.
+        self.queued_live_snaps: list[PositionSnapshot] = []
+        self.tracked_overrides: dict[tuple[str, str], object] = {}
         self.poll_count = 0
         self.revise_calls: list[tuple[str, str, float]] = []
 
@@ -195,14 +200,19 @@ class FakeMonitor:
              "tp_limit_order_id": tp_limit_order_id}
         )
 
-    def poll(self, inst_id: Optional[str] = None) -> list[CloseFill]:
+    def poll(self, inst_id: Optional[str] = None) -> tuple[list[CloseFill], list[PositionSnapshot]]:
         self.poll_count += 1
         fills = self.queued_fills
         self.queued_fills = []
-        return fills
+        live_snaps = self.queued_live_snaps
+        self.queued_live_snaps = []
+        return fills, live_snaps
 
     def get_tracked_runner(self, inst_id: str, pos_side: str):
         return None  # no-op: dynamic-TP gate exits early in tests
+
+    def get_tracked(self, inst_id: str, pos_side: str):
+        return self.tracked_overrides.get((inst_id, pos_side))
 
     def revise_runner_tp(self, inst_id: str, pos_side: str, new_tp: float) -> bool:
         self.revise_calls.append((inst_id, pos_side, new_tp))

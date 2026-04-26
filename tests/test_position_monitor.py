@@ -32,7 +32,7 @@ def _snap(inst="BTC-USDT-SWAP", side="long", size=3.0, entry=67000.0) -> Positio
 def test_fresh_monitor_has_no_tracked_positions():
     mon = PositionMonitor(FakeClient())
     assert mon.tracked_count == 0
-    assert mon.poll() == []
+    assert mon.poll()[0] == []
 
 
 def test_register_open_tracks_position():
@@ -47,7 +47,7 @@ def test_poll_emits_no_fill_while_position_still_open():
     client.snapshots = [_snap()]
     mon = PositionMonitor(client)
     mon.register_open("BTC-USDT-SWAP", "long", 3.0, 67000.0)
-    assert mon.poll() == []
+    assert mon.poll()[0] == []
     assert mon.tracked_count == 1
 
 
@@ -58,7 +58,7 @@ def test_poll_emits_fill_when_position_disappears():
     mon.register_open("BTC-USDT-SWAP", "long", 3.0, 67000.0)
     mon.poll()  # still open
     client.snapshots = []  # SL/TP closed the position
-    fills = mon.poll()
+    fills, _ = mon.poll()
     assert len(fills) == 1
     assert fills[0].inst_id == "BTC-USDT-SWAP"
     assert fills[0].pos_side == "long"
@@ -76,7 +76,7 @@ def test_poll_updates_cached_entry_price_on_partial_fill():
     client.snapshots = [_snap(entry=67250.0)]
     mon.poll()
     client.snapshots = []
-    fill = mon.poll()[0]
+    fill = mon.poll()[0][0]
     assert fill.entry_price == 67250.0
 
 
@@ -87,7 +87,7 @@ def test_poll_only_closes_tracked_on_matching_inst_id():
     mon.register_open("ETH-USDT-SWAP", "long", 1.0, 3500.0)
     # BTC poll only — ETH row is absent but should NOT be closed by this poll.
     client.snapshots = [_snap()]
-    fills = mon.poll(inst_id="BTC-USDT-SWAP")
+    fills, _ = mon.poll(inst_id="BTC-USDT-SWAP")
     assert fills == []
     assert mon.tracked_count == 2
 
@@ -509,7 +509,7 @@ def test_poll_cancels_tp_limit_when_position_closes():
     )
     mon.poll()  # still open
     client.snapshots = []  # position closed
-    fills = mon.poll()
+    fills, _ = mon.poll()
     assert len(fills) == 1
     assert client.cancelled_orders == [("BTC-USDT-SWAP", "TP_LIMIT_ORD_123")]
 
@@ -541,7 +541,7 @@ def test_poll_tolerates_idempotent_tp_limit_cancel_failure():
     )
     mon.poll()
     client.snapshots = []
-    fills = mon.poll()
+    fills, _ = mon.poll()
     assert len(fills) == 1
 
 
@@ -559,7 +559,7 @@ def test_poll_tolerates_generic_tp_limit_cancel_exception():
     )
     mon.poll()
     client.snapshots = []
-    fills = mon.poll()
+    fills, _ = mon.poll()
     assert len(fills) == 1
 
 
@@ -665,7 +665,7 @@ def test_poll_close_sweeps_algo_ids():
     assert client.cancelled_orders == []
 
     client.snapshots = []         # maker-TP filled → position flat
-    fills = mon.poll()
+    fills, _ = mon.poll()
     assert len(fills) == 1
     # Maker-TP limit AND runner OCO both swept.
     assert client.cancelled_orders == [("BTC-USDT-SWAP", "TP_LIMIT_ID")]
@@ -685,7 +685,7 @@ def test_poll_close_sweeps_multiple_algos():
     )
     mon.poll()
     client.snapshots = []
-    fills = mon.poll()
+    fills, _ = mon.poll()
     assert len(fills) == 1
     assert client.cancelled == [
         ("BTC-USDT-SWAP", "TP1_ALGO"),
@@ -710,7 +710,7 @@ def test_poll_close_sweep_tolerates_already_gone_code():
     )
     mon.poll()
     client.snapshots = []
-    fills = mon.poll()          # must not raise
+    fills, _ = mon.poll()          # must not raise
     assert len(fills) == 1
     # We still attempted the cancel; 51400 was swallowed.
     assert client.cancelled == [("BTC-USDT-SWAP", "ALGO_RUNNER")]
@@ -733,7 +733,7 @@ def test_poll_close_sweep_tolerates_unknown_cancel_error():
     )
     mon.poll()
     client.snapshots = []
-    fills = mon.poll()          # must not raise
+    fills, _ = mon.poll()          # must not raise
     assert len(fills) == 1
     assert client.cancelled == [("BTC-USDT-SWAP", "ALGO_RUNNER")]
 
@@ -750,6 +750,6 @@ def test_poll_close_sweep_skips_empty_algo_list():
     )
     mon.poll()
     client.snapshots = []
-    fills = mon.poll()
+    fills, _ = mon.poll()
     assert len(fills) == 1
     assert client.cancelled == []      # nothing to cancel

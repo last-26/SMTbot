@@ -343,6 +343,22 @@ class BybitConfigBlock(BaseModel):
 
 class JournalConfig(BaseModel):
     db_path: str = "data/trades.db"
+    # Intra-trade snapshot writer — captures live mark/PnL + running MFE/MAE
+    # + active SL/TP + lifecycle flags + derivatives/on-chain/oscillator drift
+    # every cadence_s seconds for every OPEN position. Reuses cached state;
+    # zero extra Bybit / TV calls. RL trajectory analysis only — never feeds
+    # entry/exit decisions.
+    position_snapshot_enabled: bool = True
+    position_snapshot_cadence_s: int = 300
+
+    @field_validator("position_snapshot_cadence_s")
+    @classmethod
+    def _validate_position_snapshot_cadence(cls, v: int) -> int:
+        if not 60 <= v <= 3600:
+            raise ValueError(
+                "position_snapshot_cadence_s must be in [60, 3600] (seconds)"
+            )
+        return v
 
 
 class ExecutionConfig(BaseModel):

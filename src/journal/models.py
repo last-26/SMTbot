@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
@@ -354,3 +354,44 @@ class WhaleTransferRecord(BaseModel):
     # to every watched symbol; chain-native collapses to one). Mirrors
     # `affected_symbols_for()` output at event time.
     affected_symbols: list[str] = Field(default_factory=list)
+
+
+class PositionSnapshotRecord(BaseModel):
+    """One intra-trade state snapshot for an OPEN position.
+
+    Joined back to `trades.trade_id` at read time. Captured every
+    `journal.position_snapshot_cadence_s` seconds (default 300s) for every
+    OPEN position, so the post-hoc RL/GBT layer can answer "could this trade
+    have been exited at +1.3R when MFE peaked?" without any extra exchange
+    API cost — `mark_price` + `unrealized_pnl_usdt` come from the live
+    `get_positions` payload the monitor already polls every 5s, the drift
+    fields read from `BotContext.{derivatives_cache, on_chain_snapshot,
+    last_market_state_per_symbol}` caches.
+
+    Optional fields (all `*_now*` columns) may be None when the relevant
+    cache is cold (first cycle for a symbol post-restart, Arkham fetch
+    failed, etc.) — readers should treat None as MISSING-by-coverage, not
+    "value was zero".
+    """
+
+    trade_id: str
+    captured_at: datetime
+    mark_price: float
+    unrealized_pnl_usdt: float
+    unrealized_pnl_r: float
+    mfe_r_so_far: float
+    mae_r_so_far: float
+    current_sl_price: float
+    current_tp_price: Optional[float] = None
+    sl_to_be_moved: bool = False
+    mfe_lock_applied: bool = False
+    derivatives_funding_now: Optional[float] = None
+    derivatives_oi_now_usd: Optional[float] = None
+    derivatives_ls_ratio_now: Optional[float] = None
+    derivatives_long_liq_1h_now: Optional[float] = None
+    derivatives_short_liq_1h_now: Optional[float] = None
+    on_chain_btc_netflow_now_usd: Optional[float] = None
+    on_chain_stablecoin_pulse_now: Optional[float] = None
+    on_chain_flow_alignment_now: Optional[float] = None
+    oscillator_3m_now_json: dict[str, Any] = Field(default_factory=dict)
+    vwap_3m_distance_atr_now: Optional[float] = None

@@ -88,6 +88,14 @@ class _Tracked:
     # wick-captures. Empty string when disabled or the resting-limit leg
     # failed to place (position still protected by OCO, just no maker-TP).
     tp_limit_order_id: str = ""
+    # 2026-04-26 — running MFE / MAE in R units, updated on every poll
+    # (every 5s) so peaks aren't missed between cadence-gated journal
+    # snapshot writes (default 5min). Memory-only; rehydrated positions
+    # restart from 0/0 — see CLAUDE.md restart caveat. Sign convention:
+    # mfe_r_high is the most-positive R reached (peak favourable),
+    # mae_r_low is the most-negative R reached (deepest adverse).
+    mfe_r_high: float = 0.0
+    mae_r_low: float = 0.0
 
 
 @dataclass
@@ -195,24 +203,37 @@ class PositionMonitor:
             tp_limit_order_id=tp_limit_order_id,
         )
 
-    def poll(self, inst_id: Optional[str] = None) -> list[CloseFill]:
-        """Pull current positions from OKX, emit fills for anything that closed.
+    def poll(
+        self, inst_id: Optional[str] = None,
+    ) -> tuple[list[CloseFill], list[PositionSnapshot]]:
+        """Pull current positions from Bybit, emit fills for anything that
+        closed, and return the live snapshots so the runner can write
+        intra-trade journal rows without a second API call.
 
         As a side-effect on the way, if a partial TP1 fill is detected and
         `move_sl_to_be_enabled`, cancel the remaining TP2 algo and place a
         new SL-at-breakeven OCO for the surviving contracts.
+
+        Also updates running `mfe_r_high` / `mae_r_low` on each tracked
+        position so the cadence-gated `position_snapshots` writer sees
+        peaks captured between snapshot ticks.
+
+        Return shape: `(fills, live_snaps)`. `live_snaps` is the list of
+        currently-OPEN PositionSnapshot rows for tracked positions only —
+        a closed position appears in `fills` (one CloseFill) but NOT in
+        `live_snaps` (it has no current state to snapshot).
         """
-        live_snaps: dict[tuple[str, str], PositionSnapshot] = {}
+        live_snaps_map: dict[tuple[str, str], PositionSnapshot] = {}
         for snap in self.client.get_positions(inst_id=inst_id):
             if snap.size != 0.0:
-                live_snaps[(snap.inst_id, snap.pos_side)] = snap
+                live_snaps_map[(snap.inst_id, snap.pos_side)] = snap
 
         fills: list[CloseFill] = []
         to_remove: list[tuple[str, str]] = []
         for key, tracked in self._tracked.items():
             if inst_id is not None and key[0] != inst_id:
                 continue  # skip tracked positions on other instruments this poll
-            if key not in live_snaps:
+            if key not in live_snaps_map:
                 # Tracked position no longer live → it closed.
                 fills.append(self._close_fill_from(tracked))
                 # Best-effort cancel the resting TP limit so it doesn't
@@ -230,8 +251,9 @@ class PositionMonitor:
                 # `_cancel_algos_best_effort` call that lived here).
                 to_remove.append(key)
             else:
-                snap = live_snaps[key]
+                snap = live_snaps_map[key]
                 self._detect_tp1_and_move_sl(tracked, snap)
+                self._update_excursion(tracked, snap)
                 # Refresh cached entry_price/size from the live row
                 tracked.size = snap.size
                 if snap.entry_price > 0:
@@ -240,7 +262,35 @@ class PositionMonitor:
         for key in to_remove:
             self._tracked.pop(key, None)
 
-        return fills
+        # Live snaps for the runner snapshot writer — only positions still
+        # tracked AND still in the live map (closed positions stay in
+        # `fills`, gone from this list).
+        live_snaps_out = [
+            live_snaps_map[k] for k in self._tracked.keys()
+            if k in live_snaps_map
+        ]
+        return fills, live_snaps_out
+
+    def _update_excursion(
+        self, t: _Tracked, snap: PositionSnapshot,
+    ) -> None:
+        """Update running MFE / MAE in R units on the tracked position.
+
+        Skips silently when plan_sl_price is unset (rehydrate sentinel
+        0.0) or zero-distance (fill price == plan SL, malformed).
+        Direction-aware: for shorts, "favorable" means mark below entry.
+        """
+        if t.plan_sl_price <= 0:
+            return
+        sl_dist = abs(t.entry_price - t.plan_sl_price)
+        if sl_dist <= 0:
+            return
+        sign = 1.0 if t.pos_side == "long" else -1.0
+        r_now = sign * (snap.mark_price - t.entry_price) / sl_dist
+        if r_now > t.mfe_r_high:
+            t.mfe_r_high = r_now
+        if r_now < t.mae_r_low:
+            t.mae_r_low = r_now
 
     def _detect_tp1_and_move_sl(
         self, t: _Tracked, snap: PositionSnapshot,
@@ -417,6 +467,19 @@ class PositionMonitor:
             "last_tp_revise_at": t.last_tp_revise_at,
             "sl_lock_applied": t.sl_lock_applied,
         }
+
+    def get_tracked(
+        self, inst_id: str, pos_side: str,
+    ) -> Optional[_Tracked]:
+        """Read-only handle to the full _Tracked record for the journal
+        snapshot writer. Returns None when no live position exists.
+
+        Returns the live dataclass — caller must not mutate. Used by the
+        runner's `_maybe_write_position_snapshots` to read entry_price,
+        plan_sl_price, sl_price, tp2_price, mfe_r_high/mae_r_low, and
+        the BE / lock flags in one shot.
+        """
+        return self._tracked.get((inst_id, pos_side))
 
     def lock_sl_at(
         self, inst_id: str, pos_side: str, new_sl: float,

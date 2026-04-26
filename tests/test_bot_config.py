@@ -451,3 +451,44 @@ def test_on_chain_section_absent_still_produces_default():
     cfg = BotConfig(**raw)
     # Default factory gives us the fully-off OnChainConfig.
     assert cfg.on_chain.enabled is False
+
+
+# ── JournalConfig — intra-trade snapshot writer ───────────────────────────
+
+
+def test_journal_position_snapshot_defaults_match_yaml_intent():
+    raw = _valid_raw()
+    cfg = BotConfig(**raw)
+    assert cfg.journal.position_snapshot_enabled is True
+    assert cfg.journal.position_snapshot_cadence_s == 300
+
+
+def test_journal_position_snapshot_cadence_rejects_below_floor():
+    raw = _valid_raw()
+    raw["journal"]["position_snapshot_cadence_s"] = 30
+    with pytest.raises(ValidationError, match=r"position_snapshot_cadence_s"):
+        BotConfig(**raw)
+
+
+def test_journal_position_snapshot_cadence_rejects_above_ceiling():
+    raw = _valid_raw()
+    raw["journal"]["position_snapshot_cadence_s"] = 7200
+    with pytest.raises(ValidationError, match=r"position_snapshot_cadence_s"):
+        BotConfig(**raw)
+
+
+def test_journal_position_snapshot_cadence_accepts_boundaries():
+    raw = _valid_raw()
+    raw["journal"]["position_snapshot_cadence_s"] = 60
+    cfg = BotConfig(**raw)
+    assert cfg.journal.position_snapshot_cadence_s == 60
+    raw["journal"]["position_snapshot_cadence_s"] = 3600
+    cfg = BotConfig(**raw)
+    assert cfg.journal.position_snapshot_cadence_s == 3600
+
+
+def test_journal_position_snapshot_can_be_disabled():
+    raw = _valid_raw()
+    raw["journal"]["position_snapshot_enabled"] = False
+    cfg = BotConfig(**raw)
+    assert cfg.journal.position_snapshot_enabled is False
