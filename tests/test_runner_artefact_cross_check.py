@@ -68,7 +68,7 @@ async def test_cross_check_disabled_when_client_is_none(make_ctx):
     async with ctx.journal:
         trade_id = await _seed_open_trade(ctx)
         enriched = make_close_fill(pnl_usdt=12.0)
-        fakes.okx_client.enrich_return = enriched
+        fakes.bybit_client.enrich_return = enriched
         await runner._handle_close(enriched)
 
         got = await ctx.journal.get_trade(trade_id)
@@ -95,7 +95,7 @@ async def test_cross_check_unmapped_symbol_skips(make_ctx):
         )
         ctx.open_trade_ids[("BTC-USDT", "long")] = rec.trade_id
         enriched = make_close_fill(inst_id="BTC-USDT", pnl_usdt=12.0)
-        fakes.okx_client.enrich_return = enriched
+        fakes.bybit_client.enrich_return = enriched
         await runner._handle_close(enriched)
 
         got = await ctx.journal.get_trade(rec.trade_id)
@@ -118,7 +118,7 @@ async def test_cross_check_prices_inside_candles_marks_valid(make_ctx):
     async with ctx.journal:
         trade_id = await _seed_open_trade(ctx)
         enriched = make_close_fill(pnl_usdt=15.0)
-        fakes.okx_client.enrich_return = enriched
+        fakes.bybit_client.enrich_return = enriched
         await runner._handle_close(enriched)
 
         got = await ctx.journal.get_trade(trade_id)
@@ -143,7 +143,7 @@ async def test_cross_check_exit_above_real_high_flags_artifact(make_ctx):
     async with ctx.journal:
         trade_id = await _seed_open_trade(ctx)
         enriched = make_close_fill(exit_price=68_500.0, pnl_usdt=15.0)
-        fakes.okx_client.enrich_return = enriched
+        fakes.bybit_client.enrich_return = enriched
         await runner._handle_close(enriched)
 
         got = await ctx.journal.get_trade(trade_id)
@@ -169,7 +169,7 @@ async def test_cross_check_partial_feed_none_side(make_ctx):
     async with ctx.journal:
         trade_id = await _seed_open_trade(ctx)
         enriched = make_close_fill(pnl_usdt=15.0)
-        fakes.okx_client.enrich_return = enriched
+        fakes.bybit_client.enrich_return = enriched
         await runner._handle_close(enriched)
 
         got = await ctx.journal.get_trade(trade_id)
@@ -190,7 +190,7 @@ async def test_cross_check_both_sides_missing_leaves_none(make_ctx):
     async with ctx.journal:
         trade_id = await _seed_open_trade(ctx)
         enriched = make_close_fill(pnl_usdt=15.0)
-        fakes.okx_client.enrich_return = enriched
+        fakes.bybit_client.enrich_return = enriched
         await runner._handle_close(enriched)
 
         got = await ctx.journal.get_trade(trade_id)

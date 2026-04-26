@@ -24,7 +24,7 @@ from src.journal.models import TradeOutcome
 from src.strategy.risk_manager import RiskManager
 from tests.conftest import (
     FakeMonitor,
-    FakeOKXClient,
+    FakeBybitClient,
     FakeReader,
     FakeRouter,
     make_close_fill,
@@ -109,10 +109,10 @@ async def test_dedup_clears_after_close_is_processed(monkeypatch, make_ctx):
     async with ctx.journal:
         await runner.run_once()                          # open #1
         # Queue the close — enrichment returns a real-looking fill
-        fakes.okx_client.enrich_return = make_close_fill(pnl_usdt=30.0)
+        fakes.bybit_client.enrich_return = make_close_fill(pnl_usdt=30.0)
         fakes.monitor.queued_fills.append(make_close_fill(pnl_usdt=0.0))
         await runner.run_once()                          # process close → clears dedup
-        fakes.okx_client.enrich_return = None
+        fakes.bybit_client.enrich_return = None
         await runner.run_once()                          # can open again
 
     assert len(fakes.router.calls) == 2
@@ -168,7 +168,7 @@ async def test_process_closes_flows_through_enrichment_and_updates_risk(monkeypa
         # replaces with pnl=+30
         _patch_plan_builder(monkeypatch, None)
         fakes.monitor.queued_fills.append(make_close_fill(pnl_usdt=0.0))
-        fakes.okx_client.enrich_return = make_close_fill(pnl_usdt=30.0)
+        fakes.bybit_client.enrich_return = make_close_fill(pnl_usdt=30.0)
         await runner.run_once()
 
         rec = await ctx.journal.get_trade(trade_id)
@@ -187,7 +187,7 @@ async def test_orphan_close_still_updates_risk_balance(monkeypatch, make_ctx):
     starting = fakes.risk_mgr.current_balance
     # Orphan close: no trade_id in open_trade_ids, but monitor emits a fill
     fakes.monitor.queued_fills.append(make_close_fill(pnl_usdt=0.0))
-    fakes.okx_client.enrich_return = make_close_fill(pnl_usdt=-15.0)
+    fakes.bybit_client.enrich_return = make_close_fill(pnl_usdt=-15.0)
     # Orphan close must still decrement risk_mgr.open_positions doesn't matter
     # (it's 0), but balance must update
     fakes.risk_mgr.open_positions = 1      # simulate: was opened, we forgot
@@ -272,8 +272,8 @@ async def test_rehydrate_places_fresh_tp_limit_for_open_position(
     async with ctx.journal:
         await runner._prime()
 
-    assert len(fakes.okx_client.tp_limits_placed) == 1
-    placed = fakes.okx_client.tp_limits_placed[0]
+    assert len(fakes.bybit_client.tp_limits_placed) == 1
+    placed = fakes.bybit_client.tp_limits_placed[0]
     assert placed["inst_id"] == "BTC-USDT-SWAP"
     assert placed["pos_side"] == "long"
     assert placed["post_only"] is True
@@ -306,7 +306,7 @@ async def test_rehydrate_skips_tp_limit_when_be_already_moved(
         await runner._prime()
 
     # Post-BE → no TP-limit re-placement; monitor still registered normally.
-    assert fakes.okx_client.tp_limits_placed == []
+    assert fakes.bybit_client.tp_limits_placed == []
     extras = fakes.monitor.register_extras[0]
     assert extras["be_already_moved"] is True
     assert extras["tp_limit_order_id"] == ""
@@ -333,7 +333,7 @@ async def test_rehydrate_skips_tp_limit_when_feature_disabled(
     async with ctx.journal:
         await runner._prime()
 
-    assert fakes.okx_client.tp_limits_placed == []
+    assert fakes.bybit_client.tp_limits_placed == []
     extras = fakes.monitor.register_extras[0]
     assert extras["tp_limit_order_id"] == ""
 
@@ -353,9 +353,9 @@ async def test_rehydrate_tolerates_tp_limit_place_failure(
             signal_timestamp=t0, entry_timestamp=t0,
         )
     cfg = make_config()
-    client = FakeOKXClient(tp_limit_place_raises=RuntimeError("51124"))
+    client = FakeBybitClient(tp_limit_place_raises=RuntimeError("51124"))
     journal = TradeJournal(str(db))
-    ctx, fakes = make_ctx(journal=journal, config=cfg, okx_client=client)
+    ctx, fakes = make_ctx(journal=journal, config=cfg, bybit_client=client)
     runner = BotRunner(ctx)
     async with ctx.journal:
         await runner._prime()
@@ -397,14 +397,14 @@ async def test_reconcile_logs_orphan_live_without_journal(monkeypatch, caplog, m
     messages: list[str] = []
     sink_id = logger.add(lambda m: messages.append(m), level="ERROR")
     try:
-        client = FakeOKXClient(positions=[
+        client = FakeBybitClient(positions=[
             PositionSnapshot(
                 inst_id="BTC-USDT-SWAP", pos_side="long",
                 size=5.0, entry_price=67_000.0, mark_price=67_100.0,
                 unrealized_pnl=5.0, leverage=10,
             ),
         ])
-        ctx, fakes = make_ctx(okx_client=client)
+        ctx, fakes = make_ctx(bybit_client=client)
         runner = BotRunner(ctx)
         async with ctx.journal:
             await runner._reconcile_orphans()
@@ -425,8 +425,8 @@ class _TradeSubStub:
         return {"code": "0", "data": list(self._rows)}
 
 
-class FakeOKXClientWithPending(FakeOKXClient):
-    """FakeOKXClient + the surfaces `_reconcile_orphans` touches:
+class FakeBybitClientWithPending(FakeBybitClient):
+    """FakeBybitClient + the surfaces `_reconcile_orphans` touches:
     `trade.get_order_list`, `cancel_order`, `list_pending_algos`,
     plus call logs so tests can assert."""
 
@@ -458,7 +458,7 @@ async def test_reconcile_cancels_every_resting_pending_limit(make_ctx):
     limit on OKX can't be tracked — reconcile must cancel them so they
     can't fill into an untracked (unprotected) position."""
     # Need Optional import for the helper class
-    client = FakeOKXClientWithPending(
+    client = FakeBybitClientWithPending(
         pending_limits=[
             {"instId": "ETH-USDT-SWAP", "ordId": "ORPH_ETH",
              "px": "2280.04", "sz": "29"},
@@ -466,7 +466,7 @@ async def test_reconcile_cancels_every_resting_pending_limit(make_ctx):
              "px": "620.3", "sz": "1182"},
         ],
     )
-    ctx, fakes = make_ctx(okx_client=client)
+    ctx, fakes = make_ctx(bybit_client=client)
     runner = BotRunner(ctx)
     async with ctx.journal:
         await runner._reconcile_orphans()
@@ -474,70 +474,10 @@ async def test_reconcile_cancels_every_resting_pending_limit(make_ctx):
     assert ("BNB-USDT-SWAP", "ORPH_BNB") in client.cancel_order_calls
 
 
-async def test_reconcile_cancels_surplus_oco_not_in_journal(tmp_path, make_ctx):
-    """A tracked position has journal.algo_ids = [ACTIVE_ID]. OKX has both
-    ACTIVE_ID and ORPH_ID for the same (inst, posSide). Reconcile must
-    cancel only the orphan."""
-    db = tmp_path / "trades.db"
-    t0 = datetime(2026, 4, 16, 9, tzinfo=UTC)
-    async with TradeJournal(str(db)) as seed:
-        rec = await seed.record_open(
-            make_plan(), make_report(),
-            symbol="DOGE-USDT-SWAP",
-            signal_timestamp=t0, entry_timestamp=t0,
-        )
-        await seed.update_algo_ids(rec.trade_id, ["ACTIVE_ID"])
-
-    client = FakeOKXClientWithPending(
-        positions=[
-            PositionSnapshot(
-                inst_id="DOGE-USDT-SWAP", pos_side="long",
-                size=64.0, entry_price=0.0937, mark_price=0.095,
-                unrealized_pnl=1.0, leverage=13,
-            ),
-        ],
-        pending_algos=[
-            {"algoId": "ACTIVE_ID", "instId": "DOGE-USDT-SWAP",
-             "posSide": "long", "slTriggerPx": "0.0937",
-             "tpTriggerPx": "0.0959"},
-            {"algoId": "ORPH_ID", "instId": "DOGE-USDT-SWAP",
-             "posSide": "long", "slTriggerPx": "0.0929",
-             "tpTriggerPx": "0.0959"},
-        ],
-    )
-    journal = TradeJournal(str(db))
-    ctx, fakes = make_ctx(okx_client=client, journal=journal)
-    runner = BotRunner(ctx)
-    async with ctx.journal:
-        await runner._prime()
-    assert ("DOGE-USDT-SWAP", "ORPH_ID") in client.cancel_algo_calls
-    assert ("DOGE-USDT-SWAP", "ACTIVE_ID") not in client.cancel_algo_calls
-
-
-async def test_reconcile_leaves_oco_for_keys_without_journal_row(make_ctx):
-    """If OKX has an OCO for a (inst, posSide) that has no journal OPEN
-    row, reconcile log-only flags it — does not cancel, since it might
-    be a legitimate live position the journal lost track of and auto-
-    canceling its stop could liquidate it."""
-    from loguru import logger
-    messages: list[str] = []
-    sink_id = logger.add(lambda m: messages.append(m), level="ERROR")
-    try:
-        client = FakeOKXClientWithPending(
-            pending_algos=[
-                {"algoId": "UNTRACKED", "instId": "XRP-USDT-SWAP",
-                 "posSide": "long", "slTriggerPx": "0.5",
-                 "tpTriggerPx": "0.6"},
-            ],
-        )
-        ctx, fakes = make_ctx(okx_client=client)
-        runner = BotRunner(ctx)
-        async with ctx.journal:
-            await runner._reconcile_orphans()
-        assert client.cancel_algo_calls == []
-        assert any("orphan_oco_no_journal_row" in m for m in messages)
-    finally:
-        logger.remove(sink_id)
+# Note: tests for `_cancel_surplus_ocos` were removed when that method
+# itself was deleted in the 2026-04-26 OKX cleanup (Phase 3). On Bybit V5
+# TP/SL is a position attribute, not a separate algo order, so there is
+# no orphan-OCO sweep to test.
 
 
 # ── Shutdown ────────────────────────────────────────────────────────────────

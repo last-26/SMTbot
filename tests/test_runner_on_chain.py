@@ -14,7 +14,7 @@ from src.journal.database import TradeJournal
 from src.strategy.risk_manager import RiskManager
 from tests.conftest import (
     FakeMonitor,
-    FakeOKXClient,
+    FakeBybitClient,
     FakeReader,
     FakeRouter,
     make_config,
@@ -58,7 +58,7 @@ def _make_runner(cfg: BotConfig, arkham_client: Any) -> BotRunner:
         router=FakeRouter(),
         monitor=FakeMonitor(),
         risk_mgr=RiskManager(cfg.bot.starting_balance, cfg.breakers()),
-        okx_client=FakeOKXClient(),
+        bybit_client=FakeBybitClient(),
         config=cfg,
     )
     ctx.arkham_client = arkham_client

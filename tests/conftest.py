@@ -313,11 +313,6 @@ class FakeBybitClient:
         )
 
 
-# Legacy alias — many tests still import this name. Points at the same
-# class so old test code doesn't need to be touched.
-FakeOKXClient = FakeBybitClient
-
-
 # ── Composite helper ────────────────────────────────────────────────────────
 
 
@@ -338,11 +333,7 @@ def make_ctx():
         multi_tf = overrides.pop("multi_tf", None) or FakeMultiTF()
         router = overrides.pop("router", None) or FakeRouter()
         monitor = overrides.pop("monitor", None) or FakeMonitor()
-        # Accept either keyword for back-compat: tests written before the
-        # Bybit migration pass `okx_client=`; new tests pass `bybit_client=`.
-        bybit_client = (overrides.pop("bybit_client", None)
-                        or overrides.pop("okx_client", None)
-                        or FakeBybitClient())
+        bybit_client = overrides.pop("bybit_client", None) or FakeBybitClient()
         journal = overrides.pop("journal", None) or TradeJournal(":memory:")
         risk_mgr = overrides.pop("risk_mgr", None) or RiskManager(
             cfg.bot.starting_balance, cfg.breakers())
@@ -353,10 +344,7 @@ def make_ctx():
         )
         fakes = SimpleNamespace(
             reader=reader, multi_tf=multi_tf, router=router,
-            monitor=monitor,
-            # Both names point at the same instance so tests using either
-            # vocabulary keep working. New code should use `bybit_client`.
-            bybit_client=bybit_client, okx_client=bybit_client,
+            monitor=monitor, bybit_client=bybit_client,
             journal=journal, risk_mgr=risk_mgr, config=cfg,
         )
         return ctx, fakes
