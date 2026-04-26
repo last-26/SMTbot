@@ -65,10 +65,18 @@ def regime_breakdown(
 ) -> dict[str, dict[str, float]]:
     """Per-derivatives-regime stats. Keys: regime label; values: dict with
     num_trades / win_rate / avg_r / expectancy_r. Trades with no regime tag
-    bucket into 'UNKNOWN' so they stay visible rather than silently dropping."""
+    bucket into 'UNKNOWN' so they stay visible rather than silently dropping.
+
+    2026-04-27 — `regime_at_entry` (DerivativesRegime classifier output)
+    was dropped from TradeRecord (always returned 'BALANCED' on the
+    Bybit dataset, 1-distinct constant). `trend_regime_at_entry` (ADX
+    classifier — 3-distinct: RANGING / WEAK_TREND / STRONG_TREND) is
+    the live regime signal and replaces the dropped column for this
+    bucket-by-regime breakdown.
+    """
     buckets: dict[str, list[TradeRecord]] = {}
     for t in closed:
-        key = (t.regime_at_entry or "UNKNOWN")
+        key = (getattr(t, "trend_regime_at_entry", None) or "UNKNOWN")
         buckets.setdefault(key, []).append(t)
     return {
         regime: {
