@@ -12,12 +12,13 @@ a bot commit; the read-only connection's `timeout=10` rides through it.
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import re
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import aiosqlite
 import yaml
@@ -310,7 +311,7 @@ async def build_dashboard_state(
     wallet = await wallet_task
     live_positions = await live_positions_task
 
-    return {
+    return _sanitize_floats({
         "generated_at": datetime.now(tz=timezone.utc).isoformat(),
         "starting_balance": starting_balance,
         "clean_since": clean_since.isoformat() if clean_since else None,
@@ -335,7 +336,27 @@ async def build_dashboard_state(
             "whale_total": len(whales),
             "on_chain_snapshots_total": len(on_chain_rows),
         },
-    }
+    })
+
+
+def _sanitize_floats(obj: Any) -> Any:
+    """Recursively replace inf / -inf / NaN with None.
+
+    FastAPI's JSONResponse uses `json.dumps(allow_nan=False)` and rejects
+    non-finite floats — `reporter.summary` legitimately returns
+    `profit_factor=inf` when there are no losses, which would 500 the
+    `/api/state` endpoint. Walk the payload once at the boundary and swap
+    non-finite floats for null so the frontend just sees a missing value.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _sanitize_floats(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_floats(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_sanitize_floats(v) for v in obj)
+    return obj
 
 
 def _build_on_chain_series(rows: list[dict]) -> dict:
