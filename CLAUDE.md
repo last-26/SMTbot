@@ -126,6 +126,31 @@ will decide whether any subset earns runtime scoring weight.
    adds ~24 series × 24 buckets × ~30 bytes = ~17 KB. New floor
    ~50 KB/poll. >100 KB sustained = the 24h slice limit lifted.
 
+### 2026-04-26 (late-late-night) — Dashboard UX polish session
+
+UI-only polish pass on [src/dashboard/static/index.html](src/dashboard/static/index.html). Zero backend / payload / strategy changes — every edit is in the single HTML file. Captures operator feedback across one observation session.
+
+**Changes:**
+- **Poll cadence 60s → 30s.** `POLL_MS` constant. Dashboard now refreshes twice per minute; cost stays trivial (RO journal read + 2 Bybit wallet calls).
+- **Display layer UTC → UTC+3 (Turkey).** DB stays UTC (bot is schema owner; RO dashboard does NOT mutate timestamps). Single helper `_toTzDate(s)` shifts a Date by `TZ_OFFSET_MIN=180` so subsequent `.toISOString().slice()` reads as TR-local. All `fmtTs` / `fmtTsShort` / `fmtTsHM` route through it; clock + per-asset hover + candle hover + last-update timestamp + Rejected-signals + on-chain "captured" line all carry `+03` suffix. Asia/London/NY session window indicators STILL evaluate on `getUTCHours()` (markets are absolute, not local).
+- **Edge-aligned x-axis tick labels** on candle chart + per-asset 3-line cards: first tick `textAlign="left"`, last tick `textAlign="right"`, middle ticks `"center"` — fixes label clipping at canvas edges that operator screenshotted.
+- **KPI tiles restructured 8 → 9 tiles in 3 groups.** Flex layout with 1px gradient dividers (`<div class="kpi-divider">`) to visually separate groups: Account (Wallet, Starting, Open positions) │ Trade performance (Closed trades, Win rate, Net R, Profit factor) │ Risk (Max drawdown, Sharpe). Smaller tiles (`flex: 1 1 130px`, padding 10/12/9, label 9px, value 19px, sub 10px) to fit 9 cards. New "Starting" tile sources `summary.starting_balance`.
+- **Profit factor tile** explicit branch: `null/undefined → "—"`, `Infinity → "∞"`, else `fmtNum(v, 2)`. Sub-line shows "no losses yet" when `num_losses === 0 && num_trades > 0` instead of misleading `—`. Backend already sanitises `inf → None` via `_finite_or_none` to keep `/api/state` JSON-encodable.
+- **UPnL cell visual emphasis** on Open positions table: 17px bold `td.upnl-cell` shows `$` value primary; R appears as small dim subline `.upnl-r-sub`. Replaced earlier row-highlight attempt (operator reverted that — wanted clearer numbers, not row colour).
+- **Removed "Setup" column** from Open positions: `setup_zone_source` is NULL on every current row (verified DB-side). Dropped the redundant column rather than show `—` everywhere.
+- **Removed ticker cards** above Open positions table — same data already present in the rows below. `renderTicker` function + `.ticker` CSS deleted.
+- **Contrast tuning** for dark theme: defined `--text-1: #dde3ed` (was referenced but undefined → some labels rendered transparent / browser-default), lightened `--muted` `#7782` → `#97a1b1`, lightened `--dim`. Body font 13 → 14px.
+- **Header polish:** "live" → "LIVE" status badge; removed "READ-ONLY" subtitle from terminal name (was redundant with the read-only-by-architecture story); "demo baseline" → "baseline" sub on Starting tile. UTC label in clock area shows `TR · UTC+3`.
+
+**Backend payload contract NOT changed.** All work is presentation-layer; `state.py` ships the same JSON shape as the morning per-venue per-asset commit.
+
+**Files touched:** `src/dashboard/static/index.html` only (~95+/108− lines). No tests; pure UI.
+
+**Re-eval triggers:**
+1. **30s poll cost on `data/trades.db`** — `SQLITE_BUSY` rate should stay near-zero. If non-zero at twice the prior cadence, lift to WAL or back off poll to 45s.
+2. **Bybit demo wallet rate-limit** — wallet endpoint has its own quota separate from order/position. 2 calls × 2/min = 240/h. If `bybit_demo_dns_pin_failed` or wallet tile NULL rate spikes, half the cadence.
+3. **Operator session timezone correctness** — daylight-saving doesn't apply to TR (fixed UTC+3 since 2016). If TR ever re-introduces DST, `TZ_OFFSET_MIN` becomes a function of the date.
+
 ### 2026-04-26 (night) — Read-only single-page dashboard + demo balance reset
 
 Two paired changes triggered by the operator wanting to inspect live trade

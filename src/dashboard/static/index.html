@@ -22,11 +22,12 @@
     --border-soft: #161c25;
     --border-glow: rgba(94, 193, 255, 0.18);
 
-    /* text */
-    --text: #e6ebf3;
-    --text-2: #aab4c2;
-    --muted: #6b7686;
-    --dim: #4a5364;
+    /* text — tuned for AA+ contrast on the dark backdrop */
+    --text:   #f1f4fa;  /* primary headings, KPI values, strong cells */
+    --text-1: #dde3ed;  /* secondary headings, candle labels, macro tile values */
+    --text-2: #c5cdda;  /* table body text, paragraph copy */
+    --muted:  #97a1b1;  /* metadata, sub-lines, table headers (was #6b7686) */
+    --dim:    #6a7384;  /* lowest-priority text — still readable, was #4a5364 */
 
     /* accents — cyan→violet brand gradient + neon green/red for state */
     --accent: #5ec1ff;
@@ -49,7 +50,7 @@
   html, body {
     margin: 0; padding: 0; min-height: 100%;
     color: var(--text);
-    font: 13px/1.5 var(--body);
+    font: 14px/1.5 var(--body);
     font-feature-settings: "ss01", "cv11";
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
@@ -261,17 +262,26 @@
   }
 
   /* ── KPI tiles ───────────────────────────────────────────────────── */
-  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+  .kpis {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: stretch;
+  }
   .kpi {
+    flex: 1 1 130px; min-width: 130px;
     position: relative;
     background:
       linear-gradient(180deg, rgba(255,255,255,0.022) 0%, transparent 60%),
       linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%);
     border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 14px 15px 13px;
+    border-radius: 10px;
+    padding: 10px 12px 9px;
     overflow: hidden;
     transition: border-color .25s ease, transform .25s ease, box-shadow .25s ease;
+  }
+  .kpi-divider {
+    flex: 0 0 1px; align-self: stretch;
+    background: linear-gradient(180deg, transparent, var(--border) 25%, var(--border) 75%, transparent);
+    margin: 6px 6px;
+    opacity: .8;
   }
   .kpi::before {
     content: "";
@@ -294,19 +304,19 @@
   }
   .kpi:hover::before { opacity: .9; }
   .kpi .label {
-    font-size: 9.5px; color: var(--muted);
-    text-transform: uppercase; letter-spacing: 1.4px;
+    font-size: 9px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 1.3px;
     font-weight: 600;
   }
   .kpi .value {
     font-family: var(--mono);
-    font-size: 23px; font-weight: 700; margin-top: 6px;
+    font-size: 19px; font-weight: 700; margin-top: 4px;
     letter-spacing: -0.5px;
     font-variant-numeric: tabular-nums;
     line-height: 1.15;
   }
   .kpi .sub {
-    font-size: 10.5px; color: var(--muted); margin-top: 4px;
+    font-size: 10px; color: var(--muted); margin-top: 3px;
     font-family: var(--mono); font-variant-numeric: tabular-nums;
     letter-spacing: 0.2px;
   }
@@ -342,6 +352,16 @@
   tbody tr:hover td { background: rgba(94, 193, 255, 0.04); }
   td.pos { color: var(--green); }
   td.neg { color: var(--red); }
+  td.upnl-cell {
+    font-size: 17px; font-weight: 700; line-height: 1.15;
+    font-variant-numeric: tabular-nums;
+  }
+  td.upnl-cell.pos { text-shadow: 0 0 14px var(--green-glow); }
+  td.upnl-cell.neg { text-shadow: 0 0 14px var(--red-glow); }
+  td.upnl-cell .upnl-r-sub {
+    display: block; margin-top: 2px;
+    font-size: 11px; font-weight: 500; opacity: 0.85;
+  }
   td.dim { color: var(--muted); }
   .scroll-x { overflow-x: auto; }
   .scroll-y { max-height: 440px; overflow-y: auto; }
@@ -643,38 +663,6 @@
   .onchain-panel { display: flex; flex-direction: column; min-height: 0; }
   .onchain-panel > .grid-kv { flex: 1; }
 
-  /* ── Ticker strip (open positions live cards) ────────────────────── */
-  .ticker {
-    display: flex; gap: 10px; flex-wrap: wrap;
-  }
-  .ticker .tcard {
-    flex: 1 1 220px;
-    background: linear-gradient(180deg, rgba(255,255,255,0.02) 0%, transparent 60%), var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 10px 12px;
-    display: grid; grid-template-columns: auto 1fr auto; gap: 4px 10px;
-    align-items: center;
-    position: relative;
-    overflow: hidden;
-  }
-  .ticker .tcard::before {
-    content: "";
-    position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
-    background: var(--accent);
-  }
-  .ticker .tcard.long::before { background: var(--green); box-shadow: 0 0 10px var(--green-glow); }
-  .ticker .tcard.short::before { background: var(--red); box-shadow: 0 0 10px var(--red-glow); }
-  .ticker .sym { font-weight: 700; font-family: var(--mono); font-size: 13px; }
-  .ticker .upnl {
-    grid-column: 3; grid-row: 1 / span 2;
-    font-family: var(--mono); font-weight: 700; font-size: 14px;
-    text-align: right;
-  }
-  .ticker .upnl.pos { color: var(--green); text-shadow: 0 0 12px var(--green-glow); }
-  .ticker .upnl.neg { color: var(--red); text-shadow: 0 0 12px var(--red-glow); }
-  .ticker .px { color: var(--muted); font-family: var(--mono); font-size: 10.5px; }
-
   /* ── Misc ─────────────────────────────────────────────────────── */
   .pulse-dot {
     display: inline-block; width: 6px; height: 6px; border-radius: 50%;
@@ -703,7 +691,7 @@
       </div>
       <div class="brand-text">
         <div class="name">SMTbot · Trade Terminal</div>
-        <div class="tag" id="window-info">read-only · loading…</div>
+        <div class="tag" id="window-info">loading…</div>
       </div>
     </div>
     <div class="head-meta">
@@ -712,7 +700,7 @@
         <div class="session" data-name="london"><span class="ind"></span>London</div>
         <div class="session" data-name="ny"><span class="ind"></span>New York</div>
       </div>
-      <div class="clock"><span class="lbl">UTC</span><span id="clock-utc">–</span></div>
+      <div class="clock"><span class="lbl">TR · UTC+3</span><span id="clock-utc">–</span></div>
       <div class="status">
         <span class="dot" id="status-dot"></span>
         <span id="status-text">connecting…</span>
@@ -729,21 +717,20 @@
     <div class="kpis" id="kpis"></div>
   </section>
 
-  <!-- Open positions ticker (cards) + table -->
+  <!-- Open positions table -->
   <section>
     <h2>Open positions <span class="meta" id="open-count"></span></h2>
-    <div class="ticker" id="ticker"></div>
     <div class="panel scroll-x padded-tight" style="margin-top: 12px;">
       <table id="open-table">
         <thead>
           <tr>
             <th>Symbol</th><th>Dir</th><th>Entry ts</th>
             <th class="num">Entry px</th><th class="num">Mark</th>
-            <th class="num">UPnL $</th><th class="num">UPnL R</th>
+            <th class="num">UPnL $</th>
             <th class="num">MFE R</th><th class="num">MAE R</th>
             <th class="num">SL</th><th class="num">TP</th>
             <th>BE</th><th>Lock</th>
-            <th class="num">Conf</th><th>Setup</th>
+            <th class="num">Conf</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -840,7 +827,7 @@
 
   <!-- Rejected signals -->
   <section>
-    <h2>Rejected signals <span class="meta">most recent 50</span></h2>
+    <h2>Rejected signals <span class="meta">most recent 50 · times in TR (UTC+3)</span></h2>
     <div class="panel scroll-x scroll-y padded-tight">
       <table id="rejected-table">
         <thead>
@@ -876,7 +863,7 @@
 <script>
 "use strict";
 
-const POLL_MS = 60000;
+const POLL_MS = 30000;
 
 // ── tiny formatters ─────────────────────────────────────────────────────────
 const fmtNum = (x, dp = 2) => (x === null || x === undefined || Number.isNaN(x))
@@ -894,22 +881,31 @@ const fmtFlowM = (x) => {
   if (abs >= 1e3) return `${sign}$${(abs / 1e3).toFixed(2)}K`;
   return `${sign}$${abs.toFixed(0)}`;
 };
+// Display timezone: UTC+3 (Turkey, no DST). DB/payload stay UTC; we shift
+// timestamps by +180min before reading the ISO slice so the visible string
+// is local. Session windows (Asia/London/NY) stay anchored to UTC because
+// market open hours are absolute, not local.
+const TZ_OFFSET_MIN = 180;
+const TZ_LABEL = "+03";
+const _toTzDate = (s) => {
+  if (s === null || s === undefined) return null;
+  const d = (s instanceof Date) ? s : new Date(s);
+  if (Number.isNaN(d.getTime())) return null;
+  return new Date(d.getTime() + TZ_OFFSET_MIN * 60_000);
+};
 const fmtTs = (s) => {
-  if (!s) return "—";
-  const d = new Date(s);
-  if (Number.isNaN(d.getTime())) return s;
-  return d.toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z").slice(0, 19) + "Z";
+  const d = _toTzDate(s);
+  if (!d) return s ? s : "—";
+  return d.toISOString().slice(0, 19).replace("T", " ") + " " + TZ_LABEL;
 };
 const fmtTsShort = (s) => {
-  if (!s) return "—";
-  const d = new Date(s);
-  if (Number.isNaN(d.getTime())) return s;
+  const d = _toTzDate(s);
+  if (!d) return s ? s : "—";
   return d.toISOString().slice(5, 16).replace("T", " ");
 };
 const fmtTsHM = (s) => {
-  if (!s) return "—";
-  const d = new Date(s);
-  if (Number.isNaN(d.getTime())) return s;
+  const d = _toTzDate(s);
+  if (!d) return s ? s : "—";
   return d.toISOString().slice(11, 16);
 };
 const numSign = (x) => x > 0 ? "pos" : (x < 0 ? "neg" : "");
@@ -949,7 +945,7 @@ const sparkCharts = {};
 //   New York (NY) : 12:00 – 21:00
 function tickClock() {
   const d = new Date();
-  clockUtc.textContent = d.toISOString().slice(11, 19);
+  clockUtc.textContent = _toTzDate(d).toISOString().slice(11, 19);
   const h = d.getUTCHours() + d.getUTCMinutes() / 60;
   const inWindow = (a, b) => h >= a && h < b;
   const map = {
@@ -983,9 +979,8 @@ function renderKpis(s, counts, openCount, wallet) {
 
   let walletTile;
   if (wallet) {
-    const tag = wallet.demo ? "demo" : "live";
     walletTile = tile(
-      `Wallet · ${tag}`,
+      "Wallet",
       fmtUsd(wallet.margin_balance_usd, 2),
       `available ${fmtUsd(wallet.available_usd, 2)}`,
     );
@@ -999,15 +994,25 @@ function renderKpis(s, counts, openCount, wallet) {
     );
   }
 
+  const sep = '<div class="kpi-divider"></div>';
+  // Account → Trade performance → Risk. Dividers visually group them.
+  const startingTile = tile("Starting", fmtUsd(s.starting_balance, 0), "baseline");
+  const pfValue = (s.profit_factor === null || s.profit_factor === undefined)
+    ? "—"
+    : (s.profit_factor === Infinity ? "∞" : fmtNum(s.profit_factor, 2));
+  const pfSub = (s.num_losses === 0 && s.num_trades > 0) ? "no losses yet" : "gross W ÷ L";
   k.innerHTML = [
+    walletTile,
+    startingTile,
+    tile("Open positions", openCount, `${counts.rejected_total} rejects logged`),
+    sep,
     tile("Closed trades", s.num_trades, `W ${s.num_wins} · L ${s.num_losses}`),
     tile("Win rate", fmtPct(s.win_rate), `expectancy ${fmtR(s.expectancy_r)}`, wrCls),
     tile("Net R", fmtR(netR), `avg ${fmtR(s.avg_r)}`, numSign(netR)),
-    tile("Profit factor", s.profit_factor === Infinity ? "∞" : fmtNum(s.profit_factor, 2)),
+    tile("Profit factor", pfValue, pfSub),
+    sep,
     tile("Max drawdown", fmtPct(s.max_drawdown_pct / 100), fmtUsd(-s.max_drawdown_usdt, 2), "amber"),
     tile("Sharpe (R)", fmtNum(s.sharpe_r, 2), `Calmar ${fmtNum(s.calmar, 2)}`),
-    walletTile,
-    tile("Open positions", openCount, `${counts.rejected_total} rejects logged`),
   ].join("");
 }
 
@@ -1045,48 +1050,28 @@ function _liveByInstId(payload) {
 
 let _livePositionsMap = new Map();
 
-function renderTicker(open) {
-  const t = $("#ticker");
-  if (!open.length) {
-    t.innerHTML = '<div class="empty" style="flex:1;">no open positions — bot idle</div>';
-    return;
-  }
-  t.innerHTML = open.map(({ trade, latest_snapshot: l }) => {
-    const cls = dirPillClass(trade.direction);
-    const live = _livePositionsMap.get(trade.symbol) || null;
-    const m = _mergeLive(trade, l, live);
-    const upnlCls = m.upnl_usd === null ? "" : (m.upnl_usd >= 0 ? "pos" : "neg");
-    const liveDot = m.is_live ? '<span class="live-dot" title="live"></span>' : "";
-    return `<div class="tcard ${cls}">
-      <div class="sym">${liveDot}${trade.symbol.replace("-USDT-SWAP", "")}</div>
-      <div class="px">${priceCell(trade.entry_price)} → ${m.mark !== null ? priceCell(m.mark) : "…"}</div>
-      <div class="upnl ${upnlCls}">${m.upnl_usd === null ? "—" : fmtUsd(m.upnl_usd)}<br><span style="font-size:10px;font-weight:500;">${m.upnl_r === null ? "" : fmtR(m.upnl_r)}</span></div>
-    </div>`;
-  }).join("");
-}
-
 function renderOpen(open) {
   const body = $("#open-table tbody");
   const liveCount = (_livePositionsMap && _livePositionsMap.size) || 0;
   $("#open-count").textContent = open.length
     ? `${open.length} live${liveCount ? ` · ${liveCount} on bybit` : ""}`
     : "0 live";
-  if (!open.length) { body.innerHTML = '<tr><td colspan="15" class="empty">no open positions</td></tr>'; return; }
+  if (!open.length) { body.innerHTML = '<tr><td colspan="13" class="empty">no open positions</td></tr>'; return; }
   body.innerHTML = open.map(({ trade: t, latest_snapshot: l }) => {
     const dirCls = dirPillClass(t.direction);
     const live = _livePositionsMap.get(t.symbol) || null;
     const m = _mergeLive(t, l, live);
     const upnlCls = m.upnl_usd === null ? "" : (m.upnl_usd >= 0 ? "pos" : "neg");
-    const upnlRCls = m.upnl_r === null ? "" : (m.upnl_r >= 0 ? "pos" : "neg");
     const liveDot = m.is_live ? '<span class="live-dot" title="live tick from bybit"></span>' : "";
+    const upnlMain = m.upnl_usd === null ? "—" : fmtUsd(m.upnl_usd);
+    const upnlSub = m.upnl_r === null ? "" : `<span class="upnl-r-sub">${fmtR(m.upnl_r)}</span>`;
     return `<tr>
       <td><strong>${liveDot}${t.symbol}</strong></td>
       <td><span class="pill ${dirCls}">${t.direction}</span></td>
       <td class="dim">${fmtTsShort(t.entry_timestamp)}</td>
       <td class="num">${priceCell(t.entry_price)}</td>
       <td class="num">${m.mark !== null ? priceCell(m.mark) : "—"}</td>
-      <td class="num ${upnlCls}">${m.upnl_usd === null ? "—" : fmtUsd(m.upnl_usd)}</td>
-      <td class="num ${upnlRCls}">${m.upnl_r === null ? "—" : fmtR(m.upnl_r)}</td>
+      <td class="num upnl-cell ${upnlCls}">${upnlMain}${upnlSub}</td>
       <td class="num pos">${l ? fmtR(l.mfe_r_so_far) : "—"}</td>
       <td class="num neg">${l ? fmtR(l.mae_r_so_far) : "—"}</td>
       <td class="num">${l ? priceCell(l.current_sl_price) : priceCell(t.sl_price)}</td>
@@ -1094,7 +1079,6 @@ function renderOpen(open) {
       <td>${(l && l.sl_to_be_moved) || t.sl_moved_to_be ? "✓" : ""}</td>
       <td>${l && l.mfe_lock_applied ? "✓" : ""}</td>
       <td class="num">${fmtNum(t.confluence_score, 2)}</td>
-      <td class="dim">${t.setup_zone_source || "—"}</td>
     </tr>`;
   }).join("");
 }
@@ -1340,14 +1324,17 @@ function _drawCandles(canvas, rows) {
     ctx.fillText(fmtFlowM(v), padL - 5, y);
   }
 
-  // X-axis hour ticks (every 4h = every 16 slots)
-  ctx.textAlign = "center";
+  // X-axis hour ticks (every 4h = every 16 slots). Align edge labels to
+  // the canvas edge so they don't clip past the plot bounds.
   ctx.textBaseline = "top";
+  const lastTickIdx = Math.floor((N - 1) / 16) * 16;
   for (let i = 0; i < N; i += 16) {
     const r = (rows || [])[i];
     if (!r) continue;
-    const d = new Date(r.ts);
+    const d = _toTzDate(r.ts);
+    if (!d) continue;
     const label = d.toISOString().slice(11, 13) + ":00";
+    ctx.textAlign = (i === 0) ? "left" : (i === lastTickIdx) ? "right" : "center";
     ctx.fillText(label, x0(i), padT + plotH + 4);
   }
 
@@ -1412,7 +1399,7 @@ function _attachCandleHover(canvas, rows) {
     const i = Math.max(0, Math.min(N - 1, Math.floor((x - padL) / (plotW / N))));
     const r = rows[i];
     if (!r || r.c === null) { tip.style.display = "none"; return; }
-    const ts = new Date(r.ts).toISOString().slice(11, 16) + "Z";
+    const ts = _toTzDate(r.ts).toISOString().slice(11, 16) + " " + TZ_LABEL;
     tip.innerHTML =
       `<div style="opacity:.7;margin-bottom:2px">${ts}</div>` +
       `O ${fmtFlowM(r.o)}<br>H ${fmtFlowM(r.h)}<br>` +
@@ -1506,13 +1493,14 @@ function _drawPerAssetLines(canvas, perAsset) {
     ctx.fillText(fmtFlowM(v), padL - 5, y);
   }
 
-  // X-axis hour ticks every 4h.
-  ctx.textAlign = "center";
+  // X-axis hour ticks every 4h. Align edge labels to the canvas edge so
+  // they don't clip past the plot bounds.
   ctx.textBaseline = "top";
   for (let h = 0; h <= 24; h += 4) {
     const t = tStart + h * 3600 * 1000;
-    const d = new Date(t);
+    const d = _toTzDate(t);
     const label = d.toISOString().slice(11, 13) + ":00";
+    ctx.textAlign = (h === 0) ? "left" : (h === 24) ? "right" : "center";
     ctx.fillText(label, xPx(t), padT + plotH + 4);
   }
 
@@ -1582,7 +1570,7 @@ function _attachPerAssetHover(canvas, perAsset) {
         const d = Math.abs(p.t - tHover);
         if (d < bestDt) { bestDt = d; nearest = p; }
       }
-      const ts = new Date(nearest.t).toISOString().slice(11, 16) + "Z";
+      const ts = _toTzDate(nearest.t).toISOString().slice(11, 16) + " " + TZ_LABEL;
       const sign = nearest.v >= 0 ? "+" : "";
       lines.push(
         `<span style="color:${PER_ASSET_COLORS[aKey]}">${PER_ASSET_LABELS[aKey]}</span> ` +
@@ -1826,7 +1814,7 @@ function renderMacroPanel(rootSel, snap, series) {
       fmt: (v) => v ? String(v).toUpperCase() : "—",
       tone: _biasTone(snap && snap.daily_macro_bias),
       sub: snap && snap.captured_at
-        ? `captured ${fmtTsHM(snap.captured_at)}Z`
+        ? `captured ${fmtTsHM(snap.captured_at)} ${TZ_LABEL}`
         : "no snapshot yet",
     },
     {
@@ -1936,7 +1924,6 @@ function renderAll(payload) {
   const open = payload.open_positions || [];
   _livePositionsMap = _liveByInstId(payload);
   renderKpis(s, counts, open.length, payload.wallet);
-  renderTicker(open);
   renderOpen(open);
   renderEquityChart(payload.equity_curve || []);
   renderExchangeCandles("#exchange-candle-grid", onchainPerAsset, onchainCandles);
@@ -1950,9 +1937,9 @@ function renderAll(payload) {
   renderWhales(payload.whale_transfers_recent || []);
 
   if (payload.clean_since) {
-    windowInfo.textContent = `since ${payload.clean_since.replace("T", " ").slice(0, 16)}Z · read-only`;
+    windowInfo.textContent = `since ${payload.clean_since.replace("T", " ").slice(0, 16)}Z`;
   } else {
-    windowInfo.textContent = "all-time · read-only";
+    windowInfo.textContent = "all-time";
   }
 }
 
@@ -1973,8 +1960,8 @@ async function tick() {
     }
     renderAll(payload);
     const now = new Date();
-    lastUpdate.textContent = "· " + now.toISOString().slice(11, 19) + "Z";
-    setStatus("ok", "live");
+    lastUpdate.textContent = "· " + _toTzDate(now).toISOString().slice(11, 19) + " " + TZ_LABEL;
+    setStatus("ok", "LIVE");
   } catch (e) {
     console.error(e);
     setStatus("err", e.message || String(e));
