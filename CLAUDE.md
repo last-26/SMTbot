@@ -151,6 +151,42 @@ UI-only polish pass on [src/dashboard/static/index.html](src/dashboard/static/in
 2. **Bybit demo wallet rate-limit** — wallet endpoint has its own quota separate from order/position. 2 calls × 2/min = 240/h. If `bybit_demo_dns_pin_failed` or wallet tile NULL rate spikes, half the cadence.
 3. **Operator session timezone correctness** — daylight-saving doesn't apply to TR (fixed UTC+3 since 2016). If TR ever re-introduces DST, `TZ_OFFSET_MIN` becomes a function of the date.
 
+### 2026-04-26 (late-late-night, +3) — whale_threshold_usd 150M → 75M
+
+Operator-flagged: `whale_transfers` table 0 rows in the ~24h since the
+2026-04-25 Bybit restart, despite WS listener being alive (logs show
+continuous reconnects with `usd_gte=150000000`). CLAUDE.md re-eval
+trigger explicitly states `<5/day = WS fetch failing OR threshold too
+high`, expected 20-100/day at $150M.
+
+**Diagnostic probe**: lowered to `whale_threshold_usd: 75000000.0`
+(`config/default.yaml`). Pure WS-filter change, zero extra API calls.
+Two outcomes inform the next step:
+
+- **Events flow** (≥10/day inserting into `whale_transfers`): root cause
+  was threshold mismatched to current market activity. Pass 3 GBT will
+  decide a tuned value; for now $75M is a reasonable mid-point between
+  Pass 1's $100M working baseline and the $150M dry-spell.
+- **Still zero**: threshold is not the binding constraint — bug lives
+  in `parse_transfer_message` / cached `stream_id` filter fingerprint /
+  WS event handler. Investigate before tuning further.
+
+**Why $75M not $10M**: $10M risks crossing the Arkham label budget
+(currently ~558/10k labels/month). Whale event labels resolve via
+`/intelligence/address` which IS label-counted. At $10M we'd see
+hundreds of events/day, each potentially fetching 2 entity labels;
+budget impact non-trivial. $75M sits comfortably above the label
+burn risk while still 50% below the $150M dry-spell threshold.
+
+**Re-eval after operator restart + 24h:**
+- 0 events → listener bug; abandon threshold tuning, debug WS path
+- 1-50 events → threshold was the issue; consider Pass 3 tune
+- 50-300 events → operator-acceptable signal density; hold here
+- >300 events → noise floor too low; raise toward $100M
+
+**Files touched:** `config/default.yaml` only (single line).
+No code, no schema. Zero tests.
+
 ### 2026-04-26 (late-late-night, +2) — Macro panel readability + spark cache bug fix
 
 Two paired changes — operator wanted clearer interpretation of every macro
