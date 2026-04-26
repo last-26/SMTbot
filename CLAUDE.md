@@ -151,6 +151,58 @@ UI-only polish pass on [src/dashboard/static/index.html](src/dashboard/static/in
 2. **Bybit demo wallet rate-limit** — wallet endpoint has its own quota separate from order/position. 2 calls × 2/min = 240/h. If `bybit_demo_dns_pin_failed` or wallet tile NULL rate spikes, half the cadence.
 3. **Operator session timezone correctness** — daylight-saving doesn't apply to TR (fixed UTC+3 since 2016). If TR ever re-introduces DST, `TZ_OFFSET_MIN` becomes a function of the date.
 
+### 2026-04-26 (late-late-night, +2) — Macro panel readability + spark cache bug fix
+
+Two paired changes — operator wanted clearer interpretation of every macro
+tile's sign, and spotted that macro-panel sparks went blank after the first
+30s refresh (only on poll #2 onward).
+
+**Readability:**
+- Static legend strip below the section header explains the universal sign
+  convention. Stables flip the rule so it's spelled out in two rows:
+  asset/venue netflow `+` = bearish (INTO CEX), `−` = bullish (OUT);
+  stables `+` = bullish (cash arriving), `−` = bearish.
+- Per-tile sub-lines now context-aware: BTC/ETH show `↑ supply into CEX
+  · bearish bias` vs `↓ supply out of CEX · bullish bias`; stables show
+  `↑ buying power arriving · bullish` vs `↓ buying power leaving ·
+  bearish`. Helpers `_assetFlowSub`, `_stableFlowSub`.
+- BTC/ETH tile **tone inverted** via new `_assetFlowTone` so positive (INTO
+  CEX, bearish) renders red and negative (OUT, bullish) renders green —
+  matches what the operator reads in the legend. Previous mapping used
+  `_macroToneFromValue` (positive→green) which was misleading for asset
+  netflows since the convention is inverted.
+
+**Bug fix — spark Chart instances bound to detached canvases:**
+- `renderMacroPanel` rebuilds `root.innerHTML = tiles.map(...)` on every
+  poll, which destroys the `<canvas id="spark-X">` DOM nodes and creates
+  fresh ones with the same IDs. But `sparkCharts[canvasId]` still cached
+  the **first poll's Chart instance** whose internal canvas reference
+  pointed at the detached node.
+- On poll ≥2, `_renderSpark` hit the `if (sparkCharts[canvasId])` cache
+  branch and called `c.update("none")` — which redrew into the detached
+  canvas (invisible). The fresh visible canvas stayed blank. From the
+  operator's perspective the macro pulse "veriler kayoluyor" — the
+  textual values + sub-lines were still rendering correctly (set BEFORE
+  the spark loop), but the visible trend lines vanished.
+- Fix: detect `c.canvas !== el || !document.body.contains(c.canvas)` and
+  destroy + recreate. Cheap (3 sparks: BTC / ETH / Stb), runs once per
+  poll only when the canvas was rebuilt.
+
+Backend `on_chain_latest` payload was verified rebuilt fresh per request
+(`state.py` rebuilds on every `/api/state` call); the issue was purely
+client-side Chart.js cache invalidation.
+
+**Files touched:** `src/dashboard/static/index.html` only.
+
+**Re-eval triggers:**
+1. Sparks visible on poll #2 and onward — observable in the chart
+   beneath BTC/ETH/Stb tiles. If still blank, Chart.js may have changed
+   `c.canvas` semantics; fall back to always destroying.
+2. CPU profile during poll — destroying + recreating 3 Charts every 30s
+   is ~negligible but if perf shows blocking, switch to one-time setup
+   on first poll only and reuse the canvas elements (would require
+   `renderMacroPanel` to update text without `innerHTML =`).
+
 ### 2026-04-26 (late-late-night, +1) — Macro panel: flow_alignment + top venue tiles
 
 Pure presentation-layer extension to the macro pulse panel. Three new tiles surface Arkham fields already present in `on_chain_latest` payload — zero backend changes.

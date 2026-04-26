@@ -463,6 +463,25 @@
   }
   @media (max-width: 1100px) { .macro-grid { grid-template-columns: repeat(2, 1fr); } }
   @media (max-width: 700px)  { .macro-grid { grid-template-columns: 1fr; } }
+  .macro-legend {
+    display: flex; flex-wrap: wrap; gap: 8px 16px;
+    padding: 9px 12px; margin-bottom: 10px;
+    background: rgba(15, 19, 27, 0.7);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 11px;
+    color: var(--text-2);
+  }
+  .macro-legend .ml-row { display: flex; align-items: center; gap: 6px; line-height: 1.5; }
+  .macro-legend .ml-tag {
+    display: inline-block; min-width: 18px; text-align: center;
+    padding: 1px 6px; border-radius: 4px;
+    font-weight: 700; font-size: 10px; letter-spacing: 0.3px;
+  }
+  .macro-legend .ml-tag.pos { background: rgba(38,208,124,0.15); color: var(--green); }
+  .macro-legend .ml-tag.neg { background: rgba(255,79,110,0.15); color: var(--red); }
+  .macro-legend .ml-text { color: var(--text-2); }
+  .macro-legend .ml-em   { color: var(--text-1); font-weight: 600; }
   .macro-tile {
     position: relative;
     background:
@@ -763,6 +782,33 @@
       Macro pulse
       <span class="meta" id="macro-meta">aggregate flows · regime flags</span>
     </h2>
+    <div class="macro-legend" id="macro-legend">
+      <div class="ml-row">
+        <span class="ml-em">Reading the signs:</span>
+      </div>
+      <div class="ml-row">
+        <span class="ml-tag neg">+</span>
+        <span class="ml-text">BTC/ETH/venue netflow → coins <span class="ml-em">into CEX</span> (sell pressure, bearish)</span>
+      </div>
+      <div class="ml-row">
+        <span class="ml-tag pos">−</span>
+        <span class="ml-text">BTC/ETH/venue netflow → coins <span class="ml-em">out of CEX</span> (accumulation, bullish)</span>
+      </div>
+      <div class="ml-row">
+        <span class="ml-tag pos">+</span>
+        <span class="ml-text">Stablecoin pulse → cash <span class="ml-em">into CEX</span> (buying power, bullish)</span>
+      </div>
+      <div class="ml-row">
+        <span class="ml-tag neg">−</span>
+        <span class="ml-text">Stablecoin pulse → cash <span class="ml-em">out of CEX</span> (de-risking, bearish)</span>
+      </div>
+      <div class="ml-row">
+        <span class="ml-text">Flow alignment composite: <span class="ml-em">+1 fully bullish · −1 fully bearish · 0 mixed</span></span>
+      </div>
+      <div class="ml-row">
+        <span class="ml-text">Altcoin season: <span class="ml-em">≤25 BTC season · ≥75 alt season</span></span>
+      </div>
+    </div>
     <div class="macro-grid" id="macro-grid"></div>
   </section>
 
@@ -1733,6 +1779,15 @@ function _macroToneFromValue(v) {
   return "";
 }
 
+// Asset netflow (BTC/ETH/per-venue) inverts the tone mapping because
+// positive (INTO CEX) is BEARISH, negative (OUT of CEX) is BULLISH.
+function _assetFlowTone(v) {
+  if (v === null || v === undefined) return "";
+  if (v > 0) return "neg";  // bearish supply arriving
+  if (v < 0) return "pos";  // bullish supply leaving
+  return "";
+}
+
 function _biasTone(bias) {
   const b = (bias || "").toLowerCase();
   if (b.includes("bull")) return "pos";
@@ -1753,6 +1808,24 @@ function _altIndexHint(v) {
   if (v <= 25) return "BTC season · altcoin longs penalized";
   if (v >= 75) return "alt season · altcoin shorts penalized";
   return "neutral band";
+}
+
+// Sign-aware sub-line for asset netflow tiles (BTC, ETH).
+// + = into CEX (bearish supply); − = out of CEX (bullish accumulation).
+function _assetFlowSub(v) {
+  if (v === null || v === undefined) return "no snapshot yet";
+  if (v > 0) return "↑ supply into CEX · bearish bias";
+  if (v < 0) return "↓ supply out of CEX · bullish bias";
+  return "flat · neutral";
+}
+
+// Sign-aware sub-line for stablecoin pulse tile.
+// + = cash into CEX (bullish buying power); − = cash leaving (bearish).
+function _stableFlowSub(v) {
+  if (v === null || v === undefined) return "no snapshot yet";
+  if (v > 0) return "↑ buying power arriving · bullish";
+  if (v < 0) return "↓ buying power leaving · bearish";
+  return "flat · neutral";
 }
 
 // Mirror of strategy/entry_signals.py::_flow_alignment_score so the macro
@@ -1834,10 +1907,9 @@ function renderMacroPanel(rootSel, snap, series) {
       pill: "aggregate",
       value: snap ? snap.cex_btc_netflow_24h_usd : null,
       fmt: fmtFlowM,
-      tone: _macroToneFromValue(snap && snap.cex_btc_netflow_24h_usd),
-      sub: snap && snap.cex_btc_netflow_24h_usd != null
-        ? "Σ all CEX wallets · 24h rolling"
-        : "no snapshot yet",
+      // Asset netflow: positive = INTO CEX (bearish), so flip the tone mapping.
+      tone: _assetFlowTone(snap && snap.cex_btc_netflow_24h_usd),
+      sub: _assetFlowSub(snap && snap.cex_btc_netflow_24h_usd),
       spark: series.btc_netflow_24h,
     },
     {
@@ -1846,10 +1918,8 @@ function renderMacroPanel(rootSel, snap, series) {
       pill: "aggregate",
       value: snap ? snap.cex_eth_netflow_24h_usd : null,
       fmt: fmtFlowM,
-      tone: _macroToneFromValue(snap && snap.cex_eth_netflow_24h_usd),
-      sub: snap && snap.cex_eth_netflow_24h_usd != null
-        ? "Σ all CEX wallets · 24h rolling"
-        : "no snapshot yet",
+      tone: _assetFlowTone(snap && snap.cex_eth_netflow_24h_usd),
+      sub: _assetFlowSub(snap && snap.cex_eth_netflow_24h_usd),
       spark: series.eth_netflow_24h,
     },
     {
@@ -1858,10 +1928,9 @@ function renderMacroPanel(rootSel, snap, series) {
       pill: "USDT+USDC",
       value: snap ? snap.stablecoin_pulse_1h_usd : null,
       fmt: fmtFlowM,
+      // Stables flip the convention: positive = INTO CEX (bullish).
       tone: _macroToneFromValue(snap && snap.stablecoin_pulse_1h_usd),
-      sub: snap && snap.stablecoin_pulse_1h_usd != null
-        ? "INTO CEX = bullish bias"
-        : "no snapshot yet",
+      sub: _stableFlowSub(snap && snap.stablecoin_pulse_1h_usd),
       spark: series.stablecoin_pulse_1h,
     },
     {
@@ -1967,10 +2036,18 @@ function _renderSpark(canvasId, series, tone) {
 
   if (sparkCharts[canvasId]) {
     const c = sparkCharts[canvasId];
-    c.data.datasets[0].data = points;
-    c.data.datasets[0].borderColor = color;
-    c.update("none");
-    return;
+    // renderMacroPanel rebuilds root.innerHTML on every poll, which destroys
+    // the canvas DOM node. The cached Chart's internal canvas reference now
+    // points at a detached node; updating it draws into nothing and the
+    // freshly-created visible canvas stays blank. Detect that and re-create.
+    if (c.canvas === el && document.body.contains(c.canvas)) {
+      c.data.datasets[0].data = points;
+      c.data.datasets[0].borderColor = color;
+      c.update("none");
+      return;
+    }
+    try { c.destroy(); } catch (e) { /* ignore */ }
+    delete sparkCharts[canvasId];
   }
 
   const grad = ctx.createLinearGradient(0, 0, 0, 36);
