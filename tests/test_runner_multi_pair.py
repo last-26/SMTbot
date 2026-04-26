@@ -180,16 +180,16 @@ async def test_legacy_symbol_config_backward_compat():
     assert cfg.primary_symbol() == "BTC-USDT-SWAP"
 
 
-@pytest.mark.parametrize("okx,tv", [
-    ("BTC-USDT-SWAP", "OKX:BTCUSDT.P"),
-    ("ETH-USDT-SWAP", "OKX:ETHUSDT.P"),
-    ("SOL-USDT-SWAP", "OKX:SOLUSDT.P"),
-    ("AVAX-USDT-SWAP", "OKX:AVAXUSDT.P"),
-    ("XRP-USDT-SWAP", "OKX:XRPUSDT.P"),
-    ("DOGE-USDT-SWAP", "OKX:DOGEUSDT.P"),
-    ("ADA-USDT-SWAP", "OKX:ADAUSDT.P"),
-    ("BNB-USDT-SWAP", "OKX:BNBUSDT.P"),
-    ("BTC-USDT", "OKX:BTCUSDT"),            # spot — no .P
+@pytest.mark.parametrize("internal,tv", [
+    ("BTC-USDT-SWAP", "BYBIT:BTCUSDT.P"),
+    ("ETH-USDT-SWAP", "BYBIT:ETHUSDT.P"),
+    ("SOL-USDT-SWAP", "BYBIT:SOLUSDT.P"),
+    ("AVAX-USDT-SWAP", "BYBIT:AVAXUSDT.P"),
+    ("XRP-USDT-SWAP", "BYBIT:XRPUSDT.P"),
+    ("DOGE-USDT-SWAP", "BYBIT:DOGEUSDT.P"),
+    ("ADA-USDT-SWAP", "BYBIT:ADAUSDT.P"),
+    ("BNB-USDT-SWAP", "BYBIT:BNBUSDT.P"),
+    ("BTC-USDT", "BYBIT:BTCUSDT"),            # spot — no .P
 ])
-def test_okx_to_tv_symbol(okx, tv):
-    assert okx_to_tv_symbol(okx) == tv
+def test_okx_to_tv_symbol(internal, tv):
+    assert okx_to_tv_symbol(internal) == tv

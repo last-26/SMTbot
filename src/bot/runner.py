@@ -2006,16 +2006,16 @@ class BotRunner:
             logger.exception("total_eq_sync_failed_using_cached")
             total_eq = self.ctx.risk_mgr.current_balance
         try:
-            okx_avail = await asyncio.to_thread(
+            bybit_avail = await asyncio.to_thread(
                 self.ctx.bybit_client.get_balance, "USDT"
             )
         except Exception:
             logger.exception("balance_sync_failed_using_cached")
-            okx_avail = self.ctx.risk_mgr.current_balance
+            bybit_avail = self.ctx.risk_mgr.current_balance
         slot_count = max(1, int(cfg.trading.max_concurrent_positions))
         per_slot = total_eq / slot_count
         risk_balance = min(total_eq, self.ctx.risk_mgr.current_balance)
-        margin_balance = min(per_slot, okx_avail)
+        margin_balance = min(per_slot, bybit_avail)
         sizing_balance = margin_balance  # retained for logging/back-compat
 
         # 2026-04-26 — auto-R mode. Resolve the per-trade $R override in

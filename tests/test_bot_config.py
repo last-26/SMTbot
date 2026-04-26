@@ -93,10 +93,10 @@ def test_allowed_sessions_maps_strings_to_enums():
     assert sessions == [Session.LONDON, Session.NEW_YORK]
 
 
-def test_to_okx_credentials_carries_demo_flag():
+def test_to_bybit_credentials_carries_demo_flag():
     cfg = BotConfig(**_valid_raw())
-    creds = cfg.to_okx_credentials()
-    assert creds.demo_flag == "1"
+    creds = cfg.to_bybit_credentials()
+    assert creds.demo is True
     assert creds.api_key == "k"
 
 
@@ -161,8 +161,8 @@ def test_risk_amount_usdt_env_wins_over_yaml(tmp_path, monkeypatch):
     cfg_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
 
     monkeypatch.setenv("RISK_AMOUNT_USDT", "75.5")  # env says $75.5
-    for v in ("OKX_API_KEY", "OKX_API_SECRET", "OKX_PASSPHRASE"):
-        monkeypatch.setenv(v, "x")
+    for v in ("BYBIT_API_KEY", "BYBIT_API_SECRET", "BYBIT_DEMO"):
+        monkeypatch.setenv(v, "1" if v == "BYBIT_DEMO" else "x")
     empty_env = tmp_path / ".env"
     empty_env.write_text("", encoding="utf-8")
 
@@ -179,8 +179,8 @@ def test_risk_amount_usdt_env_empty_falls_back_to_yaml(tmp_path, monkeypatch):
     cfg_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
 
     monkeypatch.delenv("RISK_AMOUNT_USDT", raising=False)
-    for v in ("OKX_API_KEY", "OKX_API_SECRET", "OKX_PASSPHRASE"):
-        monkeypatch.setenv(v, "x")
+    for v in ("BYBIT_API_KEY", "BYBIT_API_SECRET", "BYBIT_DEMO"):
+        monkeypatch.setenv(v, "1" if v == "BYBIT_DEMO" else "x")
     empty_env = tmp_path / ".env"
     empty_env.write_text("", encoding="utf-8")
 
@@ -194,8 +194,8 @@ def test_risk_amount_usdt_env_rejects_invalid_float(tmp_path, monkeypatch):
     cfg_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
 
     monkeypatch.setenv("RISK_AMOUNT_USDT", "notanumber")
-    for v in ("OKX_API_KEY", "OKX_API_SECRET", "OKX_PASSPHRASE"):
-        monkeypatch.setenv(v, "x")
+    for v in ("BYBIT_API_KEY", "BYBIT_API_SECRET", "BYBIT_DEMO"):
+        monkeypatch.setenv(v, "1" if v == "BYBIT_DEMO" else "x")
     empty_env = tmp_path / ".env"
     empty_env.write_text("", encoding="utf-8")
 
@@ -256,7 +256,7 @@ def test_vwap_zone_short_anchor_rejects_negative():
 
 def test_symbol_leverage_caps_lookup_missing_symbol_returns_default():
     """Unlisted symbols return the caller's default — the runner merges
-    min(global, okx_cap, ...dict.get(sym, global)) so missing key = no cap."""
+    min(global, instrument_cap, ...dict.get(sym, global)) so missing key = no cap."""
     raw = _valid_raw()
     raw["trading"]["symbol_leverage_caps"] = {"ETH-USDT-SWAP": 30}
     cfg = BotConfig(**raw)
