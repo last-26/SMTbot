@@ -26,6 +26,106 @@ AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT lin
 
 ## Changelog
 
+### 2026-04-26 (late-night) — Per-venue × per-asset (BTC/ETH/stables) 24h netflow capture + dashboard breakdown
+
+Operator wanted per-venue netflow on the dashboard split by asset class
+("her borsa için btc eth ve stablecoin görmek istiyorum") instead of the
+single all-token Σ that the 6-venue grid shipped with on the morning
+dashboard commit. Pure additive: journal-only schema, fire-and-forget
+background fetcher (does NOT block the trade cycle), zero runtime scoring
+change. Pass 3 candidate.
+
+**Schema (3 JSON-as-TEXT columns on `on_chain_snapshots`):** dict keyed by
+entity slug → signed USD float. Adding a 7th venue won't require schema
+migration.
+- `cex_per_venue_btc_netflow_24h_usd_json`
+- `cex_per_venue_eth_netflow_24h_usd_json`
+- `cex_per_venue_stables_netflow_24h_usd_json`
+
+Idempotent `ALTER TABLE … ADD COLUMN` migrations apply on next bot startup.
+Mirrored on `OnChainSnapshot` dataclass + `record_on_chain_snapshot`
+signature (3 new kwargs default `None`) + INSERT column list (18 → 21).
+
+**Fetcher:** [src/data/on_chain.py](src/data/on_chain.py) — new
+`fetch_entity_per_asset_netflow_24h(client, entity, token_ids)` makes 2
+`/transfers/histogram` calls (`flow=in`, `flow=out`) with
+`base=<entity>&tokens=<token_id>&granularity=1h&time_last=24h`, sums the
+24-bucket series, returns `in − out`. Same shape + label-free contract as
+the entity-aggregate fetcher (verified 2026-04-23 night). 6 venues × 3
+asset groups × 2 flows = **36 calls per refresh** at 1.1s rate cushion ≈
+40-60s wall-clock — too long for the trade cycle.
+
+**Background task (fire-and-forget):** [src/bot/runner.py](src/bot/runner.py)
+— `_kick_per_venue_per_asset_refresh(client)` checks the previous task
+via `prev.done()` and creates a fresh `asyncio.Task` (no stacking on slow
+fetchers). `_refresh_per_venue_per_asset(client)` populates 3 dict caches
+on `BotContext` (`per_venue_btc_netflow_24h_usd`, `_eth_`, `_stables_`)
+plus `last_per_venue_per_asset_ts`. Wired into the existing daily-bundle
+branch right after the per-entity netflow loop. The trade cycle reads
+from the cache (None until the first refresh completes); the next
+`OnChainSnapshot` construction with mutated dicts triggers a fresh
+journal row via the fingerprint dedup. Stable-asset group passes
+`("tether", "usd-coin")` to the same fetcher (one summed netflow per
+venue).
+
+**Dashboard:** [src/dashboard/state.py](src/dashboard/state.py) — 2 new
+payload keys:
+- `on_chain_per_venue_per_asset_24h: {venue: {btc|eth|stables: [{ts, v}…]}}`
+- `on_chain_aggregate_per_asset_24h: {btc|eth|stables: [{ts, v}…]}`
+
+Both built from the most-recent 24h slice of `on_chain_snapshots`.
+Frontend ([src/dashboard/static/index.html](src/dashboard/static/index.html))
+splits the existing 6-venue card grid: aggregate Σ (all-tokens) stays in
+the top-right tile of each card (operator pref: "toplamı sadece sağ
+üstte"); main viz is a 3-line chart (BTC red / ETH purple / Stables
+green) with shared Y-scale, real-time x-axis (24h ending NOW), zero-line,
+4h tick labels, latest-point dots, and a multi-line hover tooltip.
+Inline legend under each card title shows latest BTC/ETH/Stb values
+colour-coded by sign. New section "Total netflow per asset" reuses the
+same renderer with single-series payloads — 3 standalone cards summing
+across all 6 venues per timestamp.
+
+**Cost:** +36 calls per `daily_snapshot_refresh_s` cycle (5 min) but
+dispatched as a fire-and-forget background task — net zero impact on
+the trade cycle's 180s budget. Label-free (Arkham `tokens=` filter
+preserves the histogram endpoint's free tier; verified via the same
+2026-04-23 probe). Total label budget unchanged at ~558/10k/mo.
+
+**Pass 3 candidacy:** journal-only at this commit. Per-venue per-asset
+opens combinatorial signals the aggregate Σ collapses — e.g. "Coinbase
+ETH inflow accelerating while Coinbase BTC outflow stable" (ETH
+distribution into a CEX hub, often pre-dump on alts). Pass 3 GBT/Optuna
+will decide whether any subset earns runtime scoring weight.
+
+**Files touched:**
+- New code: `_dump_per_venue_dict` helper + 4 BotContext fields + 3
+  OnChainSnapshot construction sites + fingerprint extension +
+  `_on_chain_context_dict` keys + 2 new methods on BotRunner.
+- Schema: 3 ALTER migrations + 3 INSERT columns + 3 reader keys + 3
+  TradeRecord/RejectedSignal exposure paths via `_on_chain_context_dict`.
+- Dashboard: 2 new payload builders + 4 JSON dict normalisation keys
+  (was 1 — `token_volume_1h_net_usd_json` only) + new render functions
+  `renderExchangeCandles` (rewrite) + `renderAggregatePerAsset` +
+  `_drawPerAssetLines` + `_attachPerAssetHover` + CSS for inline legend
+  dots/values.
+
+**Re-eval triggers:**
+1. **Per-asset coverage** on `on_chain_snapshots` rows captured after
+   this commit — all 3 JSON columns should be NON-NULL on ≥95% of rows
+   once the first background refresh completes (T+5min from startup).
+   Zero-rate = `_per_venue_per_asset_task` never spawning or
+   `affected_symbols_for` rejecting the slug.
+2. **Stables-group magnitude sanity** — median venue stables 24h
+   |net| should bracket the same range as the existing global
+   stablecoin pulse (~$50M-200M); if zero across all 6 venues, the
+   `("tether", "usd-coin")` token list dropped a slug variant.
+3. **Background task latency** — `arkham_per_venue_per_asset_done`
+   log line should arrive within 90s of `arkham_per_venue_per_asset_start`.
+   Higher = Arkham rate-limit pressure (raise `rate_pause_s` from 1.1s).
+4. **Dashboard payload size** — was ~30 KB/poll; per-venue per-asset
+   adds ~24 series × 24 buckets × ~30 bytes = ~17 KB. New floor
+   ~50 KB/poll. >100 KB sustained = the 24h slice limit lifted.
+
 ### 2026-04-26 (night) — Read-only single-page dashboard + demo balance reset
 
 Two paired changes triggered by the operator wanting to inspect live trade
