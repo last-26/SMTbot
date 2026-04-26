@@ -3797,7 +3797,6 @@ class BotRunner:
             logger.error("journal_open_but_no_live_position key={} (stale row)", k)
 
         await self._cancel_orphan_pending_limits()
-        await self._cancel_surplus_ocos(journal_keys)
 
     async def _cancel_orphan_pending_limits(self) -> None:
         """Cancel every resting limit order on Bybit at startup.
@@ -3833,16 +3832,3 @@ class BotRunner:
                     inst_id, ord_id,
                 )
 
-    async def _cancel_surplus_ocos(
-        self, journal_keys: set[tuple[str, str]],
-    ) -> None:
-        """No-op on Bybit V5.
-
-        On OKX this method walked the live OCO algo list and cancelled
-        any algo not referenced by the journal's `algo_ids`. Bybit V5
-        attaches TP/SL to the position itself (no separate algo orders),
-        so there's nothing to orphan and nothing to sweep here. Method
-        kept for back-compat with `_reconcile_orphans` callers; can be
-        deleted in a follow-up cleanup.
-        """
-        return

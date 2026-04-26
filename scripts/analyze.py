@@ -492,7 +492,7 @@ def _render_rejected_counterfactual(
         return lines
     pegged = [r for r in rejects if r.hypothetical_outcome in ("WIN", "LOSS")]
     if not pegged:
-        lines.append("_No pegged (WIN/LOSS) rejects — run `peg_rejected_outcomes.py --commit` first._")
+        lines.append("_No pegged (WIN/LOSS) rejects — counter-factual pegger was removed in the 2026-04-26 OKX cleanup; pre-migration rows still carry stamps, post-migration rows are NULL until a Bybit-native pegger is written._")
         return lines
     by_reason: dict[str, list[RejectedSignal]] = {}
     for r in pegged:

@@ -1227,8 +1227,10 @@ class TradeJournal:
 
         Only called by the runner on `plan is None` return. Never raises on
         duplicate — we generate a fresh uuid per call, the table is
-        append-only. Counter-factual outcome fields stay NULL until
-        `peg_rejected_outcomes.py` walks candles forward and stamps them.
+        append-only. Counter-factual outcome fields stay NULL until a
+        forward-walking pegger stamps them. (The legacy peg script was
+        removed 2026-04-26 with the OKX cleanup; pre-migration rows still
+        carry stamps written before that date.)
         """
         conn = self._require_conn()
         rec = RejectedSignal(
@@ -1295,9 +1297,11 @@ class TradeJournal:
     ) -> None:
         """Stamp the N-bar counter-factual on an existing rejected_signals row.
 
-        Called by `scripts/peg_rejected_outcomes.py`. `hypothetical_outcome`
-        is one of 'WIN' (TP hit first), 'LOSS' (SL hit first), 'NEITHER'.
-        Raises `KeyError` on unknown id so the script's dry-run catches stale data.
+        Called historically by the OKX-era counter-factual pegger
+        (removed 2026-04-26). `hypothetical_outcome` is one of
+        'WIN' (TP hit first), 'LOSS' (SL hit first), 'NEITHER'.
+        Raises `KeyError` on unknown id so any future re-pegger's dry-run
+        catches stale data.
         """
         conn = self._require_conn()
         cur = await conn.execute(

@@ -1145,7 +1145,7 @@ Things that aren't self-evident from the code. Inline comments cover the *what*;
 - **Close enrichment is non-optional.** `BybitClient.enrich_close_fill` queries `/v5/position/closed-pnl` for real `closedPnl` / `avgExitPrice` / `openFee+closeFee`. Without it every close looks BREAKEVEN and breakers never trip.
 - **In-memory register before DB.** `monitor.register_open` + `risk_mgr.register_trade_opened` happen *before* `journal.record_open` — a DB failure logs an orphan rather than losing a live position.
 - **Phantom-cancel resistance.** `poll_pending` + `cancel_pending` only pop the row on success or idempotent-gone (Bybit codes `110001/110008/110010/170142/170213`). Transient cancel failures preserve row for next poll retry. No dropped-but-still-live orphans.
-- **Startup reconcile cancels resting limits.** `_pending` is empty at startup, so any live limit is orphan by construction; `_cancel_orphan_pending_limits` walks `list_open_orders()` and cancels them. The OKX-era `_cancel_surplus_ocos` is now a no-op (Bybit has no separate algo orders to orphan — TP/SL is part of the position).
+- **Startup reconcile cancels resting limits.** `_pending` is empty at startup, so any live limit is orphan by construction; `_cancel_orphan_pending_limits` walks `list_open_orders()` and cancels them. The pre-migration `_cancel_surplus_ocos` no-op was removed in the 2026-04-26 OKX cleanup — on Bybit there are no separate algo orders to orphan since TP/SL is part of the position.
 
 ### Data quality
 
@@ -1210,7 +1210,6 @@ Adding a 6th+ pair: drop into `trading.symbols`, add `okx_to_tv_symbol()` parame
 # Analytics
 .venv/Scripts/python.exe scripts/report.py --last 7d
 .venv/Scripts/python.exe scripts/factor_audit.py                   # per-symbol/session/regime WR + counter-factuals
-.venv/Scripts/python.exe scripts/peg_rejected_outcomes.py --commit # stamp rejected hypothetical outcomes
 
 # Diagnostic probes (ad-hoc, read-only)
 .venv/Scripts/python.exe scripts/test_bybit_connection.py          # Bybit demo: wallet, instruments, mark, positions, orders
@@ -1247,7 +1246,10 @@ Combined on a 42-trade dataset (`rl.clean_since=2026-04-19T19:55:00Z`):
 - `rl.clean_since` bumped to restart-timestamp.
 - Demo bot runs. No code changes unless factor-audit reveals a regression.
 - Run `scripts/factor_audit.py` every ~10 closed trades.
-- Run `scripts/peg_rejected_outcomes.py --commit` daily.
+- (Counter-factual pegging on rejected signals: legacy `peg_rejected_outcomes.py`
+  was removed in the 2026-04-26 OKX cleanup; needs a Bybit-native rewrite
+  before Pass 3. Until then, post-migration rejected_signals carry NULL
+  `hypothetical_outcome`.)
 - Passive accumulation of `on_chain_snapshots`, `whale_transfers`, per-pillar + per-TF oscillator journal rows.
 
 **Gate to leave:** ≥30 closed trades, Arkham `on_chain_context` populated on 100% of rows, `confluence_pillar_scores` populated on 100%, `oscillator_raw_values` populated on ≥90% for each TF, net PnL ≥ 0, WR ≥ 45%.

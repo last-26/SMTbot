@@ -14,9 +14,12 @@ Replay is DATA-LIMITED. The journal stores:
     never reads it.
   * ``reject_reason`` on rejects — enough to flip a gate off and accept
     rows previously rejected for that reason.
-  * ``hypothetical_outcome`` on rejects (stamped by
-    ``peg_rejected_outcomes.py``) — the counter-factual label used when
-    a row is now accepted.
+  * ``hypothetical_outcome`` on rejects (legacy column, stamped by the
+    pre-migration counter-factual pegger which depended on the
+    OKX-specific candle endpoint and was removed 2026-04-26) — the
+    counter-factual label used when a row is now accepted. Pre-migration
+    rows still carry these stamps; post-migration rows are NULL until
+    a Bybit-native pegger is written.
 
 Replay CANNOT:
   * Re-weight pillars (Pass 2 — when pillar-score column has data).
@@ -26,7 +29,7 @@ Replay CANNOT:
 
 R-estimate constants for accepted-from-reject rows:
   * ``WIN`` → +1.5R. Deliberately below the bot's 1:2 hard TP because
-    peg_rejected_outcomes.py only tells us "TP would have hit first",
+    the legacy pegger only tells us "TP would have hit first",
     not "with what slippage / TP1 partial / early-close on
     ltf_reversal". Operator can tune via ``win_r_estimate`` override
     if Phase 9 suggests otherwise.
@@ -205,7 +208,8 @@ def simulate_reject_outcome(
       3. None of the above → still rejected, outcome 'STILL_REJECTED', 0R.
 
     When accepted, R comes from the row's ``hypothetical_outcome`` field
-    (stamped by ``peg_rejected_outcomes.py``). Missing / NEITHER → 0R.
+    (stamped on pre-migration rows by the now-removed counter-factual
+    pegger). Missing / NEITHER → 0R.
     """
     now_accepted = False
 

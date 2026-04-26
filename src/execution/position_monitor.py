@@ -43,10 +43,6 @@ def _utc_now() -> datetime:
 # manual cancel), we treat the cancel as idempotent success.
 _ORDER_GONE_CODES = frozenset({"110001", "110008", "110010", "170142", "170213"})
 
-# Legacy alias kept while the rest of the codebase migrates off the OKX-era
-# name. Both names point at the same set on Bybit.
-_ALGO_GONE_CODES = _ORDER_GONE_CODES
-
 # Backstop: if cancel keeps failing with an unknown code, stop after this
 # many polls and surface the position as unprotected. Prevents the
 # retry-spin pathology even when `_ORDER_GONE_CODES` doesn't match the
@@ -559,7 +555,7 @@ class PositionMonitor:
     def _cancel_tp_limit_best_effort(self, inst_id: str, order_id: str) -> None:
         """Cancel a resting TP limit. Tolerates all non-fatal paths:
 
-        * Already filled / already canceled (`_ALGO_GONE_CODES` family) —
+        * Already filled / already canceled (`_ORDER_GONE_CODES` family) —
           log-only, that's the expected terminal state on a normal close.
         * Any other exception — log it; the resting limit is reduce-only,
           so in the worst case it sits on the book until the next startup

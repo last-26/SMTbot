@@ -236,9 +236,11 @@ class RejectedSignal(BaseModel):
 
     Persists the context around every `plan is None` return from
     `build_trade_plan_with_reason`. Feeds two downstream uses:
-      1. `scripts/peg_rejected_outcomes.py` walks candles forward N bars
-         and stamps a hypothetical outcome on each reject — the
-         counter-factual dataset that validates/invalidates our veto logic.
+      1. Counter-factual pegger (legacy script removed 2026-04-26 with
+         the OKX cleanup; needs a Bybit-native rewrite) walks candles
+         forward N bars and stamps a hypothetical outcome — the
+         counter-factual dataset that validates/invalidates our veto
+         logic. Pre-migration rows still carry these stamps.
       2. `scripts/factor_audit.py` joins rejects vs. trades for a fair
          apples-to-apples WR comparison across reject_reason buckets.
 
@@ -290,7 +292,10 @@ class RejectedSignal(BaseModel):
     pillar_btc_bias: Optional[str] = None
     pillar_eth_bias: Optional[str] = None
 
-    # Counter-factual outcome — filled by peg_rejected_outcomes.py after N bars
+    # Counter-factual outcome — pre-migration rows filled by the legacy
+    # peg-rejected-outcomes script (removed 2026-04-26 with the OKX cleanup;
+    # depended on the OKX candle endpoint). Post-migration rows are NULL
+    # until a Bybit-native pegger is written.
     # "WIN" = TP hit first, "LOSS" = SL hit first, "NEITHER" = neither inside window.
     hypothetical_outcome: Optional[str] = None
     hypothetical_bars_to_tp: Optional[int] = None
