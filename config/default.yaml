@@ -2,7 +2,7 @@ bot:
   mode: demo
   poll_interval_seconds: 5
   timezone: UTC
-  starting_balance: 5000.0  # Sprint 3 demo reset balance — 1% risk → 1R = $50
+  starting_balance: 500.0  # 2026-04-26 demo reset — flat-$ override RISK_AMOUNT_USDT=10 → 1R = $10
 
 trading:
   # 5 pair — hepsi aynı anda aktif (max_concurrent_positions=5, queue yok).
