@@ -26,6 +26,152 @@ AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT lin
 
 ## Changelog
 
+### 2026-04-26 (night) — Read-only single-page dashboard + demo balance reset
+
+Two paired changes triggered by the operator wanting to inspect live trade
+state without opening `data/trades.db` directly in a SQLite browser, plus a
+demo balance reset for a more conservative observation phase.
+
+**Dashboard (`src/dashboard/`):** new sibling FastAPI process, read-only, one
+scrollable HTML page. No tabs (operator preference: single consolidated panel
+"genel gözlem yapabileceğim bir front sayfası"). Polls `GET /api/state` every
+5s and re-renders. Sections: KPI tiles (closed trades / WR / Net R / PF / max
+DD / Sharpe / wallet / open count), open positions joined to latest
+`position_snapshots` row (live mark, UPnL $/R, MFE/MAE, current SL/TP, BE +
+MFE-lock flags), equity curve (Chart.js cumulative R), reject reason
+histogram, three 24h on-chain charts (BTC netflow / ETH netflow / stablecoin
+pulse 1h — sliced from `on_chain_snapshots` rows in last 24h), closed trades
+last 50, per-symbol + per-regime breakdown tables, latest on-chain snapshot
+card (15 fields covering all 6 named CEX venues), rejected signals last 50,
+whale transfers last 25.
+
+**Read-only concurrency:** `src/dashboard/state.py::ReadOnlyJournal` subclass
+overrides `connect()` to open the DB via `aiosqlite.connect("file:...?mode=ro",
+uri=True, timeout=10)` and skips schema setup — bot remains the schema owner,
+dashboard is a passive reader. Default DELETE journal mode serializes
+writers vs. readers, brief `SQLITE_BUSY` rides through the 10s timeout. WAL
+mode NOT enabled (would persist in the file and require operator opt-in).
+
+**Live wallet probe:** when `BYBIT_API_KEY/SECRET` present in `.env`,
+`fetch_wallet()` calls `BybitClient.get_balance()` + `get_total_equity()`
+in `asyncio.to_thread` with an 8s timeout per request and surfaces
+`{available_usd, margin_balance_usd, demo}` in the payload. Frontend "Wallet"
+tile shows `margin_balance_usd` with `available` as the sub-line. Missing
+creds or any failure → tile falls back to journal-simulated equity. Adds
+~2 round-trips per 5s poll cycle (cheap; no rate-limit pressure on Bybit V5).
+
+**Demo balance reset (`config/default.yaml`):** `bot.starting_balance`
+`5000.0 → 500.0`. Operator reset the Bybit demo account to a $500 baseline
+for a more conservative observation phase. `RISK_AMOUNT_USDT=10` (.env)
+unchanged in mechanism but now represents 2% of equity (was 0.2% on $5k).
+Per-slot collateral `total_eq / 5 ≈ $100`. Sizing math reads `wallet`
+from Bybit at runtime, not the YAML constant — `starting_balance` is only
+used by `reporter.summary()` for the journal-simulated equity baseline
+(equity-curve KPI when wallet probe is unavailable).
+
+**`logs.bat` removed** at repo root — operator uses `scripts/logs.py`
+directly when needed; dashboard log-streaming is out of scope here.
+
+**`dashboard.bat` startup hardening:** added `pause` after the python
+process exits so a bind error (port 8765 already in use) leaves the
+console window open with a visible exit code. Without it the window
+closed silently and operator couldn't diagnose stale-instance
+conflicts.
+
+**Files touched:**
+- New: [src/dashboard/__init__.py](src/dashboard/__init__.py), [__main__.py](src/dashboard/__main__.py),
+  [state.py](src/dashboard/state.py), [server.py](src/dashboard/server.py),
+  [static/index.html](src/dashboard/static/index.html), [dashboard.bat](dashboard.bat).
+- Modified: [requirements.txt](requirements.txt) (`fastapi>=0.115`, `uvicorn[standard]>=0.32`),
+  [config/default.yaml](config/default.yaml) (`starting_balance: 5000 → 500`).
+- Removed: `logs.bat`.
+
+**Cost:** zero on the bot writer (separate process, RO connection). On the
+dashboard side, ~2 Bybit REST calls per 5s poll while the page is open;
+no rate-limit pressure (Bybit V5 wallet endpoint has its own quota separate
+from order/position).
+
+**Re-eval triggers:**
+1. **`SQLITE_BUSY` log line frequency** in dashboard logs — should be near-zero
+   under DELETE journal mode at 5s polling. Higher than ~1/min = the bot's
+   commit window is blocking the dashboard read more than expected; consider
+   WAL opt-in.
+2. **Wallet tile NULL rate** — `wallet` key missing from `/api/state` more
+   than ~5% of polls = Bybit demo edge or DNS pin failing intermittently;
+   inspect `bybit_demo_dns_pin_failed` log.
+3. **Dashboard payload size** — currently ~30 KB/poll at 50 closed + 50
+   rejected + 25 whales + 45 on_chain rows. >200 KB sustained = a list
+   limit was inadvertently lifted; tighten `_RECENT_*_LIMIT` constants in
+   `state.py`.
+
+### 2026-04-26 (evening) — Intra-trade `position_snapshots` table for RL trajectory data
+
+New `position_snapshots` table joined to `trades.trade_id`, populated every
+5 min (configurable `journal.position_snapshot_cadence_s`, validated [60, 3600])
+for every OPEN position. Captures live mark/PnL (from Bybit `get_positions` —
+zero extra API), running MFE/MAE in R, current SL/TP + lifecycle flags
+(BE moved, MFE-lock applied), and drift fields for derivatives + on-chain +
+3m oscillator + VWAP-band distance.
+
+Hook: `_process_closes()` after `monitor.poll()` returns `(fills, live_snaps)`
+tuple. Cadence gate via `time.monotonic()`, bumped only after a successful
+write window (so a no-write cycle doesn't reset the timer). MFE/MAE updated
+on every 5s poll inside `PositionMonitor.poll()` (not just 5-min snapshot)
+so excursion peaks aren't missed. Per-symbol `last_market_state_per_symbol`
+cache on `BotContext` populated at end of `_run_one_symbol` enables
+oscillator/VWAP enrichment outside the per-symbol cycle.
+
+Pass 3+ use: post-hoc trajectory replay — "trade X peaked at +1.3R at minute
+12, was stopped at −1R at minute 47; would early-exit at +1.0R MFE have
+captured edge?" Hourly heatmap — "do positions opened in 09-12 UTC band drift
+away from VWAP composite faster than 14-17 UTC?" Joins to `trades.trade_id`
+allow per-trade trajectory reconstruction without re-fetching market state.
+
+**Restart caveat:** MFE/MAE running counters are in-memory only; rehydrated
+positions reset to 0/0 and rebuild from the next poll. Acceptable for v1; the
+alternative (4th column on `trades` + rehydrate plumbing change) is deferred
+unless RL feature importance on these columns shows entry-window sensitivity.
+Similarly, the FIRST snapshot per symbol after restart will have NULL
+oscillator/VWAP enrichment until that symbol's first per-symbol cycle
+populates the `last_market_state_per_symbol` cache.
+
+**Files touched:** new `position_snapshots` schema + `record_position_snapshot`
++ `get_position_snapshots` reader + `PositionSnapshotRecord` model in journal;
+`_Tracked.mfe_r_high/mae_r_low` + per-poll update + `poll() → (fills, snaps)`
+tuple + `get_tracked()` accessor in [src/execution/position_monitor.py](src/execution/position_monitor.py);
+`BotContext.last_market_state_per_symbol` + `last_position_snapshot_ts` +
+`_maybe_write_position_snapshots` + cache hook + `_process_closes` rewire in
+[src/bot/runner.py](src/bot/runner.py); `JournalConfig.position_snapshot_*`
+fields + `[60, 3600]` validator in [src/bot/config.py](src/bot/config.py);
+`journal:` block extended in [config/default.yaml](config/default.yaml).
+
+**Tests:** +26 across `test_journal_position_snapshots.py` (11 — schema,
+round-trip, NULL handling, JSON nested-dict, idempotent migration, cross-trade
+isolation), `test_position_monitor_mfe_mae.py` (8 — defaults, long/short
+sign-aware excursion, multi-poll persistence, plan_sl=0 skip, tuple return),
+`test_runner_position_snapshots.py` (7 — cadence gate, disabled config, empty
+snaps, missing tracked, rehydrate plan_sl=0 skip, end-to-end MFE/MAE write).
++5 `JournalConfig` validator tests in `test_bot_config.py`. New tests 26/26
+green; full-suite delta `911 → 937 passed`. Pre-existing 33 OKX→Bybit
+migration leftover failures untouched (separate cleanup task).
+
+**Cost:** zero extra API calls — `live_snaps` already fetched by `monitor.poll()`,
+just plumbed through. ~1 KB/day SQLite growth at 5 positions × 1 row / 5 min.
+
+**Re-eval triggers:**
+1. **Snapshot row coverage** — `SELECT COUNT(DISTINCT trade_id) FROM position_snapshots`
+   over a 24h window with N OPEN positions held >5 min should equal N. Lower
+   = cadence gate or hook regression.
+2. **MFE/MAE non-zero rate** — fraction of snapshot rows with `mfe_r_so_far > 0
+   OR mae_r_so_far < 0` should approach 100% after ~10 polls (50s) into a
+   position. Lower = per-poll update regression.
+3. **Oscillator drift coverage** — `oscillator_3m_now_json != NULL` rate should
+   approach 100% on snapshots taken AFTER each symbol's first cycle post-
+   restart. Cold-start gap is expected NULL.
+4. **Write throughput** — at 5 positions × 1 row / 5 min = ~1 row/min sustained.
+   `data/trades.db` growth should track ~1 KB/day from this table at full
+   tilt; alarm if > 100 KB/day (cadence gate failed).
+
 ### 2026-04-26 — VWAP daily-reset blackout + pillar_scores forwarding bugfix
 
 Two paired changes triggered by a single morning chart-review session: operator noticed Pine VWAP (1m/3m/15m) "resets" at UTC 00:00 — bands collapse and re-anchor — and asked whether new entries are protected from the noisy ~10-30 min post-reset window. Same review surfaced that all 5 OPEN positions have empty `confluence_pillar_scores={}` despite populated `confluence_factors`, breaking Pass 2 instrumentation for zone-based entries.
@@ -796,7 +942,7 @@ Things that aren't self-evident from the code. Inline comments cover the *what*;
 
 5 Bybit USDT linear perps — BTC / ETH / SOL / DOGE / XRP (post-2026-04-25). BTC + ETH are market pillars (major-class book depth); SOL + DOGE + XRP are altcoins gated by the cross-asset veto. BNB swapped out for XRP on 2026-04-25 (operator pref); BNB override maps remain in YAML (harmless when not watched), `_OKX_TO_BYBIT_SYMBOL` / `_OKX_CT_VAL` still carry both BNB and XRP rows so re-swapping either way is a one-line YAML change. ADA pulled on 2026-04-19 (eve, OKX-era) after hitting OKX demo OI platform cap; rows preserved for the same reason.
 
-`max_concurrent_positions=5` (every pair can hold a position simultaneously — no slot competition; confluence gate still picks setups, but cycle isn't queue-limited). Cross margin, `per_slot ≈ total_eq / 5 ≈ $1000` on a $5k demo. R stays 1% of total equity ($50), or flat via `RISK_AMOUNT_USDT` override.
+`max_concurrent_positions=5` (every pair can hold a position simultaneously — no slot competition; confluence gate still picks setups, but cycle isn't queue-limited). Cross margin, `per_slot ≈ total_eq / 5 ≈ $100` on a $500 demo (2026-04-26 reset). R is flat $10 via `RISK_AMOUNT_USDT=10` (= 2% of starting balance — operator-tightened for the dashboard-era live observation phase; previously $100 on a $50k demo).
 
 Cycle timing at 3m entry TF = 180s budget: typical 150–180s with 5 pairs (comfortable inside the budget after 7→5 rollback). DOGE + XRP leverage-capped at 30x via `symbol_leverage_caps` (Bybit instrument allows 75x; operator-tightened for thin-book scalp safety on momentum-driven pairs). SOL inherits global cap = 50x; BTC/ETH = 100x (Bybit instrument max).
 
