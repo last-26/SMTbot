@@ -236,15 +236,16 @@ class TVBridge:
 # ── Module-level helpers ─────────────────────────────────────────────────────
 
 
-def okx_to_tv_symbol(okx_symbol: str) -> str:
+def internal_to_tv_symbol(internal_symbol: str) -> str:
     """'BTC-USDT-SWAP' → 'BYBIT:BTCUSDT.P'; 'BTC-USDT' → 'BYBIT:BTCUSDT'.
 
-    Function name preserved (back-compat with existing call sites) — the
-    *input* still uses the OKX-style identifier we keep as the internal
-    canonical format; the *output* now points TV at the BYBIT chart so
-    the bot reads candles from the venue we actually trade on.
+    Translate the internal canonical symbol format (kept across the
+    runner / config / journal) to the TradingView ticker for the venue
+    the bot actually trades on. The internal format originated with the
+    pre-migration execution layer and is preserved as canonical to avoid
+    a mass rename of journal rows + config keys.
     """
-    raw = okx_symbol.strip()
+    raw = internal_symbol.strip()
     is_perp = raw.endswith("-SWAP")
     base = raw.replace("-SWAP", "").replace("-", "")
     suffix = ".P" if is_perp else ""

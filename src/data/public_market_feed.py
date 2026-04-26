@@ -35,11 +35,16 @@ class RealCandle:
     close: float
 
 
-def okx_swap_to_binance_futures(okx_symbol: str) -> Optional[str]:
-    """`BTC-USDT-SWAP` → `BTCUSDT`. Returns None for shapes we can't map."""
-    if not okx_symbol or not okx_symbol.endswith("-SWAP"):
+def internal_to_binance_futures(internal_symbol: str) -> Optional[str]:
+    """`BTC-USDT-SWAP` → `BTCUSDT`. Returns None for shapes we can't map.
+
+    Maps the internal canonical perp identifier to the Binance USDT-M
+    futures ticker for cross-venue artefact validation (see Phase 4
+    cross-check in `src/bot/runner.py`).
+    """
+    if not internal_symbol or not internal_symbol.endswith("-SWAP"):
         return None
-    base_quote = okx_symbol[:-len("-SWAP")]
+    base_quote = internal_symbol[:-len("-SWAP")]
     if "-" not in base_quote:
         return None
     base, quote = base_quote.split("-", 1)

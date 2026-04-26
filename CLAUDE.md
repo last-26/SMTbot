@@ -1184,7 +1184,7 @@ Per-symbol overrides (YAML, ADA/XRP rows kept for easy reinstatement):
 - `session_filter_per_symbol`: SOL + DOGE=[london] only. BNB inherits global (london+new_york) as major.
 - `min_sl_distance_pct_per_symbol`: BTC 0.004, ETH 0.008 (bumped 2026-04-21 eve), SOL 0.010, DOGE 0.008, BNB 0.005.
 
-Adding a 6th+ pair: drop into `trading.symbols`, add `okx_to_tv_symbol()` parametrized test (helper name still uses the pre-migration label until Phase 5 rename), add `derivatives.regime_per_symbol_overrides`, add `min_sl_distance_pct_per_symbol`, **add an entry to `bybit_client._INTERNAL_TO_BYBIT_SYMBOL` + `_INTERNAL_CT_VAL`** (boundary translation + sizing), extend `affected_symbols_for` in `on_chain_types.py` for chain-native tokens, watch 20-30 cycles for `htf_settle_timeout` / `set_symbol_failed`. Coinalyze free tier supports ~8 pairs at refresh_interval_s=75s; Arkham at current cadence ≤6 pairs comfortable.
+Adding a 6th+ pair: drop into `trading.symbols`, add `internal_to_tv_symbol()` parametrized test, add `derivatives.regime_per_symbol_overrides`, add `min_sl_distance_pct_per_symbol`, **add an entry to `bybit_client._INTERNAL_TO_BYBIT_SYMBOL` + `_INTERNAL_CT_VAL`** (boundary translation + sizing), extend `affected_symbols_for` in `on_chain_types.py` for chain-native tokens, watch 20-30 cycles for `htf_settle_timeout` / `set_symbol_failed`. Coinalyze free tier supports ~8 pairs at refresh_interval_s=75s; Arkham at current cadence ≤6 pairs comfortable.
 
 ---
 

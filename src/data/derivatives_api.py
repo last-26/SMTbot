@@ -32,7 +32,7 @@ EXCHANGE_PRIORITY = ["A", "6", "3", "F", "H"]
 
 @dataclass
 class DerivativesSnapshot:
-    """Point-in-time derivatives view for one symbol (OKX form)."""
+    """Point-in-time derivatives view for one symbol (internal canonical form)."""
     symbol: str
     ts_ms: int
     funding_rate_current: float = 0.0
@@ -129,7 +129,7 @@ class CoinalyzeClient:
                 await asyncio.sleep(1.5 ** attempt)
         return None
 
-    # ── Symbol mapping (OKX → Coinalyze) ───────────────────────────────────
+    # ── Symbol mapping (internal canonical → Coinalyze) ───────────────────
 
     async def ensure_symbol_map(self, watched: list[str]) -> None:
         """Populate `self._symbol_map` from `/future-markets`.
@@ -167,8 +167,8 @@ class CoinalyzeClient:
             self._symbol_map_loaded = True
             return
 
-        for okx_sym in watched:
-            base = okx_sym.split("-")[0]
+        for internal_sym in watched:
+            base = internal_sym.split("-")[0]
             candidates = [
                 m for m in data
                 if m.get("base_asset") == base
@@ -177,8 +177,8 @@ class CoinalyzeClient:
                 and m.get("margined") == "STABLE"
             ]
             if not candidates:
-                logger.warning("coinalyze_no_market_for_symbol okx={} base={}",
-                               okx_sym, base)
+                logger.warning("coinalyze_no_market_for_symbol internal={} base={}",
+                               internal_sym, base)
                 continue
 
             chosen = None
@@ -192,14 +192,14 @@ class CoinalyzeClient:
             if chosen is None:
                 chosen = candidates[0]
 
-            self._symbol_map[okx_sym] = chosen["symbol"]
-            logger.info("coinalyze_mapping okx={} coinalyze={}",
-                        okx_sym, chosen["symbol"])
+            self._symbol_map[internal_sym] = chosen["symbol"]
+            logger.info("coinalyze_mapping internal={} coinalyze={}",
+                        internal_sym, chosen["symbol"])
 
         self._symbol_map_loaded = True
 
-    def coinalyze_symbol(self, okx_symbol: str) -> Optional[str]:
-        return self._symbol_map.get(okx_symbol)
+    def coinalyze_symbol(self, internal_symbol: str) -> Optional[str]:
+        return self._symbol_map.get(internal_symbol)
 
     # ── Current snapshot endpoints (flat: {symbol, value, update}) ────────
 
@@ -356,9 +356,9 @@ class CoinalyzeClient:
 
     # ── Aggregate snapshot ────────────────────────────────────────────────
 
-    async def fetch_snapshot(self, okx_symbol: str) -> Optional[DerivativesSnapshot]:
+    async def fetch_snapshot(self, internal_symbol: str) -> Optional[DerivativesSnapshot]:
         """5 sequential per-symbol calls. Paralleling would blow the bucket."""
-        cn_sym = self._symbol_map.get(okx_symbol)
+        cn_sym = self._symbol_map.get(internal_symbol)
         if not cn_sym:
             return None
 
@@ -369,7 +369,7 @@ class CoinalyzeClient:
         ls = await self.fetch_long_short_ratio(cn_sym, "1hour")
 
         return DerivativesSnapshot(
-            symbol=okx_symbol,
+            symbol=internal_symbol,
             ts_ms=int(time.time() * 1000),
             funding_rate_current=funding or 0.0,
             funding_rate_predicted=predicted or 0.0,

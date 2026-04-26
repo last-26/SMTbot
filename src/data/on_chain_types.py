@@ -85,7 +85,7 @@ class OnChainSnapshot:
     cex_per_venue_eth_netflow_24h_usd_json: Optional[str] = None
     cex_per_venue_stables_netflow_24h_usd_json: Optional[str] = None
     # 2026-04-22 — per-symbol most-recent-hour net CEX flow (USD) via
-    # `/token/volume/{id}?granularity=1h`. JSON dict keyed by OKX symbol;
+    # `/token/volume/{id}?granularity=1h`. JSON dict keyed by internal-format symbol;
     # adding a 6th symbol won't require schema migration. Initially
     # journal-only; promoted to runtime 2026-04-22 (gece, late) as the
     # `per_symbol_cex_flow_penalty` soft signal (per-symbol directional
@@ -106,7 +106,7 @@ class WhaleEvent:
 
     `affected_symbols` carries the pre-computed blast radius — stablecoin
     events expand to every watched symbol; chain-native events collapse
-    to just the matching OKX perp. The WebSocket listener computes this
+    to just the matching internal-format perp. The WebSocket listener computes this
     once so the runner's hot path doesn't map strings on every poll.
     """
 
@@ -147,7 +147,7 @@ def affected_symbols_for(token_id: str) -> tuple[str, ...]:
     return ()
 
 
-# 2026-04-22 — reverse mapping: OKX-style perp symbol → Arkham token slug
+# 2026-04-22 — reverse mapping: internal-format perp symbol → Arkham token slug
 # (CoinGecko-style id). Used by the runner's `/token/volume/{id}` fetch
 # pipeline (per-symbol 1h CEX flow → `per_symbol_cex_flow_penalty`).
 # Adding a new symbol requires extending BOTH this dict AND

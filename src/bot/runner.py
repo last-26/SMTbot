@@ -65,11 +65,11 @@ from src.data.on_chain_ws import ArkhamWebSocketListener
 from src.data.public_market_feed import (
     BinancePublicClient,
     RealCandle,
-    okx_swap_to_binance_futures,
+    internal_to_binance_futures,
     price_inside_candle,
 )
 from src.data.structured_reader import StructuredReader
-from src.data.tv_bridge import TVBridge, okx_to_tv_symbol
+from src.data.tv_bridge import TVBridge, internal_to_tv_symbol
 from src.execution.errors import (
     AlgoOrderError,
     InsufficientMargin,
@@ -1794,7 +1794,7 @@ class BotRunner:
         # tests pass bridge=None and the reader fake already knows the symbol).
         if self.ctx.bridge is not None:
             try:
-                await self.ctx.bridge.set_symbol(okx_to_tv_symbol(symbol))
+                await self.ctx.bridge.set_symbol(internal_to_tv_symbol(symbol))
                 await asyncio.sleep(cfg.trading.symbol_settle_seconds)
             except Exception:
                 logger.exception("set_symbol_failed symbol={}", symbol)
@@ -3616,7 +3616,7 @@ class BotRunner:
         client = self.ctx.binance_public
         if client is None:
             return
-        binance_symbol = okx_swap_to_binance_futures(symbol)
+        binance_symbol = internal_to_binance_futures(symbol)
         if not binance_symbol:
             logger.debug(
                 "artefact_unmapped_symbol symbol={} trade_id={}",

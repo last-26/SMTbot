@@ -1,7 +1,7 @@
 """Tests for the Binance public futures cross-check layer (Katman 2).
 
 Covers three slices:
-  1. `okx_swap_to_binance_futures` symbol mapping.
+  1. `internal_to_binance_futures` symbol mapping.
   2. `price_inside_candle` band + tolerance math.
   3. `BinancePublicClient.get_kline_around` happy path + failure isolation
      (network error, non-200, malformed JSON, empty list) using a stubbed
@@ -19,7 +19,7 @@ from src.data.public_market_feed import (
     BINANCE_FUTURES_BASE,
     BinancePublicClient,
     RealCandle,
-    okx_swap_to_binance_futures,
+    internal_to_binance_futures,
     price_inside_candle,
 )
 
@@ -28,23 +28,23 @@ from src.data.public_market_feed import (
 
 
 @pytest.mark.parametrize(
-    "okx_symbol,expected",
+    "internal_symbol,expected",
     [
         ("BTC-USDT-SWAP", "BTCUSDT"),
         ("ETH-USDT-SWAP", "ETHUSDT"),
         ("DOGE-USDT-SWAP", "DOGEUSDT"),
     ],
 )
-def test_symbol_mapping_happy(okx_symbol: str, expected: str) -> None:
-    assert okx_swap_to_binance_futures(okx_symbol) == expected
+def test_symbol_mapping_happy(internal_symbol: str, expected: str) -> None:
+    assert internal_to_binance_futures(internal_symbol) == expected
 
 
 @pytest.mark.parametrize(
-    "okx_symbol",
+    "internal_symbol",
     ["", "BTC-USDT", "BTC-USDT-PERP", "SPOT-ONLY", "-USDT-SWAP", "BTC--SWAP"],
 )
-def test_symbol_mapping_rejects_bad_shapes(okx_symbol: str) -> None:
-    assert okx_swap_to_binance_futures(okx_symbol) is None
+def test_symbol_mapping_rejects_bad_shapes(internal_symbol: str) -> None:
+    assert internal_to_binance_futures(internal_symbol) is None
 
 
 # ── price_inside_candle ─────────────────────────────────────────────────────

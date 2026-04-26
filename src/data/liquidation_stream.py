@@ -30,12 +30,16 @@ from loguru import logger
 BINANCE_FORCE_ORDER_URL = "wss://fstream.binance.com/ws/!forceOrder@arr"
 
 
-def okx_to_binance_symbol(okx_symbol: str) -> str:
-    """'BTC-USDT-SWAP' → 'BTCUSDT'."""
-    return okx_symbol.replace("-SWAP", "").replace("-", "")
+def internal_to_binance_symbol(internal_symbol: str) -> str:
+    """'BTC-USDT-SWAP' → 'BTCUSDT'.
+
+    Maps the internal canonical perp identifier to the Binance USDT-M
+    perpetual ticker used on the forceOrder liquidation stream.
+    """
+    return internal_symbol.replace("-SWAP", "").replace("-", "")
 
 
-def binance_to_okx_symbol(binance_symbol: str) -> Optional[str]:
+def binance_to_internal_symbol(binance_symbol: str) -> Optional[str]:
     """'BTCUSDT' → 'BTC-USDT-SWAP'. Non-USDT perps return None (we ignore them)."""
     if binance_symbol.endswith("USDT"):
         base = binance_symbol[:-4]
@@ -47,7 +51,7 @@ def binance_to_okx_symbol(binance_symbol: str) -> Optional[str]:
 
 @dataclass(frozen=True)
 class LiquidationEvent:
-    symbol: str           # OKX form, e.g. 'BTC-USDT-SWAP'
+    symbol: str           # internal canonical form, e.g. 'BTC-USDT-SWAP'
     side: str             # 'LONG_LIQ' (long liquidated) | 'SHORT_LIQ'
     price: float
     quantity: float       # base asset
@@ -130,8 +134,8 @@ class LiquidationStream:
         msg = json.loads(raw)
         o = msg.get("o") or {}
         binance_sym = o.get("s", "")
-        okx_sym = binance_to_okx_symbol(binance_sym)
-        if okx_sym is None or okx_sym not in self.watched:
+        internal_sym = binance_to_internal_symbol(binance_sym)
+        if internal_sym is None or internal_sym not in self.watched:
             return
 
         side_raw = o.get("S")
@@ -149,14 +153,14 @@ class LiquidationStream:
 
         ts_ms = int(o.get("T") or msg.get("E") or time.time() * 1000)
         ev = LiquidationEvent(
-            symbol=okx_sym,
+            symbol=internal_sym,
             side=side,
             price=price,
             quantity=qty,
             notional_usd=price * qty,
             ts_ms=ts_ms,
         )
-        self.buffers[okx_sym].append(ev)
+        self.buffers[internal_sym].append(ev)
         if self._journal is not None:
             try:
                 asyncio.create_task(self._journal.insert_liquidation(ev))

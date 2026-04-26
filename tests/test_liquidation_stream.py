@@ -16,29 +16,29 @@ import pytest
 from src.data.liquidation_stream import (
     LiquidationEvent,
     LiquidationStream,
-    binance_to_okx_symbol,
-    okx_to_binance_symbol,
+    binance_to_internal_symbol,
+    internal_to_binance_symbol,
 )
 
 
 # ── Symbol mapping ────────────────────────────────────────────────────────
 
 def test_symbol_mapping_round_trip():
-    assert okx_to_binance_symbol("BTC-USDT-SWAP") == "BTCUSDT"
-    assert okx_to_binance_symbol("ETH-USDT-SWAP") == "ETHUSDT"
-    assert okx_to_binance_symbol("DOGE-USDT-SWAP") == "DOGEUSDT"
-    assert okx_to_binance_symbol("XRP-USDT-SWAP") == "XRPUSDT"
-    assert binance_to_okx_symbol("BTCUSDT") == "BTC-USDT-SWAP"
-    assert binance_to_okx_symbol("SOLUSDT") == "SOL-USDT-SWAP"
-    assert binance_to_okx_symbol("DOGEUSDT") == "DOGE-USDT-SWAP"
-    assert binance_to_okx_symbol("XRPUSDT") == "XRP-USDT-SWAP"
+    assert internal_to_binance_symbol("BTC-USDT-SWAP") == "BTCUSDT"
+    assert internal_to_binance_symbol("ETH-USDT-SWAP") == "ETHUSDT"
+    assert internal_to_binance_symbol("DOGE-USDT-SWAP") == "DOGEUSDT"
+    assert internal_to_binance_symbol("XRP-USDT-SWAP") == "XRPUSDT"
+    assert binance_to_internal_symbol("BTCUSDT") == "BTC-USDT-SWAP"
+    assert binance_to_internal_symbol("SOLUSDT") == "SOL-USDT-SWAP"
+    assert binance_to_internal_symbol("DOGEUSDT") == "DOGE-USDT-SWAP"
+    assert binance_to_internal_symbol("XRPUSDT") == "XRP-USDT-SWAP"
 
 
 def test_symbol_mapping_rejects_non_usdt():
     # BUSD, USDC, BTC-margined contracts — None means "ignore this stream".
-    assert binance_to_okx_symbol("BTCBUSD") is None
-    assert binance_to_okx_symbol("BTCUSDC") is None
-    assert binance_to_okx_symbol("USDT") is None            # empty base
+    assert binance_to_internal_symbol("BTCBUSD") is None
+    assert binance_to_internal_symbol("BTCUSDC") is None
+    assert binance_to_internal_symbol("USDT") is None            # empty base
 
 
 # ── _handle parser ────────────────────────────────────────────────────────
@@ -83,7 +83,7 @@ def test_handle_skips_unwatched_symbol():
 
 def test_handle_skips_non_usdt_symbol():
     s = LiquidationStream(["BTC-USDT-SWAP"])
-    # BUSD pair — binance_to_okx_symbol returns None, early exit.
+    # BUSD pair — binance_to_internal_symbol returns None, early exit.
     s._handle(_fake_force_order("BTCBUSD", "SELL", 70_000.0, 0.5))
     assert len(s.buffers["BTC-USDT-SWAP"]) == 0
 

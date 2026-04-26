@@ -6,7 +6,7 @@ Covers:
   * `max_concurrent_positions` caps total open entries across symbols.
   * Legacy `trading.symbol` YAML form coerces to `symbols=[...]` with a
     `DeprecationWarning`.
-  * `okx_to_tv_symbol` maps the 5 OKX perps to the right TV tickers.
+  * `internal_to_tv_symbol` maps the 5 internal-format perps to the right TV tickers.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import pytest
 
 from src.bot.config import BotConfig
 from src.bot.runner import BotRunner
-from src.data.tv_bridge import okx_to_tv_symbol
+from src.data.tv_bridge import internal_to_tv_symbol
 from tests.conftest import FakeRouter, make_config, make_plan
 
 
@@ -57,7 +57,7 @@ async def test_symbols_roundrobin_order(monkeypatch, make_ctx):
     async with ctx.journal:
         await runner.run_once()
 
-    assert bridge.symbol_calls == [okx_to_tv_symbol(s) for s in syms]
+    assert bridge.symbol_calls == [internal_to_tv_symbol(s) for s in syms]
 
 
 async def test_symbol_failure_does_not_break_others(monkeypatch, make_ctx):
@@ -73,7 +73,7 @@ async def test_symbol_failure_does_not_break_others(monkeypatch, make_ctx):
     original_set = bridge.set_symbol
 
     async def flaky(sym: str):
-        if sym == okx_to_tv_symbol("SOL-USDT-SWAP"):
+        if sym == internal_to_tv_symbol("SOL-USDT-SWAP"):
             raise RuntimeError("TV bridge blew up on SOL")
         return await original_set(sym)
 
@@ -87,8 +87,8 @@ async def test_symbol_failure_does_not_break_others(monkeypatch, make_ctx):
     # Either the 3rd set_symbol raised before logging (then 4+5 still ran),
     # or the loop's per-symbol try/except caught the failure. Either way,
     # the final two symbols must have been attempted.
-    assert okx_to_tv_symbol("AVAX-USDT-SWAP") in bridge.symbol_calls
-    assert okx_to_tv_symbol("XRP-USDT-SWAP") in bridge.symbol_calls
+    assert internal_to_tv_symbol("AVAX-USDT-SWAP") in bridge.symbol_calls
+    assert internal_to_tv_symbol("XRP-USDT-SWAP") in bridge.symbol_calls
 
 
 async def test_max_concurrent_positions_caps_entries(monkeypatch, make_ctx):
@@ -191,5 +191,5 @@ async def test_legacy_symbol_config_backward_compat():
     ("BNB-USDT-SWAP", "BYBIT:BNBUSDT.P"),
     ("BTC-USDT", "BYBIT:BTCUSDT"),            # spot — no .P
 ])
-def test_okx_to_tv_symbol(internal, tv):
-    assert okx_to_tv_symbol(internal) == tv
+def test_internal_to_tv_symbol_mapping(internal, tv):
+    assert internal_to_tv_symbol(internal) == tv
