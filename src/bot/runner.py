@@ -3856,7 +3856,11 @@ class BotRunner:
             self.ctx.monitor.register_open(
                 rec.symbol, pos_side,
                 float(rec.num_contracts), rec.entry_price,
-                algo_ids=list(rec.algo_ids),
+                # 2026-04-27 — `algo_ids` column dropped (Bybit V5 has
+                # position-attached TP/SL, no separate algo orders to
+                # track). Pass an empty list so the monitor's bookkeeping
+                # stays happy on rehydrate.
+                algo_ids=[],
                 tp2_price=rec.tp_price,
                 be_already_moved=rec.sl_moved_to_be,
                 sl_price=rec.sl_price, runner_size=runner_size,
