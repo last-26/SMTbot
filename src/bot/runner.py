@@ -52,6 +52,7 @@ from src.data.on_chain import (
     ArkhamClient,
     fetch_daily_snapshot,
     fetch_entity_netflow_24h,
+    fetch_entity_per_asset_netflow_24h,
     fetch_hourly_stablecoin_pulse,
     fetch_token_volume_last_hour,
 )
@@ -105,6 +106,19 @@ from src.strategy.trade_plan import TradePlan
 
 def _utc_now() -> datetime:
     return datetime.now(tz=timezone.utc)
+
+
+def _dump_per_venue_dict(d: dict[str, Optional[float]]) -> Optional[str]:
+    """Serialise a per-venue netflow dict to a JSON TEXT column value.
+
+    Empty dict → None so the journal column stays NULL until the
+    background fetcher actually populates a venue. None values inside the
+    dict are preserved (Pass 3 GBT can distinguish "fetch failed" from
+    "no flow") via JSON null.
+    """
+    if not d:
+        return None
+    return json.dumps(d)
 
 
 def _timeframe_key(tf: str) -> str:
@@ -606,6 +620,17 @@ class BotContext:
     # (token_volume_refresh_s, default 3600). Journal-only.
     token_volume_1h_net_usd_json: Optional[str] = None
     last_token_volume_ts: float = 0.0
+    # 2026-04-26 — per-venue × per-asset 24h netflow (BTC / ETH / stables).
+    # Each is a dict keyed by entity slug ("coinbase"/"binance"/"bybit"/
+    # "bitfinex"/"kraken"/"okx") → signed USD float (in - out). Refreshed
+    # in a fire-and-forget background task off the daily-bundle cycle so
+    # the trade cycle never waits on the 36 histogram calls this requires.
+    # Serialised to JSON dict TEXT columns on the snapshot row. Journal-only.
+    cex_per_venue_btc_netflow_24h_usd: dict[str, Optional[float]] = field(default_factory=dict)
+    cex_per_venue_eth_netflow_24h_usd: dict[str, Optional[float]] = field(default_factory=dict)
+    cex_per_venue_stables_netflow_24h_usd: dict[str, Optional[float]] = field(default_factory=dict)
+    last_per_venue_per_asset_ts: float = 0.0
+    per_venue_per_asset_task: Optional[asyncio.Task] = None
     # 2026-04-26 — per-symbol MarketState cache (entry-TF MarketState only).
     # Populated at the END of each per-symbol cycle so the intra-trade
     # position-snapshot writer can read oscillator + VWAP-band drift outside
@@ -2634,6 +2659,15 @@ class BotRunner:
                                 entity, float(value),
                             )
 
+                    # 2026-04-26 — per-venue × per-asset (BTC / ETH / stables)
+                    # 24h netflow. 6 venues × 3 assets × 2 flow = 36 histogram
+                    # calls × 1.1s rate cushion ≈ 40-60s. Run as a fire-and-
+                    # forget task so the trade cycle never blocks. Result lands
+                    # on `ctx.cex_per_venue_<asset>_netflow_24h_usd` dicts; the
+                    # NEXT daily-bundle / pulse / token-volume snapshot rebuild
+                    # picks the values up via `_dump_per_venue_dict`.
+                    self._kick_per_venue_per_asset_refresh(client)
+
                 # Preserve any live stablecoin-pulse + per-entity netflows
                 # + token volume JSON we already carry — the daily build
                 # returns None for those, we patch them back in from cache.
@@ -2650,6 +2684,12 @@ class BotRunner:
                     cex_bitfinex_netflow_24h_usd=self.ctx.cex_bitfinex_netflow_24h_usd,
                     cex_kraken_netflow_24h_usd=self.ctx.cex_kraken_netflow_24h_usd,
                     cex_okx_netflow_24h_usd=self.ctx.cex_okx_netflow_24h_usd,
+                    cex_per_venue_btc_netflow_24h_usd_json=_dump_per_venue_dict(
+                        self.ctx.cex_per_venue_btc_netflow_24h_usd),
+                    cex_per_venue_eth_netflow_24h_usd_json=_dump_per_venue_dict(
+                        self.ctx.cex_per_venue_eth_netflow_24h_usd),
+                    cex_per_venue_stables_netflow_24h_usd_json=_dump_per_venue_dict(
+                        self.ctx.cex_per_venue_stables_netflow_24h_usd),
                     token_volume_1h_net_usd_json=self.ctx.token_volume_1h_net_usd_json,
                     snapshot_age_s=0,
                     stale_threshold_s=snap.stale_threshold_s,
@@ -2714,6 +2754,9 @@ class BotRunner:
                         cex_bitfinex_netflow_24h_usd=prev.cex_bitfinex_netflow_24h_usd,
                         cex_kraken_netflow_24h_usd=prev.cex_kraken_netflow_24h_usd,
                         cex_okx_netflow_24h_usd=prev.cex_okx_netflow_24h_usd,
+                        cex_per_venue_btc_netflow_24h_usd_json=prev.cex_per_venue_btc_netflow_24h_usd_json,
+                        cex_per_venue_eth_netflow_24h_usd_json=prev.cex_per_venue_eth_netflow_24h_usd_json,
+                        cex_per_venue_stables_netflow_24h_usd_json=prev.cex_per_venue_stables_netflow_24h_usd_json,
                         token_volume_1h_net_usd_json=prev.token_volume_1h_net_usd_json,
                         snapshot_age_s=prev.snapshot_age_s,
                         stale_threshold_s=prev.stale_threshold_s,
@@ -2769,6 +2812,9 @@ class BotRunner:
                             cex_bitfinex_netflow_24h_usd=prev.cex_bitfinex_netflow_24h_usd,
                             cex_kraken_netflow_24h_usd=prev.cex_kraken_netflow_24h_usd,
                             cex_okx_netflow_24h_usd=prev.cex_okx_netflow_24h_usd,
+                            cex_per_venue_btc_netflow_24h_usd_json=prev.cex_per_venue_btc_netflow_24h_usd_json,
+                            cex_per_venue_eth_netflow_24h_usd_json=prev.cex_per_venue_eth_netflow_24h_usd_json,
+                            cex_per_venue_stables_netflow_24h_usd_json=prev.cex_per_venue_stables_netflow_24h_usd_json,
                             token_volume_1h_net_usd_json=self.ctx.token_volume_1h_net_usd_json,
                             snapshot_age_s=prev.snapshot_age_s,
                             stale_threshold_s=prev.stale_threshold_s,
@@ -2784,6 +2830,65 @@ class BotRunner:
         # own refresh rhythm (≈ hourly pulse + hourly altcoin-index +
         # once-per-UTC-day bias) rather than the much faster tick loop.
         await self._maybe_record_on_chain_snapshot()
+
+    def _kick_per_venue_per_asset_refresh(self, client: ArkhamClient) -> None:
+        """Fire-and-forget the 36-call per-venue × per-asset netflow refresh.
+
+        Skips if a previous task is still alive (avoids stacking concurrent
+        fetchers when daily-bundle fires before the previous job completes).
+        Result lands on `ctx.cex_per_venue_<asset>_netflow_24h_usd` dicts;
+        the next snapshot rebuild path serialises them via
+        `_dump_per_venue_dict` so the journal row carries fresh JSON.
+        """
+        prev_task = getattr(self.ctx, "per_venue_per_asset_task", None)
+        if prev_task is not None and not prev_task.done():
+            logger.info("arkham_per_venue_per_asset_skip_prev_inflight")
+            return
+        loop = asyncio.get_event_loop()
+        self.ctx.per_venue_per_asset_task = loop.create_task(
+            self._refresh_per_venue_per_asset(client)
+        )
+
+    async def _refresh_per_venue_per_asset(self, client: ArkhamClient) -> None:
+        """Loop 6 venues × 3 assets, fetch 24h netflow, update ctx dicts.
+
+        ~36 histogram calls × 1.1s rate cushion ≈ 40-60s. Per-(venue, asset)
+        failures isolated — one fetch raising doesn't taint the rest.
+        Label-free endpoint (probed 2026-04-23 night).
+        """
+        venues = ("coinbase", "binance", "bybit", "bitfinex", "kraken", "okx")
+        assets = (
+            ("btc", ["bitcoin"]),
+            ("eth", ["ethereum"]),
+            ("stables", ["tether", "usd-coin"]),
+        )
+        logger.info("arkham_per_venue_per_asset_refresh_started")
+        try:
+            for asset_key, token_ids in assets:
+                target_dict: dict[str, Optional[float]] = getattr(
+                    self.ctx, f"cex_per_venue_{asset_key}_netflow_24h_usd")
+                for venue in venues:
+                    try:
+                        value = await fetch_entity_per_asset_netflow_24h(
+                            client, venue, token_ids,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "arkham_per_venue_per_asset_failed "
+                            "venue={} asset={}", venue, asset_key,
+                        )
+                        value = None
+                    target_dict[venue] = value
+            self.ctx.last_per_venue_per_asset_ts = time.monotonic()
+            logger.info(
+                "arkham_per_venue_per_asset_refresh_finished "
+                "btc_venues={} eth_venues={} stables_venues={}",
+                len([v for v in self.ctx.cex_per_venue_btc_netflow_24h_usd.values() if v is not None]),
+                len([v for v in self.ctx.cex_per_venue_eth_netflow_24h_usd.values() if v is not None]),
+                len([v for v in self.ctx.cex_per_venue_stables_netflow_24h_usd.values() if v is not None]),
+            )
+        except Exception:
+            logger.exception("arkham_per_venue_per_asset_refresh_crashed")
 
     async def _maybe_record_on_chain_snapshot(self) -> None:
         """Append one row to `on_chain_snapshots` when Arkham state mutates.
@@ -2838,6 +2943,12 @@ class BotRunner:
             snap.cex_bitfinex_netflow_24h_usd,
             snap.cex_kraken_netflow_24h_usd,
             snap.cex_okx_netflow_24h_usd,
+            # 2026-04-26 — per-venue × per-asset JSON dicts. Background
+            # task mutation triggers a fresh journal row so the dashboard
+            # 24h slice has actual time-series, not flat-line.
+            snap.cex_per_venue_btc_netflow_24h_usd_json,
+            snap.cex_per_venue_eth_netflow_24h_usd_json,
+            snap.cex_per_venue_stables_netflow_24h_usd_json,
         )
         if self.ctx.last_on_chain_snapshot_fingerprint == fp:
             return
@@ -2862,6 +2973,9 @@ class BotRunner:
                 cex_bitfinex_netflow_24h_usd=snap.cex_bitfinex_netflow_24h_usd,
                 cex_kraken_netflow_24h_usd=snap.cex_kraken_netflow_24h_usd,
                 cex_okx_netflow_24h_usd=snap.cex_okx_netflow_24h_usd,
+                cex_per_venue_btc_netflow_24h_usd_json=snap.cex_per_venue_btc_netflow_24h_usd_json,
+                cex_per_venue_eth_netflow_24h_usd_json=snap.cex_per_venue_eth_netflow_24h_usd_json,
+                cex_per_venue_stables_netflow_24h_usd_json=snap.cex_per_venue_stables_netflow_24h_usd_json,
             )
             self.ctx.last_on_chain_snapshot_fingerprint = fp
         except Exception:
@@ -2912,6 +3026,11 @@ class BotRunner:
             "cex_kraken_netflow_24h_usd": snap.cex_kraken_netflow_24h_usd,
             # 2026-04-24 — 6th venue (OKX self-signal), journal-only.
             "cex_okx_netflow_24h_usd": snap.cex_okx_netflow_24h_usd,
+            # 2026-04-26 — per-venue × per-asset (BTC / ETH / stables).
+            # JSON dicts so adding a 7th venue won't change the schema.
+            "cex_per_venue_btc_netflow_24h_usd_json": snap.cex_per_venue_btc_netflow_24h_usd_json,
+            "cex_per_venue_eth_netflow_24h_usd_json": snap.cex_per_venue_eth_netflow_24h_usd_json,
+            "cex_per_venue_stables_netflow_24h_usd_json": snap.cex_per_venue_stables_netflow_24h_usd_json,
             "token_volume_1h_net_usd_json": snap.token_volume_1h_net_usd_json,
             "snapshot_age_s": int(snap.snapshot_age_s),
             "fresh": bool(snap.fresh),
