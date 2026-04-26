@@ -26,6 +26,141 @@ AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT lin
 
 ## Changelog
 
+### 2026-04-26 (late-late-night, +4) — OKX residue cleanup (8-phase atomic sweep)
+
+Operator-driven post-migration audit. The 2026-04-25 OKX → Bybit V5
+execution-layer rewrite was a single-day swap that left adjacent
+artefacts unchanged: stale OKX error-code references in comments
+(`51008` / `51277` / `51400-2` / `59102`), failing tests asserting
+`OKX:` TV ticker prefixes, a dead `peg_rejected_outcomes.py` script
+that imported the removed `python-okx` library, internal map / helper
+names with `OKX` prefixes, and the `FakeOKXClient` test alias. None of
+these affected runtime behaviour — they were narrative residue.
+Phase 7's shim removal is the only commit with production-code surface
+delta, and the underlying semantics (TP/SL via `set_position_tpsl`)
+were already canonical pre-cleanup.
+
+**Two hard constraints honoured throughout (operator: "Bybit etkilenmez,
+DB sorun olmasın"):**
+1. **Bybit functionality unchanged.** Every map's contents, every
+   boundary translation, every `set_position_tpsl` semantics
+   bit-identical pre/post. Only names and narrative text edited.
+2. **DB schema untouched.** Zero `DROP COLUMN` migrations. Internal
+   canonical symbol literals (`BTC-USDT-SWAP`) preserved everywhere
+   (~50 file, journal data, dashboard, on-chain mapping). Legacy
+   columns (`algo_id`, `algo_ids`, `client_algo_id`,
+   `hypothetical_outcome`) preserved for pre-migration row read-back.
+
+**Phases (atomic commits, each independently revertable):**
+
+- **Phase 1** (commits 0dc2e75 + part of 75cfd86): stale comments /
+  docstrings / CLI help text. ~50 line edits across 11 files. Error
+  code references `OKX sCode 51008/51277/...` → `Bybit insufficient-
+  margin (110004/110007/110012)` / `Bybit rejects (110012)`. CLI
+  `--dry-run` help text "no OKX orders placed" → "no Bybit orders
+  placed". Phase 1 in-place edits to 3 files (`config/default.yaml`,
+  `src/bot/config.py`, `src/bot/runner.py`) bundled into 75cfd86
+  (auto-R wiring) because the operator's auto-R WIP intermixed with
+  the comment edits in those files.
+- **Phase 2** (338817e): test fixes + variable rename. Restored 3
+  failing tests in `test_runner_multi_pair.py` (`OKX:` → `BYBIT:`),
+  `test_bot_config.py` (`to_okx_credentials()` →
+  `to_bybit_credentials()` + `OKX_*` env vars → `BYBIT_*`). Local var
+  `okx_avail` → `bybit_avail` at 3 sites in `runner.py`.
+- **Phase 3** (403e6f2): dead-code removal.
+  - `_cancel_surplus_ocos` no-op stub deleted from `runner.py` plus
+    its sole caller line in `_reconcile_orphans`.
+  - `_ALGO_GONE_CODES = _ORDER_GONE_CODES` alias deleted from
+    `position_monitor.py`.
+  - `scripts/peg_rejected_outcomes.py` deleted (broken since
+    `python-okx` was dropped from `requirements.txt`).
+  - 6 documentation references to the peg script reworded across
+    `replay_decisions.py`, `analyze.py`, `journal/database.py`,
+    `journal/models.py`. Schema columns `hypothetical_outcome` /
+    `hypothetical_pnl_r` preserved on `rejected_signals` for
+    pre-migration row read-back.
+- **Phase 4** (0634fc1): internal map renames (single-file refactor in
+  `bybit_client.py`):
+  - `_OKX_TO_BYBIT_SYMBOL` → `_INTERNAL_TO_BYBIT_SYMBOL`
+  - `_BYBIT_TO_OKX_SYMBOL` → `_BYBIT_TO_INTERNAL_SYMBOL`
+  - `_OKX_CT_VAL` → `_INTERNAL_CT_VAL`
+  - Local `okx_sym` → `internal_sym` in `get_positions`.
+  - 14 docstring / comment edits in the same file ("OKX format" →
+    "internal canonical format", "OKX-era" → "pre-migration", etc.).
+- **Phase 5** (53127f3): cross-file helper renames + caller updates.
+  - `okx_to_tv_symbol` → `internal_to_tv_symbol` (tv_bridge.py)
+  - `okx_to_binance_symbol` → `internal_to_binance_symbol`
+    (liquidation_stream.py)
+  - `binance_to_okx_symbol` → `binance_to_internal_symbol`
+    (liquidation_stream.py)
+  - `okx_swap_to_binance_futures` → `internal_to_binance_futures`
+    (public_market_feed.py)
+  - Parameter names `okx_symbol` / `okx_sym` →
+    `internal_symbol` / `internal_sym` across `derivatives_api.py`.
+  - All callers updated (`runner.py`, `liquidation_stream.py` self-ref).
+  - All affected tests updated (`test_runner_multi_pair.py`,
+    `test_liquidation_stream.py`, `test_public_market_feed.py`).
+- **Phase 6** (04e4dd8): test infrastructure cleanup.
+  - Deleted `FakeOKXClient = FakeBybitClient` alias in `conftest.py`.
+  - `make_ctx` fixture: removed dual-keyword `okx_client=` /
+    `bybit_client=` support and `fakes.okx_client` namespace mirror.
+  - Updated 4 caller test files (`test_bot_runner.py`,
+    `test_runner_artefact_cross_check.py`, `test_runner_on_chain.py`,
+    `test_runner_multi_pair.py`).
+  - Deleted 2 tests that asserted behaviour of the now-removed
+    `_cancel_surplus_ocos` method (replaced with a one-line
+    explanatory comment).
+- **Phase 7** (86bfc6a): back-compat shim removal in `bybit_client.py`.
+  - Deleted `place_oco_algo` / `cancel_algo` / `list_pending_algos`
+    methods (~80 lines). Their semantics were already covered by
+    `set_position_tpsl()`.
+  - Rewrote `scripts/probe_open_orders.py` "POSITION-ATTACHED TP/SL"
+    section to read `/v5/position/list` raw response directly
+    (preserves diagnostic output, no shim needed).
+  - `AlgoResult` data class kept — `order_router` still composes
+    empty-`algo_id` records to populate the legacy journal column.
+- **Phase 8** (this commit): final CLAUDE.md sync — this changelog
+  entry plus reflecting the Phase 4-7 renames in the architectural
+  notes section ("Internal symbol format kept OKX-style" → "Internal
+  canonical symbol format"; map names; helper names; "Adding a 6th+
+  pair" instructions).
+
+**What was deliberately NOT changed (out of scope):**
+
+- Internal canonical symbol literals `BTC-USDT-SWAP` etc. — DB-touching
+  mass-rename across ~50 files + journal rows is a separate project
+  with its own migration plan.
+- Journal `algo_id`, `algo_ids`, `client_algo_id`, `hypothetical_outcome`
+  schema columns — pre-migration rows have values in them.
+- `cex_okx_netflow_24h_usd` field + dashboard tile — OKX is the 6th
+  CEX netflow venue (intentional data signal, see 2026-04-24 entry).
+- ~33 pre-existing test failures (CLAUDE.md "33 OKX→Bybit migration
+  leftover failures" — `test_pending_monitor.py` tests using OKX
+  `sCode 51400` literals against the Bybit `_ORDER_GONE_CODES` set).
+  Test migration is a separate task.
+
+**Counter-factual pegging gap:** the `peg_rejected_outcomes.py` removal
+leaves a workflow gap — post-migration `rejected_signals` rows carry
+NULL `hypothetical_outcome`. Pre-Pass-3 a Bybit-native pegger
+(pybit `get_kline` or TV-bridge candle source) needs to be written
+to restore the daily counter-factual stamp. Out of scope here;
+flagged for the Pass 3 prep window.
+
+**Verification:** every phase committed only when the targeted test
+suite was green AND the pre-existing baseline failure count did not
+grow. Smoke-test of `python -c "import src.bot.runner"` after each
+phase. DB schema check via `sqlite_master` — every table from the
+2026-04-26 morning state still present, no DROP COLUMN ran.
+
+**Why this matters for Pass 3:** the cleanup compresses the
+"vocabulary surface area" the GBT / Bayesian tuning has to navigate.
+Pre-cleanup a feature engineer reading `_OKX_CT_VAL` or
+`okx_to_tv_symbol` had to know the migration history to understand
+what those names meant on a Bybit-native bot. Post-cleanup the names
+match the runtime venue, the historical narrative is preserved in the
+changelog (here), and the `BTC-USDT-SWAP` canonical format is
+documented as an intentional architectural pin rather than residue.
+
 ### 2026-04-26 (late-night) — Per-venue × per-asset (BTC/ETH/stables) 24h netflow capture + dashboard breakdown
 
 Operator wanted per-venue netflow on the dashboard split by asset class
