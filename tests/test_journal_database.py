@@ -107,7 +107,7 @@ async def test_record_open_returns_open_record():
     assert rec.direction == Direction.BULLISH
     assert rec.trade_id  # non-empty
     assert rec.order_id == "ORD-123"
-    assert rec.algo_id == "ALGO-9"
+    # algo_id / client_algo_id dropped 2026-04-27 (Bybit position-attached TP/SL).
     assert rec.entry_price == 67_000.0
 
 
@@ -231,7 +231,8 @@ async def test_mark_canceled_excludes_from_closed_list():
         closed_list = await j.list_closed_trades()
 
     assert row.outcome == TradeOutcome.CANCELED
-    assert row.notes == "signal invalidated"
+    # 2026-04-27: cancel reason now lands in close_reason (notes column dropped).
+    assert row.close_reason == "signal invalidated"
     assert open_list == []
     assert closed_list == []
 
@@ -263,7 +264,9 @@ async def test_persists_to_disk_and_reopens(tmp_path):
 
 
 async def test_schema_v2_columns_present_on_fresh_db():
-    """Phase 7.B5 — fresh DB should have the new zone/regime/funding columns."""
+    """Phase 7.B5 — fresh DB should have the zone/trend-regime columns.
+    funding_z_6h / funding_z_24h dropped 2026-04-27 (Phase 12 deferred,
+    never populated)."""
     async with TradeJournal(":memory:") as j:
         conn = j._require_conn()
         async with conn.execute("PRAGMA table_info(trades)") as cur:
@@ -273,8 +276,12 @@ async def test_schema_v2_columns_present_on_fresh_db():
     assert "zone_wait_bars" in cols
     assert "zone_fill_latency_bars" in cols
     assert "trend_regime_at_entry" in cols
-    assert "funding_z_6h" in cols
-    assert "funding_z_24h" in cols
+    # 2026-04-27 drops asserted absent
+    assert "funding_z_6h" not in cols
+    assert "funding_z_24h" not in cols
+    assert "regime_at_entry" not in cols
+    assert "notes" not in cols
+    assert "algo_id" not in cols
 
 
 async def test_schema_v2_round_trip_preserves_new_fields():
@@ -286,7 +293,6 @@ async def test_schema_v2_round_trip_preserves_new_fields():
         assert fetched.setup_zone_source is None
         assert fetched.zone_wait_bars is None
         assert fetched.trend_regime_at_entry is None
-        assert fetched.funding_z_6h is None
 
 
 async def test_record_open_persists_zone_metadata_when_provided():
@@ -356,7 +362,7 @@ async def test_record_rejected_signal_persists_full_snapshot():
     assert r.confluence_factors == ["mss_alignment", "recent_sweep"]
     assert r.pillar_btc_bias == "BULLISH"
     assert r.pillar_eth_bias == "BULLISH"
-    assert r.hypothetical_outcome is None  # not stamped yet
+    # hypothetical_outcome dropped 2026-04-27 along with peg-script removal.
 
 
 async def test_list_rejected_signals_filters_stack():
@@ -400,31 +406,10 @@ async def test_list_rejected_signals_filters_stack():
         assert narrowed[0].reject_reason == "session_filter"
 
 
-async def test_update_rejected_outcome_stamps_counterfactual():
-    async with TradeJournal(":memory:") as j:
-        r = await j.record_rejected_signal(
-            symbol="BTC-USDT-SWAP", direction=Direction.BULLISH,
-            reject_reason="below_confluence",
-            signal_timestamp=datetime(2026, 4, 19, tzinfo=UTC),
-        )
-        await j.update_rejected_outcome(
-            r.rejection_id,
-            hypothetical_outcome="WIN",
-            bars_to_tp=6,
-            bars_to_sl=None,
-        )
-        rows = await j.list_rejected_signals()
-    assert rows[0].hypothetical_outcome == "WIN"
-    assert rows[0].hypothetical_bars_to_tp == 6
-    assert rows[0].hypothetical_bars_to_sl is None
-
-
-async def test_update_rejected_outcome_unknown_id_raises():
-    async with TradeJournal(":memory:") as j:
-        with pytest.raises(KeyError):
-            await j.update_rejected_outcome(
-                "does-not-exist", hypothetical_outcome="WIN",
-            )
+# 2026-04-27 — `update_rejected_outcome` removed alongside the
+# hypothetical_outcome / hypothetical_bars_to_tp/sl column drops.
+# Tests for the method deleted; re-add when a Bybit-native peg script
+# is written and the columns return.
 
 
 async def test_replay_for_risk_manager_rebuilds_streaks_and_peak():
@@ -523,6 +508,10 @@ async def test_record_rejected_signal_on_chain_context_none_default():
 
 
 async def test_record_on_chain_snapshot_roundtrip():
+    """2026-04-27 — coinbase_asia_skew_usd / bnb_self_flow_24h_usd /
+    snapshot_age_s / fresh / whale_blackout_active dropped from schema
+    but kept as accepted-and-ignored kwargs for back-compat with callers
+    that still pass them."""
     async with TradeJournal(":memory:") as j:
         ts = datetime(2026, 4, 21, 19, 30, tzinfo=UTC)
         row_id = await j.record_on_chain_snapshot(
@@ -531,9 +520,10 @@ async def test_record_on_chain_snapshot_roundtrip():
             stablecoin_pulse_1h_usd=437_239_070.5,
             cex_btc_netflow_24h_usd=-609_349_951.8,
             cex_eth_netflow_24h_usd=None,
+            altcoin_index=42,
+            # back-compat ignored kwargs:
             coinbase_asia_skew_usd=20_000_000.0,
             bnb_self_flow_24h_usd=-5_000_000.0,
-            altcoin_index=42,
             snapshot_age_s=60,
             fresh=True,
             whale_blackout_active=False,
@@ -547,9 +537,6 @@ async def test_record_on_chain_snapshot_roundtrip():
         assert r["cex_btc_netflow_24h_usd"] == -609_349_951.8
         assert r["cex_eth_netflow_24h_usd"] is None
         assert r["altcoin_index"] == 42
-        assert r["snapshot_age_s"] == 60
-        assert r["fresh"] == 1  # SQLite INTEGER mirror of the bool
-        assert r["whale_blackout_active"] == 0
         assert r["captured_at"] == ts.isoformat()
 
 

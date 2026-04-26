@@ -26,6 +26,146 @@ AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT lin
 
 ## Changelog
 
+### 2026-04-27 — Schema cleanup: drop 27 dead/constant columns (Faz 2)
+
+Operator directive: "veri gelmemişse hiç droplayalım. RL için 50 trade
+biriktiğinde gerekirse re-add candidate." DB audit on the post-clean_since
+9-trade Bybit dataset confirmed 27 columns either 100% NULL across the
+entire dataset (kod doldurmuyor) or 1-distinct constants (no information
+content). Atomic migration drops them all from `trades`,
+`rejected_signals`, and `on_chain_snapshots`, plus removes the
+`update_rejected_outcome` writer method that targeted
+`hypothetical_outcome` (peg-script-bound, last-edited 2026-04-26 OKX
+cleanup, never re-implemented for Bybit).
+
+**Drop list (27 columns):**
+
+`trades` (13):
+- `algo_id`, `client_algo_id`, `algo_ids` — Bybit V5 has
+  position-attached TP/SL, no separate algo orders. Re-add only on
+  exchange migration to a venue with separate algo orders.
+- `notes`, `screenshot_entry`, `screenshot_exit` — manual operator-fill
+  columns; bot never wrote them. Re-add if a post-hoc annotation
+  workflow is implemented.
+- `funding_z_6h`, `funding_z_24h` — Phase 12 deferred since
+  2026-04-23 evening; needs timestamp-aware refactor of
+  `_funding_history` buffer. RL pipeline can compute rolling z over
+  `derivatives_snapshots` directly in the meantime.
+- `price_change_1h_pct_at_entry`, `price_change_4h_pct_at_entry` —
+  by-design NULL on every Bybit-era trade because all entries are
+  pending-fill (candles=None plumbed by design). Re-add only if a
+  market-entry path is reactivated.
+- `entry_timeframe`, `htf_timeframe` — config-set 1-distinct constants
+  (`'3m'` / `'15m'`). Redundant; re-add if multiple TF configs run
+  side-by-side.
+- `regime_at_entry` — `DerivativesRegime` classifier always returned
+  `'BALANCED'` on the entire dataset. `trend_regime_at_entry`
+  (ADX-based, 3-distinct) stays in schema as the live regime signal.
+  Re-add `regime_at_entry` if the DerivativesRegime classifier is
+  reworked to emit non-`'BALANCED'` states.
+
+`rejected_signals` (9):
+- `proposed_sl_price`, `proposed_tp_price`, `proposed_rr_ratio` — entry
+  path doesn't compute proposed SL/TP at reject time.
+- `hypothetical_outcome`, `hypothetical_bars_to_tp`,
+  `hypothetical_bars_to_sl` — peg-script-bound. The OKX-era pegger was
+  deleted in 2026-04-26 cleanup Phase 3. Re-add as a 6-tuple
+  (proposed_*+hypothetical_*) if a Bybit-native peg script is written
+  AND `_record_reject` starts computing what-if SL/TP for
+  counter-factual analysis.
+- `entry_timeframe`, `htf_timeframe`, `regime_at_entry` — parity with
+  trades.
+
+`on_chain_snapshots` (5):
+- `coinbase_asia_skew_usd`, `bnb_self_flow_24h_usd` — schema
+  placeholders never implemented. Re-add only if the specific signal
+  gets defined and a fetcher built.
+- `snapshot_age_s`, `fresh`, `whale_blackout_active` — 1-distinct
+  constants (always `0` / `1` / `0` respectively post-2026-04-22 whale
+  gate removal). Snapshot freshness is implicit in `captured_at`; the
+  boolean flags carry no information. Re-add if a future use makes them
+  actually mutate.
+
+**Migration safety:** every `ALTER TABLE ... DROP COLUMN` is wrapped in
+`_apply_migrations`'s `OperationalError` swallow loop, so re-running
+on a DB that already had the columns dropped is a no-op (matches the
+2026-04-24 per-exchange-derivatives rollback pattern). `DROP INDEX IF
+EXISTS idx_rejected_outcome` removes the column-bound index that
+targeted `hypothetical_outcome`.
+
+**Back-compat layer:**
+
+1. `record_open` / `record_rejected_signal` / `record_on_chain_snapshot`
+   signatures keep the dropped kwargs as accept-and-ignore parameters
+   (`# noqa: ARG002`). Runner call sites that thread these via direct
+   kwargs or `**enrichment` unpacking continue to work without edits.
+2. `RejectedSignal.hypothetical_outcome` / `_bars_to_tp` / `_bars_to_sl`
+   become `@property`s returning `None`. `scripts/analyze.py` and
+   `scripts/tune_confluence.py` keep running against post-cleanup
+   datasets, just with the counter-factual code branches yielding
+   no rows.
+3. `mark_canceled` now writes the cancel reason to `close_reason`
+   instead of the dropped `notes` column.
+
+**Tests:** core flow (`test_journal_database` 31/31,
+`test_rejected_signal_recording` 4/4, `test_runner_position_snapshots`
+9/9, `test_runner_zone_entry` 12/12, `test_derive_enrichment` 23/23) all
+green. Two test files marked module-level skip with peg-restore
+re-enable note: `tests/test_scripts_tune_confluence.py` (5 tests,
+`simulate_reject_outcome` only fires on rows with peg stamps),
+`tests/test_scripts_analyze.py` (1 test, pegged-rejects WR section
+needs stamps). Pre-existing OKX-era leftover failures
+(`test_sl_to_be`, `test_position_monitor`, `test_partial_tp`,
+`test_order_router`, `test_pending_monitor`, `test_runner_multi_pair`,
+~50 tests) untouched — those need Bybit-fake-mock updates separate
+from the schema cleanup. Suite count: 1016 passed, 56 failed (all
+pre-existing), 12 skipped.
+
+**Files touched:**
+- [src/journal/database.py](src/journal/database.py) — _MIGRATIONS
+  extended (27 DROP COLUMN + 1 DROP INDEX), CREATE TABLE statements
+  trimmed, _COLUMNS / _REJECTED_COLUMNS lists shortened, signature +
+  row converter trimmed for the 3 record_* methods,
+  `update_rejected_outcome` removed, `mark_canceled` switched to
+  `close_reason`.
+- [src/journal/models.py](src/journal/models.py) — TradeRecord,
+  RejectedSignal field lists shortened. Three back-compat @property
+  stubs added on RejectedSignal for peg-outcome columns.
+- [tests/test_journal_database.py](tests/test_journal_database.py) —
+  schema-presence assertions inverted, peg-outcome tests deleted,
+  on_chain_snapshot test updated for accept-and-ignore back-compat
+  signature.
+- [tests/test_rejected_signal_recording.py](tests/test_rejected_signal_recording.py)
+  — entry_timeframe / htf_timeframe assertions removed.
+- [tests/test_scripts_analyze.py](tests/test_scripts_analyze.py) +
+  [tests/test_scripts_tune_confluence.py](tests/test_scripts_tune_confluence.py)
+  — pytestmark module-skip with restore-trigger reason.
+
+**RL impact (post-cleanup dataset shape):**
+- Trade row width: 72 → 59 columns (-18%)
+- Reject row width: 46 → 37 columns (-20%)
+- on_chain_snapshot row width: 22 → 17 columns (-23%)
+- Eliminated 1-distinct features that RL pipelines auto-drop (cleaner
+  feature engineering audit) + 100% NULL columns that pollute coverage
+  reports.
+
+**Re-eval triggers:**
+1. **Re-add gate (50-trade soak):** when post-restart trade count
+   reaches 50 with steady cadence, audit each dropped column's re-add
+   note to see if any pattern emerged that justifies revisiting (e.g.,
+   does GBT importance reveal that any 1-distinct field would have
+   been informative if mutated by a regime change?).
+2. **Migration ordering safety:** any future column ADDs must come
+   AFTER the corresponding DROPs in `_MIGRATIONS` so re-running on a
+   freshly-cleaned DB doesn't error out. The current list ends with
+   the cleanup block; new ADDs go at the end.
+3. **Schema drift on archived DBs:** older backups
+   (`data/trades.db.pass1_backup_*`, `data/trades.db.pre_bybit_*`)
+   still carry the dropped columns. Reading them via `TradeJournal`
+   triggers the migrations on next connect — destructive on the
+   archive copy. Use a separate process or `?mode=ro` URI when
+   browsing archives post-cleanup.
+
 ### 2026-04-27 — XRP `/token/volume` re-probe documented as no-op (F5)
 
 DB audit flagged `token_volume_1h_net_usd_json` with no XRP key on the

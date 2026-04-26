@@ -65,12 +65,15 @@ CREATE TABLE IF NOT EXISTS trades (
     confluence_factors  TEXT NOT NULL DEFAULT '[]',
 
     order_id            TEXT,
-    algo_id             TEXT,
     client_order_id     TEXT,
-    client_algo_id      TEXT,
+    -- Bybit V5 has position-attached TP/SL; algo_id / client_algo_id /
+    -- algo_ids columns dropped 2026-04-27 (audit confirmed empty across
+    -- all Bybit-era rows). See _MIGRATIONS DROP COLUMN block for re-add
+    -- conditions if migrating to an exchange with separate algo orders.
 
-    entry_timeframe     TEXT,
-    htf_timeframe       TEXT,
+    -- entry_timeframe / htf_timeframe / regime_at_entry dropped
+    -- 2026-04-27 (1-distinct constants). htf_bias, session,
+    -- market_structure stay — multi-distinct, semantically informative.
     htf_bias            TEXT,
     session             TEXT,
     market_structure    TEXT,
@@ -80,11 +83,9 @@ CREATE TABLE IF NOT EXISTS trades (
     pnl_r               REAL,
     fees_usdt           REAL NOT NULL DEFAULT 0,
 
-    algo_ids            TEXT NOT NULL DEFAULT '[]',
     sl_moved_to_be      INTEGER NOT NULL DEFAULT 0,
     close_reason        TEXT,
 
-    regime_at_entry                     TEXT,
     funding_z_at_entry                  REAL,
     ls_ratio_at_entry                   REAL,
     oi_change_24h_at_entry              REAL,
@@ -100,12 +101,12 @@ CREATE TABLE IF NOT EXISTS trades (
     zone_wait_bars          INTEGER,
     zone_fill_latency_bars  INTEGER,
     trend_regime_at_entry   TEXT,
-    funding_z_6h            REAL,
-    funding_z_24h           REAL,
+    -- funding_z_6h / funding_z_24h dropped 2026-04-27 (Phase 12 deferred,
+    -- never populated; RL pipeline computes rolling z over
+    -- derivatives_snapshots directly).
 
-    notes               TEXT,
-    screenshot_entry    TEXT,
-    screenshot_exit     TEXT,
+    -- notes / screenshot_entry / screenshot_exit dropped 2026-04-27
+    -- (manual operator-fill columns, bot never wrote them).
 
     real_market_entry_valid INTEGER,
     real_market_exit_valid  INTEGER,
@@ -140,8 +141,11 @@ CREATE TABLE IF NOT EXISTS trades (
     long_liq_notional_1h_at_entry    REAL,   -- long-side liquidation USD past 1h
     short_liq_notional_1h_at_entry   REAL,   -- short-side liquidation USD past 1h
     ls_ratio_zscore_14d_at_entry     REAL,   -- LS ratio z-score over 14 days
-    price_change_1h_pct_at_entry     REAL,   -- entry-TF candle buffer derived
-    price_change_4h_pct_at_entry     REAL,   -- wider context window
+    -- price_change_1h_pct_at_entry / price_change_4h_pct_at_entry dropped
+    -- 2026-04-27 (by-design NULL on pending-fill entries — every Bybit-era
+    -- trade is pending-fill, candles=None plumbed by design). Re-add only
+    -- if a market-entry path is reactivated. RL pipeline can compute %
+    -- change over candle buffers from raw derivatives_snapshots.
     -- Top-N liquidation heatmap clusters (JSON list of dicts):
     -- `{"above": [{price, notional_usd, distance_atr}, ...],
     --   "below": [{...}, ...]}`.
@@ -165,17 +169,19 @@ CREATE TABLE IF NOT EXISTS rejected_signals (
     confluence_score    REAL NOT NULL DEFAULT 0,
     confluence_factors  TEXT NOT NULL DEFAULT '[]',
 
-    entry_timeframe     TEXT,
-    htf_timeframe       TEXT,
+    -- entry_timeframe / htf_timeframe / regime_at_entry dropped 2026-04-27
+    -- (parity with trades; 1-distinct constants).
     htf_bias            TEXT,
     session             TEXT,
     market_structure    TEXT,
 
-    proposed_sl_price   REAL,
-    proposed_tp_price   REAL,
-    proposed_rr_ratio   REAL,
+    -- proposed_sl_price / proposed_tp_price / proposed_rr_ratio dropped
+    -- 2026-04-27 — entry path doesn't compute proposed SL/TP at reject
+    -- time. peg-script that would forward-walk and stamp outcomes was
+    -- deleted in OKX cleanup (Phase 3). Re-add as a triple if a
+    -- Bybit-native peg gets written AND _record_reject computes
+    -- ATR-based what-if SL/TP.
 
-    regime_at_entry                     TEXT,
     funding_z_at_entry                  REAL,
     ls_ratio_at_entry                   REAL,
     oi_change_24h_at_entry              REAL,
@@ -190,9 +196,9 @@ CREATE TABLE IF NOT EXISTS rejected_signals (
     pillar_btc_bias     TEXT,
     pillar_eth_bias     TEXT,
 
-    hypothetical_outcome    TEXT,
-    hypothetical_bars_to_tp INTEGER,
-    hypothetical_bars_to_sl INTEGER,
+    -- hypothetical_outcome / hypothetical_bars_to_tp / hypothetical_bars_to_sl
+    -- dropped 2026-04-27 — counter-factual outcome stamping never ran
+    -- on Bybit-era rows; re-add as a triple if peg-script revived.
 
     on_chain_context        TEXT,
 
@@ -220,6 +226,9 @@ CREATE TABLE IF NOT EXISTS rejected_signals (
     long_liq_notional_1h_at_entry    REAL,
     short_liq_notional_1h_at_entry   REAL,
     ls_ratio_zscore_14d_at_entry     REAL,
+    -- price_change_1h_pct_at_entry / price_change_4h_pct_at_entry kept
+    -- on rejected_signals (F1 plumbing fills these for synchronous
+    -- rejects with candle buffer). Pending-cancel rows stay NULL.
     price_change_1h_pct_at_entry     REAL,
     price_change_4h_pct_at_entry     REAL,
     liq_heatmap_top_clusters_json    TEXT NOT NULL DEFAULT '{}'
@@ -227,7 +236,7 @@ CREATE TABLE IF NOT EXISTS rejected_signals (
 
 CREATE INDEX IF NOT EXISTS idx_rejected_symbol_ts  ON rejected_signals(symbol, signal_timestamp);
 CREATE INDEX IF NOT EXISTS idx_rejected_reason     ON rejected_signals(reject_reason);
-CREATE INDEX IF NOT EXISTS idx_rejected_outcome    ON rejected_signals(hypothetical_outcome);
+-- idx_rejected_outcome dropped 2026-04-27 with hypothetical_outcome column.
 
 -- 2026-04-21 — Arkham on-chain snapshot time-series (Phase 8 data layer).
 -- One row per detected snapshot MUTATION (not per tick). Runner writes
@@ -243,12 +252,12 @@ CREATE TABLE IF NOT EXISTS on_chain_snapshots (
     stablecoin_pulse_1h_usd         REAL,
     cex_btc_netflow_24h_usd         REAL,
     cex_eth_netflow_24h_usd         REAL,
-    coinbase_asia_skew_usd          REAL,
-    bnb_self_flow_24h_usd           REAL,
     altcoin_index                   REAL,
-    snapshot_age_s                  INTEGER,
-    fresh                           INTEGER,
-    whale_blackout_active           INTEGER,
+    -- coinbase_asia_skew_usd / bnb_self_flow_24h_usd dropped 2026-04-27
+    -- (schema placeholders, never implemented).
+    -- snapshot_age_s / fresh / whale_blackout_active dropped 2026-04-27
+    -- (1-distinct constants — always 0 / 1 / 0 post-2026-04-22 whale
+    -- gate removal). Snapshot freshness implicit in `captured_at`.
     -- 2026-04-22 — per-entity 24h netflow (last completed UTC day) via
     -- /flow/entity/{entity}. Journal-only; Phase 9 GBT decides predictive value.
     cex_coinbase_netflow_24h_usd    REAL,
@@ -370,18 +379,21 @@ _COLUMNS = [
     "entry_price", "sl_price", "tp_price", "rr_ratio",
     "leverage", "num_contracts", "position_size_usdt", "risk_amount_usdt",
     "sl_source", "reason", "confluence_score", "confluence_factors",
-    "order_id", "algo_id", "client_order_id", "client_algo_id",
-    "entry_timeframe", "htf_timeframe", "htf_bias", "session", "market_structure",
+    # 2026-04-27 drops on trades: algo_id, client_algo_id, algo_ids,
+    # entry_timeframe, htf_timeframe, regime_at_entry, funding_z_6h,
+    # funding_z_24h, notes, screenshot_entry, screenshot_exit,
+    # price_change_1h_pct_at_entry, price_change_4h_pct_at_entry.
+    "order_id", "client_order_id",
+    "htf_bias", "session", "market_structure",
     "exit_price", "pnl_usdt", "pnl_r", "fees_usdt",
-    "algo_ids", "sl_moved_to_be", "close_reason",
-    "regime_at_entry", "funding_z_at_entry", "ls_ratio_at_entry",
+    "sl_moved_to_be", "close_reason",
+    "funding_z_at_entry", "ls_ratio_at_entry",
     "oi_change_24h_at_entry", "liq_imbalance_1h_at_entry",
     "nearest_liq_cluster_above_price", "nearest_liq_cluster_below_price",
     "nearest_liq_cluster_above_notional", "nearest_liq_cluster_below_notional",
     "nearest_liq_cluster_above_distance_atr", "nearest_liq_cluster_below_distance_atr",
     "setup_zone_source", "zone_wait_bars", "zone_fill_latency_bars",
-    "trend_regime_at_entry", "funding_z_6h", "funding_z_24h",
-    "notes", "screenshot_entry", "screenshot_exit",
+    "trend_regime_at_entry",
     "real_market_entry_valid", "real_market_exit_valid",
     "demo_artifact", "artifact_reason",
     "on_chain_context",
@@ -394,8 +406,6 @@ _COLUMNS = [
     "long_liq_notional_1h_at_entry",
     "short_liq_notional_1h_at_entry",
     "ls_ratio_zscore_14d_at_entry",
-    "price_change_1h_pct_at_entry",
-    "price_change_4h_pct_at_entry",
     "liq_heatmap_top_clusters_json",
 ]
 
@@ -403,15 +413,17 @@ _COLUMNS = [
 _REJECTED_COLUMNS = [
     "rejection_id", "symbol", "direction", "reject_reason", "signal_timestamp",
     "price", "atr", "confluence_score", "confluence_factors",
-    "entry_timeframe", "htf_timeframe", "htf_bias", "session", "market_structure",
-    "proposed_sl_price", "proposed_tp_price", "proposed_rr_ratio",
-    "regime_at_entry", "funding_z_at_entry", "ls_ratio_at_entry",
+    # 2026-04-27 drops on rejected_signals: entry_timeframe, htf_timeframe,
+    # regime_at_entry, proposed_sl_price, proposed_tp_price,
+    # proposed_rr_ratio, hypothetical_outcome, hypothetical_bars_to_tp,
+    # hypothetical_bars_to_sl.
+    "htf_bias", "session", "market_structure",
+    "funding_z_at_entry", "ls_ratio_at_entry",
     "oi_change_24h_at_entry", "liq_imbalance_1h_at_entry",
     "nearest_liq_cluster_above_price", "nearest_liq_cluster_below_price",
     "nearest_liq_cluster_above_notional", "nearest_liq_cluster_below_notional",
     "nearest_liq_cluster_above_distance_atr", "nearest_liq_cluster_below_distance_atr",
     "pillar_btc_bias", "pillar_eth_bias",
-    "hypothetical_outcome", "hypothetical_bars_to_tp", "hypothetical_bars_to_sl",
     "on_chain_context",
     "confluence_pillar_scores",
     "oscillator_raw_values",
@@ -592,6 +604,91 @@ _MIGRATIONS = [
     "ON position_snapshots(trade_id)",
     "CREATE INDEX IF NOT EXISTS idx_position_snapshots_captured_at "
     "ON position_snapshots(captured_at)",
+    # 2026-04-27 — schema cleanup pass. Drop 27 columns that audit
+    # confirmed are either 100% NULL across the Bybit dataset
+    # (kod doldurmuyor) or 1-distinct constants (no information).
+    # Operator directive: "veri gelmemişse hiç droplayalım. RL için 50
+    # trade biriktiğinde gerekirse re-add candidate." Each DROP is
+    # wrapped by `_apply_migrations`'s OperationalError swallow loop
+    # so re-running on already-cleaned DBs is a no-op (matches the
+    # 2026-04-24 per-exchange rollback pattern).
+    #
+    # Re-add candidates (with reasons + how to revive):
+    #   - trades.algo_id / client_algo_id / algo_ids: Bybit V5 has
+    #     position-attached TP/SL (no separate algo orders), so these
+    #     columns stay empty by architecture. Re-add ONLY if migrating
+    #     back to an exchange with separate algo orders.
+    #   - trades.notes / screenshot_entry / screenshot_exit: manual
+    #     operator-fill columns; bot never writes them. Re-add if a
+    #     post-hoc annotation workflow gets implemented.
+    #   - trades.funding_z_6h / funding_z_24h: Phase 12 deferred — needs
+    #     timestamp-aware refactor of the funding history buffer. Re-add
+    #     when that refactor lands. RL pipeline can compute rolling z
+    #     over `derivatives_snapshots` directly in the meantime.
+    #   - trades.price_change_1h / 4h_pct_at_entry: by-design NULL on
+    #     pending-fill entries (every Bybit-era trade is pending-fill).
+    #     Re-add ONLY if a market-entry path is reactivated and that
+    #     path stashes entry-TF candles for the writer.
+    #   - trades.entry_timeframe / htf_timeframe / regime_at_entry: 1
+    #     distinct value (config sabit '3m' / '15m', and DerivativesRegime
+    #     classifier always returns 'BALANCED'). Re-add entry/htf
+    #     timeframe columns when multiple TF configs run side-by-side.
+    #     regime_at_entry re-add when DerivativesRegime classifier is
+    #     reworked to emit non-BALANCED states (`trend_regime_at_entry`
+    #     ADX-based, 3-distinct, stays in schema).
+    #   - rejected_signals.proposed_sl/tp/rr_price + hypothetical_*:
+    #     entry path doesn't compute proposed SL/TP at reject time and
+    #     the peg-script (which would forward-walk and stamp outcomes)
+    #     was deleted in OKX cleanup Phase 3 because its python-okx
+    #     dependency was removed. Re-add as a pair if a Bybit-native
+    #     peg script gets written AND `_record_reject` starts computing
+    #     ATR-based proposed SL/TP for what-if analysis.
+    #   - rejected_signals.entry_timeframe / htf_timeframe /
+    #     regime_at_entry: same parity rationale as trades.
+    #   - on_chain_snapshots.coinbase_asia_skew_usd / bnb_self_flow_24h:
+    #     schema placeholders never implemented. Re-add only if the
+    #     specific signal gets defined and a fetcher built.
+    #   - on_chain_snapshots.snapshot_age_s / fresh /
+    #     whale_blackout_active: 1 distinct constant (always 0 / 1 / 0
+    #     respectively post-2026-04-22 whale-gate removal). Snapshot
+    #     freshness is implicit in `captured_at`; the boolean flags
+    #     carry no information. Re-add if a future use makes them
+    #     actually mutate.
+    #
+    # trades drops (13)
+    "ALTER TABLE trades DROP COLUMN algo_id",
+    "ALTER TABLE trades DROP COLUMN client_algo_id",
+    "ALTER TABLE trades DROP COLUMN algo_ids",
+    "ALTER TABLE trades DROP COLUMN notes",
+    "ALTER TABLE trades DROP COLUMN screenshot_entry",
+    "ALTER TABLE trades DROP COLUMN screenshot_exit",
+    "ALTER TABLE trades DROP COLUMN funding_z_6h",
+    "ALTER TABLE trades DROP COLUMN funding_z_24h",
+    "ALTER TABLE trades DROP COLUMN price_change_1h_pct_at_entry",
+    "ALTER TABLE trades DROP COLUMN price_change_4h_pct_at_entry",
+    "ALTER TABLE trades DROP COLUMN entry_timeframe",
+    "ALTER TABLE trades DROP COLUMN htf_timeframe",
+    "ALTER TABLE trades DROP COLUMN regime_at_entry",
+    # idx_rejected_outcome targets the dropped hypothetical_outcome
+    # column. SQLite DROP COLUMN auto-removes column-bound indexes but
+    # explicit DROP INDEX is harmless and clearer.
+    "DROP INDEX IF EXISTS idx_rejected_outcome",
+    # rejected_signals drops (9)
+    "ALTER TABLE rejected_signals DROP COLUMN proposed_sl_price",
+    "ALTER TABLE rejected_signals DROP COLUMN proposed_tp_price",
+    "ALTER TABLE rejected_signals DROP COLUMN proposed_rr_ratio",
+    "ALTER TABLE rejected_signals DROP COLUMN hypothetical_outcome",
+    "ALTER TABLE rejected_signals DROP COLUMN hypothetical_bars_to_tp",
+    "ALTER TABLE rejected_signals DROP COLUMN hypothetical_bars_to_sl",
+    "ALTER TABLE rejected_signals DROP COLUMN entry_timeframe",
+    "ALTER TABLE rejected_signals DROP COLUMN htf_timeframe",
+    "ALTER TABLE rejected_signals DROP COLUMN regime_at_entry",
+    # on_chain_snapshots drops (5)
+    "ALTER TABLE on_chain_snapshots DROP COLUMN coinbase_asia_skew_usd",
+    "ALTER TABLE on_chain_snapshots DROP COLUMN bnb_self_flow_24h_usd",
+    "ALTER TABLE on_chain_snapshots DROP COLUMN snapshot_age_s",
+    "ALTER TABLE on_chain_snapshots DROP COLUMN fresh",
+    "ALTER TABLE on_chain_snapshots DROP COLUMN whale_blackout_active",
 ]
 
 
@@ -611,18 +708,17 @@ def _record_to_row(rec: TradeRecord) -> tuple:
         rec.leverage, rec.num_contracts, rec.position_size_usdt, rec.risk_amount_usdt,
         rec.sl_source, rec.reason, rec.confluence_score,
         json.dumps(rec.confluence_factors),
-        rec.order_id, rec.algo_id, rec.client_order_id, rec.client_algo_id,
-        rec.entry_timeframe, rec.htf_timeframe, rec.htf_bias, rec.session, rec.market_structure,
+        rec.order_id, rec.client_order_id,
+        rec.htf_bias, rec.session, rec.market_structure,
         rec.exit_price, rec.pnl_usdt, rec.pnl_r, rec.fees_usdt,
-        json.dumps(rec.algo_ids), int(rec.sl_moved_to_be), rec.close_reason,
-        rec.regime_at_entry, rec.funding_z_at_entry, rec.ls_ratio_at_entry,
+        int(rec.sl_moved_to_be), rec.close_reason,
+        rec.funding_z_at_entry, rec.ls_ratio_at_entry,
         rec.oi_change_24h_at_entry, rec.liq_imbalance_1h_at_entry,
         rec.nearest_liq_cluster_above_price, rec.nearest_liq_cluster_below_price,
         rec.nearest_liq_cluster_above_notional, rec.nearest_liq_cluster_below_notional,
         rec.nearest_liq_cluster_above_distance_atr, rec.nearest_liq_cluster_below_distance_atr,
         rec.setup_zone_source, rec.zone_wait_bars, rec.zone_fill_latency_bars,
-        rec.trend_regime_at_entry, rec.funding_z_6h, rec.funding_z_24h,
-        rec.notes, rec.screenshot_entry, rec.screenshot_exit,
+        rec.trend_regime_at_entry,
         (None if rec.real_market_entry_valid is None
          else int(rec.real_market_entry_valid)),
         (None if rec.real_market_exit_valid is None
@@ -640,8 +736,6 @@ def _record_to_row(rec: TradeRecord) -> tuple:
         rec.long_liq_notional_1h_at_entry,
         rec.short_liq_notional_1h_at_entry,
         rec.ls_ratio_zscore_14d_at_entry,
-        rec.price_change_1h_pct_at_entry,
-        rec.price_change_4h_pct_at_entry,
         json.dumps(rec.liq_heatmap_top_clusters or {}),
     )
 
@@ -652,16 +746,13 @@ def _rejected_to_row(rec: RejectedSignal) -> tuple:
         _iso(rec.signal_timestamp),
         rec.price, rec.atr, rec.confluence_score,
         json.dumps(rec.confluence_factors),
-        rec.entry_timeframe, rec.htf_timeframe, rec.htf_bias,
-        rec.session, rec.market_structure,
-        rec.proposed_sl_price, rec.proposed_tp_price, rec.proposed_rr_ratio,
-        rec.regime_at_entry, rec.funding_z_at_entry, rec.ls_ratio_at_entry,
+        rec.htf_bias, rec.session, rec.market_structure,
+        rec.funding_z_at_entry, rec.ls_ratio_at_entry,
         rec.oi_change_24h_at_entry, rec.liq_imbalance_1h_at_entry,
         rec.nearest_liq_cluster_above_price, rec.nearest_liq_cluster_below_price,
         rec.nearest_liq_cluster_above_notional, rec.nearest_liq_cluster_below_notional,
         rec.nearest_liq_cluster_above_distance_atr, rec.nearest_liq_cluster_below_distance_atr,
         rec.pillar_btc_bias, rec.pillar_eth_bias,
-        rec.hypothetical_outcome, rec.hypothetical_bars_to_tp, rec.hypothetical_bars_to_sl,
         (json.dumps(rec.on_chain_context)
          if rec.on_chain_context is not None else None),
         json.dumps(rec.confluence_pillar_scores or {}),
@@ -690,15 +781,9 @@ def _row_to_rejected(row: aiosqlite.Row) -> RejectedSignal:
         atr=row["atr"],
         confluence_score=row["confluence_score"],
         confluence_factors=json.loads(row["confluence_factors"] or "[]"),
-        entry_timeframe=row["entry_timeframe"],
-        htf_timeframe=row["htf_timeframe"],
         htf_bias=row["htf_bias"],
         session=row["session"],
         market_structure=row["market_structure"],
-        proposed_sl_price=row["proposed_sl_price"],
-        proposed_tp_price=row["proposed_tp_price"],
-        proposed_rr_ratio=row["proposed_rr_ratio"],
-        regime_at_entry=row["regime_at_entry"],
         funding_z_at_entry=row["funding_z_at_entry"],
         ls_ratio_at_entry=row["ls_ratio_at_entry"],
         oi_change_24h_at_entry=row["oi_change_24h_at_entry"],
@@ -711,9 +796,6 @@ def _row_to_rejected(row: aiosqlite.Row) -> RejectedSignal:
         nearest_liq_cluster_below_distance_atr=row["nearest_liq_cluster_below_distance_atr"],
         pillar_btc_bias=row["pillar_btc_bias"],
         pillar_eth_bias=row["pillar_eth_bias"],
-        hypothetical_outcome=row["hypothetical_outcome"],
-        hypothetical_bars_to_tp=row["hypothetical_bars_to_tp"],
-        hypothetical_bars_to_sl=row["hypothetical_bars_to_sl"],
         on_chain_context=_parse_on_chain_context(row),
         confluence_pillar_scores=_parse_pillar_scores(row),
         oscillator_raw_values=_parse_oscillator_raw_values(row),
@@ -838,11 +920,7 @@ def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
         confluence_score=row["confluence_score"],
         confluence_factors=json.loads(row["confluence_factors"] or "[]"),
         order_id=row["order_id"],
-        algo_id=row["algo_id"],
         client_order_id=row["client_order_id"],
-        client_algo_id=row["client_algo_id"],
-        entry_timeframe=row["entry_timeframe"],
-        htf_timeframe=row["htf_timeframe"],
         htf_bias=row["htf_bias"],
         session=row["session"],
         market_structure=row["market_structure"],
@@ -850,10 +928,8 @@ def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
         pnl_usdt=row["pnl_usdt"],
         pnl_r=row["pnl_r"],
         fees_usdt=row["fees_usdt"] or 0.0,
-        algo_ids=json.loads(_safe_col(row, "algo_ids") or "[]"),
         sl_moved_to_be=bool(_safe_col(row, "sl_moved_to_be") or 0),
         close_reason=_safe_col(row, "close_reason"),
-        regime_at_entry=_safe_col(row, "regime_at_entry"),
         funding_z_at_entry=_safe_col(row, "funding_z_at_entry"),
         ls_ratio_at_entry=_safe_col(row, "ls_ratio_at_entry"),
         oi_change_24h_at_entry=_safe_col(row, "oi_change_24h_at_entry"),
@@ -868,11 +944,6 @@ def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
         zone_wait_bars=_safe_col(row, "zone_wait_bars"),
         zone_fill_latency_bars=_safe_col(row, "zone_fill_latency_bars"),
         trend_regime_at_entry=_safe_col(row, "trend_regime_at_entry"),
-        funding_z_6h=_safe_col(row, "funding_z_6h"),
-        funding_z_24h=_safe_col(row, "funding_z_24h"),
-        notes=row["notes"],
-        screenshot_entry=row["screenshot_entry"],
-        screenshot_exit=row["screenshot_exit"],
         real_market_entry_valid=_safe_bool(row, "real_market_entry_valid"),
         real_market_exit_valid=_safe_bool(row, "real_market_exit_valid"),
         demo_artifact=_safe_bool(row, "demo_artifact"),
@@ -887,8 +958,6 @@ def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
         long_liq_notional_1h_at_entry=_safe_col(row, "long_liq_notional_1h_at_entry"),
         short_liq_notional_1h_at_entry=_safe_col(row, "short_liq_notional_1h_at_entry"),
         ls_ratio_zscore_14d_at_entry=_safe_col(row, "ls_ratio_zscore_14d_at_entry"),
-        price_change_1h_pct_at_entry=_safe_col(row, "price_change_1h_pct_at_entry"),
-        price_change_4h_pct_at_entry=_safe_col(row, "price_change_4h_pct_at_entry"),
         liq_heatmap_top_clusters=_parse_liq_heatmap_clusters(row),
     )
 
@@ -981,12 +1050,11 @@ class TradeJournal:
         symbol: str,
         signal_timestamp: datetime,
         entry_timestamp: Optional[datetime] = None,
-        entry_timeframe: Optional[str] = None,
-        htf_timeframe: Optional[str] = None,
+        # entry_timeframe / htf_timeframe / regime_at_entry kwargs dropped
+        # 2026-04-27 — 1-distinct constants in the audit.
         htf_bias: Optional[str] = None,
         session: Optional[str] = None,
         market_structure: Optional[str] = None,
-        regime_at_entry: Optional[str] = None,
         funding_z_at_entry: Optional[float] = None,
         ls_ratio_at_entry: Optional[float] = None,
         oi_change_24h_at_entry: Optional[float] = None,
@@ -1008,9 +1076,10 @@ class TradeJournal:
         long_liq_notional_1h_at_entry: Optional[float] = None,
         short_liq_notional_1h_at_entry: Optional[float] = None,
         ls_ratio_zscore_14d_at_entry: Optional[float] = None,
-        price_change_1h_pct_at_entry: Optional[float] = None,
-        price_change_4h_pct_at_entry: Optional[float] = None,
         liq_heatmap_top_clusters: Optional[dict] = None,
+        # price_change_1h/4h_pct_at_entry kwargs dropped 2026-04-27 —
+        # by-design NULL on every Bybit-era trade (all pending-fill,
+        # candles=None plumbed by design).
         # 2026-04-27 (F3) — zone metadata plumbing. Schema columns existed
         # since the zone-based pivot but the runner's pending-fill path
         # never forwarded them, leaving 9/9 NULL on the Bybit dataset.
@@ -1023,6 +1092,15 @@ class TradeJournal:
         setup_zone_source: Optional[str] = None,
         zone_wait_bars: Optional[int] = None,
         zone_fill_latency_bars: Optional[int] = None,
+        # Back-compat tail: callers may still pass these via direct kwargs
+        # or `**enrichment` unpacking. Accepted but silently ignored
+        # (kwargs no longer forwarded into TradeRecord — columns dropped
+        # 2026-04-27).
+        entry_timeframe: Optional[str] = None,  # noqa: ARG002 (1-distinct config constant)
+        htf_timeframe: Optional[str] = None,    # noqa: ARG002 (1-distinct config constant)
+        regime_at_entry: Optional[str] = None,  # noqa: ARG002 (was 1-distinct constant 'BALANCED')
+        price_change_1h_pct_at_entry: Optional[float] = None,  # noqa: ARG002
+        price_change_4h_pct_at_entry: Optional[float] = None,  # noqa: ARG002
     ) -> TradeRecord:
         """Insert an OPEN row describing a freshly-placed trade.
 
@@ -1030,7 +1108,6 @@ class TradeJournal:
         the caller MUST pass to `record_close` later.
         """
         conn = self._require_conn()
-        algo = report.algo
         entry_ts = entry_timestamp or report.entry.submitted_at
         rec = TradeRecord(
             trade_id=uuid.uuid4().hex,
@@ -1052,16 +1129,10 @@ class TradeJournal:
             confluence_score=plan.confluence_score,
             confluence_factors=list(plan.confluence_factors),
             order_id=report.entry.order_id or None,
-            algo_id=algo.algo_id if algo else None,
             client_order_id=report.entry.client_order_id or None,
-            client_algo_id=algo.client_algo_id if algo else None,
-            algo_ids=[a.algo_id for a in report.algos if a.algo_id],
-            entry_timeframe=entry_timeframe,
-            htf_timeframe=htf_timeframe,
             htf_bias=htf_bias,
             session=session,
             market_structure=market_structure,
-            regime_at_entry=regime_at_entry,
             funding_z_at_entry=funding_z_at_entry,
             ls_ratio_at_entry=ls_ratio_at_entry,
             oi_change_24h_at_entry=oi_change_24h_at_entry,
@@ -1083,8 +1154,6 @@ class TradeJournal:
             long_liq_notional_1h_at_entry=long_liq_notional_1h_at_entry,
             short_liq_notional_1h_at_entry=short_liq_notional_1h_at_entry,
             ls_ratio_zscore_14d_at_entry=ls_ratio_zscore_14d_at_entry,
-            price_change_1h_pct_at_entry=price_change_1h_pct_at_entry,
-            price_change_4h_pct_at_entry=price_change_4h_pct_at_entry,
             liq_heatmap_top_clusters=dict(liq_heatmap_top_clusters or {}),
             setup_zone_source=setup_zone_source,
             zone_wait_bars=zone_wait_bars,
@@ -1203,15 +1272,19 @@ class TradeJournal:
         atr: Optional[float] = None,
         confluence_score: float = 0.0,
         confluence_factors: Optional[list[str]] = None,
-        entry_timeframe: Optional[str] = None,
-        htf_timeframe: Optional[str] = None,
+        # entry_timeframe / htf_timeframe / regime_at_entry kwargs accepted
+        # for back-compat with `**enrichment` unpacking but no longer
+        # forwarded into RejectedSignal (columns dropped 2026-04-27).
+        entry_timeframe: Optional[str] = None,  # noqa: ARG002
+        htf_timeframe: Optional[str] = None,  # noqa: ARG002
+        regime_at_entry: Optional[str] = None,  # noqa: ARG002
+        # proposed_*/hypothetical_* kwargs dropped 2026-04-27 — entry
+        # path doesn't compute proposed SL/TP and the peg script that
+        # would forward-walk and stamp outcomes was deleted in OKX
+        # cleanup. Re-add as a pair if a Bybit-native peg gets written.
         htf_bias: Optional[str] = None,
         session: Optional[str] = None,
         market_structure: Optional[str] = None,
-        proposed_sl_price: Optional[float] = None,
-        proposed_tp_price: Optional[float] = None,
-        proposed_rr_ratio: Optional[float] = None,
-        regime_at_entry: Optional[str] = None,
         funding_z_at_entry: Optional[float] = None,
         ls_ratio_at_entry: Optional[float] = None,
         oi_change_24h_at_entry: Optional[float] = None,
@@ -1258,15 +1331,9 @@ class TradeJournal:
             atr=atr,
             confluence_score=confluence_score,
             confluence_factors=list(confluence_factors or []),
-            entry_timeframe=entry_timeframe,
-            htf_timeframe=htf_timeframe,
             htf_bias=htf_bias,
             session=session,
             market_structure=market_structure,
-            proposed_sl_price=proposed_sl_price,
-            proposed_tp_price=proposed_tp_price,
-            proposed_rr_ratio=proposed_rr_ratio,
-            regime_at_entry=regime_at_entry,
             funding_z_at_entry=funding_z_at_entry,
             ls_ratio_at_entry=ls_ratio_at_entry,
             oi_change_24h_at_entry=oi_change_24h_at_entry,
@@ -1302,34 +1369,10 @@ class TradeJournal:
         await conn.commit()
         return rec
 
-    async def update_rejected_outcome(
-        self,
-        rejection_id: str,
-        *,
-        hypothetical_outcome: str,
-        bars_to_tp: Optional[int] = None,
-        bars_to_sl: Optional[int] = None,
-    ) -> None:
-        """Stamp the N-bar counter-factual on an existing rejected_signals row.
-
-        Called historically by the OKX-era counter-factual pegger
-        (removed 2026-04-26). `hypothetical_outcome` is one of
-        'WIN' (TP hit first), 'LOSS' (SL hit first), 'NEITHER'.
-        Raises `KeyError` on unknown id so any future re-pegger's dry-run
-        catches stale data.
-        """
-        conn = self._require_conn()
-        cur = await conn.execute(
-            """UPDATE rejected_signals SET
-                   hypothetical_outcome = ?,
-                   hypothetical_bars_to_tp = ?,
-                   hypothetical_bars_to_sl = ?
-               WHERE rejection_id = ?""",
-            (hypothetical_outcome, bars_to_tp, bars_to_sl, rejection_id),
-        )
-        await conn.commit()
-        if cur.rowcount == 0:
-            raise KeyError(f"No rejected_signal with id={rejection_id!r}")
+    # 2026-04-27 — `update_rejected_outcome` removed alongside the
+    # hypothetical_outcome / hypothetical_bars_to_tp/sl column drops.
+    # Re-add when a Bybit-native peg script is written (alongside
+    # adding the columns back via _MIGRATIONS).
 
     async def list_rejected_signals(
         self,
@@ -1364,10 +1407,14 @@ class TradeJournal:
 
     async def mark_canceled(self, trade_id: str, reason: str = "") -> None:
         """Flip an OPEN row to CANCELED — used when the entry never filled or the
-        operator aborted before SL/TP could evaluate."""
+        operator aborted before SL/TP could evaluate.
+
+        2026-04-27: cancel reason now lands in `close_reason` instead of
+        `notes` (the latter was dropped as a manual-fill-only column the
+        bot never touched outside this one path)."""
         conn = self._require_conn()
         cur = await conn.execute(
-            "UPDATE trades SET outcome = ?, notes = ? WHERE trade_id = ?",
+            "UPDATE trades SET outcome = ?, close_reason = ? WHERE trade_id = ?",
             (TradeOutcome.CANCELED.value, reason or None, trade_id),
         )
         await conn.commit()
@@ -1382,12 +1429,16 @@ class TradeJournal:
         stablecoin_pulse_1h_usd: Optional[float],
         cex_btc_netflow_24h_usd: Optional[float],
         cex_eth_netflow_24h_usd: Optional[float],
-        coinbase_asia_skew_usd: Optional[float],
-        bnb_self_flow_24h_usd: Optional[float],
         altcoin_index: Optional[float],
-        snapshot_age_s: Optional[int],
-        fresh: bool,
-        whale_blackout_active: bool,
+        # 2026-04-27 — back-compat tail. Accepted but no longer forwarded:
+        # coinbase_asia_skew_usd / bnb_self_flow_24h_usd (schema
+        # placeholders), snapshot_age_s / fresh / whale_blackout_active
+        # (1-distinct constants).
+        coinbase_asia_skew_usd: Optional[float] = None,  # noqa: ARG002
+        bnb_self_flow_24h_usd: Optional[float] = None,   # noqa: ARG002
+        snapshot_age_s: Optional[int] = None,            # noqa: ARG002
+        fresh: bool = True,                              # noqa: ARG002
+        whale_blackout_active: bool = False,             # noqa: ARG002
         cex_coinbase_netflow_24h_usd: Optional[float] = None,
         cex_binance_netflow_24h_usd: Optional[float] = None,
         cex_bybit_netflow_24h_usd: Optional[float] = None,
@@ -1427,12 +1478,7 @@ class TradeJournal:
                    stablecoin_pulse_1h_usd,
                    cex_btc_netflow_24h_usd,
                    cex_eth_netflow_24h_usd,
-                   coinbase_asia_skew_usd,
-                   bnb_self_flow_24h_usd,
                    altcoin_index,
-                   snapshot_age_s,
-                   fresh,
-                   whale_blackout_active,
                    cex_coinbase_netflow_24h_usd,
                    cex_binance_netflow_24h_usd,
                    cex_bybit_netflow_24h_usd,
@@ -1443,19 +1489,14 @@ class TradeJournal:
                    cex_per_venue_btc_netflow_24h_usd_json,
                    cex_per_venue_eth_netflow_24h_usd_json,
                    cex_per_venue_stables_netflow_24h_usd_json
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 _iso(captured_at),
                 daily_macro_bias,
                 stablecoin_pulse_1h_usd,
                 cex_btc_netflow_24h_usd,
                 cex_eth_netflow_24h_usd,
-                coinbase_asia_skew_usd,
-                bnb_self_flow_24h_usd,
                 altcoin_index,
-                snapshot_age_s,
-                int(fresh),
-                int(whale_blackout_active),
                 cex_coinbase_netflow_24h_usd,
                 cex_binance_netflow_24h_usd,
                 cex_bybit_netflow_24h_usd,

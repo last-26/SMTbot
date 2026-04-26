@@ -74,8 +74,7 @@ async def test_record_reject_persists_minimum_fields(make_ctx):
     assert r.atr == 120.0
     assert r.confluence_score == 1.5
     assert r.confluence_factors == ["recent_sweep"]
-    assert r.entry_timeframe == ctx.config.trading.entry_timeframe
-    assert r.htf_timeframe == ctx.config.trading.htf_timeframe
+    # entry_timeframe / htf_timeframe dropped 2026-04-27 (1-distinct config constants).
     assert r.htf_bias == "BULLISH"
     assert r.session == "LONDON"
 

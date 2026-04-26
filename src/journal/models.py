@@ -76,14 +76,13 @@ class TradeRecord(BaseModel):
     confluence_factors: list[str] = Field(default_factory=list)
 
     # Execution context (from ExecutionReport — may be blank in dry-run)
+    # 2026-04-27 drops: algo_id / client_algo_id (Bybit position-attached
+    # TP/SL — no separate algo orders).
     order_id: Optional[str] = None
-    algo_id: Optional[str] = None
     client_order_id: Optional[str] = None
-    client_algo_id: Optional[str] = None
 
-    # Market context (threaded by the caller — optional)
-    entry_timeframe: Optional[str] = None
-    htf_timeframe: Optional[str] = None
+    # Market context (threaded by the caller — optional). 2026-04-27 drops:
+    # entry_timeframe / htf_timeframe (1-distinct config constants).
     htf_bias: Optional[str] = None
     session: Optional[str] = None
     market_structure: Optional[str] = None
@@ -94,9 +93,7 @@ class TradeRecord(BaseModel):
     pnl_r: Optional[float] = None
     fees_usdt: float = 0.0
 
-    # Partial-TP bookkeeping (Madde E) — list of algo IDs attached to the
-    # position; rewritten by the monitor after SL-to-BE replaces TP2.
-    algo_ids: list[str] = Field(default_factory=list)
+    # 2026-04-27 drop: algo_ids list (Bybit has no separate algo orders).
     # True once TP1 has filled and the SL has been replaced at break-even.
     # Persisted so that after a restart the monitor does not re-attempt the
     # (already done) cancel-and-replace dance on the still-open remainder.
@@ -106,7 +103,8 @@ class TradeRecord(BaseModel):
 
     # Derivatives snapshot at entry (Phase 1.5 Madde 7) — feed for Phase 7
     # RL features. All optional so legacy rows stay readable.
-    regime_at_entry: Optional[str] = None
+    # 2026-04-27 drop: regime_at_entry (DerivativesRegime classifier
+    # always returned 'BALANCED' — 1-distinct constant).
     funding_z_at_entry: Optional[float] = None
     ls_ratio_at_entry: Optional[float] = None
     oi_change_24h_at_entry: Optional[float] = None
@@ -132,13 +130,11 @@ class TradeRecord(BaseModel):
     zone_wait_bars: Optional[int] = None
     zone_fill_latency_bars: Optional[int] = None
     trend_regime_at_entry: Optional[str] = None
-    funding_z_6h: Optional[float] = None
-    funding_z_24h: Optional[float] = None
-
-    # Notes / screenshots (manual or future automation)
-    notes: Optional[str] = None
-    screenshot_entry: Optional[str] = None
-    screenshot_exit: Optional[str] = None
+    # 2026-04-27 drops: funding_z_6h / funding_z_24h (Phase 12 deferred,
+    # never populated; RL pipeline computes rolling z over
+    # derivatives_snapshots directly).
+    # 2026-04-27 drops: notes / screenshot_entry / screenshot_exit
+    # (manual operator-fill columns, bot never wrote them).
 
     # 2026-04-19 — demo-wick artefact flags. Populated at record_close time
     # by cross-checking entry / exit candles against a real-market public
@@ -203,8 +199,10 @@ class TradeRecord(BaseModel):
     long_liq_notional_1h_at_entry: Optional[float] = None
     short_liq_notional_1h_at_entry: Optional[float] = None
     ls_ratio_zscore_14d_at_entry: Optional[float] = None
-    price_change_1h_pct_at_entry: Optional[float] = None
-    price_change_4h_pct_at_entry: Optional[float] = None
+    # 2026-04-27 drops: price_change_1h/4h_pct_at_entry — by-design NULL
+    # on every Bybit-era trade (all pending-fill, candles=None plumbed by
+    # design). Reject-side (RejectedSignal) keeps these because reject
+    # path threads candle buffer to _derive_enrichment.
     # Top-N liq heatmap clusters (JSON). Shape:
     #   {"above": [{"price": .., "notional_usd": .., "distance_atr": ..}, ...],
     #    "below": [{...}, ...]}
@@ -261,21 +259,19 @@ class RejectedSignal(BaseModel):
     confluence_score: float = 0.0
     confluence_factors: list[str] = Field(default_factory=list)
 
-    entry_timeframe: Optional[str] = None
-    htf_timeframe: Optional[str] = None
+    # 2026-04-27 drops: entry_timeframe / htf_timeframe / regime_at_entry
+    # (1-distinct constants, parity with trades).
     htf_bias: Optional[str] = None
     session: Optional[str] = None
     market_structure: Optional[str] = None
 
-    # Proposed plan — populated when reject happens after SL/TP math
-    # (htf_tp_ceiling, tp_too_tight, insufficient_contracts_for_split);
-    # stays None on pre-math rejects (below_confluence, session_filter, etc.)
-    proposed_sl_price: Optional[float] = None
-    proposed_tp_price: Optional[float] = None
-    proposed_rr_ratio: Optional[float] = None
+    # 2026-04-27 drops: proposed_sl_price / proposed_tp_price /
+    # proposed_rr_ratio. Entry path doesn't compute proposed SL/TP at
+    # reject time. Re-add as a triple if a Bybit-native peg script gets
+    # written AND _record_reject starts computing what-if SL/TP for
+    # counter-factual analysis.
 
     # Derivatives snapshot — same fields as TradeRecord
-    regime_at_entry: Optional[str] = None
     funding_z_at_entry: Optional[float] = None
     ls_ratio_at_entry: Optional[float] = None
     oi_change_24h_at_entry: Optional[float] = None
@@ -292,14 +288,17 @@ class RejectedSignal(BaseModel):
     pillar_btc_bias: Optional[str] = None
     pillar_eth_bias: Optional[str] = None
 
-    # Counter-factual outcome — pre-migration rows filled by the legacy
-    # peg-rejected-outcomes script (removed 2026-04-26 with the OKX cleanup;
-    # depended on the OKX candle endpoint). Post-migration rows are NULL
-    # until a Bybit-native pegger is written.
-    # "WIN" = TP hit first, "LOSS" = SL hit first, "NEITHER" = neither inside window.
-    hypothetical_outcome: Optional[str] = None
-    hypothetical_bars_to_tp: Optional[int] = None
-    hypothetical_bars_to_sl: Optional[int] = None
+    # 2026-04-27 drops: hypothetical_outcome / hypothetical_bars_to_tp /
+    # hypothetical_bars_to_sl. Counter-factual outcome stamping never ran
+    # on Bybit-era rows (peg script was deleted in OKX cleanup, no
+    # Bybit-native rewrite). Re-add as a triple if a Bybit-native peg
+    # script gets written. Pre-migration rows in archived DBs still
+    # carry these stamps from the OKX-era pegger.
+    #
+    # Back-compat properties below return None so legacy callers
+    # (scripts/analyze.py, scripts/tune_confluence.py) keep running
+    # against post-2026-04-27 datasets — they just see "no peg outcome
+    # available" everywhere and skip those code paths.
 
     # 2026-04-21 — mirrors TradeRecord.on_chain_context. Carried on
     # rejects so factor_audit.py can segment reject reasons by on-chain
@@ -331,6 +330,24 @@ class RejectedSignal(BaseModel):
     price_change_1h_pct_at_entry: Optional[float] = None
     price_change_4h_pct_at_entry: Optional[float] = None
     liq_heatmap_top_clusters: dict = Field(default_factory=dict)
+
+    # 2026-04-27 — back-compat properties for the dropped peg-outcome
+    # columns. Always None on post-cleanup rows. Pre-migration rows in
+    # archived DBs (data/trades.db.pre_bybit_*) carry actual stamps but
+    # those DBs aren't loaded by the runtime journal. scripts/analyze.py
+    # and scripts/tune_confluence.py path-guard on these returning None
+    # and skip the counter-factual code branches gracefully.
+    @property
+    def hypothetical_outcome(self) -> Optional[str]:
+        return None
+
+    @property
+    def hypothetical_bars_to_tp(self) -> Optional[int]:
+        return None
+
+    @property
+    def hypothetical_bars_to_sl(self) -> Optional[int]:
+        return None
 
 
 class WhaleTransferRecord(BaseModel):
