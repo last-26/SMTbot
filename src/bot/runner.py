@@ -1831,6 +1831,23 @@ class BotRunner:
                 )
                 return
 
+        # 1. Switch the TV chart to this symbol (production has a bridge;
+        # tests pass bridge=None and the reader fake already knows the symbol).
+        # 2026-04-27 — moved BEFORE the VWAP-reset-blackout early-return so
+        # the chart still cycles through symbols during the blackout window.
+        # Pre-fix the bot would early-return at ~1ms per symbol cycle,
+        # leaving TradingView frozen on whichever symbol was loaded when
+        # the window opened — looked like the bot was hung. Now the
+        # symbol switches each cycle even though the trade decision is
+        # skipped; the operator can keep eyeballing the chart.
+        if self.ctx.bridge is not None:
+            try:
+                await self.ctx.bridge.set_symbol(internal_to_tv_symbol(symbol))
+                await asyncio.sleep(cfg.trading.symbol_settle_seconds)
+            except Exception:
+                logger.exception("set_symbol_failed symbol={}", symbol)
+                return
+
         # 0b. VWAP daily-reset blackout — skip new entries inside the
         # ±window around UTC 00:00. Pine 1m/3m/15m VWAPs all anchor on
         # the daily session change, and the ±1σ band is collapsed for
@@ -1850,16 +1867,6 @@ class BotRunner:
                 cfg.analysis.vwap_reset_blackout_window_post_min,
             )
             return
-
-        # 1. Switch the TV chart to this symbol (production has a bridge;
-        # tests pass bridge=None and the reader fake already knows the symbol).
-        if self.ctx.bridge is not None:
-            try:
-                await self.ctx.bridge.set_symbol(internal_to_tv_symbol(symbol))
-                await asyncio.sleep(cfg.trading.symbol_settle_seconds)
-            except Exception:
-                logger.exception("set_symbol_failed symbol={}", symbol)
-                return
 
         # Early dedup probe — HTF S/R zones are only consumed by the entry
         # planner (SL push + TP ceiling). Defensive close (Madde F) only
