@@ -13,9 +13,9 @@ AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT lin
 - **Strategy:** zone-based scalper. Confluence ≥ threshold → identify zone → post-only limit order at zone edge → wait N bars → fill | cancel.
 - **Pairs:** 5 Bybit USDT linear perps — `BTC / ETH / SOL / DOGE / XRP` (BNB swapped out for XRP on 2026-04-25 per operator preference; internal symbol format `BTC-USDT-SWAP` etc, translated at the Bybit boundary). 5 concurrent slots on UTA cross margin (collateral pool = USDT + USDC by USD value; BTC/ETH wallet stays out of collateral on demo per operator preference).
 - **Entry TF:** 3m. HTF context 15m, LTF confirmation 1m.
-- **Scoring:** 5 pillars (Market Structure, Liquidity, Money Flow, VWAP, Divergence) + hard gates (displacement, EMA momentum, VWAP, cross-asset opposition) + ADX regime-conditional weights. Confluence threshold `min_confluence_score=3.75` (Pass 1 Optuna tune, 2026-04-22). *Premium/discount gate and HTF TP/SR ceiling temporarily disabled 2026-04-19 — see changelog; re-evaluated as Pass 3 candidates.*
-- **Execution:** post-only limit → regular limit → market-at-edge fallback. **Position-attached TP/SL** at hard **1:2 RR** (Bybit V5: TP/SL fields on `/v5/order/create` for market entries, `/v5/position/trading-stop` for limit-fill attach + every subsequent SL/TP mutation). No separate algo orders to track — `journal.algo_ids` stays empty on Bybit-era rows. Mark-price triggers (`tpTriggerBy=slTriggerBy=MarkPrice`) for demo-wick immunity. Dynamic TP revision re-anchors TP to `entry ± 2 × sl_distance` every cycle, floor at 1.0R. **MFE-triggered SL lock (Option A, 2026-04-20)**: once MFE ≥ 1.3R, SL pulled to entry (+fee buffer); one-shot per position. **Maker-TP resting limit (2026-04-20)**: post-only reduce-only limit sits at TP price alongside the position-attached TP — captures wicks as maker, avoids trigger latency.
-- **Sizing:** fee-aware ceil on per-contract total cost so total realized SL loss (price + fee reserve) ≥ target_risk across every symbol. Overshoot bounded by one per-contract step (< $3 per position). Operator override via `RISK_AMOUNT_USDT` env bypasses percent-mode sizing; 10%-of-balance safety ceiling. Per-symbol `min_sl_distance_pct_per_symbol` floors: BTC 0.004, ETH 0.008, SOL 0.010, DOGE 0.008, BNB 0.005. Bybit boundary in `bybit_client.py` translates internal-format integer `num_contracts` to base-coin `qty` via per-symbol `_INTERNAL_CT_VAL` map (BTC 0.01, ETH 0.1, SOL 1, DOGE 1000, BNB 0.01); Bybit's `qtyStep` always cleanly divides the resulting qty (verified 2026-04-25 via `scripts/test_bybit_connection.py`).
+- **Scoring:** 5 pillars (Market Structure, Liquidity, Money Flow, VWAP, Divergence) + hard gates (displacement, EMA momentum, VWAP, cross-asset opposition) + ADX regime-conditional weights + multi-TF scalp confirmation soft factors (`ltf_ribbon_alignment` 1m EMA21-55 bias 0.25, `ltf_mss_alignment` 1m MSS 0.25, `htf_mss_alignment` 15m MSS journal-only weight=0 — added 2026-04-28). Confluence threshold `min_confluence_score=3.75` (Pass 1 Optuna tune, 2026-04-22). *Premium/discount gate and HTF TP/SR ceiling temporarily disabled 2026-04-19 — see changelog; re-evaluated as Pass 3 candidates.*
+- **Execution:** post-only limit → regular limit → market-at-edge fallback. **Position-attached TP/SL** at hard **1:1.5 RR** (2026-04-28 scalp tune from previous 1:2). Bybit V5: TP/SL fields on `/v5/order/create` for market entries, `/v5/position/trading-stop` for limit-fill attach + every subsequent SL/TP mutation. No separate algo orders to track — `journal.algo_ids` stays empty on Bybit-era rows. Mark-price triggers (`tpTriggerBy=slTriggerBy=MarkPrice`) for demo-wick immunity. Dynamic TP revision re-anchors TP to `entry ± 1.5 × sl_distance` every cycle, floor at 0.7R. **MFE-triggered SL lock (Option A)**: once MFE ≥ 1.0R (2026-04-28 scalp tune from previous 1.3R), SL pulled to entry (+fee buffer); one-shot per position. **Maker-TP resting limit**: post-only reduce-only limit sits at TP price alongside the position-attached TP — captures wicks as maker, avoids trigger latency. **Zone timeout**: 2 entry-TF bars (~6 min on 3m, scalp tune from previous 7 bars / 21 min) — stale pendings clear faster, fresh re-evaluation each cycle.
+- **Sizing:** fee-aware ceil on per-contract total cost so total realized SL loss (price + fee reserve) ≥ target_risk across every symbol. Overshoot bounded by one per-contract step (< $3 per position). Operator override via `RISK_AMOUNT_USDT` env bypasses percent-mode sizing; 10%-of-balance safety ceiling. Per-symbol `min_sl_distance_pct_per_symbol` floors (2026-04-28 scalp tighten −25%): BTC 0.003, ETH 0.006, SOL 0.008, DOGE/XRP 0.006, BNB 0.004. Bybit boundary in `bybit_client.py` translates internal-format integer `num_contracts` to base-coin `qty` via per-symbol `_INTERNAL_CT_VAL` map (BTC 0.01, ETH 0.1, SOL 1, DOGE 1000, BNB 0.01); Bybit's `qtyStep` always cleanly divides the resulting qty (verified 2026-04-25 via `scripts/test_bybit_connection.py`).
 - **Journal:** async SQLite, schema includes `on_chain_context`, `demo_artifact`, `confluence_pillar_scores`, `oscillator_raw_values` (all JSON). Separate tables: `rejected_signals` (counter-factual outcome pegged), `on_chain_snapshots` (Arkham state mutation time-series), `whale_transfers` (raw WS events for Phase 9 directional learning). *Per-exchange derivatives capture attempted 2026-04-24 and reverted same day — Coinalyze free-tier 40/min ceiling can't sustain it alongside per-symbol baseline (25 calls/cycle).*
 - **On-chain (Arkham):** runtime soft signals only — daily bias ±15%, hourly stablecoin pulse +0.75 threshold penalty, altcoin-index +0.5 penalty on misaligned altcoin trades, **flow_alignment** 6-input directional score (stablecoin + BTC/ETH + Coinbase/Binance/Bybit 24h netflow; weights 0.25/0.25/0.15/0.15/0.10/0.10; default penalty 0.25), **per_symbol_cex_flow** binary penalty on misaligned symbol 1h volume (default 0.25, $5M floor). **Bitfinex + Kraken 24h netflow captured journal-only** (2026-04-23 night-late, 4th + 5th named venues — biggest single inflow / outflow in live probe vs. `type:cex` aggregate). **OKX 24h netflow captured journal-only** (2026-04-24, 6th venue — bot's own trading exchange, self-signal; 24h net ≈ 0 structurally but $58M max hourly |net|). None of 4/5/6 yet wired into `_flow_alignment_score` — Pass 3 decides weights. Whale HARD GATE removed 2026-04-22 — WS listener feeds `whale_transfers` journal for Pass 3 directional classification. Per-symbol token_volume fallback (2026-04-23): when Arkham `/token/volume/{id}` returns JSON `null` (confirmed for `solana`, `wrapped-solana`), `fetch_token_volume_last_hour` falls back to `/transfers/histogram` (flow=in + flow=out, last bucket) — zero coverage gap for the traded symbol set. **Netflow freeze fix (2026-04-23 night):** per-entity netflow rewritten from `/flow/entity/{entity}` (daily buckets, froze at UTC day close) to `/transfers/histogram?base=<entity>&granularity=1h&time_last=24h`; same fix for BTC/ETH aggregate. Daily-bundle refresh flipped from UTC-day gate to 5-min monotonic cadence (`on_chain.daily_snapshot_refresh_s: 300`) so `on_chain_snapshots` DB rows actually replace frozen values intraday. Credit-safe via v2 persistent WS streams + filter-fingerprint cache. All Arkham weights tuned in Pass 3.
 - **Pass 2 instrumentation:** every trade row now captures `confluence_pillar_scores` (factor name → weight dict) and `oscillator_raw_values` (per-TF dict with 1m/3m/15m OscillatorTableData numerics: wt1/wt2/rsi/rsi_mfi/stoch_k/d/momentum/divergence flags). Both sourced from existing runner TF-switch cache — zero extra TV latency.
@@ -25,6 +25,142 @@ AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT lin
 ---
 
 ## Changelog
+
+### 2026-04-28 — Scalp tighten + multi-TF MSS factors + OKX test purge
+
+Three paired commits. Operator-driven scalp focus and post-migration
+hygiene. No DB schema changes (column-level migrations stay zero).
+
+**1. Scalp tighten (`6f0aa7b`):** SL floors -25% across the board paired
+with RR cap drop, MFE-lock earlier, zone timeout shorter:
+
+- `min_sl_distance_pct_per_symbol`: BTC 0.4→0.3%, ETH 0.8→0.6%, SOL
+  1.0→0.8%, DOGE/XRP 0.8→0.6%, BNB 0.5→0.4%
+- `target_rr_ratio` + `default_rr_ratio` + `zone_default_rr`: 2.0 → 1.5
+- `min_rr_ratio`: 1.5 → 1.2 (must stay below new hard cap)
+- `tp_min_rr_floor`: 1.0 → 0.7 (dynamic-revise headroom under 1.5R cap)
+- `sl_lock_mfe_r`: 1.3 → 1.0 (preserves the original 67% of-TP design
+  proportion: 2R/3R = 67%, 1R/1.5R = 67%)
+- `zone_max_wait_bars`: 7 → 2 (~6 min on 3m, was 21 min — operator
+  request: stale pendings flushed faster, fresh re-evaluation each
+  ~6 min addresses the VWAP-drift concern)
+
+Breakeven WR shifts 33% → 40% under 1:1.5 RR. Tradeoff: more wick
+stop-outs vs faster TP/SL resolution. Re-eval after 20 closed trades —
+if WR < 40% sustained, atomically revert this entire block via the
+inverse YAML edit.
+
+**Lesson re-learned (lockstep mandate):** SL floors must move WITH RR
+in lockstep. The 2026-04-23 floor *bump* at fixed RR=2.0 widened TPs
+mechanically (`tp_price = entry ± sl_distance × rr_ratio`) and
+collapsed WR 66.7% → 22.2%. Tightening SL at fixed RR has the same
+asymmetric danger in reverse — narrower TPs but more wick stops. The
+2026-04-28 tighten couples both knobs so the "size of TP relative to
+SL" stays at 1.5×, just shrinks in absolute terms. NEVER ship one
+without the other.
+
+**Pre-fix DOGE R audit:** operator flagged DOGE TP landing at ~$30
+when "R should be ~$10". Investigation showed R = `wallet × 0.02`
+under `auto_risk_pct_of_wallet=0.02` (2026-04-26 dashboard-era
+behavior); on a $745 wallet R was actually $14.91, so the TP at
+2R = $29.82 was mathematically correct. CLAUDE.md narrative had
+stale `RISK_AMOUNT_USDT=10` notes pre-dating the auto-R mode. No
+code bug. Operator opted to set `RISK_AMOUNT_USDT=10` in `.env`
+post-discussion to lock R flat.
+
+**2. OKX test purge (`99528e9`):** 52 → 8 test failures. The bot's
+production code uses Bybit V5 `set_position_tpsl` (single
+trading-stop call) but multiple test files still mocked the OKX-era
+`place_oco_algo` / `cancel_algo` path. Production calls
+`set_position_tpsl` which the FakeClients lack — tests fail with
+AttributeError before any assertion runs, so the tests test nothing.
+
+- Deleted entirely: `tests/test_sl_to_be.py`, `tests/test_journal_partial_tp.py`,
+  `tests/test_order_router.py` (all wholly OKX-era OCO algo
+  scaffolding; underlying production behaviors — SL-to-BE, MFE-lock,
+  TP revise, order routing — need fresh Bybit-V5-aware tests in a
+  separate work item)
+- Trimmed: `tests/test_position_monitor.py` 755 → 100 lines (kept
+  open/poll/close lifecycle tests; deleted FakeRevisableClient + 14
+  OCO-coupled tests). `tests/test_partial_tp.py` 166 → 47 lines
+  (kept the YAML 1:N RR guard, deleted 5 partial-TP OCO tests)
+- Updated to Bybit semantics: `tests/test_pending_monitor.py` cancel
+  code 51400 → 110001; `tests/test_runner_multi_pair.py` +
+  `tests/test_economic_calendar.py` legacy fixture `"okx"` block →
+  `"bybit"` with current Bybit field names
+- Fixed BNB→XRP migration leftovers: `tests/test_on_chain_types.py`
+  + `tests/test_on_chain_ws.py` assertions updated from
+  `BNB-USDT-SWAP` to `XRP-USDT-SWAP` per the 2026-04-25 watched-set
+  swap
+
+NOT touched per operator clarification (Arkham on-chain data, not
+a trading dependency): `cex_okx_netflow_24h_usd` column + the OKX
+slug in the per-venue netflow loop. OKX is the 6th named CEX on the
+Arkham snapshot side; the bot trades on Bybit only.
+
+Remaining 8 failures are unrelated post-migration leftovers
+(`test_journal_derivatives` × 3 use the dropped `regime_at_entry`
+column; 4 `test_bot_runner` rehydrate / reconcile / dry_run paths;
+1 `test_bot_config` whale_tokens list ordering). Separate cleanup
+pass.
+
+**3. Multi-TF MSS + EMA ribbon scalp factors (`fe21f2f`):** three new
+soft confluence factors exposing 1m + 15m signals the bot was
+already reading but not scoring on:
+
+- `ltf_ribbon_alignment` — 1m EMA21-55 ribbon bias (vmc_ribbon).
+  Weight 0.25. Fires when 1m ribbon direction matches the proposed
+  trade direction.
+- `ltf_mss_alignment` — 1m last MSS direction prefix. Weight 0.25.
+  Pairs with the existing `mss_alignment` (3m, entry-TF) — when
+  both fire, the 1m structural shift confirms the 3m picture.
+- `htf_mss_alignment` — 15m last MSS. **Weight 0.0 by default**
+  (journal-only; factor name lands in `confluence_factors` JSON for
+  Pass 3 GBT to train on without tilting the live confluence score).
+  Operator-requested data capture; flip YAML weight to 0.25 if
+  Pass 3 importance shows lift.
+
+Trio gives a complete multi-TF MSS picture (1m → 3m → 15m) for
+Pass 3 GBT to learn the cross-TF alignment patterns. A 3.75-confluence
+3m setup with both 1m factors aligned picks up an extra +0.5 vote
+without dominating the score; the 15m factor is pure instrumentation.
+
+**Data plumbing:** zero extra TV round-trips. LTFState dataclass
+gains `vmc_ribbon` + `last_mss` populated by `LTFReader` from the
+same 1m MarketState already fetched for the defensive-close gate.
+`score_direction` / `calculate_confluence` / `generate_entry_intent`
+/ `build_trade_plan_with_reason` / `build_trade_plan_from_state`
+all gain an `htf_state` kwarg threaded from
+`ctx.htf_state_cache[symbol]` — uses the existing HTF settle-pass
+cache, no new data fetch.
+
+**Tests:** 18 new in `tests/test_ltf_scalp_factors.py` covering
+aligned/misaligned × both directions × all 3 factors, empty/None
+edge cases, both-1m-factors-stack invariant, DEFAULT_WEIGHTS guard
+(both 0.25 + the 0.0 for htf_mss), and the htf_mss factor's
+weight=0 default behavior + opt-in YAML override path.
+
+**Re-eval triggers (monitor over the next 20 closed trades):**
+
+1. **Scalp tighten WR** — target ≥ 40% (1:1.5 breakeven). Lower =
+   wicks dominating; revert SL floors + RR atomically.
+2. **`zone_timeout_cancel` rate** — fraction of total pending
+   cancels. Target < 60%; if higher, the 6-min window is too tight
+   for typical zone fill latency, raise to `zone_max_wait_bars: 3`
+   (9 min).
+3. **MFE-lock fire rate** — at 1.0R threshold under 1.5R RR, the
+   lock should fire on most "nearly TP'd" trades that retrace. If
+   never fires (0% across 10 wins), threshold needs to drop further
+   (0.8R candidate).
+4. **`ltf_ribbon_alignment` + `ltf_mss_alignment` co-occurrence** —
+   fraction of accepted entries with BOTH 1m factors firing. Target
+   30-60% (signals that scalp confirmation is meaningful but not
+   forced by the gate). Below 10% = 1m signals too noisy / contra
+   the 3m direction; above 90% = redundant with mss_alignment, drop
+   weights.
+5. **`htf_mss_alignment` Pass 3 importance** — when Pass 3 GBT runs,
+   the factor's feature importance decides whether to flip the
+   default weight to 0.25 or keep at 0.
 
 ### 2026-04-27 (night, 23:27) — Mekanizma 1 + 2 SHIPPED then REVERTED same day
 
