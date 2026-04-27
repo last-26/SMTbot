@@ -92,7 +92,6 @@ from src.journal.derivatives_journal import DerivativesJournal
 from src.strategy.entry_signals import (
     _flow_alignment_score,
     build_trade_plan_with_reason,
-    count_failing_invalidation_gates,
     evaluate_pending_invalidation_gates,
     in_vwap_reset_blackout,
 )
@@ -585,13 +584,6 @@ class BotContext:
     defensive_close_in_flight: set = field(default_factory=set)
     pending_close_reasons: dict[tuple[str, str], str] = field(default_factory=dict)
     open_trade_opened_at: dict[tuple[str, str], datetime] = field(default_factory=dict)
-    # 2026-04-27 — Counter-confluence open-position protection (Mekanizma 2).
-    # `counter_confluence_streak[(symbol, pos_side)]` is the running count
-    # of consecutive cycles the trigger conditions held for that position.
-    # Reset to 0 on recovery (any condition breaks). Keyed per-position so
-    # reopening the same (symbol, side) post-close starts at 0. Cleared by
-    # `_handle_close` when the position closes.
-    counter_confluence_streak: dict[tuple[str, str], int] = field(default_factory=dict)
     # Phase 1.5 — derivatives subsystem (all opt-in via DerivativesConfig.enabled)
     liquidation_stream: Any = None         # LiquidationStream
     derivatives_cache: Any = None          # DerivativesCache (Madde 3)
@@ -1616,322 +1608,6 @@ class BotRunner:
                 "sl_lock_dispatch_failed symbol={} side={}", symbol, pos_side,
             )
 
-    # ── Counter-confluence open-position protection (Mekanizma 2, 2026-04-27) ─
-
-    def _compute_counter_confluence_score(
-        self,
-        symbol: str,
-        state: MarketState,
-        candles: list,
-        position_direction: Direction,
-    ) -> float:
-        """Score the COUNTER direction for an open position.
-
-        Sister of `_compute_pending_decay_score` — same parameter set so
-        scores are comparable across the entry-side / pending-decay /
-        counter-protection paths. Inverts `position_direction` and runs
-        `score_direction` for the inverse: the question being asked is
-        "how strong is the case for the OPPOSITE side right now?"
-        """
-        if position_direction == Direction.BULLISH:
-            counter = Direction.BEARISH
-        elif position_direction == Direction.BEARISH:
-            counter = Direction.BULLISH
-        else:
-            return 0.0
-        cfg = self.ctx.config
-        trend_regime_result = classify_trend_regime(
-            candles,
-            period=cfg.analysis.adx_period,
-            ranging_threshold=cfg.analysis.trend_regime_ranging_threshold,
-            strong_threshold=cfg.analysis.trend_regime_strong_threshold,
-        )
-        score_obj = score_direction(
-            state=state,
-            direction=counter,
-            ltf_candles=candles,
-            weights=cfg.analysis.confluence_weights or None,
-            allowed_sessions=cfg.allowed_sessions_for(symbol) or None,
-            ltf_state=self.ctx.ltf_cache.get(symbol),
-            min_rsi_mfi_magnitude=cfg.analysis.min_rsi_mfi_magnitude,
-            liquidity_pool_max_atr_dist=cfg.analysis.liquidity_pool_max_atr_dist,
-            displacement_atr_mult=cfg.analysis.displacement_atr_mult,
-            displacement_max_bars_ago=cfg.analysis.displacement_max_bars_ago,
-            divergence_fresh_bars=cfg.analysis.divergence_fresh_bars,
-            divergence_decay_bars=cfg.analysis.divergence_decay_bars,
-            divergence_max_bars=cfg.analysis.divergence_max_bars,
-            trend_regime=trend_regime_result.regime,
-            trend_regime_conditional_scoring_enabled=(
-                cfg.analysis.trend_regime_conditional_scoring_enabled
-            ),
-        )
-        return float(score_obj.score)
-
-    def _get_position_mfe_r(
-        self, symbol: str, pos_side: str,
-    ) -> Optional[float]:
-        """Read the running MFE-in-R-multiples for an open position.
-
-        Returns None when the position isn't tracked. The PositionMonitor
-        updates `_Tracked.mfe_r_high` on every poll; this is the latest
-        peak favourable excursion in plan-R units (so 1.0 = position
-        reached +1 plan_sl_distance at some point during its life).
-        """
-        getter = getattr(self.ctx.monitor, "get_tracked", None)
-        if getter is None:
-            return None
-        try:
-            t = getter(symbol, pos_side)
-        except Exception:
-            return None
-        if t is None:
-            return None
-        try:
-            return float(t.mfe_r_high)
-        except Exception:
-            return None
-
-    async def _maybe_apply_counter_confluence_protection(
-        self,
-        symbol: str,
-        pos_side: str,
-        state: MarketState,
-        candles: list,
-    ) -> None:
-        """Mekanizma 2 — protect an open position when counter-confluence
-        rises against it.
-
-        Trigger conditions (ALL required, AND mantığı):
-          1. Counter-direction confluence ≥
-             `execution.counter_confluence_threshold`.
-          2. ≥ `execution.counter_confluence_min_hard_gates` of the
-             3 hard veto gates (vwap_misaligned / ema_momentum_contra /
-             cross_asset_opposition) flipped against the position
-             direction.
-          3. Streak counter
-             `ctx.counter_confluence_streak[(symbol, pos_side)]` reaches
-             `execution.counter_confluence_decay_cycles` after this
-             cycle's increment (one-cycle hysteresis baked in: with
-             default `cycles=3`, three consecutive trigger cycles before
-             action).
-          4. NOT in `STRONG_TREND` aligned with the position direction
-             (pullback exemption — strong-trend pullbacks are noise, not
-             reversals).
-
-        On trigger, dispatch by current MFE (in plan-R multiples):
-          * MFE > 1R    → SL → entry + 0.5R (lock half the gain)
-          * MFE 0..1R   → SL → BE + fee_buffer (giveback shield)
-          * MFE < 0     → defensive close ("EARLY_CLOSE_COUNTER_CONFLUENCE")
-
-        Failure-mode tolerance: any sub-step that raises is logged +
-        swallowed so the cycle doesn't stall. Worst case: trigger
-        re-evaluates next cycle.
-        """
-        cfg = self.ctx.config
-        if not cfg.execution.counter_confluence_protection_enabled:
-            return
-        # Translate side string → Direction (the score_direction signature
-        # uses Direction; the rest of the pipeline already does this).
-        if pos_side == "long":
-            position_direction = Direction.BULLISH
-        elif pos_side == "short":
-            position_direction = Direction.BEARISH
-        else:
-            return
-
-        # 4) Trend-regime exemption — STRONG_TREND aligned with position
-        # direction means counter-confluence is likely just a pullback.
-        try:
-            trend_result = classify_trend_regime(
-                candles,
-                period=cfg.analysis.adx_period,
-                ranging_threshold=cfg.analysis.trend_regime_ranging_threshold,
-                strong_threshold=cfg.analysis.trend_regime_strong_threshold,
-            )
-        except Exception:
-            logger.exception(
-                "counter_protection_regime_failed symbol={} side={}",
-                symbol, pos_side,
-            )
-            return
-        regime = trend_result.regime
-        if regime == TrendRegime.STRONG_TREND:
-            # Read the entry-TF trend bias from the state's HTF tag — if
-            # the position direction agrees, exempt (pullback noise).
-            # Falls open (not exempt) when bias unknown so a "strong trend
-            # against the position" still triggers protection.
-            htf_bias = getattr(state, "trend_htf", Direction.UNDEFINED)
-            if htf_bias == position_direction:
-                self._reset_counter_streak(symbol, pos_side)
-                return
-
-        # 1) Counter-direction confluence rescore.
-        try:
-            counter_score = self._compute_counter_confluence_score(
-                symbol, state, candles, position_direction,
-            )
-        except Exception:
-            logger.exception(
-                "counter_confluence_score_failed symbol={} side={}",
-                symbol, pos_side,
-            )
-            return
-        threshold = float(cfg.execution.counter_confluence_threshold)
-        score_above = counter_score >= threshold
-
-        # 2) Hard-gate flip count for the position direction. Note that
-        # `pillar_opposition` is the value `_pillar_opposition_for` returns
-        # (Direction.BULLISH if both pillars bullish → blocks BEARISH alts,
-        # etc.) — `_cross_asset_opposes` inside the helper handles the
-        # direction-vs-opposition comparison and returns False when no
-        # opposition exists.
-        try:
-            failing_gates = count_failing_invalidation_gates(
-                state=state,
-                candles=candles,
-                direction=position_direction,
-                entry_price=float(getattr(state, "current_price", 0.0) or 0.0),
-                pillar_opposition=self._pillar_opposition_for(symbol),
-                vwap_hard_veto_enabled=cfg.analysis.vwap_hard_veto_enabled,
-                ema_veto_enabled=cfg.analysis.ema_veto_enabled,
-                ema_veto_fast_period=cfg.analysis.ema_veto_fast_period,
-                ema_veto_slow_period=cfg.analysis.ema_veto_slow_period,
-            )
-        except Exception:
-            logger.exception(
-                "counter_protection_gate_count_failed symbol={} side={}",
-                symbol, pos_side,
-            )
-            return
-        gates_above = failing_gates >= int(
-            cfg.execution.counter_confluence_min_hard_gates
-        )
-
-        # Streak management — both conditions must hold to advance.
-        key = (symbol, pos_side)
-        if not (score_above and gates_above):
-            # Recovery: reset streak so a future trigger must accumulate
-            # fresh consecutive cycles.
-            if self.ctx.counter_confluence_streak.get(key, 0) > 0:
-                logger.info(
-                    "counter_confluence_recovered symbol={} side={} "
-                    "score={:.2f} threshold={:.2f} gates={}/{} "
-                    "prior_streak={}",
-                    symbol, pos_side, counter_score, threshold,
-                    failing_gates,
-                    cfg.execution.counter_confluence_min_hard_gates,
-                    self.ctx.counter_confluence_streak.get(key, 0),
-                )
-            self._reset_counter_streak(symbol, pos_side)
-            return
-
-        # Both above → increment streak.
-        new_streak = self.ctx.counter_confluence_streak.get(key, 0) + 1
-        self.ctx.counter_confluence_streak[key] = new_streak
-        required = int(cfg.execution.counter_confluence_decay_cycles)
-        if new_streak < required:
-            logger.info(
-                "counter_confluence_streak symbol={} side={} "
-                "score={:.2f} threshold={:.2f} gates={}/{} "
-                "streak={}/{}",
-                symbol, pos_side, counter_score, threshold,
-                failing_gates,
-                cfg.execution.counter_confluence_min_hard_gates,
-                new_streak, required,
-            )
-            return
-
-        # 3) Streak threshold met — dispatch by MFE.
-        mfe = self._get_position_mfe_r(symbol, pos_side)
-        if mfe is None:
-            logger.info(
-                "counter_confluence_skipped_no_mfe symbol={} side={} "
-                "score={:.2f} streak={}",
-                symbol, pos_side, counter_score, new_streak,
-            )
-            # Reset to avoid re-firing on the same trigger; without MFE
-            # we cannot pick the right protective action.
-            self._reset_counter_streak(symbol, pos_side)
-            return
-
-        snap = self.ctx.monitor.get_tracked_runner(symbol, pos_side)
-        if snap is None:
-            self._reset_counter_streak(symbol, pos_side)
-            return
-        plan_sl = float(snap.get("plan_sl_price") or 0.0)
-        entry = float(snap.get("entry_price") or 0.0)
-        if entry <= 0:
-            self._reset_counter_streak(symbol, pos_side)
-            return
-        sign = 1 if pos_side == "long" else -1
-
-        if mfe < 0:
-            # Branch C — defensive close. Counter signal is strong AND
-            # we're already at a loss; the SL→BE/lock dispatch can't help.
-            logger.info(
-                "counter_confluence_close symbol={} side={} mfe_r={:.2f} "
-                "score={:.2f} gates={} streak={}",
-                symbol, pos_side, mfe, counter_score, failing_gates, new_streak,
-            )
-            await self._defensive_close(
-                symbol, pos_side,
-                reason=f"counter_confluence:{counter_score:.2f}",
-                close_reason="EARLY_CLOSE_COUNTER_CONFLUENCE",
-            )
-            # Reset streak — close path takes over; further triggers are
-            # moot once `_handle_close` clears the position state.
-            self._reset_counter_streak(symbol, pos_side)
-            return
-
-        # Branches A/B — SL lock. Both require plan_sl > 0 (post-BE
-        # rehydrate sentinel disables both, matching MFE-lock behaviour).
-        if plan_sl <= 0:
-            logger.info(
-                "counter_confluence_skipped_post_be symbol={} side={} "
-                "mfe_r={:.2f} score={:.2f}",
-                symbol, pos_side, mfe, counter_score,
-            )
-            self._reset_counter_streak(symbol, pos_side)
-            return
-        sl_distance = abs(entry - plan_sl)
-        if sl_distance <= 0:
-            self._reset_counter_streak(symbol, pos_side)
-            return
-
-        if mfe > 1.0:
-            # Branch A — lock at BE+0.5R.
-            new_sl = entry + sign * 0.5 * sl_distance
-            branch = "be_plus_05r"
-        else:
-            # Branch B — BE+fee buffer (matches MFE-lock at sl_lock_at_r=0).
-            new_sl = entry + sign * (entry * cfg.execution.sl_be_offset_pct)
-            branch = "be_plus_fee"
-
-        logger.info(
-            "counter_confluence_lock symbol={} side={} branch={} "
-            "mfe_r={:.2f} new_sl={} score={:.2f} gates={} streak={}",
-            symbol, pos_side, branch, mfe, new_sl, counter_score,
-            failing_gates, new_streak,
-        )
-        try:
-            await asyncio.to_thread(
-                self.ctx.monitor.lock_sl_at, symbol, pos_side, new_sl,
-                one_shot=False, tighter_only=True,
-            )
-        except Exception:
-            logger.exception(
-                "counter_confluence_lock_dispatch_failed symbol={} side={}",
-                symbol, pos_side,
-            )
-        # Streak persists — if the trigger conditions stay live and MFE
-        # later crosses 1R, the next cycle's call will escalate from
-        # BE+fee → BE+0.5R via the `tighter_only` guard. Streak only
-        # resets on recovery or close.
-
-    def _reset_counter_streak(self, symbol: str, pos_side: str) -> None:
-        """Drop the per-position counter-confluence streak entry."""
-        self.ctx.counter_confluence_streak.pop((symbol, pos_side), None)
-
     def _pillar_opposition_for(self, symbol: str) -> Optional[Direction]:
         """Cross-asset opposition signal for `symbol` (Phase 7.A6).
 
@@ -2173,28 +1849,12 @@ class BotRunner:
             return ltf.trend == Direction.BULLISH and sig == "BUY"
         return False
 
-    async def _defensive_close(
-        self, symbol: str, side: str, reason: str,
-        *,
-        close_reason: str = "EARLY_CLOSE_LTF_REVERSAL",
-    ) -> None:
+    async def _defensive_close(self, symbol: str, side: str, reason: str) -> None:
         """Cancel algos + close the position, tagged with `close_reason`.
 
         Idempotent via `defensive_close_in_flight`. The monitor will emit a
-        CloseFill on its next poll, and `_handle_close` will stamp the
-        `close_reason` on the journal row.
-
-        Args:
-            symbol / side: target position.
-            reason: free-form log tag (e.g. "ltf_reversal" or
-                "counter_confluence:<score>"). Goes to the trigger log,
-                NOT the journal.
-            close_reason: the journal column value. Defaults to
-                "EARLY_CLOSE_LTF_REVERSAL" so the original LTF reversal
-                callers don't need to pass anything. Counter-confluence
-                protection (2026-04-27) passes
-                "EARLY_CLOSE_COUNTER_CONFLUENCE" so the segment is
-                separable in Pass 3 GBT.
+        CloseFill on its next poll, and `_handle_close` will stamp the reason
+        on the journal row.
         """
         key = (symbol, side)
         if key in self.ctx.defensive_close_in_flight:
@@ -2215,12 +1875,9 @@ class BotRunner:
             # close on its own; we don't want to spam the exchange.
             return
 
-        self.ctx.pending_close_reasons[key] = close_reason
-        logger.info(
-            "defensive_close_triggered symbol={} side={} reason={} "
-            "close_reason={}",
-            symbol, side, reason, close_reason,
-        )
+        self.ctx.pending_close_reasons[key] = "EARLY_CLOSE_LTF_REVERSAL"
+        logger.info("defensive_close_triggered symbol={} side={} reason={}",
+                    symbol, side, reason)
 
     async def _read_last_bar(self) -> Optional[int]:
         """Best-effort read of the signal-table last_bar. None on any failure."""
@@ -2518,20 +2175,7 @@ class BotRunner:
         if open_side:
             await self._maybe_revise_tp_dynamic(symbol, open_side, state)
 
-        # 2f. Counter-confluence open-position protection (Mekanizma 2,
-        # 2026-04-27). Multi-condition check: counter-direction confluence
-        # ≥ threshold AND ≥N hard gates flipped AND streak ≥ cycles AND
-        # not in aligned STRONG_TREND. On trigger: MFE > 1R → BE+0.5R lock;
-        # MFE 0..1R → BE+fee lock; MFE < 0 → defensive close. Runs BEFORE
-        # MFE-lock so the smarter (multi-conditioned) mechanism gets first
-        # say; the lock_sl_at `tighter_only` guard ensures MFE-lock can
-        # still escalate past whatever counter-protection placed.
-        if open_side:
-            await self._maybe_apply_counter_confluence_protection(
-                symbol, open_side, state, candles,
-            )
-
-        # 2g. MFE-triggered SL lock — when MFE crosses `sl_lock_mfe_r`, pull
+        # 2f. MFE-triggered SL lock — when MFE crosses `sl_lock_mfe_r`, pull
         # the runner SL up to entry (± fee buffer) so the remaining target
         # is risk-free. Off when `execution.sl_lock_enabled` is false.
         # One-shot per position.
@@ -4157,10 +3801,6 @@ class BotRunner:
             close_reason = _infer_close_reason(enriched.pnl_usdt)
         self.ctx.defensive_close_in_flight.discard(key)
         self.ctx.open_trade_opened_at.pop(key, None)
-        # 2026-04-27 — Counter-confluence streak cleanup. Position closed →
-        # any pending streak for (symbol, side) is moot; clear so a future
-        # re-open of the same key starts fresh at 0.
-        self.ctx.counter_confluence_streak.pop(key, None)
 
         if trade_id is None:
             logger.warning("orphan_close key={} (no matching trade_id)", key)

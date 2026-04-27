@@ -549,68 +549,6 @@ class ExecutionConfig(BaseModel):
     artefact_check_timeout_s: float = 5.0
     artefact_check_tolerance_pct: float = 0.0005   # 5 bps
 
-    # 2026-04-27 — Counter-confluence open-position protection (Mekanizma 2).
-    # Companion to the pending confluence-decay early-cancel: where that
-    # mechanism kills a pending whose CONFLUENCE drops below threshold,
-    # this protects an OPEN position when the COUNTER direction's
-    # confluence rises above threshold (i.e. a strong reversal signal
-    # forms against the open position). MFE-aware decision tree (see
-    # _maybe_apply_counter_confluence_protection in runner.py):
-    #   * MFE > 1R     → SL pulled to entry + 0.5R (lock half the gain)
-    #   * MFE in [0,1R] → SL pulled to BE + fee_buffer (giveback shield)
-    #   * MFE < 0       → defensive close (entry was wrong, avoid SL bleed)
-    # Trigger requires ALL of:
-    #   1. Counter-direction confluence ≥ counter_confluence_threshold
-    #   2. ≥ counter_confluence_min_hard_gates of (vwap_misaligned /
-    #      ema_momentum_contra / cross_asset_opposition) flipped against
-    #      the position direction
-    #   3. Streak hits counter_confluence_decay_cycles consecutive cycles
-    #      (hysteresis emer one-cycle flicker; live-position dispatch
-    #      warrants more conservative cycle count than the pending-side
-    #      mechanism's 2)
-    #   4. NOT in STRONG_TREND aligned with position direction (pullback
-    #      noise exemption — strong trends naturally counter-pulse)
-    # Disable to revert to pre-2026-04-27 behavior (MFE-lock at 1.3R is
-    # the only existing automated protection between 0R and TP).
-    counter_confluence_protection_enabled: bool = True
-    # Threshold mirrors AnalysisConfig.min_confluence_score by default
-    # (gate-passport parity: counter direction must be strong enough that
-    # the bot would CONSIDER opening that side). Tighter than entry
-    # threshold means rare protection; looser means trade-kill risk.
-    counter_confluence_threshold: float = 3.75
-    # Hysteresis cycles. 3 cycle ≈ 9 min on 3m TF. Pending-side uses 2
-    # cycles; open-position dispatch is one tick more conservative
-    # because the action mutates a live position vs. just cancelling
-    # an unfilled limit.
-    counter_confluence_decay_cycles: int = 3
-    # Minimum count of HARD vetoes that must be flipped against the
-    # position direction. Single-gate flip (e.g. only vwap_misaligned)
-    # is too noisy — a mean-reversion can flip VWAP without breaking
-    # the larger setup. Two flipped gates indicates real market turn.
-    counter_confluence_min_hard_gates: int = 2
-
-    @field_validator("counter_confluence_decay_cycles")
-    @classmethod
-    def _counter_decay_cycles_in_range(cls, v: int) -> int:
-        if v < 1 or v > 10:
-            raise ValueError(
-                f"counter_confluence_decay_cycles must be in [1, 10] "
-                f"(consecutive sub-threshold cycles before protection "
-                f"action; 1=instant, 3=two-cycle hysteresis); got {v}"
-            )
-        return v
-
-    @field_validator("counter_confluence_min_hard_gates")
-    @classmethod
-    def _counter_min_gates_in_range(cls, v: int) -> int:
-        if v < 1 or v > 3:
-            raise ValueError(
-                f"counter_confluence_min_hard_gates must be in [1, 3] "
-                f"(only 3 hard veto gates exist: vwap_misaligned / "
-                f"ema_momentum_contra / cross_asset_opposition); got {v}"
-            )
-        return v
-
 
 class DerivativesConfig(BaseModel):
     """Phase 1.5 — derivatives data layer configuration.

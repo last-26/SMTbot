@@ -1240,49 +1240,6 @@ def build_trade_plan_with_reason(
     return plan, ""
 
 
-def count_failing_invalidation_gates(
-    *,
-    state: MarketState,
-    candles: list[Candle],
-    direction: Direction,
-    entry_price: float,
-    pillar_opposition: Optional[Direction] = None,
-    vwap_hard_veto_enabled: bool = True,
-    ema_veto_enabled: bool = True,
-    ema_veto_fast_period: int = 9,
-    ema_veto_slow_period: int = 21,
-) -> int:
-    """2026-04-27 — Count how many HARD veto gates would currently reject
-    a NEW entry of `direction`.
-
-    Same gates as `evaluate_pending_invalidation_gates` (vwap_misaligned,
-    ema_momentum_contra, cross_asset_opposition) but returns a count
-    instead of stopping at the first failure. Used by the counter-
-    confluence open-position protection (Mekanizma 2): a single flipped
-    gate is too noisy to mutate a live position on, but ≥ N flipped
-    gates indicates a real market turn against the position direction.
-
-    NOTE: vwap_reset_blackout is intentionally excluded here — it's a
-    time-based blackout (UTC midnight VWAP reset window) rather than a
-    market-state gate, and shouldn't contribute to the "market has
-    turned against this position" measure.
-
-    Returns an integer in [0, 3].
-    """
-    count = 0
-    if vwap_hard_veto_enabled and _vwap_hard_veto(state, direction, entry_price):
-        count += 1
-    if ema_veto_enabled and _ema_momentum_veto(
-        candles, direction, entry_price,
-        fast_period=ema_veto_fast_period,
-        slow_period=ema_veto_slow_period,
-    ):
-        count += 1
-    if _cross_asset_opposes(pillar_opposition, direction):
-        count += 1
-    return count
-
-
 def evaluate_pending_invalidation_gates(
     *,
     state: MarketState,
