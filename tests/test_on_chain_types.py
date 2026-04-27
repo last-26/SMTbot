@@ -57,7 +57,7 @@ def test_affected_symbols_for_stablecoin_expands_to_all():
     assert "ETH-USDT-SWAP" in symbols
     assert "SOL-USDT-SWAP" in symbols
     assert "DOGE-USDT-SWAP" in symbols
-    assert "BNB-USDT-SWAP" in symbols
+    assert "XRP-USDT-SWAP" in symbols
     assert len(symbols) == 5
 
 
@@ -67,19 +67,24 @@ def test_affected_symbols_for_usd_coin_matches_tether():
 
 
 def test_affected_symbols_for_chain_native_collapses_to_single():
+    # XRP intentionally absent — Arkham doesn't index XRPL (probed
+    # 2026-04-25 + 2026-04-27 F5 re-probe; see on_chain_types.py).
     assert affected_symbols_for("bitcoin") == ("BTC-USDT-SWAP",)
     assert affected_symbols_for("ethereum") == ("ETH-USDT-SWAP",)
     assert affected_symbols_for("solana") == ("SOL-USDT-SWAP",)
     assert affected_symbols_for("dogecoin") == ("DOGE-USDT-SWAP",)
-    assert affected_symbols_for("binancecoin") == ("BNB-USDT-SWAP",)
+    # binancecoin no longer in the watched set (BNB swapped out for XRP
+    # on 2026-04-25); fan-in returns empty tuple. Reinstated if BNB
+    # comes back as the 5th watched perp.
+    assert affected_symbols_for("binancecoin") == ()
 
 
 def test_affected_symbols_for_aliases_normalize():
     # Case-insensitive + common aliases all map to the same symbol.
     assert affected_symbols_for("BTC") == ("BTC-USDT-SWAP",)
     assert affected_symbols_for("Bitcoin") == ("BTC-USDT-SWAP",)
-    assert affected_symbols_for("BNB") == ("BNB-USDT-SWAP",)
-    assert affected_symbols_for("binance-coin") == ("BNB-USDT-SWAP",)
+    # XRP intentionally absent — see test above.
+    assert affected_symbols_for("ripple") == ()
 
 
 def test_affected_symbols_for_unknown_token_returns_empty_tuple():

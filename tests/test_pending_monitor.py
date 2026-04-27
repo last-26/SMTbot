@@ -200,13 +200,14 @@ def test_poll_pending_skips_row_on_get_order_exception():
 
 
 def test_poll_pending_cancel_already_gone_is_idempotent():
-    """Order vanished between get_order (returned live) and cancel (51400);
-    still emit CANCELED — the state snapshot was stale."""
+    """Order vanished between get_order (returned live) and cancel
+    (Bybit gone code 110001); still emit CANCELED — the state snapshot
+    was stale. 110001 ∈ _ORDER_GONE_CODES on Bybit V5."""
     monitor, fake = _mk()
     old = datetime.now(UTC) - timedelta(seconds=300)
     _register(monitor, max_wait_s=60.0, placed_at=old)
     fake.order_states["LIM-1"] = {"state": "live"}
-    fake.cancel_raises = OrderRejected("gone", code="51400", payload={})
+    fake.cancel_raises = OrderRejected("gone", code="110001", payload={})
 
     events = monitor.poll_pending()
     assert len(events) == 1

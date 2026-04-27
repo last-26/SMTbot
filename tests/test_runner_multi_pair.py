@@ -169,8 +169,7 @@ async def test_legacy_symbol_config_backward_compat():
             "swing_lookback": 20, "sr_min_touches": 3,
             "sr_zone_atr_mult": 0.5, "session_filter": [],
         },
-        "okx": {"demo_flag": "1", "api_key": "k",
-                "api_secret": "s", "passphrase": "p"},
+        "bybit": {"api_key": "k", "api_secret": "s", "demo": True},
     }
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")

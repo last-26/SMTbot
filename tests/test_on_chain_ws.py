@@ -425,7 +425,7 @@ def test_handle_stablecoin_transfer_blacks_out_all_symbols(tmp_path):
     )
     expected_until = ts_ms + 600_000
     for sym in ("BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP",
-                "DOGE-USDT-SWAP", "BNB-USDT-SWAP"):
+                "DOGE-USDT-SWAP", "XRP-USDT-SWAP"):
         assert state.blackouts.get(sym) == expected_until
 
 

@@ -536,7 +536,7 @@ def test_config_loads_economic_calendar_section_from_env(monkeypatch, tmp_path):
             "swing_lookback": 20, "sr_min_touches": 3,
             "sr_zone_atr_mult": 0.5,
         },
-        "okx": {"demo_flag": "1"},
+        "bybit": {"api_key": "x", "api_secret": "y", "demo": True},
         "economic_calendar": {
             "enabled": True,
             "blackout_minutes_before": 45,
