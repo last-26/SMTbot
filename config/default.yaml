@@ -550,6 +550,43 @@ execution:
   artefact_check_timeout_s: 5.0
   artefact_check_tolerance_pct: 0.0005
 
+  # 2026-04-27 — Counter-confluence open-position protection (Mekanizma 2).
+  # Operator-driven, paired with pending confluence-decay (analysis block).
+  # Where decay-cancel kills a pending whose own confluence drops, this
+  # protects an OPEN position when the COUNTER direction's confluence
+  # rises above threshold (i.e. a strong reversal signal forms against
+  # the live position).
+  #
+  # MFE-aware decision tree (only fires when ALL trigger conditions met):
+  #   * MFE > 1R    → SL → entry + 0.5R (lock half the gain, runner alive)
+  #   * MFE 0..1R   → SL → BE + fee_buffer (giveback shield)
+  #   * MFE < 0     → defensive close (entry was wrong, avoid SL bleed)
+  #
+  # Trigger requires ALL of:
+  #   1. Counter-direction confluence ≥ counter_confluence_threshold
+  #   2. ≥ counter_confluence_min_hard_gates of (vwap_misaligned /
+  #      ema_momentum_contra / cross_asset_opposition) flipped against
+  #      the position direction
+  #   3. Streak hits counter_confluence_decay_cycles consecutive cycles
+  #      (hysteresis emer one-cycle flicker; live-position dispatch
+  #      warrants more conservative cycle count than the pending side)
+  #   4. NOT in STRONG_TREND aligned with position direction (pullback
+  #      noise exemption — strong trends naturally counter-pulse)
+  #
+  # cycles=3 (~9 min on 3m TF) vs. pending-side 2 (~6 min): live-position
+  # mutation gets one extra cycle of confirmation. min_hard_gates=2 vs.
+  # the lone-gate trigger of pending decay: a single hard-gate flip is
+  # too noisy to mutate a live position on. threshold mirrors entry-side
+  # min_confluence_score (3.75) — gate-passport parity.
+  #
+  # Disable to revert to pre-2026-04-27 behavior (only existing automated
+  # protection between 0R and TP was the MFE-lock at 1.3R; this fills the
+  # 0R-1.3R band).
+  counter_confluence_protection_enabled: true
+  counter_confluence_threshold: 3.75
+  counter_confluence_decay_cycles: 3
+  counter_confluence_min_hard_gates: 2
+
 derivatives:
   # Phase 1.5 — derivatives data layer. Disabling this short-circuits the
   # Binance WS + Coinalyze poll loop but leaves entry/exit logic untouched,

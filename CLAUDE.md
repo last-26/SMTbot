@@ -26,6 +26,174 @@ AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT lin
 
 ## Changelog
 
+### 2026-04-27 — Counter-confluence open-position protection (Mekanizma 2)
+
+Companion to the pending confluence-decay early-cancel that landed
+earlier the same day. Where decay-cancel kills a pending whose own
+confluence drops, this protects an OPEN position when the COUNTER
+direction's confluence rises against it. Closes the gap between
+`MFE-lock at 1.3R` (sole existing automated protection) and the
+0R..1.3R band where the bot was previously naked all the way to
+SL — exactly the band where the 04-27 morning long cluster bled out
+(BTC/ETH/SOL/DOGE/XRP all stopped before MFE ever touched 1.3R).
+
+**Trigger conditions (ALL required, AND logic):**
+
+1. Counter-direction confluence ≥
+   `execution.counter_confluence_threshold` (default 3.75 — entry-side
+   parity; the bot would CONSIDER opening that side at this score).
+2. ≥ `execution.counter_confluence_min_hard_gates` of the 3 hard
+   vetoes (`vwap_misaligned` / `ema_momentum_contra` /
+   `cross_asset_opposition`) flipped against the position direction
+   (default 2 — single-gate flip is too noisy on a live position).
+3. Streak counter (per `(symbol, pos_side)`) reaches
+   `execution.counter_confluence_decay_cycles` consecutive cycles
+   (default 3 — one cycle more conservative than the pending side's
+   2, because dispatch mutates a live position vs. just cancelling a
+   limit; ~9 min on 3m TF). Hysteresis emer one-cycle flicker.
+4. NOT in `STRONG_TREND` aligned with position direction. Strong
+   trend pullbacks generate counter-confluence pulses naturally;
+   killing runners on those would feed the very tape the bot wants
+   to stay in.
+
+**MFE-aware decision tree (on trigger):**
+
+| Position state | Action | Why |
+|---|---|---|
+| MFE > 1R       | SL → entry + 0.5R | Lock half the gain, keep runner alive |
+| MFE 0..1R      | SL → BE + fee_buffer | Giveback shield, fills the 0..1.3R band MFE-lock leaves naked |
+| MFE < 0        | Defensive close (`EARLY_CLOSE_COUNTER_CONFLUENCE`) | Confluence says entry was wrong, SL beleed has negative EV |
+
+**Wiring:**
+
+- [src/bot/config.py](src/bot/config.py) — `ExecutionConfig` gains 4
+  knobs (enabled / threshold / cycles / min_hard_gates) + 2 validators
+  ([1, 10] cycles, [1, 3] gates).
+- [config/default.yaml](config/default.yaml) — new block under
+  `execution:` with operator-facing prose explaining the trigger
+  matrix and MFE branches.
+- [src/strategy/entry_signals.py](src/strategy/entry_signals.py) — new
+  `count_failing_invalidation_gates(...)` returns int count of
+  flipped hard vetoes. Sister of `evaluate_pending_invalidation_gates`
+  but doesn't short-circuit at first failure. `vwap_reset_blackout`
+  intentionally excluded — that's a time-based blackout, not a
+  market-state gate.
+- [src/execution/position_monitor.py](src/execution/position_monitor.py)
+  — `lock_sl_at` extended with `one_shot: bool = True` (default
+  preserves MFE-lock's Option-A semantics; counter-protection passes
+  `False` to allow escalation across separate triggers) and
+  `tighter_only: bool = True` (refuses loosening, ensures BE+fee
+  → BE+0.5R is the only allowed direction; equal/looser is a no-op).
+- [src/bot/runner.py](src/bot/runner.py) —
+  - `BotContext.counter_confluence_streak: dict[(symbol, side), int]`
+    per-position counter. Cleared on close in `_handle_close`.
+  - `_compute_counter_confluence_score` — sister of
+    `_compute_pending_decay_score` for the counter direction. Same
+    parameter set so scores are comparable across the
+    entry-side / pending-decay / counter-protection axes.
+  - `_get_position_mfe_r` — reads `_Tracked.mfe_r_high` via
+    `monitor.get_tracked()`. Returns None when position not tracked.
+  - `_maybe_apply_counter_confluence_protection` — the main
+    evaluator. Runs the regime exemption, score, and gate count
+    checks; manages the streak counter; dispatches the
+    MFE-appropriate action.
+  - `_defensive_close` extended with `close_reason: str = "EARLY_CLOSE_LTF_REVERSAL"`
+    parameter — counter-protection passes `"EARLY_CLOSE_COUNTER_CONFLUENCE"`
+    so the segment is separable in Pass 3 GBT analysis. Default
+    preserves all existing LTF-reversal callers without edits.
+  - Wired into `_run_one_symbol` as section 2f, BEFORE MFE-lock
+    (2g). Smarter (multi-conditioned) mechanism gets first say;
+    the `tighter_only=True` guard on `lock_sl_at` ensures MFE-lock
+    can still escalate past whatever counter-protection placed.
+    Section 2d (LTF reversal close) still runs first — when LTF
+    closes the position, the cycle returns and counter-protection
+    never fires for that tick.
+
+**LTF reversal precedence resolution:**
+
+- LTF reversal triggers FIRST (section 2d) and `return`s on close;
+  counter-protection (2f) is unreachable that cycle.
+- LTF reversal silent / disabled, counter-protection triggers →
+  counter-protection runs its MFE-aware dispatch as designed.
+- Both mechanisms can co-exist: counter-protection handles the
+  pre-close MFE band (BE-locks, half-R locks); LTF reversal handles
+  the post-flip explicit close. They don't fight for the same trade.
+
+**Threshold parity rationale:**
+
+The counter threshold mirrors the entry-side `min_confluence_score`
+(currently 3.75) by design — the question being asked is
+"would the bot CONSIDER opening the opposite side at this score?"
+A looser counter threshold (e.g. 3.0) would trade-kill on noise; a
+tighter one (e.g. 4.5) would rarely fire at all. Pass 3 GBT can tune.
+
+**Logging:** four new log lines for observability:
+
+- `counter_confluence_streak symbol={} side={} score={} gates={}/{} streak={n}/{required}`
+  — counter increment, no fire yet.
+- `counter_confluence_lock symbol={} side={} branch={be_plus_05r|be_plus_fee} mfe_r={} new_sl={} ...`
+  — SL lock dispatched.
+- `counter_confluence_close symbol={} side={} mfe_r={} ...` — close
+  branch.
+- `counter_confluence_recovered symbol={} side={} prior_streak={}` —
+  conditions broken; counter reset (only when prior_streak > 0).
+
+**Tests:** new
+[tests/test_runner_counter_confluence_protection.py](tests/test_runner_counter_confluence_protection.py)
+— 11 cases covering: BE+0.5R lock (MFE > 1R), BE+fee lock (MFE 0..1R),
+defensive close (MFE < 0 + EARLY_CLOSE_COUNTER_CONFLUENCE close_reason),
+below-threshold no-fire, insufficient gates no-fire, STRONG_TREND
+aligned exemption, STRONG_TREND against-position no-exemption,
+hysteresis (cycles=3 needs 3 consecutive trips), disabled flag is a
+no-op, recovery resets streak, short-position sign flip on the
+BE+0.5R branch (entry - 0.5R for shorts). Pattern follows Mekanizma 1
+tests via `monkeypatch` on the helper methods + module-level imports;
+no candle/score wiring duplication.
+
+**Operational expectations:**
+
+- Cluster scenarios like 04-27 morning, where pendings fill near a
+  top and confluence subsequently flips: this catches the
+  pre-1.3R MFE band that MFE-lock alone misses.
+- Independent of pre-entry filtering. Pre-entry filter (P/D soft
+  penalty etc., still pending operator decision) is the structural
+  fix for top/bottom entries; counter-protection is the safety net
+  for when the bot DID enter near a turn anyway. Two layers of
+  defense are independent.
+- Trade-kill expectation: with the multi-condition AND logic + 3-cycle
+  hysteresis + STRONG_TREND exemption, the trigger is conservative.
+  Worst-case operational mode is over-conservative (BE-locks fire
+  late, runners give back gains). If this is observed, lower
+  `counter_confluence_decay_cycles` to 2 first; only then loosen
+  threshold or gate count.
+
+**Re-eval triggers:**
+
+1. **Trigger fire rate** — fraction of OPEN-position cycles where
+   the streak hits the threshold and dispatch fires. Target 5-15%
+   of position-cycles. >25% sustained = mechanism too sensitive
+   (raise cycles / threshold). <2% over a 50-cycle window = doing
+   nothing (lower cycles / threshold).
+2. **Branch distribution** — split the trigger fires by
+   {BE+0.5R / BE+fee / close}. Healthy distribution mirrors the
+   pre-fire MFE distribution of trades — close branch should be
+   ~10-30% (positions actually in loss when triggered); BE-fee
+   ~50-70% (most fires happen in the 0..1R band). Pure-close
+   bias means the bot is still entering badly (pre-entry filter
+   needed).
+3. **Counter-protection vs MFE-lock interaction** — log line audit
+   for "MFE-lock fires after counter-protection already locked
+   tighter" → should be ~0 thanks to `tighter_only`. Non-zero =
+   guard regression.
+4. **STRONG_TREND exemption frequency** — fraction of would-be
+   triggers that exempt out via the regime gate. Target 10-25%
+   (some pullback noise is healthy). >50% = exemption too broad,
+   real reversals being missed (consider exempting only on
+   very-strong-trend ADX threshold).
+5. **Recovery rate** — fraction of cycles where streak hits 1 or 2
+   then resets to 0 vs. fires. Target ≥30% (hysteresis is doing
+   its job). <10% = trigger conditions too easily satisfied.
+
 ### 2026-04-27 — Pending confluence-decay early-cancel (operator-driven)
 
 Operator flagged the 04-27 morning long-cluster stop-out (5 BULLISH

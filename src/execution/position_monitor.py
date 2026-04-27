@@ -478,26 +478,41 @@ class PositionMonitor:
 
     def lock_sl_at(
         self, inst_id: str, pos_side: str, new_sl: float,
+        *,
+        one_shot: bool = True,
+        tighter_only: bool = True,
     ) -> bool:
         """Update the position's SL to `new_sl` (keeping current TP).
 
-        Used by the MFE-lock gate in the runner: once the trade is far
-        enough in favor, the old SL below entry is no longer protecting
-        risk — it's protecting a loss that shouldn't happen. This pulls
-        the SL up to BE / profit-lock via /v5/position/trading-stop.
+        Used by the MFE-lock gate (one_shot=True default — original
+        Option-A behaviour) AND the counter-confluence open-position
+        protection (one_shot=False so escalating BE+fee → BE+0.5R is
+        possible across separate triggers).
 
-        One-shot: `sl_lock_applied` is set to True on success so repeated
-        MFE ticks can't re-trigger (subsequent tightening needs a real
-        trail, out of scope here).
+        Args:
+            one_shot: When True (default), sets `sl_lock_applied=True`
+                on success so repeated MFE ticks can't re-trigger; honours
+                the existing flag so already-locked positions are no-ops.
+                When False, neither reads nor writes the flag (caller
+                manages its own escalation gate).
+            tighter_only: When True (default), refuses to mutate the SL
+                if `new_sl` is not strictly tighter (closer to TP) than
+                the existing `t.sl_price`. Counter-confluence escalation
+                relies on this guard so a later "BE+fee" call after an
+                earlier "BE+0.5R" lock is a no-op rather than a loosening.
 
-        Failure mode: trading-stop call rejects → existing SL stays in
-        place, return False, set `sl_lock_applied=True` so we don't loop.
+        Failure modes:
+            * trading-stop call rejects → existing SL stays in place,
+              returns False. With `one_shot=True` also marks
+              `sl_lock_applied=True` to prevent retry-spin.
+            * `tighter_only=True` and new_sl is not tighter → no-op,
+              returns False (no log spam — this is a routine guard).
         """
         key = (inst_id, pos_side)
         t = self._tracked.get(key)
         if t is None:
             return False
-        if t.sl_lock_applied:
+        if one_shot and t.sl_lock_applied:
             return False
         if t.runner_size <= 0:
             return False
@@ -511,6 +526,16 @@ class PositionMonitor:
             return False
         if t.pos_side == "short" and new_sl <= t.tp2_price:
             return False
+        # Tighter-only guard: counter-confluence escalation calls this
+        # repeatedly with potentially-looser values (e.g. BE+fee after a
+        # prior BE+0.5R lock). For longs "tighter" means new_sl > current;
+        # for shorts new_sl < current. Equal is a no-op.
+        if tighter_only and t.sl_price is not None:
+            cur = float(t.sl_price)
+            if t.pos_side == "long" and new_sl <= cur:
+                return False
+            if t.pos_side == "short" and new_sl >= cur:
+                return False
 
         try:
             self.client.set_position_tpsl(
@@ -528,14 +553,16 @@ class PositionMonitor:
                 "protects, marking lock_applied to prevent retry-spin",
                 t.inst_id, t.pos_side, new_sl, t.tp2_price, exc, code, payload,
             )
-            t.sl_lock_applied = True
+            if one_shot:
+                t.sl_lock_applied = True
             return False
 
         t.sl_price = new_sl
-        t.sl_lock_applied = True
+        if one_shot:
+            t.sl_lock_applied = True
         logger.info(
-            "sl_locked inst={} side={} size={} new_sl={} tp={}",
-            t.inst_id, t.pos_side, t.runner_size, new_sl, t.tp2_price,
+            "sl_locked inst={} side={} size={} new_sl={} tp={} one_shot={}",
+            t.inst_id, t.pos_side, t.runner_size, new_sl, t.tp2_price, one_shot,
         )
         if self._on_sl_moved is not None:
             try:
