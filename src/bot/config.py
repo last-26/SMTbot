@@ -288,34 +288,6 @@ class AnalysisConfig(BaseModel):
     vwap_reset_blackout_window_pre_min: int = 5
     vwap_reset_blackout_window_post_min: int = 15
 
-    # 2026-04-27 — Pending confluence-decay early-cancel. Re-scores confluence
-    # for resting pending limits each cycle (zone-pullback path skips the
-    # entry-side scorer because it short-circuits on `pending_setups`
-    # presence; this rescore is independent and uses `score_direction`
-    # directly with the meta'd `direction`). When the rescored confluence
-    # falls below `min_confluence_score` for `pending_confluence_decay_cycles`
-    # consecutive cycles, the pending is canceled with reject reason
-    # `pending_confluence_decay`. Hysteresis (≥2) emer cycle-flicker — a
-    # one-cycle dip can recover, two consecutive dips confirm a real decay.
-    # Threshold mirrors `min_confluence_score` (entry-side parity, not a
-    # separate tunable) so a tightened entry threshold also tightens the
-    # pending defense. Set `enabled=False` to keep behavior at the original
-    # hard-gate-only invalidation. Set `cycles=1` for instant cancel (no
-    # hysteresis, expect more flicker-induced cancels).
-    pending_confluence_decay_enabled: bool = True
-    pending_confluence_decay_cycles: int = 2
-
-    @field_validator("pending_confluence_decay_cycles")
-    @classmethod
-    def _pending_decay_cycles_in_range(cls, v: int) -> int:
-        if v < 1 or v > 10:
-            raise ValueError(
-                f"pending_confluence_decay_cycles must be in [1, 10] "
-                f"(cycles of consecutive sub-threshold confluence before "
-                f"cancel; 1=instant, 2=one-cycle hysteresis); got {v}"
-            )
-        return v
-
     @field_validator("vwap_reset_blackout_window_pre_min")
     @classmethod
     def _vwap_blackout_pre_nonneg(cls, v: int) -> int:
