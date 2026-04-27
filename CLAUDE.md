@@ -1,10 +1,10 @@
 # CLAUDE.md — Crypto Futures Trading Bot
 
-AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT linear perps). Zone-based limit entries, 5-pillar confluence, cross-asset + regime-aware vetoes, Arkham on-chain soft signals. Demo-runnable end-to-end. Pass 1 complete 2026-04-22 on OKX; **venue migrated to Bybit on 2026-04-25** — fresh dataset collection restarts under `rl.clean_since=2026-04-25T21:45:00Z`.
+AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT linear perps). Zone-based limit entries, 5-pillar confluence, cross-asset + regime-aware vetoes, Arkham on-chain soft signals. Demo-runnable end-to-end. The bot was initially piloted on OKX; demo-wick artefacts polluted fill data, so the venue switched to Bybit V5 Demo on 2026-04-25. Fresh dataset collection restarts under `rl.clean_since=2026-04-25T21:45:00Z`.
 
 **Architectural principle:** Claude Code is the *orchestrator* (writes Pine, runs tuning, debugs). Runtime decisions are made by the Python bot, **not** Claude. TradingView = eyes, Bybit = hands, Python = brain.
 
-**Internal symbol format note:** the codebase keeps the OKX-style symbol string `BTC-USDT-SWAP` as the canonical internal identifier across config, journal, runner state and tests. The Bybit boundary translation (`BTC-USDT-SWAP ↔ BTCUSDT`) lives inside `src/execution/bybit_client.py`. Old journal rows (Pass 1 + early Pass 2 from OKX) therefore string-match new rows on `inst_id`, and the symbol-keyed override dicts in YAML need no migration.
+**Internal symbol format note:** the codebase keeps the canonical symbol string `BTC-USDT-SWAP` as the internal identifier across config, journal, runner state and tests — a pre-migration format preserved to avoid mass-renaming ~50 files + journal rows. The Bybit boundary translation (`BTC-USDT-SWAP ↔ BTCUSDT`) lives inside `src/execution/bybit_client.py`. Pre-migration journal rows therefore string-match new rows on `inst_id`, and the symbol-keyed override dicts in YAML need no migration.
 
 ---
 
@@ -17,19 +17,19 @@ AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT lin
 - **Execution:** post-only limit → regular limit → market-at-edge fallback. **Position-attached TP/SL** at hard **1:1.5 RR** (2026-04-28 scalp tune from previous 1:2). Bybit V5: TP/SL fields on `/v5/order/create` for market entries, `/v5/position/trading-stop` for limit-fill attach + every subsequent SL/TP mutation. No separate algo orders to track — `journal.algo_ids` stays empty on Bybit-era rows. Mark-price triggers (`tpTriggerBy=slTriggerBy=MarkPrice`) for demo-wick immunity. Dynamic TP revision re-anchors TP to `entry ± 1.5 × sl_distance` every cycle, floor at 0.7R. **MFE-triggered SL lock (Option A)**: once MFE ≥ 1.0R (2026-04-28 scalp tune from previous 1.3R), SL pulled to entry (+fee buffer); one-shot per position. **Maker-TP resting limit**: post-only reduce-only limit sits at TP price alongside the position-attached TP — captures wicks as maker, avoids trigger latency. **Zone timeout**: 2 entry-TF bars (~6 min on 3m, scalp tune from previous 7 bars / 21 min) — stale pendings clear faster, fresh re-evaluation each cycle.
 - **Sizing:** fee-aware ceil on per-contract total cost so total realized SL loss (price + fee reserve) ≥ target_risk across every symbol. Overshoot bounded by one per-contract step (< $3 per position). Operator override via `RISK_AMOUNT_USDT` env bypasses percent-mode sizing; 10%-of-balance safety ceiling. Per-symbol `min_sl_distance_pct_per_symbol` floors (2026-04-28 scalp tighten −25%): BTC 0.003, ETH 0.006, SOL 0.008, DOGE/XRP 0.006, BNB 0.004. Bybit boundary in `bybit_client.py` translates internal-format integer `num_contracts` to base-coin `qty` via per-symbol `_INTERNAL_CT_VAL` map (BTC 0.01, ETH 0.1, SOL 1, DOGE 1000, BNB 0.01); Bybit's `qtyStep` always cleanly divides the resulting qty (verified 2026-04-25 via `scripts/test_bybit_connection.py`).
 - **Journal:** async SQLite, schema includes `on_chain_context`, `demo_artifact`, `confluence_pillar_scores`, `oscillator_raw_values` (all JSON). Separate tables: `rejected_signals` (counter-factual outcome pegged), `on_chain_snapshots` (Arkham state mutation time-series), `whale_transfers` (raw WS events for Phase 9 directional learning). *Per-exchange derivatives capture attempted 2026-04-24 and reverted same day — Coinalyze free-tier 40/min ceiling can't sustain it alongside per-symbol baseline (25 calls/cycle).*
-- **On-chain (Arkham):** runtime soft signals only — daily bias ±15%, hourly stablecoin pulse +0.75 threshold penalty, altcoin-index +0.5 penalty on misaligned altcoin trades, **flow_alignment** 6-input directional score (stablecoin + BTC/ETH + Coinbase/Binance/Bybit 24h netflow; weights 0.25/0.25/0.15/0.15/0.10/0.10; default penalty 0.25), **per_symbol_cex_flow** binary penalty on misaligned symbol 1h volume (default 0.25, $5M floor). **Bitfinex + Kraken 24h netflow captured journal-only** (2026-04-23 night-late, 4th + 5th named venues — biggest single inflow / outflow in live probe vs. `type:cex` aggregate). **OKX 24h netflow captured journal-only** (2026-04-24, 6th venue — bot's own trading exchange, self-signal; 24h net ≈ 0 structurally but $58M max hourly |net|). None of 4/5/6 yet wired into `_flow_alignment_score` — Pass 3 decides weights. Whale HARD GATE removed 2026-04-22 — WS listener feeds `whale_transfers` journal for Pass 3 directional classification. Per-symbol token_volume fallback (2026-04-23): when Arkham `/token/volume/{id}` returns JSON `null` (confirmed for `solana`, `wrapped-solana`), `fetch_token_volume_last_hour` falls back to `/transfers/histogram` (flow=in + flow=out, last bucket) — zero coverage gap for the traded symbol set. **Netflow freeze fix (2026-04-23 night):** per-entity netflow rewritten from `/flow/entity/{entity}` (daily buckets, froze at UTC day close) to `/transfers/histogram?base=<entity>&granularity=1h&time_last=24h`; same fix for BTC/ETH aggregate. Daily-bundle refresh flipped from UTC-day gate to 5-min monotonic cadence (`on_chain.daily_snapshot_refresh_s: 300`) so `on_chain_snapshots` DB rows actually replace frozen values intraday. Credit-safe via v2 persistent WS streams + filter-fingerprint cache. All Arkham weights tuned in Pass 3.
+- **On-chain (Arkham):** runtime soft signals only — daily bias ±15%, hourly stablecoin pulse +0.75 threshold penalty, altcoin-index +0.5 penalty on misaligned altcoin trades, **flow_alignment** 6-input directional score (stablecoin + BTC/ETH + Coinbase/Binance/Bybit 24h netflow; weights 0.25/0.25/0.15/0.15/0.10/0.10; default penalty 0.25), **per_symbol_cex_flow** binary penalty on misaligned symbol 1h volume (default 0.25, $5M floor). **Bitfinex + Kraken 24h netflow captured journal-only** (2026-04-23 night-late, 4th + 5th named venues — biggest single inflow / outflow in live probe vs. `type:cex` aggregate). **OKX 24h netflow captured journal-only** (2026-04-24, 6th venue — major derivatives CEX with high gross turnover; 24h net ≈ 0 structurally but $58M max hourly |net|). None of 4/5/6 yet wired into `_flow_alignment_score` — Pass 3 decides weights. Whale HARD GATE removed 2026-04-22 — WS listener feeds `whale_transfers` journal for Pass 3 directional classification. Per-symbol token_volume fallback (2026-04-23): when Arkham `/token/volume/{id}` returns JSON `null` (confirmed for `solana`, `wrapped-solana`), `fetch_token_volume_last_hour` falls back to `/transfers/histogram` (flow=in + flow=out, last bucket) — zero coverage gap for the traded symbol set. **Netflow freeze fix (2026-04-23 night):** per-entity netflow rewritten from `/flow/entity/{entity}` (daily buckets, froze at UTC day close) to `/transfers/histogram?base=<entity>&granularity=1h&time_last=24h`; same fix for BTC/ETH aggregate. Daily-bundle refresh flipped from UTC-day gate to 5-min monotonic cadence (`on_chain.daily_snapshot_refresh_s: 300`) so `on_chain_snapshots` DB rows actually replace frozen values intraday. Credit-safe via v2 persistent WS streams + filter-fingerprint cache. All Arkham weights tuned in Pass 3.
 - **Pass 2 instrumentation:** every trade row now captures `confluence_pillar_scores` (factor name → weight dict) and `oscillator_raw_values` (per-TF dict with 1m/3m/15m OscillatorTableData numerics: wt1/wt2/rsi/rsi_mfi/stoch_k/d/momentum/divergence flags). Both sourced from existing runner TF-switch cache — zero extra TV latency.
-- **Tests:** ~1060, mostly green. Demo-runnable end-to-end. (Test count fluctuates with the migration: `test_okx_client.py` / `test_okx_enrichment.py` / `test_limit_entry.py` deleted as OKX-internal; `FakeBybitClient` in `conftest.py` keeps the OKX-era assertion vocabulary working via aliasing.)
-- **Data cutoff (`rl.clean_since`):** `2026-04-25T21:45:00Z` — **Bybit migration cut**. Pre-migration DB archived as `data/trades.db.pre_bybit_2026-04-25T214500Z` (4.6 MB; mixes OKX Pass 1 + Pass 2 trades plus the SL-floor-bump losing cluster). Pass 1 baseline before that: `data/trades.db.pass1_backup_2026-04-22T203324Z`. Fresh DB created on first Bybit bot startup; reporter / GBT tooling reads only post-cutoff rows.
+- **Tests:** ~1060, mostly green. Demo-runnable end-to-end.
+- **Data cutoff (`rl.clean_since`):** `2026-04-25T21:45:00Z` — **Bybit migration cut**. Pre-migration DB archived as `data/trades.db.pre_bybit_2026-04-25T214500Z` (4.6 MB; mixes Pass 1 + early Pass 2 trades plus the SL-floor-bump losing cluster). Pass 1 baseline before that: `data/trades.db.pass1_backup_2026-04-22T203324Z`. Fresh DB created on first Bybit bot startup; reporter / GBT tooling reads only post-cutoff rows.
 
 ---
 
 ## Changelog
 
-### 2026-04-28 — Scalp tighten + multi-TF MSS factors + OKX test purge
+### 2026-04-28 — Scalp tighten + multi-TF MSS factors
 
-Three paired commits. Operator-driven scalp focus and post-migration
-hygiene. No DB schema changes (column-level migrations stay zero).
+Two paired commits. Operator-driven scalp focus. No DB schema changes
+(column-level migrations stay zero).
 
 **1. Scalp tighten (`6f0aa7b`):** SL floors -25% across the board paired
 with RR cap drop, MFE-lock earlier, zone timeout shorter:
@@ -68,43 +68,7 @@ stale `RISK_AMOUNT_USDT=10` notes pre-dating the auto-R mode. No
 code bug. Operator opted to set `RISK_AMOUNT_USDT=10` in `.env`
 post-discussion to lock R flat.
 
-**2. OKX test purge (`99528e9`):** 52 → 8 test failures. The bot's
-production code uses Bybit V5 `set_position_tpsl` (single
-trading-stop call) but multiple test files still mocked the OKX-era
-`place_oco_algo` / `cancel_algo` path. Production calls
-`set_position_tpsl` which the FakeClients lack — tests fail with
-AttributeError before any assertion runs, so the tests test nothing.
-
-- Deleted entirely: `tests/test_sl_to_be.py`, `tests/test_journal_partial_tp.py`,
-  `tests/test_order_router.py` (all wholly OKX-era OCO algo
-  scaffolding; underlying production behaviors — SL-to-BE, MFE-lock,
-  TP revise, order routing — need fresh Bybit-V5-aware tests in a
-  separate work item)
-- Trimmed: `tests/test_position_monitor.py` 755 → 100 lines (kept
-  open/poll/close lifecycle tests; deleted FakeRevisableClient + 14
-  OCO-coupled tests). `tests/test_partial_tp.py` 166 → 47 lines
-  (kept the YAML 1:N RR guard, deleted 5 partial-TP OCO tests)
-- Updated to Bybit semantics: `tests/test_pending_monitor.py` cancel
-  code 51400 → 110001; `tests/test_runner_multi_pair.py` +
-  `tests/test_economic_calendar.py` legacy fixture `"okx"` block →
-  `"bybit"` with current Bybit field names
-- Fixed BNB→XRP migration leftovers: `tests/test_on_chain_types.py`
-  + `tests/test_on_chain_ws.py` assertions updated from
-  `BNB-USDT-SWAP` to `XRP-USDT-SWAP` per the 2026-04-25 watched-set
-  swap
-
-NOT touched per operator clarification (Arkham on-chain data, not
-a trading dependency): `cex_okx_netflow_24h_usd` column + the OKX
-slug in the per-venue netflow loop. OKX is the 6th named CEX on the
-Arkham snapshot side; the bot trades on Bybit only.
-
-Remaining 8 failures are unrelated post-migration leftovers
-(`test_journal_derivatives` × 3 use the dropped `regime_at_entry`
-column; 4 `test_bot_runner` rehydrate / reconcile / dry_run paths;
-1 `test_bot_config` whale_tokens list ordering). Separate cleanup
-pass.
-
-**3. Multi-TF MSS + EMA ribbon scalp factors (`fe21f2f`):** three new
+**2. Multi-TF MSS + EMA ribbon scalp factors (`fe21f2f`):** three new
 soft confluence factors exposing 1m + 15m signals the bot was
 already reading but not scoring on:
 
@@ -238,7 +202,7 @@ Permanent fix for the race that caused it.
 "already filled" durumlarını içeriyor. Pre-fix `cancel_pending`
 implementation cancel REST çağrısından bu code geldiğinde **direkt
 idempotent başarı sayıyordu** (CLAUDE.md "Phantom-cancel resistance"
-pattern, OKX-era'da 51400/51401/51402 sadece "order not found"
+pattern, pre-migration'da 51400/51401/51402 sadece "order not found"
 durumunu işaret ettiği için doğruydu). Bybit-era'da fill ile cancel
 arasında ms-cinsinden race olunca:
 
@@ -265,7 +229,7 @@ arasında ms-cinsinden race olunca:
 `test_cancel_pending_phantom_fill_routes_to_FILLED`,
 `test_cancel_pending_verified_cancelled_keeps_caller_reason`,
 `test_cancel_pending_verify_get_order_failure_falls_back_to_CANCELED`.
-20/21 green; pre-existing OKX-era failure (`51400` code reference)
+20/21 green; pre-existing pre-migration failure (`51400` code reference)
 unrelated.
 
 **Etki:**
@@ -315,7 +279,7 @@ mümkün ama bot tek yön açar). Reconciliation:
 fill etmişti. Cancel REST çağrısı bir `_ORDER_GONE_CODES` (110001 / 110008
 / 110010 / 170142 / 170213) hata kodu döndürdü. Bot bunu "idempotent
 cancel başarılı" olarak yorumladı (CLAUDE.md "Phantom-cancel resistance"
-pattern, OKX-era'dan beri varolan ama OKX'te 51400/51401/51402 sadece
+pattern, pre-migration'dan beri varolan ama eski venue'de 51400/51401/51402 sadece
 "order not found / cancelled" demekti — Bybit'te "Filled" durumunu da
 aynı code aralığı içine alıyor olabilir). Sonuç: pending_canceled olarak
 DB'ye yazıldı, fill event hiç işlenmedi, pozisyon **SL/TP'siz NAKED**
@@ -364,8 +328,8 @@ entire dataset (kod doldurmuyor) or 1-distinct constants (no information
 content). Atomic migration drops them all from `trades`,
 `rejected_signals`, and `on_chain_snapshots`, plus removes the
 `update_rejected_outcome` writer method that targeted
-`hypothetical_outcome` (peg-script-bound, last-edited 2026-04-26 OKX
-cleanup, never re-implemented for Bybit).
+`hypothetical_outcome` (peg-script-bound, last-edited 2026-04-26
+post-migration cleanup, never re-implemented for Bybit).
 
 **Drop list (27 columns):**
 
@@ -397,7 +361,7 @@ cleanup, never re-implemented for Bybit).
 - `proposed_sl_price`, `proposed_tp_price`, `proposed_rr_ratio` — entry
   path doesn't compute proposed SL/TP at reject time.
 - `hypothetical_outcome`, `hypothetical_bars_to_tp`,
-  `hypothetical_bars_to_sl` — peg-script-bound. The OKX-era pegger was
+  `hypothetical_bars_to_sl` — peg-script-bound. The pre-migration pegger was
   deleted in 2026-04-26 cleanup Phase 3. Re-add as a 6-tuple
   (proposed_*+hypothetical_*) if a Bybit-native peg script is written
   AND `_record_reject` starts computing what-if SL/TP for
@@ -443,7 +407,7 @@ green. Two test files marked module-level skip with peg-restore
 re-enable note: `tests/test_scripts_tune_confluence.py` (5 tests,
 `simulate_reject_outcome` only fires on rows with peg stamps),
 `tests/test_scripts_analyze.py` (1 test, pegged-rejects WR section
-needs stamps). Pre-existing OKX-era leftover failures
+needs stamps). Pre-existing pre-migration leftover failures
 (`test_sl_to_be`, `test_position_monitor`, `test_partial_tp`,
 `test_order_router`, `test_pending_monitor`, `test_runner_multi_pair`,
 ~50 tests) untouched — those need Bybit-fake-mock updates separate
@@ -718,157 +682,6 @@ sites, ~26 lines added.
    design); if it drops without a `candles` plumbing change, that
    means `_derive_enrichment` started receiving candles from somewhere
    unexpected — investigate.
-
-### 2026-04-26 (late-late-night, +4) — OKX residue cleanup (9-phase atomic sweep)
-
-Operator-driven post-migration audit. The 2026-04-25 OKX → Bybit V5
-execution-layer rewrite was a single-day swap that left adjacent
-artefacts unchanged: stale OKX error-code references in comments
-(`51008` / `51277` / `51400-2` / `59102`), failing tests asserting
-`OKX:` TV ticker prefixes, a dead `peg_rejected_outcomes.py` script
-that imported the removed `python-okx` library, internal map / helper
-names with `OKX` prefixes, and the `FakeOKXClient` test alias. None of
-these affected runtime behaviour — they were narrative residue.
-Phase 7's shim removal is the only commit with production-code surface
-delta, and the underlying semantics (TP/SL via `set_position_tpsl`)
-were already canonical pre-cleanup.
-
-**Two hard constraints honoured throughout (operator: "Bybit etkilenmez,
-DB sorun olmasın"):**
-1. **Bybit functionality unchanged.** Every map's contents, every
-   boundary translation, every `set_position_tpsl` semantics
-   bit-identical pre/post. Only names and narrative text edited.
-2. **DB schema untouched.** Zero `DROP COLUMN` migrations. Internal
-   canonical symbol literals (`BTC-USDT-SWAP`) preserved everywhere
-   (~50 file, journal data, dashboard, on-chain mapping). Legacy
-   columns (`algo_id`, `algo_ids`, `client_algo_id`,
-   `hypothetical_outcome`) preserved for pre-migration row read-back.
-
-**Phases (atomic commits, each independently revertable):**
-
-- **Phase 1** (commits 0dc2e75 + part of 75cfd86): stale comments /
-  docstrings / CLI help text. ~50 line edits across 11 files. Error
-  code references `OKX sCode 51008/51277/...` → `Bybit insufficient-
-  margin (110004/110007/110012)` / `Bybit rejects (110012)`. CLI
-  `--dry-run` help text "no OKX orders placed" → "no Bybit orders
-  placed". Phase 1 in-place edits to 3 files (`config/default.yaml`,
-  `src/bot/config.py`, `src/bot/runner.py`) bundled into 75cfd86
-  (auto-R wiring) because the operator's auto-R WIP intermixed with
-  the comment edits in those files.
-- **Phase 2** (338817e): test fixes + variable rename. Restored 3
-  failing tests in `test_runner_multi_pair.py` (`OKX:` → `BYBIT:`),
-  `test_bot_config.py` (`to_okx_credentials()` →
-  `to_bybit_credentials()` + `OKX_*` env vars → `BYBIT_*`). Local var
-  `okx_avail` → `bybit_avail` at 3 sites in `runner.py`.
-- **Phase 3** (403e6f2): dead-code removal.
-  - `_cancel_surplus_ocos` no-op stub deleted from `runner.py` plus
-    its sole caller line in `_reconcile_orphans`.
-  - `_ALGO_GONE_CODES = _ORDER_GONE_CODES` alias deleted from
-    `position_monitor.py`.
-  - `scripts/peg_rejected_outcomes.py` deleted (broken since
-    `python-okx` was dropped from `requirements.txt`).
-  - 6 documentation references to the peg script reworded across
-    `replay_decisions.py`, `analyze.py`, `journal/database.py`,
-    `journal/models.py`. Schema columns `hypothetical_outcome` /
-    `hypothetical_pnl_r` preserved on `rejected_signals` for
-    pre-migration row read-back.
-- **Phase 4** (0634fc1): internal map renames (single-file refactor in
-  `bybit_client.py`):
-  - `_OKX_TO_BYBIT_SYMBOL` → `_INTERNAL_TO_BYBIT_SYMBOL`
-  - `_BYBIT_TO_OKX_SYMBOL` → `_BYBIT_TO_INTERNAL_SYMBOL`
-  - `_OKX_CT_VAL` → `_INTERNAL_CT_VAL`
-  - Local `okx_sym` → `internal_sym` in `get_positions`.
-  - 14 docstring / comment edits in the same file ("OKX format" →
-    "internal canonical format", "OKX-era" → "pre-migration", etc.).
-- **Phase 5** (53127f3): cross-file helper renames + caller updates.
-  - `okx_to_tv_symbol` → `internal_to_tv_symbol` (tv_bridge.py)
-  - `okx_to_binance_symbol` → `internal_to_binance_symbol`
-    (liquidation_stream.py)
-  - `binance_to_okx_symbol` → `binance_to_internal_symbol`
-    (liquidation_stream.py)
-  - `okx_swap_to_binance_futures` → `internal_to_binance_futures`
-    (public_market_feed.py)
-  - Parameter names `okx_symbol` / `okx_sym` →
-    `internal_symbol` / `internal_sym` across `derivatives_api.py`.
-  - All callers updated (`runner.py`, `liquidation_stream.py` self-ref).
-  - All affected tests updated (`test_runner_multi_pair.py`,
-    `test_liquidation_stream.py`, `test_public_market_feed.py`).
-- **Phase 6** (04e4dd8): test infrastructure cleanup.
-  - Deleted `FakeOKXClient = FakeBybitClient` alias in `conftest.py`.
-  - `make_ctx` fixture: removed dual-keyword `okx_client=` /
-    `bybit_client=` support and `fakes.okx_client` namespace mirror.
-  - Updated 4 caller test files (`test_bot_runner.py`,
-    `test_runner_artefact_cross_check.py`, `test_runner_on_chain.py`,
-    `test_runner_multi_pair.py`).
-  - Deleted 2 tests that asserted behaviour of the now-removed
-    `_cancel_surplus_ocos` method (replaced with a one-line
-    explanatory comment).
-- **Phase 7** (86bfc6a): back-compat shim removal in `bybit_client.py`.
-  - Deleted `place_oco_algo` / `cancel_algo` / `list_pending_algos`
-    methods (~80 lines). Their semantics were already covered by
-    `set_position_tpsl()`.
-  - Rewrote `scripts/probe_open_orders.py` "POSITION-ATTACHED TP/SL"
-    section to read `/v5/position/list` raw response directly
-    (preserves diagnostic output, no shim needed).
-  - `AlgoResult` data class kept — `order_router` still composes
-    empty-`algo_id` records to populate the legacy journal column.
-- **Phase 8** (commit 36c972e): final CLAUDE.md sync — this changelog
-  entry plus reflecting the Phase 4-7 renames in the architectural
-  notes section ("Internal symbol format kept OKX-style" → "Internal
-  canonical symbol format"; map names; helper names; "Adding a 6th+
-  pair" instructions).
-- **Phase 9** (commit 5616a82): marginal text-only sweep across the 15
-  files that the main 8-phase pass left with residual OKX strings in
-  comments / docstrings / test fixtures. Notable: `tests/test_altcoin_index_penalty.py`
-  config fixture `"okx": {api_key, api_secret, passphrase}` rewritten
-  to `"bybit": {api_key, api_secret, demo}` — that test moved
-  FAIL → PASS (it had been on the leftover-failure list).
-  `tests/test_pending_monitor.py` mock class `_FakeOKX` → `_FakeBybit`
-  (collection-time rename so the test module imports cleanly).
-  `tests/test_economic_calendar.py` env-var monkeypatch
-  `OKX_API_KEY/SECRET/PASSPHRASE` → `BYBIT_API_KEY/SECRET/DEMO`,
-  mirroring the Phase 2 fix in `test_bot_config.py`. After this pass
-  every remaining "OKX" / "okx" string in non-doc files is one of:
-  (a) the 6th CEX netflow venue (`cex_okx_netflow_24h_usd`, dashboard
-  tile, `affected_symbols_for` venue tuple, dict key `"okx"`),
-  (b) a cleanup-changelog meta-reference, or (c) the symbol literals
-  `BTC-USDT-SWAP` etc. (intentionally kept canonical).
-
-**What was deliberately NOT changed (out of scope):**
-
-- Internal canonical symbol literals `BTC-USDT-SWAP` etc. — DB-touching
-  mass-rename across ~50 files + journal rows is a separate project
-  with its own migration plan.
-- Journal `algo_id`, `algo_ids`, `client_algo_id`, `hypothetical_outcome`
-  schema columns — pre-migration rows have values in them.
-- `cex_okx_netflow_24h_usd` field + dashboard tile — OKX is the 6th
-  CEX netflow venue (intentional data signal, see 2026-04-24 entry).
-- ~33 pre-existing test failures (CLAUDE.md "33 OKX→Bybit migration
-  leftover failures" — `test_pending_monitor.py` tests using OKX
-  `sCode 51400` literals against the Bybit `_ORDER_GONE_CODES` set).
-  Test migration is a separate task.
-
-**Counter-factual pegging gap:** the `peg_rejected_outcomes.py` removal
-leaves a workflow gap — post-migration `rejected_signals` rows carry
-NULL `hypothetical_outcome`. Pre-Pass-3 a Bybit-native pegger
-(pybit `get_kline` or TV-bridge candle source) needs to be written
-to restore the daily counter-factual stamp. Out of scope here;
-flagged for the Pass 3 prep window.
-
-**Verification:** every phase committed only when the targeted test
-suite was green AND the pre-existing baseline failure count did not
-grow. Smoke-test of `python -c "import src.bot.runner"` after each
-phase. DB schema check via `sqlite_master` — every table from the
-2026-04-26 morning state still present, no DROP COLUMN ran.
-
-**Why this matters for Pass 3:** the cleanup compresses the
-"vocabulary surface area" the GBT / Bayesian tuning has to navigate.
-Pre-cleanup a feature engineer reading `_OKX_CT_VAL` or
-`okx_to_tv_symbol` had to know the migration history to understand
-what those names meant on a Bybit-native bot. Post-cleanup the names
-match the runtime venue, the historical narrative is preserved in the
-changelog (here), and the `BTC-USDT-SWAP` canonical format is
-documented as an intentional architectural pin rather than residue.
 
 ### 2026-04-26 (late-night) — Per-venue × per-asset (BTC/ETH/stables) 24h netflow capture + dashboard breakdown
 
@@ -1228,8 +1041,8 @@ sign-aware excursion, multi-poll persistence, plan_sl=0 skip, tuple return),
 `test_runner_position_snapshots.py` (7 — cadence gate, disabled config, empty
 snaps, missing tracked, rehydrate plan_sl=0 skip, end-to-end MFE/MAE write).
 +5 `JournalConfig` validator tests in `test_bot_config.py`. New tests 26/26
-green; full-suite delta `911 → 937 passed`. Pre-existing 33 OKX→Bybit
-migration leftover failures untouched (separate cleanup task).
+green; full-suite delta `911 → 937 passed`. Pre-existing 33
+post-migration leftover failures untouched (separate cleanup task).
 
 **Cost:** zero extra API calls — `live_snaps` already fetched by `monitor.poll()`,
 just plumbed through. ~1 KB/day SQLite growth at 5 positions × 1 row / 5 min.
@@ -1279,58 +1092,6 @@ Two paired changes triggered by a single morning chart-review session: operator 
 2. **Blackout fire rate** — per-day count of `vwap_reset_blackout` log lines in the runner. Expect 5 symbols × ~1 cycle/min × 20 min = ~100 NO_TRADE log emissions per day. Materially higher = clock skew or naive-datetime handling regression.
 3. **Pending-cancel attribution** — fraction of pending cancels with `reason=vwap_reset_blackout` should track ~1.4% of total cancels (20min/24h = 1.39%). Higher = pending limits clustering in the blackout window (zone-source bias toward late-day setups); lower = blackout firing on fewer pendings than expected.
 4. **Operator pendings holding through midnight** — if a pending placed at 23:50 UTC gets cancelled at 23:55 UTC (5 min into pre-window), confirm operator considers this acceptable; otherwise tighten `pre_min` to 0 and accept the 15-min post-only outage.
-
-### 2026-04-25 — OKX → Bybit V5 Demo migration (venue swap)
-
-Operator-driven full venue swap. OKX completely removed from the codebase; bot trades against Bybit V5 Demo (`https://api-demo.bybit.com`) under a UTA hedge-mode account. Decision drivers: cleaner demo wick behaviour at mark-price triggers, simpler API surface (TP/SL is a position property, not a separate algo), better long-term roadmap fit. No strategy / scoring changes — only the execution layer + config / docs / scripts touched.
-
-**Architectural shifts:**
-
-1. **TP/SL are now position-attached.** OKX placed an OCO algo as a separate order with its own `algoId`; Bybit treats `takeProfit` / `stopLoss` as fields on the position itself, set via `POST /v5/order/create` (market entry) or `POST /v5/position/trading-stop` (limit-fill attach + every subsequent mutation). Eliminates the entire OKX-era machinery: `place_oco_algo` / `cancel_algo` / `list_pending_algos` / `_verify_algo_gone` / `_cancel_surplus_ocos` / `_cancel_algos_best_effort` / `algo_ids[]` tracking. SL-to-BE, TP-revise, and MFE-lock all collapse to a single trading-stop call with no cancel+place dance and no "unprotected window" between cancel and place.
-
-2. **Hedge mode via `positionIdx=1/2`**, not OKX `posSide=long/short`. Set once at startup via `POST /v5/position/switch-mode {mode: 3, coin: USDT}`. Bot still speaks OKX's "long"/"short" vocabulary internally; `bybit_client._pos_idx()` translates at the boundary (long→1, short→2). Account-wide margin mode (UTA `REGULAR_MARGIN` ≈ cross) replaces OKX's per-call `tdMode=isolated/cross` — `RouterConfig.margin_mode` field is preserved but no longer forwarded to API calls.
-
-3. **Internal canonical symbol format `BTC-USDT-SWAP`** is preserved (originated with the pre-migration execution layer; survived as canonical because mass-renaming ~50 files + journal rows would dwarf the rename's value). The Bybit boundary in `bybit_client.py` translates `_INTERNAL_TO_BYBIT_SYMBOL["BTC-USDT-SWAP"] → "BTCUSDT"` on outgoing requests and `_BYBIT_TO_INTERNAL_SYMBOL["BTCUSDT"] → "BTC-USDT-SWAP"` on incoming responses. Old journal rows remain string-comparable to new ones.
-
-4. **Sizing math unchanged.** The pre-migration `num_contracts × ctVal × price` convention is preserved by hardcoding `_INTERNAL_CT_VAL = {BTC=0.01, ETH=0.1, SOL=1, DOGE=1000, BNB=0.01}` in `bybit_client.py`; the boundary multiplies `num_contracts × ct_val` to produce Bybit's required base-coin `qty` string. Verified against Bybit's `qtyStep` filter: every symbol's contract size is an integer multiple of step (BTC ct_val 0.01 = 10 × step 0.001; DOGE 1000 = 1000 × step 1.0; etc).
-
-5. **Wallet reads UTA-aware.** `get_balance()` returns `totalAvailableBalance` (USD-aggregated, USDT+USDC pooled by USD value when both are toggled as collateral). `get_total_equity()` returns `totalMarginBalance` — the collateral pool that actually backs margin, NOT the wider `totalEquity` (which includes BTC/ETH wallet balances when those have "Used as Collateral" off). Sizing math therefore reflects the bot's true usable capital, not visual-wallet noise.
-
-6. **Demo CloudFront edge auto-pin.** Some ISPs (observed on TR-mobile / TR-fiber egress) silently drop TCP-443 SYNs to the `13.249.8.0/24` CloudFront range that `api-demo.bybit.com` sometimes resolves to. Mainnet uses a different distribution that routes fine, which made the issue look like a credentials problem. `BybitClient._maybe_pin_demo_dns()` now resolves the host at construction, probes each returned IP with a 2s TCP-443 connect, and pins the first reachable one to the requests session via a custom HTTPS adapter (TLS still validates against the real hostname via SNI). Falls back to a hardcoded shortlist of known-working edges when system DNS yields only blocked IPs.
-
-7. **Error-code hierarchy** kept identical (`InsufficientMargin`, `OrderRejected`, `LeverageSetError`, `AlgoOrderError`); class `OKXError` renamed to `BybitError` with Bybit retCodes:
-   - 110004/110007/110012 → `InsufficientMargin`
-   - 110001/110008/110010/170142/170213 → `_ORDER_GONE_CODES` (idempotent cancel)
-   - 170218 → `OrderRejected` (post-only would cross — triggers limit fallback)
-   - 110086/110087 → `LeverageSetError`
-   - 110021 → operator-visible (OI cap), not auto-handled
-
-**Code surface (files touched):**
-
-- New: [src/execution/bybit_client.py](src/execution/bybit_client.py) — full pybit V5 wrapper with boundary translation, DNS-pin, and AlgoResult/cancel_algo back-compat shims so journal models + old test fixtures stay valid.
-- Deleted: `src/execution/okx_client.py`, `tests/test_okx_client.py`, `tests/test_okx_enrichment.py`, `tests/test_limit_entry.py`, `scripts/test_okx_connection.py`, `scripts/cancel_orphans.py`.
-- Rewritten: [src/execution/order_router.py](src/execution/order_router.py) (no separate algo placement; market entry passes TP/SL on `place_order`; pending-fill path calls `set_position_tpsl`), [src/execution/position_monitor.py](src/execution/position_monitor.py) (SL-to-BE / TP-revise / SL-lock all simplified to single trading-stop calls), [src/execution/__init__.py](src/execution/__init__.py), [scripts/probe_open_orders.py](scripts/probe_open_orders.py), [scripts/test_bybit_connection.py](scripts/test_bybit_connection.py) (new smoke).
-- Updated: [src/execution/errors.py](src/execution/errors.py) (`BybitError`), [src/bot/config.py](src/bot/config.py) (`BybitConfigBlock`, `BYBIT_*` env loading), [src/bot/runner.py](src/bot/runner.py) (`bybit_client` field, ~15 call sites, `_cancel_surplus_ocos` neutered to no-op, `_cancel_orphan_pending_limits` rewired to `list_open_orders`), [src/data/tv_bridge.py](src/data/tv_bridge.py) (`OKX:` → `BYBIT:` in TV ticker), [config/default.yaml](config/default.yaml) (`bybit:` block, `clean_since` reset to 2026-04-25T21:45:00Z), [.env.example](.env.example) (`BYBIT_*`), [requirements.txt](requirements.txt) (`pybit>=5.7.0`, `python-okx` removed).
-
-**Verification (2026-04-25 21:42 local):**
-
-`python scripts/test_bybit_connection.py` against demo:
-- DNS-pin selected edge `3.168.236.5` (after switching to Google DNS + disabling GoodbyeDPI which was breaking TLS to the demo distribution).
-- Wallet: `totalAvailableBalance` = `totalMarginBalance` = `50,013.40 USDT` (matches operator's adjusted demo balance).
-- All 5 instrument specs returned cleanly with correct `qtyStep` / `maxLeverage`.
-- Mark prices fetched live (BTC $77,296 / ETH $2,311 / SOL $85.66 / DOGE $0.0977 / BNB $628.50).
-- No live positions, no resting orders (clean account, expected).
-
-**Pre-restart DB archive:** `data/trades.db.pre_bybit_2026-04-25T214500Z` (4.6 MB). Window from 2026-04-22 Pass 2 restart through 2026-04-25 had two known data-quality issues: (a) demo-wick artefact pollution (operator-flagged as a primary motivator for the venue swap), (b) the 2026-04-23 SL-floor-bump losing cluster (WR collapsed 66.7% → 22.2% before the 2026-04-24 revert). Both make that window unsuitable for Pass 3 tuning; cutting clean.
-
-**Re-eval triggers (post-Bybit, monitor over first 20 closed trades):**
-
-1. **DNS-pin success rate** — `bybit_demo_dns_pinned` log line on every restart should pick a reachable IP within 1 probe round (≤ 2s). If the helper logs `bybit_demo_dns_pin_failed` repeatedly, the hardcoded fallback list (`_DEMO_FALLBACK_IPS`) is stale; refresh from a working host.
-2. **TP/SL attachment latency** — for limit-fill entries, the `set_position_tpsl` call should land within 500ms of the fill event. Higher = Bybit-side queue or rate-limit; investigate.
-3. **trading-stop "lose binding relationship" warning** — Bybit warns that one-sided modify (BE move, TP revise, SL lock) unbinds the TP/SL pair. Functionally fine (both legs still work; position-close auto-cancels orphan), but if Bybit later changes that contract the bot would silently double-fire. Periodic spot-check via `probe_open_orders.py` after a TP1 event.
-4. **UTA collateral ratio** — `totalAvailableBalance / totalMarginBalance` should hover near 1.0 when no positions are open. If it drifts below 0.95 with no positions, a haircut policy or cross-margin loan is consuming collateral; investigate before Pass 3.
-5. **`get_total_equity` field robustness** — Bybit demo response has been seen to omit `totalMarginBalance` on rare empty-account states. Code falls back to `totalEquity`; if logs show `totalEquity` being read on a populated account (per-slot sizing would over-allocate), inspect.
-6. **Bybit demo 7-day order persistence** — Bybit auto-expires demo orders after 7 days. Doesn't affect bot logic (positions reconcile every restart), but if a long pending limit unexpectedly disappears between cycles, this is the cause.
 
 ### 2026-04-22 — Pass 1 restructure day (consolidated)
 
@@ -1522,7 +1283,7 @@ Wiring via three new helpers in `src/bot/runner.py`:
 
 **Re-eval triggers:**
 1. **Wick-out rate** (SL floor bumps) — % of closed trades where SL hit within 1 ATR of floor-widened SL. Target < 40% post-bump. Higher → loosen further (e.g. BTC 0.006 → 0.008). Lower < 15% → may have over-loosened; consider tightening one step.
-2. **Accept-rate per symbol post-bump** — if per-symbol accepts drop materially (e.g., BNB from ~1/hour to <1/4h) because notional floor hits OKX minimum, one-step tightening justified.
+2. **Accept-rate per symbol post-bump** — if per-symbol accepts drop materially (e.g., BNB from ~1/hour to <1/4h) because notional floor hits Bybit minimum, one-step tightening justified.
 3. **Enrichment column coverage** — `open_interest_usd_at_entry IS NOT NULL` fraction on post-restart rows should approach 100% for symbols where Coinalyze snapshot stays fresh. Lower = cache freshness regression.
 4. **Price change window hit rate** — `price_change_1h_pct_at_entry IS NOT NULL` on market-entry trades should be ~100%, 0% on pending-fill trades (expected by design). Mismatch = wiring regression.
 
@@ -1653,157 +1414,8 @@ Per-symbol post-bump: BTC 1/3, ETH 0/1, SOL 0/1, DOGE 0/2, BNB 1/2. DOGE+SOL (wi
 1. **Post-revert WR** over 10 closed trades — target ≥ 40% (break-even @ 1:2 RR is 33.3%, Pass 1 baseline was 47.6%).
 2. **Post-revert hold time** — target < 150 min median (pre-bump was 70 min; 150 min is ~2× pre-bump, still sub-chop-horizon).
 3. **`zone_timeout_cancel` rate** as fraction of total rejects — target < 25% (post-bump was 32%; pre-bump was ~16%).
-4. **`no_sl_source` / `tp_too_tight` reject spikes** — BTC 0.4% floor can occasionally land SL inside OKX fee + mark drift; if either reject rate > 5% of entry attempts, tighten that specific symbol's floor one step (e.g. BTC 0.004 → 0.005).
+4. **`no_sl_source` / `tp_too_tight` reject spikes** — BTC 0.4% floor can occasionally land SL inside Bybit fee + mark drift; if either reject rate > 5% of entry attempts, tighten that specific symbol's floor one step (e.g. BTC 0.004 → 0.005).
 5. **If post-revert metrics fail** — do NOT re-bump floors. Either collect more data (regime-driven noise) or investigate upstream signal quality (confluence threshold, pillar weights). Bump mechanism is proven harmful at fixed 1:2 RR.
-
-### 2026-04-24 (evening) — Per-exchange derivatives capture REVERTED
-
-After 4 fix iterations against Coinalyze's 40/min free-tier rate limit, operator called it: **"çekemediklerimizi dbden kaldırırız"** — keep what works, drop what doesn't. Full revert shipped as `4fb1018` (−369 lines net). Rationale:
-
-Per-symbol refresh baseline is ~20 calls/cycle (OI + funding + predicted + liq_history + ls_ratio × 5 symbols). At `refresh_interval_s=60s`, that's ~16-17 calls/min sustained. 60s rolling server-side window continuously saturated to ~80% of the 40/min ceiling from per-symbol alone. 3 extra per-exchange batch calls (OI + funding + predicted) fire as a burst, pushing instantaneous rate over the limit. Server 429s on whichever endpoint is called second in the burst.
-
-Iterations of fix-and-test:
-
-| Commit | Fix attempt | Result |
-|---|---|---|
-| `21e8f49` | 2s sleep between per-exchange batches | 429 on funding stayed |
-| `55c8a70` | cadence 3, OKX 3rd construction site | Funding still 429 |
-| `a262d50` | cadence 5, early-skip, 3s sleep | Still 429 |
-| `9526909` | drop predicted_funding from per-symbol | 429 shifted to /open-interest instead |
-| `4fb1018` | **full revert** | This commit |
-
-On the last run (03:29:35 UTC, cadence-5), 6 consecutive per-exchange fires between 06:34-07:07 local ALL 429'd on the first `/open-interest` call → zero data captured. Pattern shift (funding→OI) suggested endpoint-level limiting that our client-side 40/min token bucket can't predict.
-
-**Revert removes:**
-- 3 JSON columns on `trades` + `rejected_signals` (`oi_per_exchange_usd_json_at_entry`, `funding_rate_per_exchange_json_at_entry`, `funding_rate_predicted_per_exchange_json_at_entry`) via idempotent `ALTER TABLE ... DROP COLUMN` migrations
-- 3 `DerivativesState` dict fields (`oi_per_exchange_usd`, `funding_per_exchange`, `funding_predicted_per_exchange`)
-- `_refresh_per_exchange_snapshot` method + cycle counter + cadence knob in `DerivativesCache`
-- Per-exchange symbol map + `_batch_fetch_current_values` + `_regroup_by_okx_symbol` helpers + 3 batch fetcher methods in `CoinalyzeClient`
-- Corresponding signatures + serializers + readers in `database.py`
-- 3 dict fields on `TradeRecord` + `RejectedSignal` models
-- `_parse_per_exchange_dict` helper
-
-**Revert preserves** (unrelated features stay):
-- OKX as 6th Arkham netflow venue (`202f107`) — different feature, works fine
-- All single-exchange derivatives journal enrichment (2026-04-23 eve, 9 REAL columns + 1 JSON column: OI, funding_current, funding_predicted, liq notionals, LS z-score, price_change 1h/4h, heatmap top clusters)
-- Core on_chain_snapshots schema (all 6 named venues, daily bias, stablecoin pulse, altcoin index, per-symbol token volume JSON)
-- All other Pass 2 instrumentation (confluence_pillar_scores, oscillator_raw_values, whale_transfers)
-
-**Pre-revert path for re-enable (Pass 3+):**
-
-1. **Upgrade Coinalyze tier** — paid plans offer 500/min+ which trivialises the capacity tension.
-2. **First reduce per-symbol cost** — `fetch_liquidation_history` is the cheapest drop (Binance WS already provides this, the Coinalyze call is a gap-filler for WS throttle). Frees ~5 calls/min per cycle. Could also drop `fetch_long_short_ratio` (1h bucket, changes slowly; z-score still works from 336h seeded history).
-3. **Revisit with tooling** — if Coinalyze rate still tight, decouple per-exchange fetch into own asyncio task with 15-min cadence + aggressive rate-pause awareness (option C from iter-5 discussion, not shipped).
-
-**Lessons captured to memory** (`feedback_free_tier_rate_budget_backfired.md`): when a feature requires API calls near a known sustained rate limit, the first iteration should audit the EXISTING sustained rate before adding new calls. If baseline is >70% of the ceiling, don't add a parallel burst.
-
-**Tests:** 131 targeted pass across 7 suites. Operator restart required to clear the now-unused column population attempts; DROP COLUMN migrations run on next startup.
-
-### 2026-04-24 — Per-exchange derivatives journal capture (Binance/Bybit/OKX) [REVERTED — see 2026-04-24 (evening) above]
-
-Operator flagged that bot trades derivatives on OKX/Bybit/Binance but the
-journal only holds ONE exchange's snapshot per symbol (liquidity-ranked via
-`EXCHANGE_PRIORITY=[A=Binance, 6=Bybit, 3=OKX, F=Deribit, H=HTX]`, almost
-always the Binance one). Pass 3 features like funding-spread, OI-share,
-and cross-venue divergence are therefore invisible to the model. Added
-per-exchange journal-only capture without touching runtime scoring.
-
-**Coinalyze research findings (`scripts/probe_arkham.py`-style ad-hoc):**
-- 11 endpoints total; 40 calls/min per key; data retention ~2k intraday datapoints
-- Documented as "no per-exchange breakdown" — technically WRONG. Per-exchange
-  IS available via symbol encoding: `BTCUSDT_PERP.A` (Binance), `BTCUSDT.6`
-  (Bybit; note no `_PERP`), `BTCUSDT_PERP.3` (OKX) all return separate rows
-  from the same endpoint
-- Missing: spot-perp basis, whale endpoints, top-trader L/S split
-
-**Live probe (2026-04-24) — spreads are meaningful, not noise:**
-
-| Symbol | Funding Binance | Funding Bybit | Funding OKX | Spread |
-|---|---:|---:|---:|---:|
-| SOL | −77bp | **+48bp** | −20bp | **125bp** |
-| DOGE | **+100bp** | −39bp | −17bp | **139bp** |
-| ETH | −36bp | −20bp | −47bp | 27bp |
-| BNB | +33bp | +50bp | **+66bp** | 33bp |
-| BTC | −38bp | −34bp | −37bp | 4bp |
-
-OI shares (BTC): Binance $7.76B / Bybit $4.05B / OKX $2.81B — 3:2:1 ratio.
-Funding spread signals crowded one-side positioning (GBT-learnable);
-OI share drift hints at flow-of-money between venues.
-
-**Tier decision:** Tier A only (OI current + funding current + funding
-predicted, 3 batch calls per refresh). Tier B (per-exchange liquidation +
-L/S ratio history) deferred — higher cost (5 calls × 2 metrics vs 3 total),
-lower marginal value until Tier A confirms column coverage.
-
-**Shipped as two paired commits:**
-
-Commit `2cc5a36` — journal schema + model:
-- `src/journal/models.py` — 3 new `dict` fields on `TradeRecord` + `RejectedSignal` (default `{}`):
-  - `oi_per_exchange_usd_at_entry`
-  - `funding_rate_per_exchange_at_entry`
-  - `funding_rate_predicted_per_exchange_at_entry`
-- `src/journal/database.py` — CREATE TABLE columns on `trades` + `rejected_signals`; 6 idempotent ALTER migrations (3 cols × 2 tables); `_COLUMNS`/`_REJECTED_COLUMNS` lists; `record_open` + `record_rejected_signal` signatures; `_record_to_row`/`_rejected_to_row` writers; `_row_to_record`/`_row_to_rejected` readers via new `_parse_per_exchange_dict` helper.
-
-Commit `1cd2498` — fetcher + cache + runner wiring:
-- `src/data/derivatives_api.py`:
-  - `_per_exchange_symbol_map: dict[okx_sym, dict[binance|bybit|okx, coinalyze_sym]]` populated alongside `_symbol_map` in `ensure_symbol_map` (no extra API call — reuses the `/future-markets` response already cached there)
-  - `_batch_fetch_current_values(path)` — single comma-joined `symbols=` query covering all watched × 3 exchanges (up to 15 symbols; API limit 20)
-  - `_regroup_by_okx_symbol(flat)` — pivots flat `{coinalyze_sym: value}` back to `{okx_sym: {exchange_label: value}}`
-  - `fetch_per_exchange_oi_usd`, `fetch_per_exchange_funding`, `fetch_per_exchange_predicted_funding` — 1 API call each
-- `src/data/derivatives_cache.py`:
-  - `DerivativesState` gains 3 `field(default_factory=dict)` fields
-  - `_refresh_loop` calls new `_refresh_per_exchange_snapshot` once per FULL cycle (not per symbol) — 3 batch calls total, metric-level independent failure isolation
-- `src/bot/runner.py`:
-  - `_derive_enrichment` — 3 new keys copy per-exchange dicts from `state.derivatives`
-  - Both `record_rejected_signal` call sites extended with 3 new explicit kwargs (matches the existing explicit-extraction style at those sites; broader plumbing gap where 2026-04-23 derivatives fields also don't reach `rejected_signals` flagged as separate follow-up, not fixed opportunistically)
-
-**Cost:** +3 Coinalyze calls per `refresh_interval_s` cycle (default 60s) = +180 calls/h. 40/min budget leaves comfortable headroom (existing ~20-30/min).
-
-**Not done (intentional):**
-- Runtime scoring integration (Pass 3 Optuna decides weights).
-- Per-exchange liquidation / L/S ratio history (Tier B; deferred).
-- Fixing the broader `record_rejected_signal` gap where 2026-04-23 single-exchange derivatives fields also go unpopulated — separate follow-up task; doing both here would have bundled an unrelated bugfix into the feature commit.
-
-**Tests:** 82 targeted tests pass across `test_derivatives_api.py`, `test_derivatives_cache.py`, `test_derive_enrichment.py`, `test_journal_database.py`, `test_journal_derivatives.py`. New fields default to empty dict; legacy rows + fixtures unaffected; migrations idempotent.
-
-**Re-eval triggers:**
-1. **Per-exchange column coverage** on post-commit trades/rejected_signals — expect ≥95% non-empty JSON (`!= '{}'`). Zero-rate = `_per_exchange_symbol_map` not populating (check `ensure_symbol_map` log for `coinalyze_mapping` lines).
-2. **Funding spread magnitude** — median |max − min| across Binance/Bybit/OKX per symbol. If consistently <10bp for 7 days, the cross-venue signal is too quiet to feature-engineer on. Expected range based on 2026-04-24 probe: 20-140bp with DOGE/SOL routinely spiking.
-3. **Rate-limit saturation** — watch for `coinalyze_429` warnings. If frequent, drop per-exchange refresh to every N cycles rather than every cycle.
-4. **OI share drift as Pass 3 feature importance** — if GBT assigns >0.03 feature importance to `oi_binance_share = oi_binance / (oi_binance + oi_bybit + oi_okx)`, cross-venue signal has edge; if near zero after 50+ trades, drop the OI-per-exchange columns and keep only funding-per-exchange.
-
-### 2026-04-24 — OKX added as 6th named netflow venue (journal-only)
-
-Operator asked whether OKX — the bot's own trading exchange — should join the per-entity netflow pool alongside Coinbase/Binance/Bybit/Bitfinex/Kraken. Argument for: OKX's derivatives volume is large and the bot trades here, so the venue's own on-chain flow is a natural self-signal.
-
-**Live probe (2026-04-24) before commit:**
-
-| Entity | 24h gross turnover | 24h net | Net/turnover | Max 1h \|net\| |
-|---|---:|---:|---:|---:|
-| Bitfinex | $1.85B | +$243M | +13.1% (bullish) | $403M |
-| Kraken | $4.57B | −$439M | −9.6% (bearish) | $459M |
-| Bybit | $2.60B | −$13M | −0.5% (balanced) | $112M |
-| **OKX** | **$1.86B** | **−$2M** | **−0.12%** (balanced) | **$58M** |
-
-Key finding: OKX's **gross turnover** matches Bitfinex scale — the "Arkham can't see OKX futures" concern was wrong, OKX is well-tracked on-chain. But the **24h net is structurally near-zero** because in/out are almost perfectly balanced (OKX is derivatives-heavy; traders cycle collateral in/out rapidly). The signal is likely hidden in hourly variance ($58M single-hour spikes) rather than the 24h aggregate.
-
-**Decision:** Add OKX as a 6th venue journal-only at the 24h grain, following the same pattern as Bitfinex/Kraken (2026-04-23 night-late). Parity with existing entities + Pass 3 data for exploration. A short-window (1h) OKX slot is NOT added today — that would be a new integration pattern (existing pool is all 24h), deferred to Pass 3 if the exploration justifies it.
-
-**Wiring (same template as Bitfinex/Kraken commit `38c3938`):**
-- [on_chain_types.py](src/data/on_chain_types.py) — `OnChainSnapshot.cex_okx_netflow_24h_usd` field
-- [runner.py](src/bot/runner.py) — `BotContext` field + entity tuple extended `("coinbase", "binance", "bybit", "bitfinex", "kraken", "okx")`; 3 `OnChainSnapshot(...)` construction sites, fingerprint tuple, `record_on_chain_snapshot(...)` call, `on_chain_context` dict all thread it through
-- [database.py](src/journal/database.py) — CREATE TABLE column + idempotent ALTER TABLE migration + `record_on_chain_snapshot` kwarg
-
-**Cost:** +2 histogram calls per 5-min daily-bundle cycle → +24/h (label-free, confirmed 2026-04-23 night). Total label budget untouched (558/10k/mo).
-
-**Not done:** `_flow_alignment_score` weight, config exposure. Deliberate — same rationale as Bitfinex/Kraken: mechanical weight add without Pass 3 data would be a guess; journal capture is the minimum that unblocks Pass 3 tuning.
-
-**Tests:** 1063 → 1063 (79 targeted tests in `test_on_chain_fetchers.py` + `test_runner_on_chain.py` + `test_journal_database.py` pass; new field defaults to `None`, existing callers unchanged, migration idempotent).
-
-**Re-eval triggers:**
-1. **OKX coverage** on `on_chain_snapshots` rows post-commit — column should be NON-NULL on ≥95% of rows. Zero-rate = slug `okx` not resolving.
-2. **24h net magnitude sanity** — expect median |net| ≤$10M over 7 days (we predicted ~$0 from probe). If ≥$50M, our "balanced derivatives venue" model was wrong; re-examine.
-3. **Hourly volatility capture** — the true OKX signal is in short-window buckets. If Pass 3 shows 24h OKX has near-zero feature importance but hourly volatility correlates with outcome, add a 1h-window OKX slot.
 
 ### Historical context (pre-Pass-1, 2026-04-19 → 2026-04-21)
 
@@ -1816,7 +1428,7 @@ Design decisions baked into the current code. Git log (`git log --before=2026-04
 **Execution hardening day (2026-04-20).** Five fixes, one dev day:
 - **MFE-triggered SL lock (Option A)** — at MFE ≥ 1.3R, cancel + replace runner OCO with SL at entry + fee buffer. One-shot per position. Kills "almost-win → round-trip to -1R" bucket.
 - **Maker-TP resting limit** — post-only reduce-only limit sits at TP price alongside the OCO. Primary (maker fill); OCO market-trigger = fallback. `clOrdId` prefix `smttp` distinguishes from entry limits (`smtbot`).
-- **Phantom-cancel fix** — `poll_pending` / `cancel_pending` only drop the row on success or idempotent-gone (`51400/51401/51402`); transient failures preserve the row for next poll retry. Eliminated orphan-limit-to-OCO race during brief OKX outages.
+- **Phantom-cancel fix** — `poll_pending` / `cancel_pending` only drop the row on success or idempotent-gone (`51400/51401/51402`); transient failures preserve the row for next poll retry. Eliminated orphan-limit-to-OCO race during brief Bybit outages.
 - **Stale-algoId + startup reconcile** — `revise_runner_tp` forwards `_on_sl_moved` so journal `algo_ids` stays in sync. Startup runs `_cancel_orphan_pending_limits` + `_cancel_surplus_ocos`.
 - **Flat-USDT override** — `trading.risk_amount_usdt` / `RISK_AMOUNT_USDT` env bypasses `balance × risk_pct`. 10%-of-balance safety rail at config load.
 
@@ -1877,7 +1489,7 @@ The bot calls Bybit's V5 REST API directly via the `pybit` Python SDK — there 
 6. **API key permissions:** Read + Trade only, never Withdrawal. IP whitelist recommended (90-day expiry without it, no expiry with).
 7. Smoke test: `python scripts/test_bybit_connection.py` — exercises wallet, instruments-info, mark price, positions, open orders.
 
-**Bybit naming:** USDT linear perp = `BTCUSDT` (Bybit-native). The bot keeps the OKX-style `BTC-USDT-SWAP` as its **internal** identifier and translates at the boundary inside `bybit_client.py`. TV ticker for charts = `BYBIT:BTCUSDT.P`.
+**Bybit naming:** USDT linear perp = `BTCUSDT` (Bybit-native). The bot keeps the canonical `BTC-USDT-SWAP` as its **internal** identifier and translates at the boundary inside `bybit_client.py`. TV ticker for charts = `BYBIT:BTCUSDT.P`.
 
 **Demo endpoint quirk (TR ISP egress):** Some networks silently drop TCP-443 to specific CloudFront ranges that `api-demo.bybit.com` resolves to (observed: `13.249.8.0/24`). `BybitClient._maybe_pin_demo_dns()` probes each resolved IP at construction and pins a reachable edge to the requests session. If the bot logs `bybit_demo_dns_pin_failed`, switch system DNS to `8.8.8.8` / `1.1.1.1` and disable any DPI bypass tool (e.g. GoodbyeDPI, which fragments TLS in a way the demo distribution rejects).
 
@@ -1905,7 +1517,7 @@ Modules have docstrings; a tour for orientation:
 - `src/data/` — TV bridge, `MarketState` assembly, candle buffers, Binance liq WS, Coinalyze REST, economic calendar (Finnhub + FairEconomy), HTF cache, **Arkham client + WS listener + on-chain types**.
 - `src/analysis/` — Structure (MSS/BOS/CHoCH), FVG, OB, liquidity, ATR-scaled S/R, multi-TF confluence + regime-conditional weights + **daily-bias modifier**, derivatives regime, **ADX trend regime**, **EMA momentum veto**, **displacement / premium-discount** gates.
 - `src/strategy/` — R:R math, SL hierarchy, entry orchestration (+ **Arkham soft signals: daily-bias / stablecoin-pulse / altcoin-index / flow_alignment / per_symbol_cex_flow penalties**), **setup planner** (zone-based limit-order plans), cross-asset snapshot veto, risk manager.
-- `src/execution/` — pybit V5 wrapper (sync → `asyncio.to_thread`) with OKX↔Bybit boundary translation, order router (`place_limit_entry` / `cancel_pending_entry` / `attach_algos` via trading-stop / `place_reduce_only_limit` / market fallback), REST-poll position monitor with **PENDING** state + **MFE-lock + TP-revise + maker-TP tracking** (all SL/TP mutations are single trading-stop calls), typed errors.
+- `src/execution/` — pybit V5 wrapper (sync → `asyncio.to_thread`) with internal-canonical↔Bybit boundary translation, order router (`place_limit_entry` / `cancel_pending_entry` / `attach_algos` via trading-stop / `place_reduce_only_limit` / market fallback), REST-poll position monitor with **PENDING** state + **MFE-lock + TP-revise + maker-TP tracking** (all SL/TP mutations are single trading-stop calls), typed errors.
 - `src/journal/` — async SQLite, schema v3 trade records (+ `on_chain_context`, `demo_artifact`), `rejected_signals` + counter-factual stamps, `on_chain_snapshots` time-series, pure-function reporter.
 - `src/bot/` — YAML/env config, async outer loop (`BotRunner.run_once` — closes → snapshot → pending → per-symbol cycle), on-chain snapshot scheduler, CLI entry.
 
@@ -1984,12 +1596,12 @@ Things that aren't self-evident from the code. Inline comments cover the *what*;
 - **Two TP exits per position.** Position-attached TP (set via `/v5/order/create.takeProfit` for market entries or `/v5/position/trading-stop` for limit-fills) fires as market-on-trigger (fallback); a post-only reduce-only maker limit sits at the same TP price (primary). Either closes the position flat; the other becomes irrelevant when size→0. `orderLinkId` prefix `smttp` distinguishes TP limits from entry limits (`smtbot`).
 - **MFE-triggered SL lock.** At MFE ≥ 1.3R, single `set_position_tpsl(stop_loss=lock_px)` call mutates the position's SL to BE+fee_buffer. One-shot flag prevents retry. Skipped if `be_already_moved=True` or `plan_sl_price=0.0` (rehydrate sentinel).
 - **Fee-buffered SL-to-BE** (`sl_be_offset_pct=0.001`). After TP1 fill the new SL sits a hair past entry on the profit side. *Inert while `partial_tp_enabled=false` — TP1 never fires.*
-- **SL/TP mutations are atomic.** Bybit V5 trading-stop is a single REST call: success replaces the value on the position; failure leaves the existing TP/SL intact. No "unprotected window" between cancel and place (the OKX-era 3-step dance is gone). 3 consecutive failures → give up + mark `be_already_moved=True` to stop spin; old SL still protects.
+- **SL/TP mutations are atomic.** Bybit V5 trading-stop is a single REST call: success replaces the value on the position; failure leaves the existing TP/SL intact. No "unprotected window" between cancel and place (the pre-migration 3-step dance is gone). 3 consecutive failures → give up + mark `be_already_moved=True` to stop spin; old SL still protects.
 - **Threaded callback → main loop.** `PositionMonitor.poll()` runs in `asyncio.to_thread`. Callbacks use `asyncio.run_coroutine_threadsafe(coro, ctx.main_loop)`; `create_task` from worker thread raises `RuntimeError: no running event loop`.
 - **Close enrichment is non-optional.** `BybitClient.enrich_close_fill` queries `/v5/position/closed-pnl` for real `closedPnl` / `avgExitPrice` / `openFee+closeFee`. Without it every close looks BREAKEVEN and breakers never trip.
 - **In-memory register before DB.** `monitor.register_open` + `risk_mgr.register_trade_opened` happen *before* `journal.record_open` — a DB failure logs an orphan rather than losing a live position.
 - **Phantom-cancel resistance.** `poll_pending` + `cancel_pending` only pop the row on success or idempotent-gone (Bybit codes `110001/110008/110010/170142/170213`). Transient cancel failures preserve row for next poll retry. No dropped-but-still-live orphans.
-- **Startup reconcile cancels resting limits.** `_pending` is empty at startup, so any live limit is orphan by construction; `_cancel_orphan_pending_limits` walks `list_open_orders()` and cancels them. The pre-migration `_cancel_surplus_ocos` no-op was removed in the 2026-04-26 OKX cleanup — on Bybit there are no separate algo orders to orphan since TP/SL is part of the position.
+- **Startup reconcile cancels resting limits.** `_pending` is empty at startup, so any live limit is orphan by construction; `_cancel_orphan_pending_limits` walks `list_open_orders()` and cancels them. The pre-migration `_cancel_surplus_ocos` no-op was removed in the 2026-04-26 post-migration cleanup — on Bybit there are no separate algo orders to orphan since TP/SL is part of the position.
 
 ### Data quality
 
@@ -2091,7 +1703,7 @@ Combined on a 42-trade dataset (`rl.clean_since=2026-04-19T19:55:00Z`):
 - Demo bot runs. No code changes unless factor-audit reveals a regression.
 - Run `scripts/factor_audit.py` every ~10 closed trades.
 - (Counter-factual pegging on rejected signals: legacy `peg_rejected_outcomes.py`
-  was removed in the 2026-04-26 OKX cleanup; needs a Bybit-native rewrite
+  was removed in the 2026-04-26 post-migration cleanup; needs a Bybit-native rewrite
   before Pass 3. Until then, post-migration rejected_signals carry NULL
   `hypothetical_outcome`.)
 - Passive accumulation of `on_chain_snapshots`, `whale_transfers`, per-pillar + per-TF oscillator journal rows.
@@ -2137,14 +1749,14 @@ Candidates, **not commitments.** Re-evaluate after Phase 11 stability.
 - **Per-symbol Arkham overrides** — SOL vs DOGE may respond differently to BTC dominance / altcoin index. Pass 3 candidate.
 - **Whale transfer directional classification** — GBT on `whale_transfers` join reveals which flows predict direction. If signal exists, add `whale_directional_score` soft factor (replacement for the removed hard gate in a data-informed form).
 - **HTF Order Block re-add** — Pine 3m OBs failed post-pivot; 15m OBs may survive. Factor-audit confirms before re-enable.
-- **Additional pairs** — 6th+ OKX perp. Coinalyze budget allows ~6 symbols at free tier.
+- **Additional pairs** — 6th+ Bybit perp. Coinalyze budget allows ~6 symbols at free tier.
 - **1m as zone source in `setup_planner`** — `ltf_fvg_entry` / `ltf_sweep_retest`. Pass 3 GBT confirms 1m factors carry weight first.
 - **1m-triggered dynamic trail / runner management** — dynamic exit after TP1 using 1m oscillator. Complements `ltf_reversal_close`.
 - **ATR-trailing SL after MFE threshold (Option B)** — continue trailing after 1.3R lock. Only if Option A's locked-and-fell-back data shows a meaningful "resumed then reversed" bucket.
 - **Pine overlay split** — `smt_overlay.pine` → `_structure.pine` + `_levels.pine`. Worth the refactor only if freshness-poll latency becomes a bottleneck.
 - **Multi-strategy ensemble** — scalper + swing module routing to shared execution layer. Only meaningful once scalper is provably stable.
 - **Auto-retrain loop** — monthly Optuna refresh on rolling window. Cron + CI pipeline. Meaningless until Phase 11 is steady.
-- **Alt-exchange support** — Bybit / Binance futures. Current execution layer OKX-specific; abstracting `ExchangeClient` is 2-3 weeks careful refactor.
+- **Alt-exchange support** — Bybit / Binance futures. Current execution layer Bybit-specific; abstracting `ExchangeClient` is 2-3 weeks careful refactor.
 
 ### What is explicitly NOT on the roadmap
 
