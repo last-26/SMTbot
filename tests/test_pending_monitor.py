@@ -236,10 +236,83 @@ def test_cancel_pending_emits_event_and_clears_row():
 def test_cancel_pending_idempotent_when_exchange_reports_gone():
     monitor, fake = _mk()
     _register(monitor)
-    fake.cancel_raises = OrderRejected("gone", code="51400", payload={})
+    fake.cancel_raises = OrderRejected("gone", code="170142", payload={})
+    # Default get_order returns {"state": "live"} — inconclusive, falls
+    # back to legacy CANCELED behavior.
     ev = monitor.cancel_pending("BTC-USDT-SWAP", "long", reason="manual")
     assert ev is not None
     assert ev.event_type == "CANCELED"
+    assert monitor.pending_count == 0
+
+
+# ── Regression: 2026-04-27 phantom-cancel-vs-fill race (F6) ────────────────
+#
+# Bybit V5's `_ORDER_GONE_CODES` (110001/110008/110010/170142/170213) cover
+# both "already cancelled" and "already filled". If the order actually
+# filled in the millisecond window between our cancel-cmd dispatch and
+# Bybit's rejection, blindly accepting the idempotent code as "cancel
+# success" loses the fill event — the position lives on without SL/TP.
+#
+# Fix (F6): when cancel returns a gone-code, verify the real terminal
+# state via get_order and route Filled to FILLED instead of CANCELED.
+
+
+def test_cancel_pending_phantom_fill_routes_to_FILLED():
+    """If cancel hits gone-code AND get_order returns Filled, surface the
+    fill event so the caller can route through fill flow (record_open +
+    SL/TP attach). Loses the cancel reason — caller treats as a normal
+    fill instead."""
+    monitor, fake = _mk()
+    _register(monitor)
+    fake.cancel_raises = OrderRejected("gone", code="170142", payload={})
+    # The order actually filled before our cancel arrived.
+    fake.order_states["LIM-1"] = {
+        "orderStatus": "Filled", "cumExecQty": "5", "avgPrice": "100.25",
+    }
+
+    ev = monitor.cancel_pending("BTC-USDT-SWAP", "long", reason="invalidated")
+
+    assert ev is not None
+    assert ev.event_type == "FILLED"
+    assert ev.reason == "phantom_cancel_recovery"
+    assert ev.filled_size == 5.0
+    assert ev.avg_price == 100.25
+    assert monitor.pending_count == 0
+
+
+def test_cancel_pending_verified_cancelled_keeps_caller_reason():
+    """If cancel hits gone-code AND get_order confirms Cancelled status,
+    surface CANCELED with the caller's reason — same as the legacy
+    happy path."""
+    monitor, fake = _mk()
+    _register(monitor)
+    fake.cancel_raises = OrderRejected("gone", code="170142", payload={})
+    fake.order_states["LIM-1"] = {
+        "orderStatus": "Cancelled", "cumExecQty": "0", "avgPrice": "0",
+    }
+
+    ev = monitor.cancel_pending("BTC-USDT-SWAP", "long", reason="invalidated")
+
+    assert ev is not None
+    assert ev.event_type == "CANCELED"
+    assert ev.reason == "invalidated"
+    assert monitor.pending_count == 0
+
+
+def test_cancel_pending_verify_get_order_failure_falls_back_to_CANCELED():
+    """If get_order itself fails after a gone-code cancel, fall back to
+    legacy idempotent-cancel behavior (don't lose the row, but accept
+    cancel best-effort). Logs a warning so audits notice."""
+    monitor, fake = _mk()
+    _register(monitor)
+    fake.cancel_raises = OrderRejected("gone", code="170142", payload={})
+    fake.get_order_raises = RuntimeError("tcp reset on verify")
+
+    ev = monitor.cancel_pending("BTC-USDT-SWAP", "long", reason="manual")
+
+    assert ev is not None
+    assert ev.event_type == "CANCELED"
+    assert ev.reason == "manual"
     assert monitor.pending_count == 0
 
 

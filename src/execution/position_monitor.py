@@ -765,6 +765,15 @@ class PositionMonitor:
         pending row is kept so the caller can retry. If we silently
         popped on transient failure, the order could remain live on the
         exchange as a phantom orphan (see 2026-04-20 changelog).
+
+        2026-04-27 (F6) — `_ORDER_GONE_CODES` covers BOTH "already
+        cancelled" and "already filled" on Bybit V5. If the order
+        actually filled between our cancel-cmd dispatch and Bybit's
+        rejection, blindly accepting the idempotent code as "cancel
+        success" loses the fill event (the position stays live without
+        SL/TP attached, see SOL short phantom-cancel 2026-04-27 changelog
+        entry). Now we verify the real terminal state via `get_order`
+        before deciding event type.
         """
         key = (inst_id, pos_side)
         p = self._pending.get(key)
@@ -780,6 +789,20 @@ class PositionMonitor:
                     p.inst_id, p.order_id, exc.code, str(exc), reason,
                 )
                 raise
+            # 2026-04-27 (F6) — order is "gone" per Bybit, but that could
+            # mean either Cancelled OR Filled. Verify the real terminal
+            # state to avoid silent fill loss.
+            verified = self._verify_cancel_terminal_state(p, reason)
+            if verified is not None:
+                self._pending.pop(key, None)
+                return verified
+            # get_order itself failed — fall through to legacy behavior
+            # (assume cancel landed, log a warning so this case is visible)
+            logger.warning(
+                "pending_manual_cancel_unverified inst={} ord={} reason={} "
+                "— treating as CANCELED but real state unknown",
+                p.inst_id, p.order_id, reason,
+            )
         except Exception:
             logger.exception(
                 "pending_manual_cancel_exception inst={} ord={} reason={} "
@@ -792,3 +815,54 @@ class PositionMonitor:
             p.inst_id, p.pos_side, p.order_id,
             event_type="CANCELED", reason=reason,
         )
+
+    def _verify_cancel_terminal_state(
+        self, p: "_PendingEntry", cancel_reason: str,
+    ) -> Optional[PendingEvent]:
+        """Inspect the real order status when Bybit returned an
+        `_ORDER_GONE_CODES` error from a cancel attempt. Three outcomes:
+
+        - status `Filled` (or partial fill that completed) → return a
+          FILLED event so the caller routes through the fill flow
+          (record_open + position-attached TP/SL). Logs
+          `phantom_cancel_detected` so audits can spot the race.
+        - status `Cancelled` / `Rejected` / `Deactivated` → return a
+          CANCELED event with the caller's reason (legacy behaviour).
+        - get_order fails or returns an inconclusive status → return
+          None; the caller falls back to assuming cancel landed (legacy
+          best-effort).
+        """
+        try:
+            raw = self.client.get_order(p.inst_id, p.order_id)
+        except Exception:
+            logger.exception(
+                "cancel_verify_get_order_failed inst={} ord={} reason={}",
+                p.inst_id, p.order_id, cancel_reason,
+            )
+            return None
+        state = str(raw.get("orderStatus") or raw.get("state") or "").lower()
+        filled_sz = float(raw.get("cumExecQty") or raw.get("accFillSz") or 0.0)
+        avg_px = float(raw.get("avgPrice") or raw.get("avgPx") or 0.0)
+        if state in _TERMINAL_FILLED:
+            logger.warning(
+                "phantom_cancel_detected inst={} ord={} actual_status=Filled "
+                "filled_sz={} avg_px={} cancel_reason={} — routing to FILLED",
+                p.inst_id, p.order_id, filled_sz, avg_px, cancel_reason,
+            )
+            return PendingEvent(
+                p.inst_id, p.pos_side, p.order_id,
+                event_type="FILLED", reason="phantom_cancel_recovery",
+                filled_size=filled_sz, avg_price=avg_px,
+            )
+        if state in _TERMINAL_CANCELED:
+            return PendingEvent(
+                p.inst_id, p.pos_side, p.order_id,
+                event_type="CANCELED", reason=cancel_reason,
+            )
+        # Inconclusive state (e.g. New, PartiallyFilled while Bybit said
+        # "gone") — let the caller fall back to its default.
+        logger.warning(
+            "cancel_verify_inconclusive inst={} ord={} status={} reason={}",
+            p.inst_id, p.order_id, state, cancel_reason,
+        )
+        return None

@@ -26,6 +26,77 @@ AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT lin
 
 ## Changelog
 
+### 2026-04-27 — `cancel_pending` race fix (F6) — get_order verify on gone-code
+
+Pendant of the SOL short phantom-cancel data repair (entry below).
+Permanent fix for the race that caused it.
+
+**Root cause:** Bybit V5'in `_ORDER_GONE_CODES`
+(`{110001, 110008, 110010, 170142, 170213}`) hem "already cancelled" hem
+"already filled" durumlarını içeriyor. Pre-fix `cancel_pending`
+implementation cancel REST çağrısından bu code geldiğinde **direkt
+idempotent başarı sayıyordu** (CLAUDE.md "Phantom-cancel resistance"
+pattern, OKX-era'da 51400/51401/51402 sadece "order not found"
+durumunu işaret ettiği için doğruydu). Bybit-era'da fill ile cancel
+arasında ms-cinsinden race olunca:
+
+1. Bot cancel REST çağırır
+2. Bybit "order zaten Filled" cevabı döndürür (gone-code)
+3. Bot bunu "cancel idempotent başarılı" yorumlar
+4. Pending row pop edilir, fill event hiç işlenmez
+5. Pozisyon Bybit'te live ama bot bilmediği için SL/TP attach edilmez
+
+**Fix:** `cancel_pending` gone-code yakaladığında yeni
+`_verify_cancel_terminal_state` helper'ı çağırır:
+
+- `get_order` ile gerçek statüye bakılır
+- `Filled` → `phantom_cancel_detected` warning + FILLED event
+  (`reason="phantom_cancel_recovery"`); fill flow caller'da tetiklenir
+- `Cancelled / Rejected / Deactivated` → CANCELED event (caller'ın
+  reason'ı korunur, mevcut davranışla aynı)
+- `get_order` kendisi başarısız olursa → `pending_manual_cancel_unverified`
+  warning + legacy fallback (CANCELED kabul, idempotent best-effort)
+- Inconclusive state (örn. `New` while Bybit said gone) → None döner,
+  caller fallback'e düşer
+
+**Tests (3 yeni):** [tests/test_pending_monitor.py](tests/test_pending_monitor.py)
+`test_cancel_pending_phantom_fill_routes_to_FILLED`,
+`test_cancel_pending_verified_cancelled_keeps_caller_reason`,
+`test_cancel_pending_verify_get_order_failure_falls_back_to_CANCELED`.
+20/21 green; pre-existing OKX-era failure (`51400` code reference)
+unrelated.
+
+**Etki:**
+
+- Pre-fix: cancel-vs-fill race → silent fill loss, naked position
+  (Pass 2 dataset'te 1 olay tespit edildi, sentetik recovery ile
+  tamir edildi — bkz. SOL short entry aşağıda)
+- Post-fix: cancel-vs-fill race → fill event yakalanır,
+  `_handle_pending_filled` flow'a yönlendirilir, DB'ye trade row
+  yazılır, SL/TP attach edilir (Bybit position-attached TP/SL via
+  `set_position_tpsl`). Race kapsam dışı.
+
+**Not:** `poll_pending`'in timeout-cancel branch'i (line 711) zaten
+güvende — orada cancel öncesi `get_order` çağrısı vardı, fill-or-cancel
+state çekiliyordu ve cancel sonrası `filled_sz > 0` ise FILLED event
+emit ediliyordu. Race sadece `cancel_pending` (caller-driven manual /
+invalidation cancel) path'inde vardı.
+
+**Re-eval triggers:**
+
+1. `phantom_cancel_detected` log line frequency — Pass 2 boyunca
+   (50+ trade) kaç kez tetiklendiği. > 5/50 = race rate beklenenden
+   yüksek, Bybit'e ek pre-cancel order_history check düşünülmeli.
+   0 = race nadir, F6 yeterli.
+2. `pending_manual_cancel_unverified` log line — `get_order` verify
+   call'ının ne sıklıkta başarısız olduğu. > 1/100 cancel = network
+   instability, fallback davranışı öne çıkacak; Bybit DNS-pin
+   sağlığını kontrol et.
+3. `cancel_verify_inconclusive` log line — Bybit gone-code dönerken
+   order hâlâ `New`/`PartiallyFilled` görünüyorsa indexer geriye
+   doğru kaydı güncelliyor; küçük bir gecikmeyle yeniden poll
+   durumu çözmeli (bu kayıtlar otomatik retry üzerinden temizlenir).
+
 ### 2026-04-27 — Phantom cancel kurtarması: SOL short sentetik trade row
 
 Operatör fark etti: Bybit live'da SOL hem long hem short açık (hedge mode'da
