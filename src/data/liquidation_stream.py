@@ -1,7 +1,7 @@
 """Binance Futures liquidation stream listener.
 
 Subscribes to the public `!forceOrder@arr` WebSocket and keeps a rolling
-in-memory buffer (per OKX symbol) of `LiquidationEvent`s. Optionally hands
+in-memory buffer (per internal canonical symbol) of `LiquidationEvent`s. Optionally hands
 events off to a `DerivativesJournal` for persistence (wired in Madde 3).
 
 Failure policy:

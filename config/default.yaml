@@ -13,7 +13,7 @@ trading:
   # gecikmesi ~240s, (c) zone SL floor bypass. 7→5 per-slot margin'i +40%
   # açar ($714→$1000), cycle bütçesini 180s-üstü worst-case'den kurtarır,
   # attach race'i daraltır.
-  # 2026-04-19 (eve, OKX-era): ADA ↔ DOGE swap. ADA demo OI'da platform
+  # 2026-04-19 (eve, pre-migration): ADA ↔ DOGE swap. ADA demo OI'da platform
   # tavanına dayandı (sCode 54031), her cycle reddedildi.
   # 2026-04-25 (Bybit migration): BNB ↔ XRP swap. Operatör tercihi —
   # XRP artık 5'inci aktif sembol; BNB override'ları (harmless) YAML'da
@@ -852,10 +852,10 @@ rl:
   # soft signals live, confluence_pillar_scores + oscillator_raw_values
   # 1m/3m/15m populated from first tick). Pass 2 reporter / GBT /
   # Optuna use this cut as the clean-window start.
-  # 2026-04-25 — Bybit V5 Demo migration cut. OKX exchange wholly
-  # dropped: python-okx removed, pybit added, all execution endpoints
-  # rewired against Bybit V5 (TP/SL position-attached via trading-stop
-  # instead of OKX OCO algos). Pass 2 trades.db archived as
+  # 2026-04-25 — Bybit V5 Demo migration cut. Previous venue wholly
+  # dropped, all execution endpoints rewired against Bybit V5 (TP/SL
+  # position-attached via trading-stop instead of separate OCO algos).
+  # Pass 2 trades.db archived as
   # `data/trades.db.pre_bybit_2026-04-25T214500Z` — that window had
   # both demo-wick artefact pollution and the SL-floor-bump losing
   # cluster (see 2026-04-24 changelog).

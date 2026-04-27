@@ -475,9 +475,9 @@ async def test_reconcile_cancels_every_resting_pending_limit(make_ctx):
 
 
 # Note: tests for `_cancel_surplus_ocos` were removed when that method
-# itself was deleted in the 2026-04-26 OKX cleanup (Phase 3). On Bybit V5
-# TP/SL is a position attribute, not a separate algo order, so there is
-# no orphan-OCO sweep to test.
+# itself was deleted in the 2026-04-26 post-migration cleanup (Phase 3).
+# On Bybit V5 TP/SL is a position attribute, not a separate algo order,
+# so there is no orphan-OCO sweep to test.
 
 
 # ── Shutdown ────────────────────────────────────────────────────────────────

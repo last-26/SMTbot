@@ -178,9 +178,9 @@ CREATE TABLE IF NOT EXISTS rejected_signals (
     -- proposed_sl_price / proposed_tp_price / proposed_rr_ratio dropped
     -- 2026-04-27 — entry path doesn't compute proposed SL/TP at reject
     -- time. peg-script that would forward-walk and stamp outcomes was
-    -- deleted in OKX cleanup (Phase 3). Re-add as a triple if a
-    -- Bybit-native peg gets written AND _record_reject computes
-    -- ATR-based what-if SL/TP.
+    -- deleted in the post-migration cleanup (Phase 3). Re-add as a
+    -- triple if a Bybit-native peg gets written AND _record_reject
+    -- computes ATR-based what-if SL/TP.
 
     funding_z_at_entry                  REAL,
     ls_ratio_at_entry                   REAL,
@@ -309,7 +309,7 @@ CREATE TABLE IF NOT EXISTS whale_transfers (
     from_entity      TEXT,
     to_entity        TEXT,
     tx_hash          TEXT,
-    -- JSON list of OKX perp symbols affected (from `affected_symbols_for`).
+    -- JSON list of internal canonical perp symbols affected (from `affected_symbols_for`).
     affected_symbols TEXT NOT NULL DEFAULT '[]'
 );
 
@@ -639,10 +639,10 @@ _MIGRATIONS = [
     #   - rejected_signals.proposed_sl/tp/rr_price + hypothetical_*:
     #     entry path doesn't compute proposed SL/TP at reject time and
     #     the peg-script (which would forward-walk and stamp outcomes)
-    #     was deleted in OKX cleanup Phase 3 because its python-okx
-    #     dependency was removed. Re-add as a pair if a Bybit-native
-    #     peg script gets written AND `_record_reject` starts computing
-    #     ATR-based proposed SL/TP for what-if analysis.
+    #     was deleted in the post-migration cleanup Phase 3 when its
+    #     python-okx dependency was removed. Re-add as a pair if a
+    #     Bybit-native peg script gets written AND `_record_reject`
+    #     starts computing ATR-based proposed SL/TP for what-if analysis.
     #   - rejected_signals.entry_timeframe / htf_timeframe /
     #     regime_at_entry: same parity rationale as trades.
     #   - on_chain_snapshots.coinbase_asia_skew_usd / bnb_self_flow_24h:
@@ -1280,8 +1280,9 @@ class TradeJournal:
         regime_at_entry: Optional[str] = None,  # noqa: ARG002
         # proposed_*/hypothetical_* kwargs dropped 2026-04-27 — entry
         # path doesn't compute proposed SL/TP and the peg script that
-        # would forward-walk and stamp outcomes was deleted in OKX
-        # cleanup. Re-add as a pair if a Bybit-native peg gets written.
+        # would forward-walk and stamp outcomes was deleted in the
+        # post-migration cleanup. Re-add as a pair if a Bybit-native
+        # peg gets written.
         htf_bias: Optional[str] = None,
         session: Optional[str] = None,
         market_structure: Optional[str] = None,
@@ -1317,8 +1318,8 @@ class TradeJournal:
         duplicate — we generate a fresh uuid per call, the table is
         append-only. Counter-factual outcome fields stay NULL until a
         forward-walking pegger stamps them. (The legacy peg script was
-        removed 2026-04-26 with the OKX cleanup; pre-migration rows still
-        carry stamps written before that date.)
+        removed 2026-04-26 in the post-migration cleanup; pre-migration
+        rows still carry stamps written before that date.)
         """
         conn = self._require_conn()
         rec = RejectedSignal(

@@ -15,8 +15,8 @@ Replay is DATA-LIMITED. The journal stores:
   * ``reject_reason`` on rejects — enough to flip a gate off and accept
     rows previously rejected for that reason.
   * ``hypothetical_outcome`` on rejects (legacy column, stamped by the
-    pre-migration counter-factual pegger which depended on the
-    OKX-specific candle endpoint and was removed 2026-04-26) — the
+    pre-migration counter-factual pegger which depended on a
+    pre-migration candle endpoint and was removed 2026-04-26) — the
     counter-factual label used when a row is now accepted. Pre-migration
     rows still carry these stamps; post-migration rows are NULL until
     a Bybit-native pegger is written.

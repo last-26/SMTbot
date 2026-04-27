@@ -19,8 +19,8 @@ from pathlib import Path
 import pytest
 
 # 2026-04-27 — peg-outcome columns (hypothetical_outcome,
-# hypothetical_bars_to_tp/sl) dropped alongside the OKX-era peg script
-# removal. `tune_confluence.simulate_reject_outcome` only produces
+# hypothetical_bars_to_tp/sl) dropped alongside the pre-migration peg
+# script removal. `tune_confluence.simulate_reject_outcome` only produces
 # non-NEITHER outcomes when a row carries these stamps, so every test
 # here that asserts WIN/LOSS attribution against a fabricated reject is
 # stuck on NEITHER. Skipping the full file until a Bybit-native peg

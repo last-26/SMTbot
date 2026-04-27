@@ -242,8 +242,7 @@ class PositionMonitor:
                     )
                 # On Bybit V5 the position-attached TP/SL clears
                 # automatically when the position size hits zero — no
-                # algo-orphan sweep needed (compare the OKX-era
-                # `_cancel_algos_best_effort` call that lived here).
+                # algo-orphan sweep needed.
                 to_remove.append(key)
             else:
                 snap = live_snaps_map[key]

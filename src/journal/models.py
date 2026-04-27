@@ -235,7 +235,7 @@ class RejectedSignal(BaseModel):
     Persists the context around every `plan is None` return from
     `build_trade_plan_with_reason`. Feeds two downstream uses:
       1. Counter-factual pegger (legacy script removed 2026-04-26 with
-         the OKX cleanup; needs a Bybit-native rewrite) walks candles
+         the post-migration cleanup; needs a Bybit-native rewrite) walks candles
          forward N bars and stamps a hypothetical outcome — the
          counter-factual dataset that validates/invalidates our veto
          logic. Pre-migration rows still carry these stamps.
@@ -290,10 +290,10 @@ class RejectedSignal(BaseModel):
 
     # 2026-04-27 drops: hypothetical_outcome / hypothetical_bars_to_tp /
     # hypothetical_bars_to_sl. Counter-factual outcome stamping never ran
-    # on Bybit-era rows (peg script was deleted in OKX cleanup, no
-    # Bybit-native rewrite). Re-add as a triple if a Bybit-native peg
-    # script gets written. Pre-migration rows in archived DBs still
-    # carry these stamps from the OKX-era pegger.
+    # on Bybit-era rows (peg script was deleted in the post-migration
+    # cleanup, no Bybit-native rewrite). Re-add as a triple if a
+    # Bybit-native peg script gets written. Pre-migration rows in
+    # archived DBs still carry these stamps from the pre-migration pegger.
     #
     # Back-compat properties below return None so legacy callers
     # (scripts/analyze.py, scripts/tune_confluence.py) keep running

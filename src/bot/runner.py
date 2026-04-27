@@ -663,7 +663,7 @@ class BotContext:
     cex_okx_netflow_24h_usd: Optional[float] = None
     # 2026-04-22 — per-symbol most-recent-hour net CEX flow via
     # `/token/volume/{id}?granularity=1h`. JSON-encoded dict of
-    # {OKX_symbol: usd_netflow_float}. Refreshed on its own cadence
+    # {internal_symbol: usd_netflow_float}. Refreshed on its own cadence
     # (token_volume_refresh_s, default 3600). Journal-only.
     token_volume_1h_net_usd_json: Optional[str] = None
     last_token_volume_ts: float = 0.0

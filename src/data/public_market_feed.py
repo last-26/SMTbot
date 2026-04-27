@@ -3,8 +3,8 @@
 Used by the demo-wick artefact cross-check (Katman 2). When the bot closes a
 trade, we fetch the concurrent 1m candle from Binance USD-M futures and
 check whether entry/exit prices actually sat inside that candle's [low,
-high] band. A hit outside the real-market range strongly suggests an
-OKX demo-book wick that never happened on a real exchange — which if
+high] band. A hit outside the real-market range strongly suggests a
+demo-book wick that never happened on a real exchange — which if
 unflagged would poison RL training data with artefact outcomes.
 
 Non-blocking failure: every method returns None (never raises) when the
@@ -145,7 +145,7 @@ def price_inside_candle(
     """Is `price` inside `[candle.low, candle.high]` modulo tolerance?
 
     `tolerance_pct` (fraction, e.g. 0.0005 = 5bps) widens the band on both
-    sides to tolerate Binance-vs-OKX microstructure differences (funding
+    sides to tolerate Binance-vs-Bybit microstructure differences (funding
     snapshot, quoting jitter). A 0.05% default catches blatant demo wicks
     without flagging routine cross-exchange skew.
     """

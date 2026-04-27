@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
-# All five bot-traded perps (OKX-style internal symbol format kept after
+# All five bot-traded perps (internal canonical symbol format kept after
 # the 2026-04-25 Bybit migration; bybit_client.py translates at the API
 # boundary). Stablecoin whale events shock the whole market (USDT/USDC
 # moving in size → possible CEX buy/sell pressure across every quote-

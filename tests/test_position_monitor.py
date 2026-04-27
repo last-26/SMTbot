@@ -1,12 +1,12 @@
 """Tests for src.execution.position_monitor — poll → CloseFill events.
 
 Scope: core position lifecycle (register → poll → close-detection). Earlier
-revisions of this file also covered the OKX-era OCO algo mechanic
+revisions of this file also covered the pre-migration OCO algo mechanic
 (`cancel_algo` + `place_oco_algo` for SL-to-BE / MFE-lock / TP revise),
 but on Bybit V5 those are single `set_position_tpsl` trading-stop calls
 on the position itself. The OCO test scaffolding was deleted in the
-2026-04-28 OKX test cleanup; new Bybit-V5-aware tests for the active
-behaviors (MFE-lock, dynamic TP revise) are pending separate work.
+2026-04-28 post-migration test cleanup; new Bybit-V5-aware tests for the
+active behaviors (MFE-lock, dynamic TP revise) are pending separate work.
 """
 
 from __future__ import annotations

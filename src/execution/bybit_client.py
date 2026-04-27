@@ -18,7 +18,7 @@ Bybit V5 architectural notes (vs the pre-migration wrapper):
     separate algo order to cancel/replace. The pre-migration
     `place_oco_algo` / `cancel_algo` / `list_pending_algos` surface
     was replaced by a single `set_position_tpsl()` method (the back-compat
-    shims were removed in the 2026-04-26 OKX cleanup, Phase 7).
+    shims were removed in the 2026-04-26 post-migration cleanup, Phase 7).
   - **Symbol format** is `BTCUSDT` (linear perp). Internally we still
     call the parameter `inst_id` to keep journal column names + dataclass
     field names stable across the migration; the value is just a Bybit
@@ -181,9 +181,9 @@ def _install_dns_pin(session: Any, host: str, ip: str) -> None:
 # every runner / config / journal / test site uses. We translate to
 # Bybit-native (`BTCUSDT`) at the API boundary so the rest of the codebase
 # doesn't need to know which exchange backs it. The format originated with
-# the OKX-era execution layer; it survived the 2026-04-25 migration as
-# canonical because mass-renaming ~50 files + journal rows would dwarf the
-# value of the rename.
+# the pre-migration execution layer; it survived the 2026-04-25 Bybit
+# migration as canonical because mass-renaming ~50 files + journal rows
+# would dwarf the value of the rename.
 _INTERNAL_TO_BYBIT_SYMBOL = {
     "BTC-USDT-SWAP": "BTCUSDT",
     "ETH-USDT-SWAP": "ETHUSDT",
