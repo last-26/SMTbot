@@ -89,25 +89,9 @@ trading:
     ADA-USDT-SWAP: 30   # thin 3m book, match DOGE/XRP
   # Multi-pair settle budgets — wait after set_symbol / set_timeframe so
   # the heavy SMT Overlay Pine has time to recompute before we read.
-  # 2026-04-27 — symbol_settle dropped 6.0 → 0.1: the immediately-following
-  # HTF _switch_timeframe already runs tf_settle (3.5s) + _wait_for_pine_settle
-  # polling, which observes Pine re-rendering for BOTH the new symbol AND the
-  # new TF in a single window. Standalone 6s symbol_settle was duplicating
-  # that wait. Polling timeout (10s) is the safety net if combined transition
-  # takes longer.
-  symbol_settle_seconds: 0.1
-  # 2026-04-27 — tf_settle 3.5 → 0.1 + pine_settle_max_wait 10 → 14 after
-  # empirical CDP probe (probe_settle.mjs in tradingview-mcp/) measured Pine
-  # full-render time as 5.1s (15→1) to 11.4s (1→3 worst case). The static
-  # sleep was wasted: _wait_for_pine_settle polling already detects Pine
-  # ready via last_bar flip and is fully ADAPTIVE — fast loads return in
-  # ~300ms, slow loads wait up to max_wait. The static window only delayed
-  # the start of polling. Trimmed to 0.1s (event-loop tick buffer); polling
-  # is the single source of truth for "Pine yenilendi" detection. Widened
-  # max_wait to 14s so the 1m→3m worst case (11.4s) no longer trips
-  # tf_settle_timeout. Tasarruf hızlı senaryolarda ~3s/switch.
-  tf_settle_seconds: 0.1
-  pine_settle_max_wait_s: 14.0
+  symbol_settle_seconds: 6.0
+  tf_settle_seconds: 3.5
+  pine_settle_max_wait_s: 10.0
   pine_settle_poll_interval_s: 0.3
   # Post-flip grace — _wait_for_pine_settle only watches Signals.last_bar,
   # but Oscillator can lag a beat (worst on 1m, where last_bar ticks every
