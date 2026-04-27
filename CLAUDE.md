@@ -26,6 +26,75 @@ AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT lin
 
 ## Changelog
 
+### 2026-04-27 — TF settle config tuned from empirical CDP probe
+
+Operatör per-cycle yavaşlığı işaret etti (5 sembol cycle ~210s, 3m bar
+bütçesinin 30s üstünde). CDP polling trace doğruladı: her sembol için
+3 set_timeframe çağrısı yapılıyor (HTF=15m → LTF=1m → Entry=3m), pattern
+sabit; "5'inci değişim" optik yanılsama (sonraki sembolün ilk HTF switch'i,
+chart sembol etiketi değişmiş ama TF kalmış olarak görünür).
+
+**Empirik ölçüm** (`tradingview-mcp/probe_settle.mjs`, persistent CDP, 100ms
+polling, Pine SMT Signals tablosundan `last_bar` izleme):
+
+| Geçiş | API call | Pine fully-rendered | Stable |
+|---|---:|---:|---:|
+| set_timeframe 15→1 | 1.5s | 5.1s | 5.2s |
+| set_timeframe 1→3 | 1.7s | **11.4s** ⚠️ | 11.4s |
+| set_symbol → BTC/ETH/SOL | **10.5s blocking** | — | — |
+
+**Çıkarımlar:**
+- `setSymbol` chart.js içinde 10.5s blocking — bot bunu kaçınılmaz await
+  ediyor. Önceki `symbol_settle_seconds: 6.0` ek bekleme bu 10.5s'in
+  alt-kümesinde duplicate'ti, hiçbir koruma sağlamıyordu. Önceki commitle
+  0.1'e düşürülmüştü; doğru karar empirically confirmed.
+- `tf_settle_seconds: 3.5` static sleep'i `_wait_for_pine_settle` polling
+  başlamadan önce gereksiz duplicate bekleme yaratıyordu. Polling zaten
+  `last_bar` flip ile Pine ready'liğini detect eder ve **tam adaptif**:
+  hızlı yüklemelerde ~300ms'de döner, yavaş yüklemelerde max_wait'e kadar
+  bekler. Static window sadece polling'in başlamasını geciktiriyordu.
+- `pine_settle_max_wait_s: 10` worst case (1m→3m, 11.4s) altında kalıyordu;
+  `tf_settle_timeout` skip oranı yükseltiyordu.
+
+**Uygulanan değişiklikler** ([config/default.yaml](config/default.yaml)):
+
+| Knob | Önce | Sonra | Niye |
+|---|---:|---:|---|
+| `symbol_settle_seconds` | 0.1 | 0.1 ✓ | setSymbol kendisi 10.5s blocking, ekstra bekleme gereksiz |
+| `tf_settle_seconds` | 3.5 | **0.1** | Polling tam adaptif — static sleep sadece event-loop tick buffer'ı; Pine ready detection polling'e devredildi |
+| `pine_settle_max_wait_s` | 10.0 | **14.0** | Worst-case 11.4s + emniyet marjı |
+| `pine_post_settle_grace_s` | 1.0 | 1.0 ✓ | Oscillator catch-up, doğru ayar |
+
+**Tasarruf**: hızlı senaryolarda ~3s/switch, 5 sembol × 3 switch ≈ **45s/cycle**.
+Yavaş senaryolarda fark yok (polling worst case'i bekler). Cycle 210s →
+**adaptif ~165-200s** aralığı, Pine yenileme hızına göre.
+
+**Per-TF static override değil, polling-adaptive yaklaşım**: 1m + 15m
+geçişlerinin 3m'den daha yavaş gözlendiği bir an düşünüldü; ancak
+polling zaten "veri geldiğinde otomatik geç" semantiğini sağladığı için
+manuel per-TF static buffer gereksiz. Hızlı yenilenen TF cycle'larda
+boşa beklemiyoruz; yavaş yenilenenlerde polling (max 14s) buna izin
+veriyor. Bu yaklaşım tüm geçişler için **veriye göre adaptif**,
+"erken/geç" senaryolarda manuel tuning gerektirmiyor.
+
+**Veri güvenliği**: değişmedi. Polling logic + grace window aynı → Pine
+fully-rendered noktası her durumda yakalanır. Sadece kritik olmayan
+static sleep azaldı, polling penceresi genişledi (data → DB write
+sırasında veri kayıp riski sıfır).
+
+**Probe script** repo'da değil — `tradingview-mcp/probe_settle.mjs`
+(diagnostic, geçici). İleride benzer ölçüm gerekirse referans için tutuldu.
+
+**Re-eval triggers:**
+1. **`tf_settle_timeout` log frequency** — yeni config altında 14s timeout'a
+   girme oranı %1'in üstüne çıkarsa Pine yenilemesi 11.4s tahmin edilenden
+   daha uzun süreli — `pine_settle_max_wait_s` 18'e bumb edilebilir.
+2. **`htf_settle_timeout` / `entry_settle_timeout`** — aynı semantik;
+   sembolün cycle'ı skip edilirse veri kaybı yok ama performans düşer.
+3. **Cycle süresi sürprizi** — yeni cycle ≥ 200s olursa yeniden ölç,
+   başka bir bottleneck (Coinalyze/Arkham fetch latency, journal write
+   contention) öne çıkmış olabilir.
+
 ### 2026-04-27 — Counter-confluence open-position protection (Mekanizma 2)
 
 Companion to the pending confluence-decay early-cancel that landed
