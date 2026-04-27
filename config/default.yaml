@@ -277,6 +277,19 @@ analysis:
     derivatives_capitulation: 0.6
     derivatives_heatmap_target: 0.5
     session_filter: 0.25
+    # 2026-04-28 — scalp-confirmation soft factors. 1m EMA21-55 ribbon
+    # bias + 1m MSS direction. Both fire when the 1m signal aligns with
+    # the proposed trade direction — small bonuses (0.25 each) so a
+    # 3.75 confluence threshold setup with both 1m signals aligned
+    # picks up an extra +0.5 scalp vote without dominating the score.
+    # Source: LTFState (vmc_ribbon, last_mss) — no extra TV round-trip.
+    ltf_ribbon_alignment: 0.25
+    ltf_mss_alignment: 0.25
+    # 2026-04-28 — 15m MSS journal-only by default. Operator wants the
+    # 15m last_mss CAPTURED in `confluence_factors` so Pass 3 GBT can
+    # train on it; weight 0 keeps it out of live scoring. Flip to 0.25
+    # if Pass 3 importance shows a lift (matches the 1m MSS weight).
+    htf_mss_alignment: 0.0
   # Example override block (uncomment + edit to hand-tune before Phase 7 RL):
   # confluence_weights:
   #   htf_trend_alignment: 0.75

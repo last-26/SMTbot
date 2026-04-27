@@ -30,6 +30,11 @@ class LTFState:
     oscillator numerics (wt1/wt2/rsi_mfi/stoch_k/d/momentum/divergence
     flags) at entry / pending-placement time for Pass 2 GBT features.
 
+    2026-04-28 added `vmc_ribbon` + `last_mss` for the new scalp-
+    confirmation soft factors `ltf_ribbon_alignment` and
+    `ltf_mss_alignment`. Both come straight from the 1m SignalTable
+    that the LTFReader already fetches — zero extra TV round-trip.
+
     `oscillator` is Optional to preserve backward compatibility with
     existing LTFState constructors in tests — legacy callers see no
     change, new callers attach the full snapshot.
@@ -44,6 +49,11 @@ class LTFState:
     last_signal_bars_ago: int
     trend: Direction         # BULLISH / BEARISH / RANGING — heuristic
     oscillator: Optional[OscillatorTableData] = None
+    # 2026-04-28 — 1m EMA ribbon bias (EMA21 vs EMA55 alignment) and
+    # 1m last MSS direction prefix. Both default empty so legacy LTFState
+    # constructors (older tests) keep working without changes.
+    vmc_ribbon: str = ""        # "BULLISH" / "BEARISH" / ""
+    last_mss: Optional[str] = None  # "BULLISH@..." / "BEARISH@..." / None
 
 
 def _trend_from_oscillator(wt_state: str, rsi: float) -> Direction:
@@ -91,4 +101,8 @@ class LTFReader:
             # Defensive-close logic only reads the flat fields above; this
             # attachment is additive and never mutates.
             oscillator=osc.model_copy(deep=True),
+            # 2026-04-28 — 1m EMA ribbon + 1m MSS for scalp confirmation
+            # soft factors. Same MarketState already in hand, no extra read.
+            vmc_ribbon=sig.vmc_ribbon or "",
+            last_mss=sig.last_mss,
         )

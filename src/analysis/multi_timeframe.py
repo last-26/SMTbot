@@ -84,6 +84,20 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "vmc_ribbon": 0.5,
     "session_filter": 0.25,
     "ltf_momentum_alignment": 0.75,
+    # 2026-04-28 — scalp-confirmation soft factors using existing 1m
+    # SignalTable data already fetched by LTFReader. Both fire when the
+    # 1m signal aligns with the proposed trade direction — small bonuses
+    # designed to add scalp-vote without disturbing the main pillar
+    # weights or the min_confluence_score threshold.
+    "ltf_ribbon_alignment": 0.25,   # 1m EMA21-55 ribbon bias (vmc_ribbon)
+    "ltf_mss_alignment": 0.25,      # 1m last MSS direction prefix
+    # 2026-04-28 — 15m MSS journal-only by default (weight=0.0). Operator
+    # asked for the 15m last_mss to be CAPTURED in the journal so Pass 3
+    # GBT can train on it; active scoring weight is opt-in. The factor
+    # still appears in `factors` list with weight 0 → name lands in
+    # `confluence_factors` JSON column → Pass 3 sees it as a binary
+    # feature. Flip to 0.25 in YAML if Pass 3 importance shows lift.
+    "htf_mss_alignment": 0.0,
     # Derivatives (Phase 1.5 Madde 6) — at most one of these three fires per
     # cycle; the elif chain in score_direction enforces that.
     "derivatives_contrarian": 0.7,
@@ -308,6 +322,7 @@ def score_direction(
     weights: Optional[dict[str, float]] = None,
     allowed_sessions: Optional[list[Session]] = None,
     ltf_state: Optional[object] = None,
+    htf_state: Optional[object] = None,
     min_rsi_mfi_magnitude: float = DEFAULT_MIN_RSI_MFI_MAGNITUDE,
     liquidity_pool_max_atr_dist: float = DEFAULT_LIQUIDITY_POOL_MAX_ATR_DIST,
     displacement_atr_mult: float = DEFAULT_DISPLACEMENT_ATR_MULT,
@@ -611,6 +626,53 @@ def score_direction(
                     detail=f"ltf_signal={sig_raw} bars_ago={bars_ago}",
                 ))
 
+        # 12.B 1m EMA ribbon alignment (vmc_ribbon = EMA21 vs EMA55 bias).
+        # Operator-driven scalp factor (2026-04-28). Fires when 1m EMA
+        # ribbon direction matches the proposed trade direction. Small
+        # bonus only — won't break the min_confluence_score threshold
+        # alone, but adds scalp-vote weight when ribbon + MSS + main
+        # pillars line up.
+        ribbon_dir = _parse_direction_prefix(getattr(ltf_state, "vmc_ribbon", ""))
+        if ribbon_dir == direction:
+            factors.append(ConfluenceFactor(
+                name="ltf_ribbon_alignment",
+                weight=w.get("ltf_ribbon_alignment", 0.0),
+                direction=direction,
+                detail=f"1m_ribbon={ltf_state.vmc_ribbon}",
+            ))
+
+        # 12.C 1m MSS alignment (last market structure shift on 1m).
+        # Pairs with `mss_alignment` (entry-TF MSS) — when both fire, the
+        # short-window structural shift confirms the entry-TF picture.
+        # Operator-driven scalp factor (2026-04-28).
+        mss_dir = _parse_direction_prefix(getattr(ltf_state, "last_mss", None))
+        if mss_dir == direction:
+            factors.append(ConfluenceFactor(
+                name="ltf_mss_alignment",
+                weight=w.get("ltf_mss_alignment", 0.0),
+                direction=direction,
+                detail=f"1m_mss={ltf_state.last_mss}",
+            ))
+
+    # 12.D 15m MSS alignment (HTF last MSS direction prefix).
+    # Operator-driven journal capture (2026-04-28). DEFAULT WEIGHT = 0.0
+    # — the factor lands in `confluence_factors` JSON for Pass 3 GBT to
+    # train on, but doesn't tilt the live confluence score. Flip the
+    # YAML weight to 0.25 if a future Pass 3 importance pass shows lift.
+    # Trio with `mss_alignment` (3m, entry-TF) + `ltf_mss_alignment` (1m)
+    # gives a complete multi-TF MSS picture for the model.
+    if htf_state is not None:
+        htf_sig = getattr(htf_state, "signal_table", None)
+        htf_mss_raw = getattr(htf_sig, "last_mss", None) if htf_sig else None
+        htf_mss_dir = _parse_direction_prefix(htf_mss_raw)
+        if htf_mss_dir == direction:
+            factors.append(ConfluenceFactor(
+                name="htf_mss_alignment",
+                weight=w.get("htf_mss_alignment", 0.0),
+                direction=direction,
+                detail=f"15m_mss={htf_mss_raw}",
+            ))
+
     # 12.5 Multi-TF VWAP alignment.
     #
     # Two factor families fire here:
@@ -714,6 +776,7 @@ def calculate_confluence(
     weights: Optional[dict[str, float]] = None,
     allowed_sessions: Optional[list[Session]] = None,
     ltf_state: Optional[object] = None,
+    htf_state: Optional[object] = None,
     min_rsi_mfi_magnitude: float = DEFAULT_MIN_RSI_MFI_MAGNITUDE,
     liquidity_pool_max_atr_dist: float = DEFAULT_LIQUIDITY_POOL_MAX_ATR_DIST,
     displacement_atr_mult: float = DEFAULT_DISPLACEMENT_ATR_MULT,
@@ -751,6 +814,7 @@ def calculate_confluence(
         order_blocks=order_blocks, sr_zones=sr_zones,
         weights=weights, allowed_sessions=allowed_sessions,
         ltf_state=ltf_state,
+        htf_state=htf_state,
         min_rsi_mfi_magnitude=min_rsi_mfi_magnitude,
         liquidity_pool_max_atr_dist=liquidity_pool_max_atr_dist,
         displacement_atr_mult=displacement_atr_mult,
@@ -767,6 +831,7 @@ def calculate_confluence(
         order_blocks=order_blocks, sr_zones=sr_zones,
         weights=weights, allowed_sessions=allowed_sessions,
         ltf_state=ltf_state,
+        htf_state=htf_state,
         min_rsi_mfi_magnitude=min_rsi_mfi_magnitude,
         liquidity_pool_max_atr_dist=liquidity_pool_max_atr_dist,
         displacement_atr_mult=displacement_atr_mult,
