@@ -56,14 +56,21 @@ trading:
   # most wins wicked TP3 and reversed before the OCO market-trigger could
   # fill (maker-TP helps but 3R TP is still far from 2R MFE-lock). 1:2 RR
   # brings TP closer to the typical post-zone-fill momentum envelope.
-  default_rr_ratio: 2.0
+  # 2026-04-28: 2.0 → 1.5 paired with per-symbol SL-floor tighten (-25%).
+  # Scalp-native pivot — faster TP resolution at the cost of higher
+  # breakeven WR (33% → 40%). MUST stay in lockstep with
+  # execution.target_rr_ratio (test_default_yaml_runner_tp_is_hard_1_2
+  # guards this).
+  default_rr_ratio: 1.5
   # 2026-04-18: lowered 2.0 → 1.5 to ease `htf_tp_ceiling` rejections on 15m
   # HTF. With buffer=0.2×ATR the clipped-TP RR often lands 1.6-1.9 on
   # DOGE/SOL/XRP — legitimate setups that still clear 2× round-trip fees +
   # slippage. 15m HTF is not a "major" TF; VWAP (1m/3m/15m) already filters
   # direction. Consider raising back to 2.0 if TP1 hit rate < 40% on clipped
   # plans post-Sprint-3.
-  min_rr_ratio: 1.5
+  # 2026-04-28: 1.5 → 1.2 because default_rr_ratio dropped to 1.5; min_rr
+  # must stay below the hard cap so HTF-clipped plans still clear the gate.
+  min_rr_ratio: 1.2
   max_concurrent_positions: 5
   contract_size: 0.01
   # Operator-side per-symbol leverage caps (on top of Bybit instrument caps).
@@ -197,16 +204,23 @@ analysis:
   # harder to trigger at the wider absolute price distance. zone_timeout_cancel
   # rejects also spiked 3.7× (14→52) because widened zone edges missed fills.
   # Reverted values = Pass 1 profile that produced +13.46R over 42 trades.
-  # R=$100 stays flat; fee-aware ceil sizer widens notional back (risk/sl_pct).
-  # See CLAUDE.md 2026-04-24 changelog entry for full postmortem.
+  #
+  # 2026-04-28 SCALP TIGHTEN: reduced ~25% across the board paired with a
+  # simultaneous RR cut (target_rr_ratio 2.0 → 1.5) to keep 1:RR mechanics
+  # symmetric. Tighter SL → tighter TP → faster TP/SL resolution → more
+  # data per unit time, scalp-native trade-shape profile. Breakeven WR at
+  # 1.5 RR = 40% (was 33% at 1:2). Tradeoff: more wick stop-outs vs faster
+  # cycles. Re-eval after 20 closed trades — if WR <40%, revert this block
+  # AND target_rr_ratio together. NEVER tighten SL without lowering RR
+  # (2026-04-23 confirmed asymmetric tightening at fixed RR is destructive).
   min_sl_distance_pct_per_symbol:
-    BTC-USDT-SWAP: 0.004    # 2026-04-24 REVERT from 0.006 (Pass 2 bump backfired)
-    ETH-USDT-SWAP: 0.008    # 2026-04-24 REVERT from 0.010 (keeps the 2026-04-21 eve level: 0.006→0.008 then)
-    SOL-USDT-SWAP: 0.010    # 2026-04-24 REVERT from 0.012
-    DOGE-USDT-SWAP: 0.008   # 2026-04-24 REVERT from 0.010
-    XRP-USDT-SWAP: 0.008    # parallel revert (symbol not watched; consistent with DOGE profile)
-    ADA-USDT-SWAP: 0.008    # parallel revert (symbol not watched)
-    BNB-USDT-SWAP: 0.005    # 2026-04-24 REVERT from 0.007; back to global-default parity
+    BTC-USDT-SWAP: 0.003    # 2026-04-28 0.004 → 0.003 (scalp tighten)
+    ETH-USDT-SWAP: 0.006    # 2026-04-28 0.008 → 0.006 (scalp tighten)
+    SOL-USDT-SWAP: 0.008    # 2026-04-28 0.010 → 0.008 (scalp tighten)
+    DOGE-USDT-SWAP: 0.006   # 2026-04-28 0.008 → 0.006 (scalp tighten)
+    XRP-USDT-SWAP: 0.006    # 2026-04-28 0.008 → 0.006 (scalp tighten)
+    ADA-USDT-SWAP: 0.006    # parallel tighten (symbol not watched)
+    BNB-USDT-SWAP: 0.004    # 2026-04-28 0.005 → 0.004 (scalp tighten)
   # Confluence weight overrides — empty = DEFAULT_WEIGHTS from
   # src/analysis/multi_timeframe.py (Moderate rebalance baseline below is
   # already baked into code). Only keys set here override; others stay at
@@ -440,10 +454,20 @@ execution:
   # reject list). When `false`, missing-zone signals fall back to the
   # legacy market-order path (hybrid mode — not what CLAUDE.md describes).
   zone_require_setup: true
-  zone_max_wait_bars: 7
+  # 2026-04-28: 7 → 2 (~6 dk on 3m TF). Operator request — 3m VWAP drifts
+  # cycle-to-cycle, a stale 21-min pending fills into a confluence picture
+  # that may have decayed. Hard-gate invalidation already runs every cycle
+  # (vwap_misaligned / ema_momentum_contra / cross_asset_opposition); this
+  # change adds a tight time-budget on top so soft drift can't be bypassed
+  # via "zone still technically holds" inertia. If a setup is still valid
+  # at +6 min, the next cycle re-evaluates and places fresh. Re-eval after
+  # 20 closed trades: zone_timeout_cancel rate <40% of total cancels = OK,
+  # >60% = window too tight, raise to 3 bars.
+  zone_max_wait_bars: 2
   zone_buffer_atr: 0.25
   zone_sl_buffer_atr: 0.5
-  zone_default_rr: 2.0
+  # 2026-04-28: 2.0 → 1.5 in lockstep with trading.default_rr_ratio.
+  zone_default_rr: 1.5
   # 2026-04-19 rebalance — zone-source priority is now
   # vwap_retest > ema21_pullback > fvg_entry > sweep_retest > liq_pool_near.
   # EMA21 pullback reuses analysis.ema_veto_{fast,slow}_period for the stack.
@@ -474,7 +498,10 @@ execution:
   # tp_price = entry ± target_rr_ratio × sl_distance and clamps every
   # ladder rung to that boundary. 0.0 = off (legacy heatmap-cluster TP).
   # 2026-04-21 (eve): 3.0 → 2.0 (operator tune, see trading.default_rr_ratio).
-  target_rr_ratio: 2.0
+  # 2026-04-28: 2.0 → 1.5 paired with per-symbol SL-floor tighten. See
+  # CLAUDE.md 2026-04-28 changelog entry; test_default_yaml_runner_tp_is_hard_1_2
+  # locks this against trading.default_rr_ratio.
+  target_rr_ratio: 1.5
 
   # Dynamic TP revision (live-data-driven). When true, the runner
   # periodically recomputes a fresh target from the live mark + the
@@ -489,7 +516,10 @@ execution:
   # Under 1:2, a 1.5R floor would bind on almost every revise attempt
   # (mark drift past entry on a 2R target routinely leaves <1.5R headroom).
   # 1.0R floor keeps revise active under the tighter ceiling.
-  tp_min_rr_floor: 1.0
+  # 2026-04-28: 1.0 → 0.7 paired with target_rr_ratio drop 2.0 → 1.5. Same
+  # logic — under 1:1.5, a 1.0R floor would bind once mark drifts >0.5R
+  # favorably. 0.7R keeps dynamic TP revision active under the new ceiling.
+  tp_min_rr_floor: 0.7
   tp_revise_min_delta_atr: 0.5
   tp_revise_cooldown_s: 30.0
 
@@ -505,8 +535,12 @@ execution:
   # coincided with the 2R TP — lock would never fire before TP. 1.3R ≈ 65%
   # of the 2R TP, preserving the "almost-win → risk-free" design intent
   # (old proportion was 2R / 3R = 67%).
+  # 2026-04-28: 1.3 → 1.0 paired with target_rr_ratio drop 2.0 → 1.5. Under
+  # 1:1.5, a 1.3R MFE sits 87% of the way to TP — lock would rarely fire
+  # before TP. 1.0R = 67% of the 1.5R TP, preserves the original design
+  # proportion (2R / 3R = 67%, 1.3R / 2R = 65%, 1.0R / 1.5R = 67%).
   sl_lock_enabled: true
-  sl_lock_mfe_r: 1.3
+  sl_lock_mfe_r: 1.0
   sl_lock_at_r: 0.0
 
   # 2026-04-19 — Position-attached TP/SL trigger price source. "mark" uses
