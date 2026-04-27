@@ -26,6 +26,33 @@ AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT lin
 
 ## Changelog
 
+### 2026-04-27 (night) — `pending_confluence_decay_cycles` 2 → 3
+
+Operator-flagged: ~9 saatlik trade-açılmama session'ında log audit
+showed **30% decay-cancel rate** on pending invalidations (12 of ~40
+total cancels), CLAUDE.md re-eval trigger #2 said >25% sustained =
+mechanism too sensitive. Recovery flicker also high (~50% — borderline
+shorts oscillating in the 3.45-3.70 band, threshold 3.75). Market
+context: post-04-27-morning long cluster stop-out, bot kept trying
+SHORT into a recovery rally; pending'ler ya skor borderline'da
+decay-cancel'a takıldı, ya rally'de fill etmedi (timeout), ya da
+EMA momentum flipliyordu.
+
+**Fix:** `analysis.pending_confluence_decay_cycles: 2 → 3` in
+[config/default.yaml](config/default.yaml). Hysteresis ~6 → ~9 min on
+3m TF. One more recovery cycle absorbs flicker before cancel; trigger
+matrix becomes 3-consecutive-low instead of 2. Threshold (3.75 base
+`min_confluence_score`) unchanged — same knob still controls accept
+side. Counter-confluence protection (Mekanizma 2) untouched — its
+own audit showed only 1 SL-lock fired in the same window, behaving
+as designed.
+
+**Re-eval after operator restart + 30 closed trades:** decay-cancel
+rate target 5-15%. Still >25% = bump cycles to 4 OR investigate
+whether `min_confluence_score` itself drifted too high relative to
+current market regime. <2% over 50-cycle window = mechanism doing
+nothing, retreat to cycles=2.
+
 ### 2026-04-27 — Counter-confluence open-position protection (Mekanizma 2)
 
 Companion to the pending confluence-decay early-cancel that landed
