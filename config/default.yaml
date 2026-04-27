@@ -91,23 +91,14 @@ trading:
   # the heavy SMT Overlay Pine has time to recompute before we read.
   symbol_settle_seconds: 6.0
   tf_settle_seconds: 3.5
-  # 2026-04-27 — pine_settle_max_wait 10 → 16 to reduce tf_settle_timeout
-  # cycle skips. Empirical Pine full-render worst case 11.4s (1m→3m); old
-  # 10s timeout was tripping skip on slow transitions. 16s = ~40% margin
-  # over worst case. Operator preference: data quality > cycle speed.
-  pine_settle_max_wait_s: 16.0
+  pine_settle_max_wait_s: 10.0
   pine_settle_poll_interval_s: 0.3
   # Post-flip grace — _wait_for_pine_settle only watches Signals.last_bar,
   # but Oscillator can lag a beat (worst on 1m, where last_bar ticks every
-  # wall-clock minute regardless of full table re-render). 2026-04-27:
-  # bumped 1.0 → 3.0 after observing wt1=0.0 contamination on ~20% of
-  # rejected_signals rows; further to 5.0 after grace=3.0 still leaving
-  # ~4% contaminated rows in 10min sample. `OscillatorTableData()` empty
-  # default was getting stamped when Pine still hadn't rendered the
-  # Oscillator table by the time read_market_state() fired. Per-cycle
-  # cost +60s (5 sym × 3 TF × 4s extra over old 1.0) but data quality
-  # protected. Re-eval after 30min clean rows.
-  pine_post_settle_grace_s: 5.0
+  # wall-clock minute regardless of full table re-render). 1.0s = enough
+  # for the rest of the tables to catch up; per cycle cost ≈ 4s for 4 TF
+  # switches × 1 symbol, total ~12s for 3 pairs.
+  pine_post_settle_grace_s: 1.0
 
 circuit_breakers:
   # TEMPORARY 2026-04-18: all three breakers loosened pre-RL so the bot can
@@ -396,17 +387,13 @@ analysis:
   # cycles, the pending is canceled with reject reason
   # `pending_confluence_decay`.
   #
-  # cycles=3 (~9 min on 3m TF): three consecutive sub-threshold cycles
-  # confirm decay. Bumped 2026-04-27 night from 2 → 3 after a session
-  # showed 30% decay-cancel rate (CLAUDE.md re-eval trigger >25% =
-  # sensitive) with ~50% recovery flicker on borderline scores
-  # (3.45-3.70 range). cycles=2 (~6 min) was kovalıyordu borderline
-  # short pendings; cycles=3 lets one more recovery cycle absorb the
-  # noise before cancel. Set cycles=1 for instant cancel (no hysteresis,
+  # cycles=2 (~6 min on 3m TF): one-cycle dip can recover, two consecutive
+  # dips confirm decay. Lifts cancel decision well below the 21-min
+  # pending lifetime. Set cycles=1 for instant cancel (no hysteresis,
   # expect more flicker-induced cancels). Threshold mirrors
   # min_confluence_score above — entry-side parity, not a separate knob.
   pending_confluence_decay_enabled: true
-  pending_confluence_decay_cycles: 3
+  pending_confluence_decay_cycles: 2
 
 bybit:
   base_url: https://api-demo.bybit.com
