@@ -463,14 +463,17 @@ def apply_zone_to_plan(
     target_rr_cap: float = 0.0,
     vwap_long_anchor: float = 0.75,
     vwap_short_anchor: float = 0.25,
+    margin_balance: float = 0.0,
+    max_leverage: int = 0,
 ) -> TradePlan:
     """Return a new TradePlan with entry/SL/TP taken from *zone*, re-sized
-    so total USDT risk on the structural SL equals `plan.risk_amount_usdt`.
+    so total USDT risk on the structural SL equals `plan.max_risk_usdt`
+    (operator's intended target, not the post-ceil realized risk).
 
     Why re-size: the original plan was sized against the minimum-% SL
     floor. The zone's structural SL can be wider or narrower, so leaving
-    contracts unchanged would drift risk. Leverage + risk budget are
-    preserved; primary TP is overridden with the zone's target, and
+    contracts unchanged would drift risk. Risk budget is preserved off
+    `max_risk_usdt`; primary TP is overridden with the zone's target, and
     `tp_ladder` carries the full partial-TP ladder for downstream
     consumption.
 
@@ -490,6 +493,16 @@ def apply_zone_to_plan(
     log showed "$300 SL → $3600 TP"). When `target_rr_cap > 0` the
     primary TP becomes exactly ``entry ± cap × sl_distance`` — clusters
     no longer override the RR contract.
+
+    `margin_balance` + `max_leverage` (added 2026-04-28): when both >0
+    the function recomputes leverage from the new SL using the same
+    `min_lev_for_margin` + `liq_safe_leverage` logic as
+    `rr_system.size_position_with_caps`. This is required because a tight
+    zone SL grows the notional needed to hit `max_risk_usdt`, and the
+    original plan's leverage (sized against a wide structural SL) would
+    leave Bybit short on initial margin (110007 "ab not enough"). When
+    either is 0 the function falls back to `plan.leverage` for
+    back-compat with test fixtures.
     """
     if plan.direction != zone.direction:
         raise ValueError(
@@ -522,23 +535,79 @@ def apply_zone_to_plan(
     new_sl_pct = new_sl_distance / new_entry
     # Mirror rr_system's 2026-04-19 ceil-sizing contract here: when the
     # original plan was ceil-sized (not capped), re-size with ceil so the
-    # zone-adjusted realized loss stays ≥ plan.risk_amount_usdt with
+    # zone-adjusted realized loss stays ≥ plan.max_risk_usdt with
     # bounded overshoot (< one per_contract_cost). Capped plans keep
     # floor — respecting the leverage/margin ceiling wins over the
     # equal-risk target. Without this mirror, zone entries floor-rounded
     # while market/legacy entries ceiled, producing the $2-$13 $R spread
     # the operator observed across the 5 open positions on 2026-04-20.
-    risk = plan.risk_amount_usdt
+    #
+    # Risk target = plan.max_risk_usdt (operator's intent), NOT
+    # plan.risk_amount_usdt (post-ceil REALIZED risk on the wider
+    # structural SL). When a wide structural SL ceils to overshoot the
+    # target (e.g. DOGE 8.7% SL → ceil(10/8.69)=2 contracts → realized
+    # $17.36 vs target $10), reading risk_amount_usdt would re-target
+    # the inflated $17.36 against the now-tighter zone SL, multiplying
+    # contracts (2026-04-28: DOGE 26 contracts → 110007 insufficient
+    # margin every cycle). max_risk_usdt is invariant across SL changes.
+    risk = plan.max_risk_usdt
     denom = new_sl_pct + plan.fee_reserve_pct
     per_contract_usdt = new_entry * contract_size
     per_contract_cost = denom * per_contract_usdt
+    # Recompute leverage from the new SL when caller threaded margin +
+    # max_leverage. Tight zone SL → larger notional for fixed risk →
+    # higher leverage required to fit inside the per-slot margin budget.
+    # Mirror rr_system.size_position_with_caps: liq-safety upper bound
+    # paired with margin-floor lower bound. effective_margin uses the
+    # _MARGIN_SAFETY=0.95 buffer (rr_system constant kept inline here to
+    # avoid a cross-module import).
+    new_leverage = plan.leverage
+    new_required_leverage = plan.required_leverage
+    new_capped = plan.capped
+    if margin_balance > 0 and max_leverage > 0 and new_sl_pct > 0:
+        margin_safety = 0.95
+        liq_safety_factor = 0.6
+        effective_margin = margin_balance
+        ideal_notional = (
+            risk / denom if denom > 0 else risk / new_sl_pct
+        )
+        new_required_leverage = ideal_notional / effective_margin
+        max_notional_cap = effective_margin * max_leverage * margin_safety
+        if ideal_notional > max_notional_cap:
+            chosen_notional = max_notional_cap
+            new_capped = True
+        else:
+            chosen_notional = ideal_notional
+            new_capped = False
+        min_lev_for_margin = max(
+            1, math.ceil(chosen_notional / (effective_margin * margin_safety))
+        )
+        liq_safe_leverage = max(
+            1, math.floor(liq_safety_factor / max(new_sl_pct, 1e-6))
+        )
+        new_leverage = min(max_leverage, liq_safe_leverage)
+        new_leverage = max(new_leverage, min_lev_for_margin, 1)
     if per_contract_cost <= 0 or per_contract_usdt <= 0:
         num_contracts = 0
-    elif plan.capped:
+    elif new_capped:
         notional = risk / denom if denom > 0 else risk / new_sl_pct
+        # Cap notional at the leverage/margin ceiling when recompute fired.
+        if margin_balance > 0 and max_leverage > 0:
+            cap = margin_balance * new_leverage * 0.95
+            notional = min(notional, cap)
         num_contracts = int(notional / per_contract_usdt)
     else:
         num_contracts = math.ceil(risk / per_contract_cost)
+        # Safety: ceil must not breach the leverage/margin ceiling. When
+        # the cap can't afford the ceiled count, fall back to floor on
+        # the cap (matches rr_system's `target > max_contracts_by_notional`
+        # branch).
+        if margin_balance > 0 and max_leverage > 0:
+            cap_notional = margin_balance * new_leverage * 0.95
+            max_contracts_by_notional = int(cap_notional / per_contract_usdt)
+            if num_contracts > max_contracts_by_notional:
+                num_contracts = max_contracts_by_notional
+                new_capped = True
     actual_notional = num_contracts * per_contract_usdt
     actual_risk = actual_notional * new_sl_pct
     tp_distance = abs(new_tp - new_entry)
@@ -566,12 +635,12 @@ def apply_zone_to_plan(
         sl_distance=new_sl_distance,
         sl_pct=new_sl_pct,
         position_size_usdt=actual_notional,
-        leverage=plan.leverage,
-        required_leverage=plan.required_leverage,
+        leverage=new_leverage,
+        required_leverage=new_required_leverage,
         num_contracts=num_contracts,
         risk_amount_usdt=actual_risk,
         max_risk_usdt=plan.max_risk_usdt,
-        capped=plan.capped,
+        capped=new_capped,
         fee_reserve_pct=plan.fee_reserve_pct,
         sl_source=f"zone_{zone.zone_source}",
         confluence_score=plan.confluence_score,

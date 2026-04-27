@@ -811,6 +811,111 @@ def test_apply_zone_to_plan_ceil_keeps_risk_at_or_above_target_uncapped():
     assert total_realized <= plan.risk_amount_usdt + per_contract_cost + 1e-6
 
 
+def test_apply_zone_to_plan_resizes_off_max_risk_not_realized_risk():
+    """2026-04-28 DOGE 110007 regression. When the original plan's
+    structural SL is far from entry (e.g. major support 8.7% below), ceil
+    sizing overshoots `max_risk_usdt`: a $10 target with 8.7% SL sizes to
+    2 contracts realising $17.36. Pre-fix, `apply_zone_to_plan` then
+    re-targeted that inflated $17.36 against the floor-widened zone SL
+    (0.6%), multiplying contracts ~14×. The fix grounds zone re-sizing
+    on `plan.max_risk_usdt` (operator's invariant target) so a tighter
+    zone SL re-sizes to a realistic count.
+    """
+    plan = TradePlan(
+        direction=Direction.BULLISH,
+        entry_price=0.0987, sl_price=0.0900, tp_price=0.1117,
+        rr_ratio=1.5, sl_distance=0.0087, sl_pct=0.0881,
+        position_size_usdt=197.4, leverage=6, required_leverage=1.17,
+        num_contracts=2,
+        risk_amount_usdt=17.36,         # post-ceil REALIZED, NOT the target
+        max_risk_usdt=10.0,             # operator's intended target
+        capped=False, fee_reserve_pct=0.001,
+    )
+    zone = ZoneSetup(
+        direction=Direction.BULLISH,
+        entry_zone=(0.0984, 0.0986),
+        trigger_type="zone_touch",
+        sl_beyond_zone=0.0982,          # ~0.4% sl_pct, below 0.6% floor
+        tp_primary=0.1010,
+        max_wait_bars=2,
+        zone_source="ema21_pullback",
+    )
+    new_plan = apply_zone_to_plan(
+        plan, zone, contract_size=1000.0,
+        min_sl_distance_pct=0.006,      # DOGE per-symbol floor
+        target_rr_cap=1.5,
+    )
+    # Realized risk on zone SL must track max_risk_usdt (10), not the
+    # inflated risk_amount_usdt (17.36). Pre-fix: ceil(17.36/0.689)=26
+    # contracts → realized ~$15.36. Post-fix: ceil(10/0.689)=15.
+    assert new_plan.num_contracts == 15
+    effective_sl_pct = new_plan.sl_pct + new_plan.fee_reserve_pct
+    realized = new_plan.position_size_usdt * effective_sl_pct
+    assert realized >= plan.max_risk_usdt - 1e-6
+    ctu = new_plan.entry_price * 1000.0
+    per_contract_cost = effective_sl_pct * ctu
+    assert realized <= plan.max_risk_usdt + per_contract_cost + 1e-6
+
+
+def test_apply_zone_to_plan_recomputes_leverage_when_margin_threaded():
+    """Zone tightens SL → notional grows for fixed risk → leverage must
+    grow to fit inside margin slot. Pre-fix, `apply_zone_to_plan` kept
+    `plan.leverage` (sized against the wide structural SL, e.g. 6x), so
+    the inflated zone notional left no room inside the per-slot margin
+    budget and Bybit returned 110007 every cycle for DOGE on a $97 slot.
+    """
+    plan = TradePlan(
+        direction=Direction.BULLISH,
+        entry_price=0.0987, sl_price=0.0900, tp_price=0.1117,
+        rr_ratio=1.5, sl_distance=0.0087, sl_pct=0.0881,
+        position_size_usdt=197.4, leverage=6, required_leverage=1.17,
+        num_contracts=2,
+        risk_amount_usdt=17.36,
+        max_risk_usdt=10.0,
+        capped=False, fee_reserve_pct=0.001,
+    )
+    zone = ZoneSetup(
+        direction=Direction.BULLISH,
+        entry_zone=(0.0984, 0.0986),
+        trigger_type="zone_touch",
+        sl_beyond_zone=0.0982,
+        tp_primary=0.1010,
+        max_wait_bars=2,
+        zone_source="ema21_pullback",
+    )
+    new_plan = apply_zone_to_plan(
+        plan, zone, contract_size=1000.0,
+        min_sl_distance_pct=0.006,
+        target_rr_cap=1.5,
+        margin_balance=97.0,
+        max_leverage=30,
+    )
+    # Notional fits inside margin × leverage × safety buffer.
+    margin_required = new_plan.position_size_usdt / new_plan.leverage
+    assert margin_required <= 97.0 * 0.95 + 1e-6
+    # Leverage scaled up from the original 6x.
+    assert new_plan.leverage > plan.leverage
+
+
+def test_apply_zone_to_plan_back_compat_keeps_plan_leverage_when_margin_zero():
+    """When `margin_balance=0` (default) or `max_leverage=0`, leverage
+    stays pinned to `plan.leverage` — preserves the pre-2026-04-28 contract
+    for test fixtures that don't thread margin/leverage caps.
+    """
+    plan = _plan()  # leverage=10, max_risk_usdt=50, fee_reserve_pct=0.001
+    zone = ZoneSetup(
+        direction=Direction.BULLISH,
+        entry_zone=(99.0, 99.5),
+        trigger_type="zone_touch",
+        sl_beyond_zone=98.5,
+        tp_primary=102.25,
+        max_wait_bars=10,
+        zone_source="vwap_retest",
+    )
+    new_plan = apply_zone_to_plan(plan, zone, contract_size=0.01)
+    assert new_plan.leverage == plan.leverage  # back-compat
+
+
 def test_apply_zone_to_plan_capped_plan_still_floors():
     """Capped plans (leverage/margin ceiling bound) keep the floor so the
     zone re-size never silently breaches the original leverage cap."""

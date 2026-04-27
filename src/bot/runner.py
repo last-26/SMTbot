@@ -588,6 +588,12 @@ class BotContext:
     contract_sizes: dict[str, float] = field(default_factory=dict)
     # Per-symbol Bybit max leverage (BTC/ETH=100, SOL=50). Above this trips 110086.
     max_leverage_per_symbol: dict[str, int] = field(default_factory=dict)
+    # Last per-slot margin (computed each `_run_one_symbol` cycle). Threaded
+    # into `apply_zone_to_plan` so zone re-sizing can recompute leverage off
+    # the same margin budget the original sizing saw — without this, a
+    # tight zone SL grows notional past the initial-margin ceiling and
+    # Bybit returns 110007 (DOGE 2026-04-28).
+    last_margin_balance: float = 0.0
     # Phase 7.A6 — cross-asset pillar bias snapshot. Updated each cycle from
     # BTC-USDT-SWAP and ETH-USDT-SWAP EMA stacks; consulted before altcoin
     # entries so trades against both pillars can be rejected.
@@ -2085,6 +2091,9 @@ class BotRunner:
         risk_balance = min(total_eq, self.ctx.risk_mgr.current_balance)
         margin_balance = min(per_slot, bybit_avail)
         sizing_balance = margin_balance  # retained for logging/back-compat
+        # Stash for zone re-sizing path (apply_zone_to_plan needs the same
+        # margin budget the original plan was sized against).
+        self.ctx.last_margin_balance = margin_balance
 
         # 2026-04-26 — auto-R mode. Resolve the per-trade $R override in
         # priority order:
@@ -3238,6 +3247,20 @@ class BotRunner:
 
         contract_size = self.ctx.contract_sizes.get(
             symbol, cfg.trading.contract_size)
+        # Margin + leverage cap thread-through (2026-04-28): zone re-sizing
+        # against a tighter SL needs to recompute leverage so the new
+        # notional fits inside the per-slot margin budget. Without this,
+        # a 8.7% structural SL → 0.6% zone SL transition multiplies
+        # required notional ~14× while leverage stays pinned to the
+        # original (low) value, blowing past Bybit's initial-margin
+        # check (110007). DOGE was the canonical surface case.
+        zone_max_leverage = min(
+            cfg.trading.max_leverage,
+            self.ctx.max_leverage_per_symbol.get(
+                symbol, cfg.trading.max_leverage),
+            cfg.trading.symbol_leverage_caps.get(
+                symbol, cfg.trading.max_leverage),
+        )
         try:
             zoned_plan = apply_zone_to_plan(
                 plan, zone, contract_size,
@@ -3245,6 +3268,8 @@ class BotRunner:
                 target_rr_cap=cfg.execution.target_rr_ratio,
                 vwap_long_anchor=cfg.analysis.vwap_zone_long_anchor,
                 vwap_short_anchor=cfg.analysis.vwap_zone_short_anchor,
+                margin_balance=self.ctx.last_margin_balance,
+                max_leverage=zone_max_leverage,
             )
         except Exception:
             logger.exception(
