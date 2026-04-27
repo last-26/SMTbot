@@ -26,6 +26,72 @@ AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT lin
 
 ## Changelog
 
+### 2026-04-27 (night, 23:27) — Mekanizma 1 + 2 SHIPPED then REVERTED same day
+
+Three protection-related commits (`cebe7db`, `b6a3be9`, `66dae2c`) shipped
+during the day, then fully reverted by operator decision after a ~9h
+post-Mekanizma-1 session showed the protection layer was the dominant
+cause of the trade-açılmama window:
+
+- **Mekanizma 1 — pending_confluence_decay early-cancel** (commit `cebe7db`,
+  reverted in `de91c0b`): every cycle re-scored the pending's confluence
+  via `score_direction()` and cancelled with `pending_confluence_decay` if
+  the score sat below `min_confluence_score` for N consecutive cycles
+  (default 2). Designed for the 04-27 morning long-cluster scenario where
+  confluence eroded after placement.
+- **Mekanizma 2 — counter-confluence open-position protection** (commit
+  `b6a3be9`, reverted in `f4a1c90`): on OPEN positions, when the COUNTER
+  direction's confluence + ≥2 hard gates flipped against the position for
+  3 consecutive cycles, dispatched MFE-aware action (BE+0.5R lock if
+  MFE>1R, BE+fee_buffer if MFE 0..1R, defensive close
+  `EARLY_CLOSE_COUNTER_CONFLUENCE` if MFE<0). STRONG_TREND aligned-direction
+  exemption.
+- **Cycles bump 2 → 3** (commit `66dae2c`, reverted in `958a964`):
+  partial mitigation after observing 30% decay-cancel rate; superseded by
+  full revert.
+
+**Observation that triggered revert:** session log audit between 13:23
+(last fill) and 22:29 (revert prep) showed:
+- 12 `confluence_decay` cancels of ~40 total pending cancels (30% — well
+  above CLAUDE.md re-eval trigger of >25% = mechanism too sensitive)
+- ~50% recovery flicker (streak hit 1 then reset before reaching threshold)
+- Borderline scores (3.45-3.70) oscillating just below the 3.75 threshold
+- Mekanizma 2 fired only 1 SL-lock the entire window (behaving as
+  designed but irrelevant — no trade survived to need it)
+
+**Post-revert state:**
+- Pending invalidation = original 3 hard vetoes
+  (`vwap_misaligned` / `ema_momentum_contra` /
+  `cross_asset_opposition`) + `vwap_reset_blackout`. No confluence rescore.
+- Open-position protection = MFE-lock at 1.3R only (Option A,
+  2026-04-20). The 0..1.3R band is again unprotected.
+- `pending_confluence_decay` reject_reason no longer emitted.
+  `EARLY_CLOSE_COUNTER_CONFLUENCE` close_reason no longer emitted.
+- Tests removed: `tests/test_runner_counter_confluence_protection.py`.
+  `tests/test_runner_zone_entry.py` lost its 5 decay-related cases.
+- Schema unchanged (no DB columns added by either mechanism, so no
+  rollback migration needed).
+
+**Original problem still open:** the 04-27 morning long-cluster
+stop-out (5 BULLISH positions stopped within 4h) remains unaddressed.
+The structural lesson: post-placement / post-entry protection on a
+borderline confluence threshold is too noisy. Future fixes should
+target the **entry side** — pre-entry filter for top/bottom proximity,
+P/D re-add as soft factor (already on roadmap), HTF distance penalty
+— rather than letting a borderline entry through and then trying to
+abort it.
+
+**Re-enable conditions (bar for re-introduction):**
+- Pre-entry filter alone proves insufficient on a future cluster
+  scenario, AND
+- Pass 3 GBT counter-factual replay on the post-restart Bybit dataset
+  shows a decay/counter-confluence mechanism would have improved EV, AND
+- The proposed re-introduction decouples its threshold from the entry-
+  side `min_confluence_score` (e.g. lower base + longer hysteresis),
+  to avoid coupling pending-defense sensitivity to entry-accept tuning.
+
+Until then, hard-gate-only invalidation + MFE-lock is the contract.
+
 ### 2026-04-27 — `cancel_pending` race fix (F6) — get_order verify on gone-code
 
 Pendant of the SOL short phantom-cancel data repair (entry below).
