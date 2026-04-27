@@ -26,6 +26,139 @@ AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT lin
 
 ## Changelog
 
+### 2026-04-27 — Pending confluence-decay early-cancel (operator-driven)
+
+Operator flagged the 04-27 morning long-cluster stop-out (5 BULLISH
+positions opened 08:11-08:15 across BTC/ETH/SOL/DOGE/XRP, all
+`vwap_retest`/`ema21_pullback` zone setups, BTC ~79.5k peak; long
+liquidation cascade stopped 4 of 5 within 4 hours). Confluence at
+placement was strong (4.7-7.3) but the **position** was the problem:
+multi-symbol confluence aligned on the same direction (every gate
+green) gave no concentration brake. Cross-asset veto only catches
+**opposing**-direction misalignment, not aggregate-direction
+crowding from a top.
+
+The narrower symptom that this commit addresses: the existing
+`evaluate_pending_invalidation_gates` re-evaluates only the **3 hard
+vetoes** (`vwap_misaligned` / `ema_momentum_contra` /
+`cross_asset_opposition`) + `vwap_reset_blackout` per cycle. Soft
+pillar decay + Arkham penalty drift do NOT trip gate flips, so a
+pending placed at confluence 4.0 can sit for 21 minutes and fill at
+confluence 3.0 if hard gates haven't crossed. The 04-27 cluster
+fits this pattern: by 08:11-08:15 hard gates were still passing
+but the underlying setup quality had eroded.
+
+**Fix:** new `pending_confluence_decay` cancel path. Each cycle's
+pending re-evaluation now (1) runs the existing hard-gate check,
+(2) if all gates are clean, calls `score_direction()` for the
+pending's stamped `meta.plan.direction` and compares the rescored
+confluence to `cfg.analysis.min_confluence_score`. Sub-threshold
+result increments `PendingSetupMeta.low_confluence_streak`;
+recovery resets it to 0. When the streak reaches
+`pending_confluence_decay_cycles` (default 2 = ~6 min hysteresis
+on 3m TF), the pending is cancelled with cancel-reason
+`confluence_decay:<score>`, mapped to journal reject reason
+`pending_confluence_decay`.
+
+**Why hysteresis:** the docstring on
+`evaluate_pending_invalidation_gates` correctly noted that pullback
+strategies see natural confluence fluctuation while waiting, which
+is why confluence rescore was originally NOT in the hard-gate
+loop. The hysteresis directly addresses that concern: a single
+sub-threshold cycle could be flicker (oscillator bar-mid noise,
+Arkham penalty 5-min refresh boundary, etc.) and recovers; two
+ardarda confirms a real decay. Default 2 cycles ≈ 6 min on 3m
+TF, materially below the 21-min pending lifetime, well above
+single-cycle noise.
+
+**Threshold parity:** decay uses the BASE `min_confluence_score`
+(currently 3.75), not the Arkham-modifier-adjusted `effective_min_conf`.
+Rationale: the modifier/penalty axis fluctuates on a 5-min daily-bundle
+cadence orthogonal to the confluence flow; coupling them would let an
+Arkham refresh boundary trip a cancel even when the underlying setup
+is fine. Pure-base comparison is more predictable and operator-
+controllable. Pass 3 GBT can later evaluate whether penalty-aware
+rescoring would have additional edge.
+
+**Config knobs:**
+- `analysis.pending_confluence_decay_enabled: bool = True`
+  (default on; flip false to restore pre-2026-04-27 hard-gate-only
+  invalidation behaviour).
+- `analysis.pending_confluence_decay_cycles: int = 2` (validated
+  to `[1, 10]`; 1 = instant cancel/no hysteresis, 2 = one-cycle
+  hysteresis (~6 min @ 3m TF), 3+ more conservative).
+
+No new threshold knob — pending defense uses the same
+`min_confluence_score` as entry-side accept (parity by design).
+
+**Wiring:**
+- [src/bot/runner.py](src/bot/runner.py) —
+  `PendingSetupMeta.low_confluence_streak: int = 0` (counter survives
+  per-pending instance, reset to 0 on recovery, popped with the meta
+  when cancelled). New helper
+  `BotRunner._compute_pending_decay_score(symbol, state, candles,
+  direction)` mirrors `build_trade_plan_with_reason`'s scoring args
+  (weights / sessions / LTF state / divergence bands / regime
+  conditional flag). Decay branch wired into `_maybe_invalidate_pending_for`
+  AFTER the hard-gate branch (gate flip = instant cancel takes
+  precedence; decay = counter path runs only when gates are clean).
+  `_handle_pending_canceled` reason mapping extended:
+  `confluence_decay:<score>` → `pending_confluence_decay` reject.
+  `score_direction` import added.
+- [src/bot/config.py](src/bot/config.py) — `AnalysisConfig` gains
+  the two new fields + `_pending_decay_cycles_in_range` validator.
+- [config/default.yaml](config/default.yaml) — knobs surfaced with
+  inline operator-facing comments under the `analysis` block.
+
+**Logging:** three new log lines for observability:
+- `pending_confluence_decay_streak symbol={} side={} score={} threshold={} streak={n}/{required}` — counter increment, no cancel.
+- `pending_confluence_decay symbol={} ...` — streak hit, cancel firing.
+- `pending_confluence_recovered symbol={} ... prior_streak={}` —
+  recovery reset (only when prior streak > 0, suppresses noise).
+
+**Tests:** +5 in [tests/test_runner_zone_entry.py](tests/test_runner_zone_entry.py) —
+single-low-no-cancel, two-consecutive-lows-cancel,
+recovery-resets-streak, disabled-flag-skips-score-check,
+cycles=1-instant-cancel. Stub via
+`monkeypatch.setattr(BotRunner, "_compute_pending_decay_score", ...)`
+so tests don't depend on `score_direction` internals or candle
+buffers.
+
+**Operational expectations:**
+- Cluster scenarios like 04-27 morning: if soft pillars decay
+  while pending limits wait at the top, this catches them within
+  ~6 min vs. the 21-min lifetime.
+- The decay path does NOT touch the entry-side accept threshold
+  (currently 3.75 from Pass 1 Optuna tune) — same threshold
+  controls both, tightening one tightens the other.
+- Solves a narrow band of the operator's broader concern (top/dip
+  ters-yön kalma). Soft P/D re-add and HTF distance penalty are
+  still the deeper structural fixes; this commit handles
+  post-placement degradation, not bad-position-at-placement.
+
+**Re-eval triggers:**
+1. `pending_confluence_decay` reject_reason rate post-restart —
+   expect 2-10% of total pending cancels (most pendings either
+   fill or hit `zone_timeout_cancel`/`pending_hard_gate_invalidated`).
+   >25% sustained = threshold or hysteresis too sensitive,
+   consider raising `pending_confluence_decay_cycles` to 3.
+2. **Recovery flicker rate** — fraction of cycles where a pending's
+   `low_confluence_streak` hits 1 then resets to 0 next cycle
+   (recovery). Trackable via the `pending_confluence_recovered`
+   log line. Target <30%; higher = `cycles=2` is borderline,
+   consider `cycles=3` to avoid borderline cancels.
+3. **Cluster-event protection effect** — counter-factual on the
+   next 04-27-style cluster: how many of N cluster pendings get
+   caught vs. fill into reversal. Pass 3 GBT can train on
+   `pending_confluence_decay` rows to learn whether decay-cancelled
+   setups actually had lower expected outcome (vs. luck).
+4. **Score parity sanity** — periodic spot-check that the decay
+   helper's `_compute_pending_decay_score` produces values
+   within ±0.1 of `build_trade_plan_with_reason`'s entry-side
+   scorer for the same state+direction. Drift >0.5 = parameter
+   set out of sync (likely a new analysis knob added on entry
+   side but not in the decay helper).
+
 ### 2026-04-27 — `cancel_pending` race fix (F6) — get_order verify on gone-code
 
 Pendant of the SOL short phantom-cancel data repair (entry below).
@@ -1757,7 +1890,7 @@ All config in `config/default.yaml` (self-documenting). Top-level sections: `bot
 
 **`.env` keys:** `BYBIT_API_KEY`, `BYBIT_API_SECRET`, `BYBIT_DEMO` (1/0), `COINALYZE_API_KEY`, `FINNHUB_API_KEY`, `ARKHAM_API_KEY`, `RISK_AMOUNT_USDT` (optional flat-$ override), `TV_MCP_PORT`, `LOG_LEVEL`.
 
-**Reject reasons (unified):** `below_confluence`, `no_setup_zone`, `vwap_misaligned`, `ema_momentum_contra`, `cross_asset_opposition`, `session_filter`, `macro_event_blackout`, `crowded_skip`, `no_sl_source`, `zero_contracts`, `tp_too_tight`, `zone_timeout_cancel`, `pending_invalidated`, `pending_hard_gate_invalidated` (mid-pending hard-gate flip). Deprecated but kept in vocabulary for legacy rows: `whale_transfer_blackout` (gate removed 2026-04-22), `wrong_side_of_premium_discount`, `htf_tp_ceiling`, `insufficient_contracts_for_split` (flags disabled). Sub-floor SL distances are **widened**, not rejected. Every reject writes to `rejected_signals` with `on_chain_context` + `confluence_pillar_scores` + `oscillator_raw_values` JSON columns.
+**Reject reasons (unified):** `below_confluence`, `no_setup_zone`, `vwap_misaligned`, `ema_momentum_contra`, `cross_asset_opposition`, `session_filter`, `macro_event_blackout`, `crowded_skip`, `no_sl_source`, `zero_contracts`, `tp_too_tight`, `zone_timeout_cancel`, `pending_invalidated`, `pending_hard_gate_invalidated` (mid-pending hard-gate flip), `pending_confluence_decay` (mid-pending confluence drop below `min_confluence_score` for N consecutive cycles, 2026-04-27). Deprecated but kept in vocabulary for legacy rows: `whale_transfer_blackout` (gate removed 2026-04-22), `wrong_side_of_premium_discount`, `htf_tp_ceiling`, `insufficient_contracts_for_split` (flags disabled). Sub-floor SL distances are **widened**, not rejected. Every reject writes to `rejected_signals` with `on_chain_context` + `confluence_pillar_scores` + `oscillator_raw_values` JSON columns.
 
 **Circuit breakers (currently loosened for data collection):** `max_consecutive_losses=9999`, `max_daily_loss_pct=40`, `max_drawdown_pct=40`, `min_rr_ratio=1.5`. Restore to `5 / 15 / 25 / 2.0` after 20+ post-pivot closed trades.
 

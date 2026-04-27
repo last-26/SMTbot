@@ -32,7 +32,7 @@ from typing import Any, Optional
 from loguru import logger
 
 from src.analysis.liquidity_heatmap import build_heatmap
-from src.analysis.multi_timeframe import calculate_confluence
+from src.analysis.multi_timeframe import calculate_confluence, score_direction
 from src.analysis.support_resistance import detect_sr_zones
 from src.analysis.trend_regime import TrendRegime, classify_trend_regime
 from src.bot.config import BotConfig
@@ -536,6 +536,14 @@ class PendingSetupMeta:
     # caches were unavailable at placement (bridge=None, LTF timeout,
     # already-open HTF skip).
     oscillator_raw_values_at_placement: dict[str, dict] = field(default_factory=dict)
+    # 2026-04-27 — pending confluence-decay early-cancel hysteresis counter.
+    # Bumped each cycle the rescored confluence falls below
+    # `analysis.min_confluence_score`; reset to 0 on recovery. When the
+    # counter reaches `analysis.pending_confluence_decay_cycles`, the
+    # pending is canceled with `pending_confluence_decay` reject reason.
+    # Hysteresis emer cycle-flicker (one-cycle dip recovers, two-cycle
+    # confirms a real decay).
+    low_confluence_streak: int = 0
 
 
 @dataclass
@@ -1293,42 +1301,173 @@ class BotRunner:
                     symbol_, pos_side,
                 )
                 continue
-            if gate_reason is None:
+            if gate_reason is not None:
+                # Hard gate flipped — cancel the pending. Pass gate_reason as
+                # cancel reason; `_handle_pending_canceled` maps it to a
+                # journal `pending_hard_gate_invalidated` reject reason.
+                logger.info(
+                    "pending_hard_gate_invalidated symbol={} side={} order_id={} "
+                    "gate={} entry_px={}",
+                    symbol_, pos_side, meta.order_id, gate_reason,
+                    meta.plan.entry_price,
+                )
+                try:
+                    ev = await asyncio.to_thread(
+                        self.ctx.monitor.cancel_pending,
+                        symbol_, pos_side,
+                        reason=f"hard_gate:{gate_reason}",
+                    )
+                except Exception:
+                    logger.exception(
+                        "pending_hard_gate_cancel_failed symbol={} side={}",
+                        symbol_, pos_side,
+                    )
+                    continue
+                # `cancel_pending` returns the CANCELED event but does NOT
+                # queue it — only `poll_pending` events flow through
+                # `_process_pending`. We must dispatch the handler ourselves
+                # so the journal records a `pending_hard_gate_invalidated`
+                # rejected_signals row + the pending_setups slot is cleared.
+                if ev is not None:
+                    try:
+                        await self._handle_pending_canceled(ev)
+                    except Exception:
+                        logger.exception(
+                            "pending_hard_gate_handler_failed symbol={} side={}",
+                            symbol_, pos_side,
+                        )
+                # Pending cancelled via hard gate — skip decay path; meta is
+                # popped by the canceled handler so subsequent `pending_setups`
+                # access on this key returns None next cycle.
                 continue
-            # Hard gate flipped — cancel the pending. Pass gate_reason as
-            # cancel reason; `_handle_pending_canceled` maps it to a
-            # journal `pending_hard_gate_invalidated` reject reason.
-            logger.info(
-                "pending_hard_gate_invalidated symbol={} side={} order_id={} "
-                "gate={} entry_px={}",
-                symbol_, pos_side, meta.order_id, gate_reason,
-                meta.plan.entry_price,
-            )
+
+            # 2026-04-27 — Pending confluence-decay early-cancel.
+            # Hard gates clean. Re-score confluence using `score_direction`
+            # for the pending's direction; if score drops below
+            # `min_confluence_score` for `pending_confluence_decay_cycles`
+            # consecutive cycles, cancel with reason
+            # `pending_confluence_decay`. Hysteresis emer one-cycle dips so
+            # natural pullback fluctuation doesn't kill the pending —
+            # only sustained sub-threshold confluence does.
+            if not cfg.analysis.pending_confluence_decay_enabled:
+                continue
             try:
-                ev = await asyncio.to_thread(
-                    self.ctx.monitor.cancel_pending,
-                    symbol_, pos_side,
-                    reason=f"hard_gate:{gate_reason}",
+                new_score = self._compute_pending_decay_score(
+                    symbol_, state, candles, meta.plan.direction,
                 )
             except Exception:
                 logger.exception(
-                    "pending_hard_gate_cancel_failed symbol={} side={}",
+                    "pending_confluence_decay_score_failed symbol={} side={}",
                     symbol_, pos_side,
                 )
                 continue
-            # `cancel_pending` returns the CANCELED event but does NOT
-            # queue it — only `poll_pending` events flow through
-            # `_process_pending`. We must dispatch the handler ourselves
-            # so the journal records a `pending_hard_gate_invalidated`
-            # rejected_signals row + the pending_setups slot is cleared.
-            if ev is not None:
+            threshold = float(cfg.analysis.min_confluence_score)
+            required_streak = int(cfg.analysis.pending_confluence_decay_cycles)
+            if new_score < threshold:
+                meta.low_confluence_streak += 1
+                if meta.low_confluence_streak < required_streak:
+                    logger.info(
+                        "pending_confluence_decay_streak symbol={} side={} "
+                        "order_id={} score={:.2f} threshold={:.2f} "
+                        "streak={}/{}",
+                        symbol_, pos_side, meta.order_id,
+                        new_score, threshold,
+                        meta.low_confluence_streak, required_streak,
+                    )
+                    continue
+                # Streak hit — cancel via confluence_decay path.
+                logger.info(
+                    "pending_confluence_decay symbol={} side={} order_id={} "
+                    "score={:.2f} threshold={:.2f} streak={}/{}",
+                    symbol_, pos_side, meta.order_id,
+                    new_score, threshold,
+                    meta.low_confluence_streak, required_streak,
+                )
                 try:
-                    await self._handle_pending_canceled(ev)
+                    ev = await asyncio.to_thread(
+                        self.ctx.monitor.cancel_pending,
+                        symbol_, pos_side,
+                        reason=f"confluence_decay:{new_score:.2f}",
+                    )
                 except Exception:
                     logger.exception(
-                        "pending_hard_gate_handler_failed symbol={} side={}",
+                        "pending_confluence_decay_cancel_failed "
+                        "symbol={} side={}",
                         symbol_, pos_side,
                     )
+                    continue
+                if ev is not None:
+                    try:
+                        await self._handle_pending_canceled(ev)
+                    except Exception:
+                        logger.exception(
+                            "pending_confluence_decay_handler_failed "
+                            "symbol={} side={}",
+                            symbol_, pos_side,
+                        )
+            else:
+                # Recovered above threshold — reset counter so a future
+                # streak must accumulate fresh.
+                if meta.low_confluence_streak > 0:
+                    logger.info(
+                        "pending_confluence_recovered symbol={} side={} "
+                        "order_id={} score={:.2f} threshold={:.2f} "
+                        "prior_streak={}",
+                        symbol_, pos_side, meta.order_id,
+                        new_score, threshold,
+                        meta.low_confluence_streak,
+                    )
+                meta.low_confluence_streak = 0
+
+    def _compute_pending_decay_score(
+        self,
+        symbol: str,
+        state: MarketState,
+        candles: list,
+        direction: Direction,
+    ) -> float:
+        """2026-04-27 — Compute the rescored confluence for a pending limit.
+
+        Mirrors the parameter set used by `build_trade_plan_with_reason`'s
+        scoring step so that the pending-side decay check and the entry-side
+        accept threshold compare scores derived under the SAME scorer
+        config. Trend regime is recomputed inline because the entry-side
+        result is local to `_run_one_symbol` and not stashed on context.
+
+        Returns the raw `ConfluenceScore.score` (pre-Arkham-modifier). The
+        decay check compares against `cfg.analysis.min_confluence_score`
+        directly — Arkham penalty/modifier drift is intentionally NOT in
+        the decay loop because they fluctuate on a 5-min daily-bundle
+        cadence orthogonal to the confluence flow, and would couple two
+        independent signals into one cancel decision.
+        """
+        cfg = self.ctx.config
+        trend_regime_result = classify_trend_regime(
+            candles,
+            period=cfg.analysis.adx_period,
+            ranging_threshold=cfg.analysis.trend_regime_ranging_threshold,
+            strong_threshold=cfg.analysis.trend_regime_strong_threshold,
+        )
+        score_obj = score_direction(
+            state=state,
+            direction=direction,
+            ltf_candles=candles,
+            weights=cfg.analysis.confluence_weights or None,
+            allowed_sessions=cfg.allowed_sessions_for(symbol) or None,
+            ltf_state=self.ctx.ltf_cache.get(symbol),
+            min_rsi_mfi_magnitude=cfg.analysis.min_rsi_mfi_magnitude,
+            liquidity_pool_max_atr_dist=cfg.analysis.liquidity_pool_max_atr_dist,
+            displacement_atr_mult=cfg.analysis.displacement_atr_mult,
+            displacement_max_bars_ago=cfg.analysis.displacement_max_bars_ago,
+            divergence_fresh_bars=cfg.analysis.divergence_fresh_bars,
+            divergence_decay_bars=cfg.analysis.divergence_decay_bars,
+            divergence_max_bars=cfg.analysis.divergence_max_bars,
+            trend_regime=trend_regime_result.regime,
+            trend_regime_conditional_scoring_enabled=(
+                cfg.analysis.trend_regime_conditional_scoring_enabled
+            ),
+        )
+        return float(score_obj.score)
 
     async def _maybe_revise_tp_dynamic(
         self, symbol: str, pos_side: str, state: MarketState,
@@ -3558,8 +3697,15 @@ class BotRunner:
         # variants to `pending_hard_gate_invalidated` so Phase 9 GBT can
         # filter by this category specifically. The original gate name
         # is preserved in the bot's log line at cancel time.
+        # 2026-04-27 — confluence-decay cancels carry the rescored value
+        # in `reason` as `confluence_decay:<score>`. Mapped to a dedicated
+        # `pending_confluence_decay` reject reason so soft-pillar / Arkham
+        # decay (which hard gates miss) is segmentable from the gate-flip
+        # category.
         if ev.reason and ev.reason.startswith("hard_gate:"):
             reject_reason = "pending_hard_gate_invalidated"
+        elif ev.reason and ev.reason.startswith("confluence_decay:"):
+            reject_reason = "pending_confluence_decay"
         else:
             reject_reason = reason_map.get(ev.reason, "pending_invalidated")
         logger.info(

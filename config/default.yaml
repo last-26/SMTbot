@@ -375,6 +375,26 @@ analysis:
   vwap_reset_blackout_window_pre_min: 0
   vwap_reset_blackout_window_post_min: 10
 
+  # 2026-04-27 — Pending confluence-decay early-cancel.
+  # Operator-driven (post 04-27 long-cluster stop-out): pending limits sit
+  # up to 7 bars (~21 min on 3m TF) waiting for fill. The existing
+  # `evaluate_pending_invalidation_gates` re-evaluates HARD vetoes only
+  # (vwap_misaligned / ema_momentum_contra / cross_asset_opposition /
+  # vwap_reset_blackout). Soft-pillar decay + Arkham penalty drift do NOT
+  # show up there, so a pending placed with confluence 4.0 can fill at
+  # confluence 3.0 if hard gates haven't flipped. This rescores confluence
+  # each cycle; when score < min_confluence_score for N consecutive
+  # cycles, the pending is canceled with reject reason
+  # `pending_confluence_decay`.
+  #
+  # cycles=2 (~6 min on 3m TF): one-cycle dip can recover, two consecutive
+  # dips confirm decay. Lifts cancel decision well below the 21-min
+  # pending lifetime. Set cycles=1 for instant cancel (no hysteresis,
+  # expect more flicker-induced cancels). Threshold mirrors
+  # min_confluence_score above — entry-side parity, not a separate knob.
+  pending_confluence_decay_enabled: true
+  pending_confluence_decay_cycles: 2
+
 bybit:
   base_url: https://api-demo.bybit.com
   demo: true

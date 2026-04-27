@@ -480,6 +480,216 @@ async def test_pending_kept_alive_when_no_hard_gate_fires(monkeypatch, make_ctx)
     assert "pending_hard_gate_invalidated" not in [r.reject_reason for r in rows]
 
 
+# ── 2026-04-27: pending confluence-decay invalidation (early-cancel) ───────
+
+
+def _patch_decay_scores(monkeypatch, scores: list[float]):
+    """Stub `_compute_pending_decay_score` to return successive values.
+
+    Each `run_once()` consumes one entry; the test must size the list to
+    the number of cycles it intends to drive.
+    """
+    it = iter(scores)
+
+    def _stub(self, _sym, _state, _candles, _direction):
+        return next(it)
+    monkeypatch.setattr(BotRunner, "_compute_pending_decay_score", _stub)
+
+
+def _stub_no_hard_gate(monkeypatch):
+    """Force the hard-gate evaluator to return None so only the decay
+    branch can fire."""
+    monkeypatch.setattr(
+        "src.bot.runner.evaluate_pending_invalidation_gates",
+        lambda **_kw: None,
+    )
+
+
+def _seed_pending(ctx, fakes):
+    """Seed a single BTC long pending limit on the runner's context."""
+    ctx.pending_setups[("BTC-USDT-SWAP", "long")] = PendingSetupMeta(
+        plan=make_plan(), zone=_ZONE, order_id="LIM-DECAY",
+        signal_state=fakes.reader.state, placed_at=datetime.now(UTC),
+    )
+
+
+async def test_pending_confluence_decay_single_low_does_not_cancel(
+    monkeypatch, make_ctx,
+):
+    """One cycle of sub-threshold confluence increments the streak counter
+    but does NOT cancel the pending — hysteresis (cycles=2) demands a
+    second consecutive low before cancel.
+    """
+    _patch_plan_builder(monkeypatch, None)
+    _patch_zone_builder(monkeypatch, _ZONE)
+    cfg = make_config(contract_size=0.01)
+    _enable_zone(cfg)
+    cfg.analysis.min_confluence_score = 3.75
+    cfg.analysis.pending_confluence_decay_enabled = True
+    cfg.analysis.pending_confluence_decay_cycles = 2
+    monitor = ZoneFakeMonitor()
+    router = ZoneFakeRouter()
+    ctx, fakes = make_ctx(config=cfg, monitor=monitor, router=router)
+    ctx.contract_sizes = {"BTC-USDT-SWAP": 0.01}
+    _seed_pending(ctx, fakes)
+    _stub_no_hard_gate(monkeypatch)
+    _patch_decay_scores(monkeypatch, [3.00])  # below 3.75
+
+    runner = BotRunner(ctx)
+    async with ctx.journal:
+        await runner.run_once()
+
+    assert monitor.cancel_pending_calls == []
+    meta = ctx.pending_setups[("BTC-USDT-SWAP", "long")]
+    assert meta.low_confluence_streak == 1
+
+
+async def test_pending_confluence_decay_two_consecutive_lows_cancel(
+    monkeypatch, make_ctx,
+):
+    """Two consecutive sub-threshold cycles trip the hysteresis and cancel
+    the pending. Journal records `pending_confluence_decay`.
+    """
+    _patch_plan_builder(monkeypatch, None)
+    _patch_zone_builder(monkeypatch, _ZONE)
+    cfg = make_config(contract_size=0.01)
+    _enable_zone(cfg)
+    cfg.analysis.min_confluence_score = 3.75
+    cfg.analysis.pending_confluence_decay_enabled = True
+    cfg.analysis.pending_confluence_decay_cycles = 2
+    monitor = ZoneFakeMonitor()
+    router = ZoneFakeRouter()
+    ctx, fakes = make_ctx(config=cfg, monitor=monitor, router=router)
+    ctx.contract_sizes = {"BTC-USDT-SWAP": 0.01}
+    _seed_pending(ctx, fakes)
+    _stub_no_hard_gate(monkeypatch)
+    _patch_decay_scores(monkeypatch, [3.20, 2.80])
+
+    runner = BotRunner(ctx)
+    async with ctx.journal:
+        await runner.run_once()  # cycle 1: streak → 1
+        await runner.run_once()  # cycle 2: streak → 2 (cancel)
+        rows = await ctx.journal.list_rejected_signals()
+
+    # Cancel call dispatched with `confluence_decay:` prefix.
+    assert len(monitor.cancel_pending_calls) == 1
+    inst_id, pos_side, reason = monitor.cancel_pending_calls[0]
+    assert inst_id == "BTC-USDT-SWAP"
+    assert pos_side == "long"
+    assert reason.startswith("confluence_decay:")
+    # Pending slot cleared (handler ran).
+    assert ("BTC-USDT-SWAP", "long") not in ctx.pending_setups
+    # Journal row written with the dedicated reject reason.
+    reasons = [r.reject_reason for r in rows]
+    assert "pending_confluence_decay" in reasons
+    # Sanity: this is NOT misclassified as a hard-gate cancel.
+    assert "pending_hard_gate_invalidated" not in reasons
+
+
+async def test_pending_confluence_decay_recovery_resets_streak(
+    monkeypatch, make_ctx,
+):
+    """Sub-threshold → above-threshold → sub-threshold sequence resets the
+    counter on recovery, so the third cycle's lone low does not cancel.
+    """
+    _patch_plan_builder(monkeypatch, None)
+    _patch_zone_builder(monkeypatch, _ZONE)
+    cfg = make_config(contract_size=0.01)
+    _enable_zone(cfg)
+    cfg.analysis.min_confluence_score = 3.75
+    cfg.analysis.pending_confluence_decay_enabled = True
+    cfg.analysis.pending_confluence_decay_cycles = 2
+    monitor = ZoneFakeMonitor()
+    router = ZoneFakeRouter()
+    ctx, fakes = make_ctx(config=cfg, monitor=monitor, router=router)
+    ctx.contract_sizes = {"BTC-USDT-SWAP": 0.01}
+    _seed_pending(ctx, fakes)
+    _stub_no_hard_gate(monkeypatch)
+    _patch_decay_scores(monkeypatch, [3.00, 4.10, 3.00])
+
+    runner = BotRunner(ctx)
+    async with ctx.journal:
+        await runner.run_once()  # cycle 1: streak → 1
+        await runner.run_once()  # cycle 2: recovered → streak → 0
+        await runner.run_once()  # cycle 3: streak → 1 (no cancel)
+
+    assert monitor.cancel_pending_calls == []
+    meta = ctx.pending_setups[("BTC-USDT-SWAP", "long")]
+    assert meta.low_confluence_streak == 1
+
+
+async def test_pending_confluence_decay_disabled_skips_score_check(
+    monkeypatch, make_ctx,
+):
+    """When `pending_confluence_decay_enabled=False`, the decay branch is
+    a no-op: streak counter stays at 0 even on sustained sub-threshold
+    cycles, and no cancel fires.
+    """
+    _patch_plan_builder(monkeypatch, None)
+    _patch_zone_builder(monkeypatch, _ZONE)
+    cfg = make_config(contract_size=0.01)
+    _enable_zone(cfg)
+    cfg.analysis.min_confluence_score = 3.75
+    cfg.analysis.pending_confluence_decay_enabled = False
+    cfg.analysis.pending_confluence_decay_cycles = 2
+    monitor = ZoneFakeMonitor()
+    router = ZoneFakeRouter()
+    ctx, fakes = make_ctx(config=cfg, monitor=monitor, router=router)
+    ctx.contract_sizes = {"BTC-USDT-SWAP": 0.01}
+    _seed_pending(ctx, fakes)
+    _stub_no_hard_gate(monkeypatch)
+    # Sentinel: if the decay branch fires while disabled, this stub raises.
+    call_count = {"n": 0}
+
+    def _spy(self, *a, **kw):
+        call_count["n"] += 1
+        return 1.0  # arbitrarily low; should not be observed
+    monkeypatch.setattr(BotRunner, "_compute_pending_decay_score", _spy)
+
+    runner = BotRunner(ctx)
+    async with ctx.journal:
+        await runner.run_once()
+        await runner.run_once()
+
+    assert monitor.cancel_pending_calls == []
+    assert call_count["n"] == 0
+    meta = ctx.pending_setups[("BTC-USDT-SWAP", "long")]
+    assert meta.low_confluence_streak == 0
+
+
+async def test_pending_confluence_decay_cycles_one_is_instant_cancel(
+    monkeypatch, make_ctx,
+):
+    """`cycles=1` means no hysteresis: the first sub-threshold cycle
+    cancels the pending. Verifies the validator-allowed instant-cancel
+    mode is wired correctly.
+    """
+    _patch_plan_builder(monkeypatch, None)
+    _patch_zone_builder(monkeypatch, _ZONE)
+    cfg = make_config(contract_size=0.01)
+    _enable_zone(cfg)
+    cfg.analysis.min_confluence_score = 3.75
+    cfg.analysis.pending_confluence_decay_enabled = True
+    cfg.analysis.pending_confluence_decay_cycles = 1
+    monitor = ZoneFakeMonitor()
+    router = ZoneFakeRouter()
+    ctx, fakes = make_ctx(config=cfg, monitor=monitor, router=router)
+    ctx.contract_sizes = {"BTC-USDT-SWAP": 0.01}
+    _seed_pending(ctx, fakes)
+    _stub_no_hard_gate(monkeypatch)
+    _patch_decay_scores(monkeypatch, [2.50])
+
+    runner = BotRunner(ctx)
+    async with ctx.journal:
+        await runner.run_once()
+        rows = await ctx.journal.list_rejected_signals()
+
+    assert len(monitor.cancel_pending_calls) == 1
+    assert monitor.cancel_pending_calls[0][2].startswith("confluence_decay:")
+    assert ("BTC-USDT-SWAP", "long") not in ctx.pending_setups
+    assert "pending_confluence_decay" in [r.reject_reason for r in rows]
+
+
 # ── Multi-cycle integration (7.C5) ─────────────────────────────────────────
 
 
