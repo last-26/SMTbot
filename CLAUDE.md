@@ -26,6 +26,62 @@ AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT lin
 
 ## Changelog
 
+### 2026-04-27 — Phantom cancel kurtarması: SOL short sentetik trade row
+
+Operatör fark etti: Bybit live'da SOL hem long hem short açık (hedge mode'da
+mümkün ama bot tek yön açar). Reconciliation:
+
+- **DB OPEN trades:** sadece SOL long (42e9c1...)
+- **Bybit live:** SOL long sz=11 entry=86.79 + SOL short sz=11 entry=86.73
+- **Bybit order_history:** order `69dc0335-9434-4418-8371-73931ce897e2`
+  status=**Filled** at `2026-04-27T00:39:03Z` (avgPx=86.73, cumExecQty=11)
+- **Bot log:** aynı order için `pending_canceled reason=hard_gate:cross_asset_opposition`
+  at `00:39:41Z` — fill'den **38 saniye sonra**
+
+**Race condition:** bot pending'i cancel etmeye çalışırken Bybit zaten
+fill etmişti. Cancel REST çağrısı bir `_ORDER_GONE_CODES` (110001 / 110008
+/ 110010 / 170142 / 170213) hata kodu döndürdü. Bot bunu "idempotent
+cancel başarılı" olarak yorumladı (CLAUDE.md "Phantom-cancel resistance"
+pattern, OKX-era'dan beri varolan ama OKX'te 51400/51401/51402 sadece
+"order not found / cancelled" demekti — Bybit'te "Filled" durumunu da
+aynı code aralığı içine alıyor olabilir). Sonuç: pending_canceled olarak
+DB'ye yazıldı, fill event hiç işlenmedi, pozisyon **SL/TP'siz NAKED**
+kaldı.
+
+Operatör Bybit UI'dan SOL short'u manuel kapadı: realized −$8.20 USDT
+(entry 86.73 → exit 87.41).
+
+**Veri tamiri (bu commit):**
+
+1. Yeni sentetik `trades` row eklendi:
+   - `trade_id` 330e351a669e440a9bca2beb45ad175a
+   - `outcome=LOSS pnl_r=-0.8638 pnl_usdt=-8.20`
+   - `close_reason=manual_user_close_after_phantom_cancel`
+   - `artifact_reason=phantom_cancel_synthetic_2026-04-27` (filter
+     hook — Pass 3 GBT bu rows'u dataset'ten dropla isterse)
+   - Pass 3 features (on_chain_context, confluence_pillar_scores,
+     oscillator_raw_values, derivatives 9 alan, liq_heatmap top
+     clusters) source rejected_signal row'undan kopyalandı, böylece
+     RL feature pipeline'ında "missing data" değil
+2. Yanlış `rejected_signals` row'u silindi (rejection_id
+   `aeec57b87a90...`) — bu pending fill oldu, reject olmadı.
+
+**Updated dataset:** 9→10 closed, WR 55.6%→**50.0%**, net R +5.19→+4.32,
+net USDT +$58.43→+$50.23. Bybit realized wallet (+$49.77) ile drift
+~$0.46 (fee tahmin sapması) — kabul edilebilir.
+
+**Bot kodunda kalıcı çözüm (F6, ayrı commit candidate):**
+`cancel_pending` Bybit'ten `_ORDER_GONE_CODES` aldığında doğrudan
+idempotent kabul etmek yerine `get_order` ile orderın gerçek statüsüne
+bakacak. `Filled` ise → fill flow'a yönlendir, `Cancelled` ise →
+idempotent kabul. ~30 satır kod, F1-F5 pattern'iyle paralel.
+
+**Re-eval triggers:**
+1. Phantom cancel rate — `trades.artifact_reason LIKE 'phantom_cancel_%'`
+   sayısı 50 trade'de >1 = F6 fix acil. 0 = tek seferlik race.
+2. DB↔wallet drift — restart sonrası realized vs DB net USDT farkı
+   > $5 = başka bir kaybedilmiş fill var, audit gerek.
+
 ### 2026-04-27 — Schema cleanup: drop 27 dead/constant columns (Faz 2)
 
 Operator directive: "veri gelmemişse hiç droplayalım. RL için 50 trade
