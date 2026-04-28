@@ -26,6 +26,86 @@ AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT lin
 
 ## Changelog
 
+### 2026-04-28 (gece) — `get_positions` IEEE 754 quantization fix
+
+One-line fix on a long-latent bug surfaced by the post-whale-threshold
+restart at 03:18 UTC. ETH SL-to-BE attempt failed at restart with
+`StopLoss:23054900 set for Buy position should lower than
+base_price:23041600??MarkPrice` — Bybit rejected because the proposed
+SL sat above mark price (mark < BE band, position slightly underwater).
+The actual **trigger** for that erroneous attempt was traced to a float
+precision bug 1 layer up: `_detect_tp1_and_move_sl` mis-fired its
+"size shrank → TP1 partial" branch on every poll for fractional-ct_val
+symbols.
+
+**Root cause:** [src/execution/bybit_client.py:1043](src/execution/bybit_client.py:1043)
+converted Bybit base-coin size back to internal contract units via
+naive division: `size_contracts = size_base / ct_val`. Contract units
+are integer by construction (verified per-symbol via
+`_INTERNAL_CT_VAL`: BTC 0.01, ETH 0.1, SOL 1, DOGE 1000, XRP 100), but
+IEEE 754 division drifts at ULP scale for fractional ct_val:
+
+| Symbol | base | ct_val | naive division | bug? |
+|---|---|---|---|---|
+| ETH | 0.7 | 0.1 | 6.999999999999999 | **YES** — `< 7.0` |
+| BTC | 0.04 | 0.01 | 4.0 (lucky) | no |
+| BTC | 0.03 | 0.01 | 2.9999999999999996 | **YES** — `< 3.0` |
+| SOL | 27 | 1 | 27.0 | no (integer ct_val) |
+| DOGE | 15000 | 1000 | 15.0 | no |
+| XRP | 800 | 100 | 8.0 | no |
+
+The drifted size landed below `t.initial_size` in
+[position_monitor.py:309](src/execution/position_monitor.py:309), so
+`_detect_tp1_and_move_sl` interpreted the position as having had a
+partial fill and tried to pull SL to BE. On a position whose mark
+price hadn't yet crossed BE (long with mark < BE band), Bybit
+correctly rejected the trading-stop call. After 3 retries
+(`_CANCEL_MAX_RETRIES`) the monitor would set `be_already_moved=True`,
+**which then early-returns the legitimate MFE-lock path
+([runner.py:1444](src/bot/runner.py:1444))** — silently disabling the
+1.0R risk-removal feature for the affected position. The original SL
+still protected the position, so no capital was at risk; the lost
+behavior was the MFE-lock activation.
+
+**Fix:** wrap with `round()`, since contract units are integer by
+construction:
+
+```python
+size_contracts = round(size_base / ct_val) if ct_val > 0 else size_base
+```
+
+Inverse direction (internal → Bybit base coin via `_qty_in_base`)
+already uses `Decimal(str(...)) * Decimal(str(...))` and was clean.
+
+**Tests:** new [tests/test_bybit_client_qty_roundtrip.py](tests/test_bybit_client_qty_roundtrip.py)
+locks 10 cases — ETH 0.7/0.1=7, ETH 1.5/0.1=15, BTC 0.03/0.01=3,
+BTC 0.04/0.01=4, SOL 27/1=27, DOGE 15000/1000=15, XRP 800/100=8, plus
+zero-size and unknown-ct_val fallback paths. 10/10 green; pre-fix the
+ETH 0.7 case would assert-fail at `6.999... != 7.0`.
+
+**Restart-time impact:** the failing log line will not recur on the
+next restart (or for any in-flight position polling). Existing
+positions whose `be_already_moved` got mis-set to True before this
+fix won't recover automatically — but since `be_already_moved=True`
+just means "skip MFE-lock", the worst outcome is a position that
+stops at its plan SL instead of locked-BE. No exposure increase.
+
+**Re-eval triggers:**
+1. **`sl_to_be_trading_stop_failed` log frequency** — should drop to
+   ~0 after this fix (only legitimate cases remain: actual partial
+   fills via maker-TP limit or operator manual partial-close,
+   neither expected on a Bybit fill). Non-zero rate post-fix means
+   another path is mis-firing the TP1 branch.
+2. **MFE-lock activation rate post-fix** — `mfe_lock_applied=1` on
+   journal rows that exited at ≥ 1.0R MFE should now approach 100%
+   minus genuinely fast wick-to-TP cases. Pre-fix dataset will show
+   under-counts on ETH/BTC; segment Pass 3 analysis accordingly.
+3. **`be_already_moved` on rehydrate** — if a journal OPEN row had
+   `sl_moved_to_be=1` from a previous mis-fire, restart will rehydrate
+   with the BE flag set and `plan_sl_price=0`, which disables dynamic
+   TP revision for that position. Operator-acceptable for the live
+   ETH position; future trades won't accumulate this state.
+
 ### 2026-04-28 (evening) — Whale threshold 75M → 10M (Arkham floor) + dashboard windowInfo UTC+3
 
 Two-line config + UI patch triggered by operator's audit of label-quota

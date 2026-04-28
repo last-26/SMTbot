@@ -1038,9 +1038,14 @@ class BybitClient:
             # Bybit's `size` is in base coin; flip back to internal-format
             # contract units so the rest of the codebase (monitor, sizing
             # math, journal) works in the integer-contracts vocabulary it
-            # was written in.
+            # was written in. `round()` absorbs IEEE 754 division drift —
+            # e.g. ETH 0.7 / 0.1 = 6.999999999999999 must become 7. Without
+            # it, `_detect_tp1_and_move_sl` mis-fires "size shrank" on every
+            # poll for fractional-ct_val symbols (BTC 0.01 / ETH 0.1) and
+            # eventually trips `be_already_moved=True` after retry exhaustion,
+            # blocking the legitimate MFE-lock path downstream.
             ct_val = float(_INTERNAL_CT_VAL.get(internal_sym, 0.0))
-            size_contracts = size_base / ct_val if ct_val > 0 else size_base
+            size_contracts = round(size_base / ct_val) if ct_val > 0 else size_base
             snapshots.append(PositionSnapshot(
                 inst_id=internal_sym,
                 pos_side=pos_side,
