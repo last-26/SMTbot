@@ -559,3 +559,110 @@ def _normalize_on_chain_row(row: dict) -> dict:
             except (TypeError, ValueError):
                 pass
     return out
+
+
+# ── Generic DB browser (read-only, whitelist-only) ───────────────────────────
+#
+# Powers the "Database" overlay in the dashboard. Each entry maps a SQL
+# table to (default ORDER BY column, descending). Whitelist is closed —
+# unknown table names are rejected at the endpoint boundary so a typo / URL
+# probe can't pivot into arbitrary SQL.
+_DB_BROWSER_TABLES: dict[str, tuple[str, bool]] = {
+    "trades":             ("entry_timestamp",  True),
+    "rejected_signals":   ("signal_timestamp", True),
+    "on_chain_snapshots": ("captured_at",      True),
+    "whale_transfers":    ("captured_at",      True),
+    "position_snapshots": ("captured_at",      True),
+}
+
+_DB_BROWSER_DEFAULT_LIMIT = 200
+_DB_BROWSER_MAX_LIMIT = 2000
+
+
+async def list_db_tables(db_path: str) -> list[dict]:
+    """Return [{name, row_count, order_by, order_desc}] for each whitelist
+    table. Row count via `SELECT COUNT(*)`; cheap on the indexes we already
+    have. Tables that don't exist (older DB before a migration) yield
+    `row_count=None` so the UI can render them as missing without 500'ing.
+    """
+    out: list[dict] = []
+    async with ReadOnlyJournal(db_path) as j:
+        conn = j._conn
+        assert conn is not None
+        for name, (order_by, order_desc) in _DB_BROWSER_TABLES.items():
+            try:
+                async with conn.execute(f"SELECT COUNT(*) FROM {name}") as cur:
+                    row = await cur.fetchone()
+                    rc = int(row[0]) if row else 0
+            except Exception:
+                rc = None
+            out.append({
+                "name": name,
+                "row_count": rc,
+                "order_by": order_by,
+                "order_desc": order_desc,
+            })
+    return out
+
+
+async def fetch_db_rows(
+    db_path: str,
+    table: str,
+    *,
+    limit: int = _DB_BROWSER_DEFAULT_LIMIT,
+    offset: int = 0,
+) -> dict:
+    """Return {columns: [...], rows: [[...], ...], total, limit, offset}
+    for a whitelisted table, ordered by its registered timestamp column
+    DESC so the most recent rows land first.
+
+    Whitelist guard is the only defence against arbitrary table names —
+    `table` MUST be a key of `_DB_BROWSER_TABLES`. We still parameterize
+    LIMIT/OFFSET via aiosqlite bindings even though they're ints, since
+    that keeps the SQL builder uniform.
+    """
+    if table not in _DB_BROWSER_TABLES:
+        raise ValueError(f"unknown table: {table!r}")
+    order_by, order_desc = _DB_BROWSER_TABLES[table]
+    limit = max(1, min(int(limit), _DB_BROWSER_MAX_LIMIT))
+    offset = max(0, int(offset))
+    direction = "DESC" if order_desc else "ASC"
+
+    async with ReadOnlyJournal(db_path) as j:
+        conn = j._conn
+        assert conn is not None
+        async with conn.execute(f"SELECT COUNT(*) FROM {table}") as cur:
+            r = await cur.fetchone()
+            total = int(r[0]) if r else 0
+        sql = (
+            f"SELECT * FROM {table} "
+            f"ORDER BY {order_by} {direction} "
+            f"LIMIT ? OFFSET ?"
+        )
+        async with conn.execute(sql, (limit, offset)) as cur:
+            cols = [d[0] for d in (cur.description or [])]
+            raw = await cur.fetchall()
+        rows = [[_db_cell(v) for v in row] for row in raw]
+    return {
+        "table": table,
+        "columns": cols,
+        "rows": rows,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "order_by": order_by,
+        "order_desc": order_desc,
+    }
+
+
+def _db_cell(v: Any) -> Any:
+    """Coerce a raw SQLite cell to JSON-safe primitives. Non-finite floats
+    (inf / -inf / NaN) → None so FastAPI's strict JSON encoder doesn't
+    explode. bytes → hex string (rare; sqlite blobs aren't expected on
+    these tables but defensive). Everything else passes through.
+    """
+    if isinstance(v, float):
+        return v if math.isfinite(v) else None
+    if isinstance(v, (bytes, bytearray)):
+        return v.hex()
+    return v

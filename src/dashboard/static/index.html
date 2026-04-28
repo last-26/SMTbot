@@ -207,6 +207,238 @@
     50% { opacity: 0.55; transform: scale(0.85); }
   }
 
+  /* ── Database button (header) + DB browser modal ─────────────────── */
+  .db-btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 6px 12px;
+    background: rgba(20, 26, 36, 0.6);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--text-2);
+    font-family: var(--mono); font-size: 10.5px; font-weight: 600;
+    letter-spacing: 1px; text-transform: uppercase;
+    cursor: pointer;
+    transition: color .2s, border-color .2s, box-shadow .2s, background .2s;
+  }
+  .db-btn:hover {
+    color: var(--text);
+    border-color: rgba(94, 193, 255, 0.55);
+    box-shadow: 0 0 14px rgba(94, 193, 255, 0.18);
+    background: rgba(20, 26, 36, 0.85);
+  }
+  .db-btn svg { opacity: 0.8; }
+  .db-btn:hover svg { opacity: 1; color: var(--accent); }
+
+  .db-modal {
+    position: fixed; inset: 0; z-index: 200;
+    background: rgba(3, 5, 9, 0.86);
+    backdrop-filter: blur(10px);
+    display: none;
+    align-items: stretch; justify-content: center;
+    animation: db-fade .18s ease-out;
+  }
+  .db-modal.open { display: flex; }
+  @keyframes db-fade {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+  }
+  .db-modal-inner {
+    margin: 16px; flex: 1;
+    background: #0e131c;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 16px;
+    box-shadow:
+      0 40px 100px rgba(0, 0, 0, 0.65),
+      0 0 0 1px rgba(255, 255, 255, 0.02) inset;
+    display: flex; flex-direction: column;
+    overflow: hidden;
+    animation: db-pop .22s cubic-bezier(.2,.8,.2,1);
+  }
+  @keyframes db-pop {
+    from { transform: scale(.985); opacity: 0; }
+    to   { transform: scale(1);    opacity: 1; }
+  }
+  .db-modal-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 18px 24px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  }
+  .db-modal-title {
+    font-family: var(--display);
+    font-size: 15px; font-weight: 600; letter-spacing: 0.4px;
+    color: #f3f6fb;
+    display: flex; align-items: center; gap: 14px;
+  }
+  .db-modal-title::before {
+    content: "";
+    width: 3px; height: 18px; border-radius: 2px;
+    background: linear-gradient(180deg, var(--accent), var(--accent-2));
+  }
+  .db-modal-title .sub {
+    color: #8a93a3; font-family: var(--mono); font-size: 11px;
+    letter-spacing: 0.6px; font-weight: 400;
+  }
+  .db-modal-actions { display: flex; align-items: center; gap: 8px; }
+  .db-modal-actions button {
+    padding: 7px 14px;
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    color: #c8d1de;
+    font-family: var(--mono); font-size: 11px; font-weight: 500;
+    letter-spacing: 0.4px;
+    cursor: pointer;
+    transition: color .15s, border-color .15s, background .15s;
+  }
+  .db-modal-actions button:hover {
+    color: #f3f6fb;
+    border-color: rgba(94, 193, 255, 0.45);
+    background: rgba(94, 193, 255, 0.06);
+  }
+  .db-modal-actions .close-btn:hover {
+    color: #ff8a9a;
+    border-color: rgba(239, 89, 110, 0.45);
+    background: rgba(239, 89, 110, 0.06);
+  }
+
+  .db-modal-body {
+    flex: 1; min-height: 0;
+    display: grid;
+    grid-template-columns: 280px 1fr;
+    gap: 0;
+  }
+  .db-tables-list {
+    border-right: 1px solid rgba(255, 255, 255, 0.06);
+    overflow-y: auto;
+    padding: 14px 10px;
+    background: rgba(8, 11, 17, 0.4);
+  }
+  .db-tables-list .item {
+    display: flex; flex-direction: column; gap: 4px;
+    padding: 12px 14px;
+    margin-bottom: 4px;
+    border-radius: 10px;
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition: background .15s, border-color .15s, color .15s;
+  }
+  .db-tables-list .item:hover {
+    background: rgba(255, 255, 255, 0.03);
+  }
+  .db-tables-list .item.active {
+    background: rgba(94, 193, 255, 0.08);
+    border-color: rgba(94, 193, 255, 0.25);
+  }
+  .db-tables-list .item .name {
+    font-family: var(--mono); font-size: 12.5px; font-weight: 600;
+    color: #e7ecf3; letter-spacing: 0.2px;
+  }
+  .db-tables-list .item .sub {
+    font-family: var(--mono); font-size: 10.5px;
+    color: #7c8595; letter-spacing: 0.3px;
+  }
+  .db-tables-list .item.active .name { color: var(--accent); }
+  .db-tables-list .item.active .sub  { color: #a4adbd; }
+
+  .db-content {
+    overflow: hidden;
+    display: flex; flex-direction: column;
+    min-width: 0;
+    background: #0b0f17;
+  }
+  .db-content-bar {
+    padding: 14px 22px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 14px;
+    flex-wrap: wrap;
+    font-family: var(--mono); font-size: 12px; color: #8a93a3;
+  }
+  .db-content-bar .meta { display: flex; gap: 22px; align-items: center; }
+  .db-content-bar .meta strong {
+    color: #f3f6fb; font-weight: 600;
+  }
+  .db-content-bar .pager { display: flex; align-items: center; gap: 6px; }
+  .db-content-bar .pager button {
+    padding: 6px 12px;
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 7px;
+    color: #c8d1de;
+    font-family: var(--mono); font-size: 11px; font-weight: 500;
+    cursor: pointer;
+    transition: color .15s, border-color .15s, background .15s;
+  }
+  .db-content-bar .pager button:disabled {
+    opacity: .3; cursor: not-allowed;
+  }
+  .db-content-bar .pager button:not(:disabled):hover {
+    color: #f3f6fb;
+    border-color: rgba(94, 193, 255, 0.45);
+    background: rgba(94, 193, 255, 0.06);
+  }
+
+  .db-table-wrap {
+    flex: 1; min-height: 0;
+    overflow: auto;
+    background: #0b0f17;
+  }
+  .db-table-wrap::-webkit-scrollbar { width: 10px; height: 10px; }
+  .db-table-wrap::-webkit-scrollbar-track { background: transparent; }
+  .db-table-wrap::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 6px;
+  }
+  .db-table-wrap::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.16);
+  }
+  .db-table-wrap table {
+    width: 100%; border-collapse: separate; border-spacing: 0;
+    font-family: var(--mono); font-size: 12px;
+  }
+  .db-table-wrap thead th {
+    position: sticky; top: 0; z-index: 1;
+    background: #11161f;
+    color: #a4adbd;
+    text-align: left;
+    padding: 12px 14px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.8px; font-size: 10.5px;
+    white-space: nowrap;
+  }
+  .db-table-wrap tbody td {
+    padding: 10px 14px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    color: #e7ecf3;
+    vertical-align: top;
+    max-width: 420px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    line-height: 1.45;
+  }
+  .db-table-wrap tbody tr { transition: background .12s; }
+  .db-table-wrap tbody tr:hover { background: rgba(94, 193, 255, 0.04); }
+  .db-table-wrap tbody tr:hover td { color: #ffffff; }
+  .db-table-wrap td.json {
+    font-size: 11.5px;
+    color: #98a3b5;
+  }
+  .db-table-wrap td.num {
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    color: #f3f6fb;
+  }
+  .db-table-wrap td.null {
+    color: #4a5260;
+  }
+  .db-empty {
+    padding: 56px 24px; text-align: center;
+    color: #7c8595; font-family: var(--mono); font-size: 13px;
+    letter-spacing: 0.3px;
+  }
+
   /* ── Main / sections ─────────────────────────────────────────────── */
   main { padding: 18px 14px 60px; max-width: none; margin: 0; }
   section { margin-bottom: 22px; }
@@ -714,6 +946,14 @@
       </div>
     </div>
     <div class="head-meta">
+      <button type="button" class="db-btn" id="db-open-btn" title="Database tablolarını incele">
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <ellipse cx="12" cy="5" rx="8" ry="3"></ellipse>
+          <path d="M4 5v6c0 1.66 3.58 3 8 3s8-1.34 8-3V5"></path>
+          <path d="M4 11v6c0 1.66 3.58 3 8 3s8-1.34 8-3v-6"></path>
+        </svg>
+        <span>Database</span>
+      </button>
       <div class="sessions" id="sessions">
         <div class="session" data-name="asia"><span class="ind"></span>Asia</div>
         <div class="session" data-name="london"><span class="ind"></span>London</div>
@@ -905,6 +1145,41 @@
   </section>
 
 </main>
+
+<!-- DB browser modal — opened by the "Database" button in the header. -->
+<div class="db-modal" id="db-modal" role="dialog" aria-modal="true" aria-hidden="true">
+  <div class="db-modal-inner">
+    <div class="db-modal-head">
+      <div class="db-modal-title">
+        Database browser
+        <span class="sub" id="db-modal-sub">read-only · live</span>
+      </div>
+      <div class="db-modal-actions">
+        <button type="button" id="db-refresh-btn" title="Tabloyu yeniden çek">Refresh</button>
+        <button type="button" class="close-btn" id="db-close-btn" title="Kapat (Esc)">Close</button>
+      </div>
+    </div>
+    <div class="db-modal-body">
+      <aside class="db-tables-list" id="db-tables-list"></aside>
+      <div class="db-content">
+        <div class="db-content-bar">
+          <div class="meta">
+            <span>Table: <strong id="db-current-table">—</strong></span>
+            <span>Rows: <strong id="db-current-range">—</strong> / <strong id="db-current-total">—</strong></span>
+            <span id="db-current-order"></span>
+          </div>
+          <div class="pager">
+            <button type="button" id="db-prev-btn" disabled>‹ Prev</button>
+            <button type="button" id="db-next-btn" disabled>Next ›</button>
+          </div>
+        </div>
+        <div class="db-table-wrap" id="db-table-wrap">
+          <div class="db-empty">Bir tablo seç…</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
 
 <script>
 "use strict";
@@ -2151,6 +2426,184 @@ async function tick() {
     setStatus("err", e.message || String(e));
   }
 }
+
+// ── DB browser modal ───────────────────────────────────────────────────────
+//
+// Triggered by the "Database" button in the header. Loads the table list
+// from `/api/db/tables` once on first open (then on every Refresh click),
+// and the rows for whichever table is selected from
+// `/api/db/rows/{table}?limit&offset`. Both endpoints are read-only and
+// whitelist-bounded server-side.
+const DB_PAGE_SIZE = 200;
+const dbModal = $("#db-modal");
+const dbOpenBtn = $("#db-open-btn");
+const dbCloseBtn = $("#db-close-btn");
+const dbRefreshBtn = $("#db-refresh-btn");
+const dbTablesList = $("#db-tables-list");
+const dbTableWrap = $("#db-table-wrap");
+const dbCurrentTable = $("#db-current-table");
+const dbCurrentRange = $("#db-current-range");
+const dbCurrentTotal = $("#db-current-total");
+const dbCurrentOrder = $("#db-current-order");
+const dbPrevBtn = $("#db-prev-btn");
+const dbNextBtn = $("#db-next-btn");
+
+const dbState = {
+  tables: [],         // [{name, row_count, order_by, order_desc}, …]
+  current: null,      // active table name
+  offset: 0,
+  total: 0,
+  loadedRows: 0,      // rows count in last response
+};
+
+function dbOpen() {
+  dbModal.classList.add("open");
+  dbModal.setAttribute("aria-hidden", "false");
+  dbLoadTables({ keepSelection: false });
+}
+
+function dbClose() {
+  dbModal.classList.remove("open");
+  dbModal.setAttribute("aria-hidden", "true");
+}
+
+async function dbLoadTables({ keepSelection } = { keepSelection: true }) {
+  try {
+    const r = await fetch("/api/db/tables");
+    const j = await r.json();
+    if (!Array.isArray(j.tables)) throw new Error("bad payload");
+    dbState.tables = j.tables;
+    dbRenderTables();
+    let next = keepSelection && dbState.current ? dbState.current : null;
+    if (!next) {
+      const firstWithRows = dbState.tables.find(t => (t.row_count || 0) > 0);
+      next = (firstWithRows || dbState.tables[0] || {}).name || null;
+    }
+    if (next) await dbSelectTable(next, 0);
+  } catch (e) {
+    console.error("db tables fetch failed", e);
+    dbTablesList.innerHTML =
+      `<div class="db-empty">Tabloları yüklerken hata: ${escapeHtml(e.message || String(e))}</div>`;
+  }
+}
+
+function dbRenderTables() {
+  dbTablesList.innerHTML = dbState.tables.map(t => {
+    const active = t.name === dbState.current ? " active" : "";
+    const rc = t.row_count === null ? "n/a" : fmtNum(t.row_count, 0);
+    return `
+      <div class="item${active}" data-table="${escapeHtml(t.name)}">
+        <span class="name">${escapeHtml(t.name)}</span>
+        <span class="sub">${rc} rows · ORDER BY ${escapeHtml(t.order_by)} ${t.order_desc ? "DESC" : "ASC"}</span>
+      </div>`;
+  }).join("");
+  $$(".db-tables-list .item").forEach(el => {
+    el.addEventListener("click", () => dbSelectTable(el.dataset.table, 0));
+  });
+}
+
+async function dbSelectTable(name, offset) {
+  dbState.current = name;
+  dbState.offset = Math.max(0, offset || 0);
+  $$(".db-tables-list .item").forEach(el => {
+    el.classList.toggle("active", el.dataset.table === name);
+  });
+  dbCurrentTable.textContent = name;
+  dbTableWrap.innerHTML = `<div class="db-empty">Yükleniyor…</div>`;
+  try {
+    const url = `/api/db/rows/${encodeURIComponent(name)}?limit=${DB_PAGE_SIZE}&offset=${dbState.offset}`;
+    const r = await fetch(url);
+    if (!r.ok) {
+      const errBody = await r.json().catch(() => ({}));
+      throw new Error(errBody.detail || errBody.message || `HTTP ${r.status}`);
+    }
+    const j = await r.json();
+    dbState.total = j.total || 0;
+    dbState.loadedRows = (j.rows || []).length;
+    const orderText = `ORDER BY ${j.order_by} ${j.order_desc ? "DESC" : "ASC"}`;
+    dbCurrentOrder.textContent = orderText;
+    const start = dbState.offset + 1;
+    const end = dbState.offset + dbState.loadedRows;
+    dbCurrentRange.textContent = dbState.loadedRows
+      ? `${start.toLocaleString()}–${end.toLocaleString()}`
+      : "0";
+    dbCurrentTotal.textContent = dbState.total.toLocaleString();
+    dbPrevBtn.disabled = dbState.offset <= 0;
+    dbNextBtn.disabled = dbState.offset + dbState.loadedRows >= dbState.total;
+    dbRenderRows(j);
+  } catch (e) {
+    console.error("db rows fetch failed", e);
+    dbTableWrap.innerHTML =
+      `<div class="db-empty">Hata: ${escapeHtml(e.message || String(e))}</div>`;
+    dbPrevBtn.disabled = true;
+    dbNextBtn.disabled = true;
+  }
+}
+
+function dbRenderRows(payload) {
+  const cols = payload.columns || [];
+  const rows = payload.rows || [];
+  if (!rows.length) {
+    dbTableWrap.innerHTML = `<div class="db-empty">Bu tabloda satır yok.</div>`;
+    return;
+  }
+  const thead = `<thead><tr>${cols.map(c => `<th>${escapeHtml(c)}</th>`).join("")}</tr></thead>`;
+  const tbody = `<tbody>${rows.map(row => {
+    return `<tr>${row.map(v => dbCellHtml(v)).join("")}</tr>`;
+  }).join("")}</tbody>`;
+  dbTableWrap.innerHTML = `<table>${thead}${tbody}</table>`;
+}
+
+function dbCellHtml(v) {
+  if (v === null || v === undefined) return `<td class="null">—</td>`;
+  if (typeof v === "number") {
+    const display = Number.isInteger(v)
+      ? v.toLocaleString()
+      : Math.abs(v) >= 1e6 ? v.toExponential(3)
+      : Math.abs(v) >= 100  ? v.toFixed(2)
+      : v.toFixed(6);
+    return `<td class="num" title="${escapeHtml(String(v))}">${escapeHtml(display)}</td>`;
+  }
+  if (typeof v === "string") {
+    const trimmed = v.length > 0 && (v.startsWith("{") || v.startsWith("["));
+    const cls = trimmed ? "json" : "";
+    const short = v.length > 200 ? v.slice(0, 200) + "…" : v;
+    return `<td class="${cls}" title="${escapeHtml(v)}">${escapeHtml(short)}</td>`;
+  }
+  return `<td>${escapeHtml(String(v))}</td>`;
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+dbOpenBtn.addEventListener("click", dbOpen);
+dbCloseBtn.addEventListener("click", dbClose);
+dbModal.addEventListener("click", (e) => {
+  if (e.target === dbModal) dbClose();
+});
+dbRefreshBtn.addEventListener("click", () => {
+  dbLoadTables({ keepSelection: true });
+});
+dbPrevBtn.addEventListener("click", () => {
+  if (!dbState.current) return;
+  const next = Math.max(0, dbState.offset - DB_PAGE_SIZE);
+  dbSelectTable(dbState.current, next);
+});
+dbNextBtn.addEventListener("click", () => {
+  if (!dbState.current) return;
+  const next = dbState.offset + DB_PAGE_SIZE;
+  if (next >= dbState.total) return;
+  dbSelectTable(dbState.current, next);
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && dbModal.classList.contains("open")) dbClose();
+});
 
 tick();
 setInterval(tick, POLL_MS);
