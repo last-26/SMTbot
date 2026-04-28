@@ -2117,7 +2117,11 @@ function renderAll(payload) {
   renderWhales(payload.whale_transfers_recent || []);
 
   if (payload.clean_since) {
-    windowInfo.textContent = `since ${payload.clean_since.replace("T", " ").slice(0, 16)}Z`;
+    const d = _toTzDate(payload.clean_since);
+    const label = d
+      ? d.toISOString().slice(0, 16).replace("T", " ") + " " + TZ_LABEL
+      : payload.clean_since.replace("T", " ").slice(0, 16) + "Z";
+    windowInfo.textContent = `since ${label}`;
   } else {
     windowInfo.textContent = "all-time";
   }

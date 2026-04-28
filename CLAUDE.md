@@ -26,6 +26,76 @@ AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT lin
 
 ## Changelog
 
+### 2026-04-28 (evening) — Whale threshold 75M → 10M (Arkham floor) + dashboard windowInfo UTC+3
+
+Two-line config + UI patch triggered by operator's audit of label-quota
+post-2026-04-26 75M drop. Observation: `whale_transfers` table picked
+up 2-3 events in the days following the 75M threshold drop, but Arkham
+label usage stayed pinned at 558/10k/mo — ruling out the
+"$10M risks crossing label budget" caution that originally justified
+the 75M floor.
+
+**Code audit confirms operator's hypothesis.** [src/data/on_chain_ws.py:78-96](src/data/on_chain_ws.py:78)
+`parse_transfer_extras` reads `from_entity` / `to_entity` from
+`arkhamEntity.name` field already present in the WS payload, with a
+fallback to the raw `address` string when no label is attached. **There
+is NO `/intelligence/address` lookup anywhere in the whale event path.**
+Arkham's WS stream delivers transfer events with entity labels
+pre-resolved server-side; our Python listener parses what's already in
+the message. Label-quota burn for whale events is therefore zero by
+construction, not zero-by-luck. The CLAUDE.md historical note that
+called $10M "label-budget risky" was a precaution written before the
+parse path was audited.
+
+**Threshold drop (`config/default.yaml:717`):**
+- `whale_threshold_usd: 75_000_000.0 → 10_000_000.0` (= Arkham WS
+  hard floor enforced by Pydantic validator at `src/bot/config.py:796`).
+
+**Cost analysis at 10M:**
+- Network: ~200-500 transfer messages/day at the 10M threshold (rough
+  industry figure; actual volume will calibrate over the next 24h).
+  Each message ~500 bytes JSON, parsed once + 1 SQLite insert.
+  Negligible vs. the per-cycle Coinalyze/Arkham REST baseline.
+- Label-quota: zero (audit above).
+- Pass 3 GBT data density: maximized — operator gets a whale-event
+  dataset 7.5× denser than the 75M setting at no marginal cost.
+
+**Dashboard `windowInfo` UTC+3 fix
+(`src/dashboard/static/index.html:2120`):** the only timezone holdout
+from the 2026-04-26 polish session. Pre-fix the header showed
+`since 2026-04-25 21:45Z` (raw UTC `Z`-suffixed) while every other
+timestamp on the page already rendered in UTC+3. Routed through the
+existing `_toTzDate` helper with `TZ_LABEL` suffix; falls back to the
+old UTC string only if `_toTzDate` returns null (malformed
+`clean_since`). No backend payload change.
+
+**Files touched:**
+- `config/default.yaml` — single line value + comment.
+- `src/dashboard/static/index.html` — 5-line `windowInfo` block.
+- `algoritma.md` — operating params table row updated.
+
+**Tests:** none added — both changes are config-only / UI-only with no
+new code paths. Pydantic validator for `whale_threshold_usd ≥ 10M`
+already covered by `test_bot_config.py`; the new value is the floor
+itself so the validator test still passes.
+
+**Re-eval triggers (after 24h soak at 10M):**
+1. **Whale event rate** — `SELECT COUNT(*) FROM whale_transfers WHERE
+   captured_at > '2026-04-28T<commit-ts>'`. Expected 200-500/day; <50
+   means listener bug (not threshold), >2000 means market regime
+   abnormally hot or filter mis-applied.
+2. **Label usage drift** — Arkham `label_usage_pct` should stay flat
+   near 558/10k. Any upward drift = the "no label burn" audit missed
+   a path; revisit `parse_transfer_extras`.
+3. **`whale_transfers` row size sanity** — `from_entity` should be
+   non-null on >70% of rows (entity-labelled CEX wallets); the rest
+   will be raw addresses where Arkham didn't attach a label. <40%
+   non-null = WS payload schema changed and `_label` extractor needs
+   updating.
+4. **Dashboard `windowInfo`** — visually confirm "since 2026-04-26
+   00:45 +03" (or equivalent shifted ISO slice) in the header on next
+   page reload.
+
 ### 2026-04-28 — Scalp tighten + multi-TF MSS factors
 
 Two paired commits. Operator-driven scalp focus. No DB schema changes

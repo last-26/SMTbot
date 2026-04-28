@@ -714,7 +714,7 @@ on_chain:
   # longer react to whale events. flow_alignment soft signal (below)
   # replaces the directional intuition whale blackout attempted to capture.
   whale_blackout_enabled: true
-  whale_threshold_usd: 75000000.0                  # WS filter (usdGte); ≥10M min. 2026-04-22: 100M→150M halved label burn. 2026-04-26: 150M→75M after 24h of zero whale_transfers rows post-Bybit restart (Pass 2). Re-eval after first 24h: if >300/day raise back; if 0 still, it's a listener bug not threshold
+  whale_threshold_usd: 10000000.0                  # WS filter (usdGte); ≥10M min (Arkham WS hard floor). 2026-04-22: 100M→150M halved label burn. 2026-04-26: 150M→75M after 24h of zero whale_transfers rows post-Bybit restart (Pass 2). 2026-04-28: 75M→10M after `parse_transfer_extras` audit confirmed whale events DO NOT burn labels (entity name comes pre-resolved in WS payload, no `/intelligence/address` lookup); operator's 558-stable observation post-2026-04-26 75M drop validated this. 10M = Arkham hard floor, max whale dataset density for Pass 3 GBT.
   whale_blackout_duration_s: 600                   # State-activity window (informational flag only, not a gate)
   # Token slug whitelist on the WS stream — only transfers in these
   # tokens reach the listener. Drops gross label-lookup tax from
