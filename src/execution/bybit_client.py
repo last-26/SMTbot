@@ -1041,6 +1041,18 @@ class BybitClient:
             # was written in.
             ct_val = float(_INTERNAL_CT_VAL.get(internal_sym, 0.0))
             size_contracts = size_base / ct_val if ct_val > 0 else size_base
+            # Bybit V5 returns takeProfit/stopLoss as decimal strings; "" or
+            # "0" means "no leg attached on this side of the position".
+            tp_raw = row.get("takeProfit") or "0"
+            sl_raw = row.get("stopLoss") or "0"
+            try:
+                take_profit = float(tp_raw)
+            except (TypeError, ValueError):
+                take_profit = 0.0
+            try:
+                stop_loss = float(sl_raw)
+            except (TypeError, ValueError):
+                stop_loss = 0.0
             snapshots.append(PositionSnapshot(
                 inst_id=internal_sym,
                 pos_side=pos_side,
@@ -1049,6 +1061,8 @@ class BybitClient:
                 mark_price=float(row.get("markPrice") or 0.0),
                 unrealized_pnl=float(row.get("unrealisedPnl") or 0.0),
                 leverage=int(float(row.get("leverage") or 0)),
+                take_profit=take_profit,
+                stop_loss=stop_loss,
             ))
         return snapshots
 

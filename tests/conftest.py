@@ -244,6 +244,16 @@ class FakeBybitClient:
     def get_positions(self, inst_id: Optional[str] = None) -> list[PositionSnapshot]:
         return list(self.positions)
 
+    def get_contract_size(self, inst_id: str) -> float:
+        # Mirror the real BybitClient's hardcoded internal-canonical map so
+        # tests that touch sizing math get the same multipliers.
+        return {
+            "BTC-USDT-SWAP": 0.01, "ETH-USDT-SWAP": 0.1,
+            "SOL-USDT-SWAP": 1.0, "DOGE-USDT-SWAP": 1000.0,
+            "BNB-USDT-SWAP": 0.01, "XRP-USDT-SWAP": 100.0,
+            "ADA-USDT-SWAP": 100.0,
+        }.get(inst_id, 0.01)
+
     def enrich_close_fill(self, fill: CloseFill) -> CloseFill:
         return self.enrich_return if self.enrich_return is not None else fill
 

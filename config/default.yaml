@@ -3,6 +3,11 @@ bot:
   poll_interval_seconds: 5
   timezone: UTC
   starting_balance: 500.0  # 2026-04-26 demo reset — flat-$ override RISK_AMOUNT_USDT=10 → 1R = $10
+  # 2026-04-28 — actively reconcile live Bybit state vs. journal at startup.
+  # Synthetic-inserts rows for live positions with no DB row, grows DB
+  # num_contracts when live size > DB size, attaches TP/SL when missing.
+  # See SOL 2026-04-28 incident in CLAUDE.md.
+  startup_orphan_reconcile_enabled: true
 
 trading:
   # 5 pair — hepsi aynı anda aktif (max_concurrent_positions=5, queue yok).

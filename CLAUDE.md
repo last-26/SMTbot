@@ -26,6 +26,118 @@ AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT lin
 
 ## Changelog
 
+### 2026-04-28 — Startup orphan-position reconciliation (SOL incident)
+
+Closes the gap exposed by a same-day SOL incident. A SOL pending limit
+(orderLinkId `smtbotd0053f6...`) filled WHILE the bot was being
+restarted between sessions. By the time the new session ran its
+existing orphan-pending-limit sweep (`_cancel_orphan_pending_limits`),
+the order was already `status=Filled` and gone from `list_open_orders`,
+so the sweep had nothing to cancel. Rehydrate path
+(`_rehydrate_open_positions`) only consults the local DB for OPEN
+trades, so a position that was never journaled stayed invisible to the
+bot's monitor and management loops (SL-to-BE, MFE-lock, TP-revise).
+Result: 13 SOL contracts ran live on Bybit with zero bot oversight
+until operator + DB hand-patch (14 → 27 contracts) brought rehydrate
+into agreement with reality on the next restart.
+
+The 2026-04-27 F6 fix (`cancel_pending` race detection via `get_order`
+verify) addresses cancel-vs-fill races within a single bot session;
+this commit covers the **restart-while-pending race**, which F6
+cannot.
+
+**Mechanism (active reconciliation in `_reconcile_orphans`):**
+
+The pre-existing log-only branch becomes a four-way decision tree, run
+*before* `_rehydrate_open_positions` so synthetic-inserted rows are
+picked up by the existing rehydrate flow (monitor.register_open + maker
+TP-limit re-place) without separate plumbing:
+
+1. **Live position with no journal row** → synthetic-insert + maybe
+   attach position TP/SL. `journal.record_open_synthetic` writes a
+   plausible OPEN row stamped with
+   `artifact_reason=startup_reconcile_synthetic_<ISO ts>` and
+   `demo_artifact=1`. SL/TP defaults: prefer Bybit's
+   `takeProfit`/`stopLoss` fields (V5 `/v5/position/list` response,
+   now plumbed through `PositionSnapshot.take_profit` /
+   `.stop_loss`). Falls back to per-symbol `min_sl_distance_pct_per_symbol`
+   (anchored at entry) for SL and `execution.target_rr_ratio × sl_distance`
+   for TP. If either leg is missing on Bybit, `set_position_tpsl` attaches
+   it. If both already attached, no-op (idempotent).
+2. **Live size > journal size** → grow journal num_contracts (+ scale
+   notional + risk linearly) via `journal.update_open_position_size`.
+   Stamps `artifact_reason=startup_reconcile_size_grow_<ISO ts>`. This
+   is the exact SOL-2026-04-28 case: DB=14, live=27, second fill
+   landed unmanaged.
+3. **Live size < journal size** → log-only. A partial close already
+   happened; the next monitor.poll() handles closure organically via
+   `enrich_close_fill`.
+4. **Journal row but no live position** → log-only. Same flow:
+   rehydrate registers the row, monitor.poll() emits CloseFill on the
+   first tick, enrichment marks it WIN/LOSS/BREAKEVEN.
+
+Synthetic rows carry `demo_artifact=True` + their `artifact_reason`
+prefix so Pass 3 GBT can drop them from feature analysis (matches the
+2026-04-27 phantom_cancel_synthetic precedent).
+
+**Config flag — `bot.startup_orphan_reconcile_enabled` (default: `true`).**
+When `false`, the legacy log-only behaviour is preserved (operator
+hand-patches the DB on mismatch). Off-switch exists so a future
+diagnostic session can prove a problem with reconcile without yanking
+the whole feature.
+
+**Files touched:**
+
+- `src/bot/config.py` + `config/default.yaml` — new RuntimeConfig flag.
+- `src/execution/models.py` — `PositionSnapshot` gains `take_profit` +
+  `stop_loss` (default 0.0). Hot consumers (PositionMonitor.poll,
+  runner snapshot writer) ignore both.
+- `src/execution/bybit_client.py` — `get_positions` parses
+  `takeProfit` / `stopLoss` from the V5 row.
+- `src/journal/database.py` — `record_open_synthetic` + 
+  `update_open_position_size` helpers.
+- `src/bot/runner.py` — `_reconcile_orphans` rewritten to four-way
+  decision tree; new private helpers `_reconcile_synthetic_insert` +
+  `_reconcile_grow_journal_size`.
+- `tests/conftest.py` — `FakeBybitClient.get_contract_size` for the
+  reconcile path's sizing math.
+- `tests/test_startup_reconcile.py` — 8 tests covering the four cases
+  + the on/off flag + the TP/SL idempotent skip.
+- `tests/test_journal_database.py` — 3 tests covering the new helpers
+  end-to-end.
+
+**Why now (not waiting):** the race is lurking. Today's SOL case had a
+benign outcome (a second fill arrived right after, processed
+correctly, operator + manual DB patch closed the gap). Next time it
+might be an isolated orphan that sits unmanaged for hours, growing in
+MFE/MAE without bot oversight, exposing the operator to size-
+accumulating SL hits. The 13-contract over-sizing today nearly doubled
+SOL's risk budget without any bot-side awareness.
+
+**Re-eval triggers:**
+
+1. **`reconcile_synthetic_inserted` log frequency** per restart — >0
+   = orphan happened, fix caught it. 0 across 30 restarts = race
+   never fires; flag is harmless overhead. Multiple per restart =
+   structural problem upstream (e.g. crashes-during-pending), worth
+   investigating.
+2. **`reconcile_size_grown` log frequency** — >0 means the bot
+   restarted *during* a pending-fill sequence; same investigative
+   signal as case 1.
+3. **`reconcile_synthetic_tpsl_attach_failed` rate** — should be 0%.
+   Non-zero = Bybit rejected the trading-stop call (likely SL on the
+   wrong side of mark, or TP/SL too close to mark). Operator review
+   required because the position is naked until either reconcile
+   succeeds on next restart or the operator hand-attaches.
+4. **`artifact_reason LIKE 'startup_reconcile_%'` count** in the
+   trades table — Pass 3 GBT should drop these rows from feature
+   analysis the same way it drops `phantom_cancel_synthetic` rows.
+5. **`reconcile_size_partial` warning rate** — fraction of restarts
+   where live < db. Sustained > 1 per 10 restarts means partial-close
+   monitor.poll() is regularly losing track and the synthetic-insert
+   side underestimates positions; investigate the close-enrichment
+   flow.
+
 ### 2026-04-28 — Scalp tighten + multi-TF MSS factors
 
 Two paired commits. Operator-driven scalp focus. No DB schema changes

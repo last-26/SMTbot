@@ -3912,20 +3912,30 @@ class BotRunner:
 
         Three passes:
 
-        1. Positions mismatch — log-only (operator decides). Unknown live
-           positions with no journal row, or stale journal OPEN rows whose
-           live position is gone.
+        1. Position mismatch — when `bot.startup_orphan_reconcile_enabled`
+           (default True): synthetic-insert rows for live-without-journal
+           positions, grow journal num_contracts when live size > journal
+           size, attach position TP/SL when missing. When disabled: log
+           only.
+
+           This closes the gap exposed by the 2026-04-28 SOL incident: a
+           pending limit filled DURING a bot restart, the new session's
+           orphan-pending-limit sweep saw status=Filled (gone from
+           `list_open_orders`), and 13 SOL contracts ran unmanaged for
+           hours. The 2026-04-27 F6 fix covers cancel-vs-fill races
+           DURING a single bot session; this pass covers the
+           restart-while-pending race.
+
+           "Journal but no live position" is left to the existing
+           rehydrate → monitor.poll → enrich_close_fill flow: rehydrate
+           registers the journal row in the monitor, the next poll cycle
+           sees the position is gone and emits a CloseFill, which gets
+           enriched via `/v5/position/closed-pnl` and journaled.
+
         2. Orphan resting limit orders — CANCEL. The monitor's in-memory
            `_pending` dict is empty at startup, so any live pending limit
-           on Bybit at this moment cannot be tracked by this process; if it
-           filled we'd get an untracked (= unprotected) position. Safer to
-           cancel now than to discover it as an orphan later.
-        3. Surplus OCOs — CANCEL those not referenced by the journal's
-           `algo_ids` for a (symbol, posSide) that has an OPEN row. This
-           covers the 2026-04-20 DOGE 2-OCO bug: a pre-restart
-           revise/lock placed a replacement OCO whose new algoId never made
-           it to the journal, so rehydrate missed it and the unreferenced
-           algo lives on as a phantom stop.
+           on Bybit at this moment cannot be tracked by this process; if
+           it filled we'd get an untracked (= unprotected) position.
 
         Never auto-closes *positions* — that stays operator-decides.
         """
@@ -3934,25 +3944,229 @@ class BotRunner:
         except Exception:
             logger.exception("reconcile_fetch_failed")
             return
-        live_keys = {(p.inst_id, p.pos_side) for p in live if p.size != 0}
+        live_by_key = {
+            (p.inst_id, p.pos_side): p for p in live if p.size != 0
+        }
         # Read journal OPEN rows directly — `open_trade_ids` is empty here
-        # because reconcile now runs BEFORE rehydrate (so the pending-limit
+        # because reconcile runs BEFORE rehydrate (so the pending-limit
         # sweep can't nuke freshly-placed TP limits).
         try:
             open_recs = await self.ctx.journal.list_open_trades()
         except Exception:
             logger.exception("reconcile_journal_read_failed")
             return
-        journal_keys = {
-            (rec.symbol, _direction_to_pos_side(rec.direction))
+        journal_by_key: dict[tuple[str, str], Any] = {
+            (rec.symbol, _direction_to_pos_side(rec.direction)): rec
             for rec in open_recs
         }
-        for k in live_keys - journal_keys:
-            logger.error("orphan_live_position_no_journal_row key={}", k)
-        for k in journal_keys - live_keys:
-            logger.error("journal_open_but_no_live_position key={} (stale row)", k)
+        live_keys = set(live_by_key.keys())
+        journal_keys = set(journal_by_key.keys())
+
+        reconcile_enabled = self.ctx.config.bot.startup_orphan_reconcile_enabled
+
+        # Pass A: live without journal → synthetic insert + maybe attach TP/SL
+        for key in live_keys - journal_keys:
+            snap = live_by_key[key]
+            logger.error(
+                "orphan_live_position_no_journal_row key={} size={} entry={} "
+                "tp={} sl={}",
+                key, snap.size, snap.entry_price, snap.take_profit, snap.stop_loss,
+            )
+            if reconcile_enabled:
+                await self._reconcile_synthetic_insert(snap)
+
+        # Pass B: matched keys → check size grew (live > journal)
+        for key in live_keys & journal_keys:
+            snap = live_by_key[key]
+            rec = journal_by_key[key]
+            live_n = int(round(snap.size))
+            db_n = int(rec.num_contracts)
+            if live_n > db_n > 0:
+                logger.error(
+                    "reconcile_size_mismatch key={} db_n={} live_n={} (live > db)",
+                    key, db_n, live_n,
+                )
+                if reconcile_enabled:
+                    await self._reconcile_grow_journal_size(rec, live_n)
+            elif 0 < live_n < db_n:
+                logger.warning(
+                    "reconcile_size_partial key={} db_n={} live_n={} (live < db, "
+                    "likely partial close — leaving DB untouched, monitor poll "
+                    "will reconcile)", key, db_n, live_n,
+                )
+
+        # Pass C: journal without live position → log only.
+        for key in journal_keys - live_keys:
+            logger.error("journal_open_but_no_live_position key={} (stale row)", key)
 
         await self._cancel_orphan_pending_limits()
+
+    async def _reconcile_synthetic_insert(self, snap) -> None:
+        """Build a synthetic OPEN journal row for a live position with no
+        DB counterpart, and attach position TP/SL if Bybit's row has none.
+
+        Defaults derived from per-symbol `min_sl_distance_pct_per_symbol`
+        (or global `min_sl_distance_pct`) and `execution.target_rr_ratio`
+        — same shape as a fresh trade plan, so dynamic-TP-revise + MFE
+        lock paths see a plausible plan_sl_price after rehydrate.
+        """
+        from src.data.models import Direction
+
+        cfg = self.ctx.config
+        client = self.ctx.bybit_client
+        symbol = snap.inst_id
+        pos_side = snap.pos_side
+        direction = Direction.BULLISH if pos_side == "long" else Direction.BEARISH
+        is_long = pos_side == "long"
+        entry = float(snap.entry_price or 0.0)
+        if entry <= 0:
+            logger.error(
+                "reconcile_synthetic_skip_no_entry symbol={} pos_side={} — "
+                "Bybit avgPrice unset; cannot synthesize plan",
+                symbol, pos_side,
+            )
+            return
+        num_contracts = int(round(snap.size))
+        if num_contracts <= 0:
+            logger.error(
+                "reconcile_synthetic_skip_zero_size symbol={} pos_side={}",
+                symbol, pos_side,
+            )
+            return
+
+        ct_val = float(client.get_contract_size(symbol) or 0.0)
+        position_size_usdt = num_contracts * ct_val * entry
+
+        # SL: prefer Bybit's own attached SL; else derive from per-symbol floor.
+        sl_floor_pct = float(cfg.min_sl_distance_pct_for(symbol) or 0.0)
+        if snap.stop_loss > 0:
+            sl_price = float(snap.stop_loss)
+        elif sl_floor_pct > 0:
+            sl_price = entry * (1.0 - sl_floor_pct) if is_long \
+                else entry * (1.0 + sl_floor_pct)
+        else:
+            # No floor configured — fall back to a 0.5% nominal so
+            # plan_sl_price isn't pathological. Logged so the operator can
+            # tighten by hand if the live SL ends up implausibly wide.
+            sl_price = entry * (1.0 - 0.005) if is_long else entry * (1.0 + 0.005)
+
+        sl_distance = abs(entry - sl_price)
+        risk_amount_usdt = num_contracts * ct_val * sl_distance
+
+        # TP: prefer Bybit's; else target_rr_ratio × sl_distance.
+        target_rr = float(getattr(cfg.execution, "target_rr_ratio", 0.0) or 0.0)
+        if snap.take_profit > 0:
+            tp_price = float(snap.take_profit)
+        elif target_rr > 0 and sl_distance > 0:
+            tp_price = entry + target_rr * sl_distance if is_long \
+                else entry - target_rr * sl_distance
+        else:
+            # Fallback: 1:1.5 RR (current scalp default).
+            tp_price = entry + 1.5 * sl_distance if is_long \
+                else entry - 1.5 * sl_distance
+
+        rr_ratio = (
+            abs(tp_price - entry) / sl_distance if sl_distance > 0 else 0.0
+        )
+        leverage = int(snap.leverage or 0)
+        ts = datetime.now(tz=timezone.utc)
+        artifact_reason = (
+            f"startup_reconcile_synthetic_{ts.strftime('%Y-%m-%dT%H%M%SZ')}"
+        )
+
+        try:
+            rec = await self.ctx.journal.record_open_synthetic(
+                symbol=symbol,
+                direction=direction,
+                entry_price=entry,
+                sl_price=sl_price,
+                tp_price=tp_price,
+                num_contracts=num_contracts,
+                position_size_usdt=position_size_usdt,
+                risk_amount_usdt=risk_amount_usdt,
+                leverage=leverage,
+                rr_ratio=rr_ratio,
+                artifact_reason=artifact_reason,
+                entry_timestamp=ts,
+            )
+        except Exception:
+            logger.exception(
+                "reconcile_synthetic_insert_failed symbol={} pos_side={}",
+                symbol, pos_side,
+            )
+            return
+        logger.warning(
+            "reconcile_synthetic_inserted trade_id={} symbol={} pos_side={} "
+            "size={} entry={} sl={} tp={} rr={:.2f} artifact={}",
+            rec.trade_id, symbol, pos_side, num_contracts,
+            entry, sl_price, tp_price, rr_ratio, artifact_reason,
+        )
+
+        # Attach position TP/SL on Bybit if any leg is missing. Bybit V5
+        # accepts both legs in a single trading-stop call; sending only
+        # the missing one keeps the existing one untouched (passing None
+        # for the other leg).
+        attach_tp = snap.take_profit <= 0
+        attach_sl = snap.stop_loss <= 0
+        if attach_tp or attach_sl:
+            try:
+                await asyncio.to_thread(
+                    client.set_position_tpsl,
+                    symbol, pos_side,
+                    tp_price if attach_tp else None,
+                    sl_price if attach_sl else None,
+                )
+                logger.warning(
+                    "reconcile_synthetic_tpsl_attached symbol={} pos_side={} "
+                    "tp_attached={} sl_attached={}",
+                    symbol, pos_side, attach_tp, attach_sl,
+                )
+            except Exception:
+                logger.exception(
+                    "reconcile_synthetic_tpsl_attach_failed symbol={} "
+                    "pos_side={} — operator review required",
+                    symbol, pos_side,
+                )
+
+    async def _reconcile_grow_journal_size(self, rec, live_n: int) -> None:
+        """Update the journal's num_contracts for an OPEN row whose live
+        Bybit size has grown past the recorded value (2026-04-28 SOL:
+        DB had 14, live had 27 — second fill landed unmanaged).
+
+        Notional + risk scale linearly with num_contracts (entry_price +
+        sl_distance unchanged), so we multiply by the size ratio.
+        """
+        old_n = int(rec.num_contracts)
+        if old_n <= 0:
+            return
+        ratio = live_n / old_n
+        new_position = float(rec.position_size_usdt) * ratio
+        new_risk = float(rec.risk_amount_usdt) * ratio
+        ts = datetime.now(tz=timezone.utc)
+        artifact_reason = (
+            f"startup_reconcile_size_grow_{ts.strftime('%Y-%m-%dT%H%M%SZ')}"
+        )
+        try:
+            await self.ctx.journal.update_open_position_size(
+                rec.trade_id,
+                num_contracts=live_n,
+                position_size_usdt=new_position,
+                risk_amount_usdt=new_risk,
+                artifact_reason=artifact_reason,
+            )
+        except Exception:
+            logger.exception(
+                "reconcile_size_grow_failed trade_id={} symbol={}",
+                rec.trade_id, rec.symbol,
+            )
+            return
+        logger.warning(
+            "reconcile_size_grown trade_id={} symbol={} pos_side={} "
+            "old_n={} new_n={} old_risk={:.2f} new_risk={:.2f} artifact={}",
+            rec.trade_id, rec.symbol,
+            _direction_to_pos_side(rec.direction),
+            old_n, live_n, rec.risk_amount_usdt, new_risk, artifact_reason,
+        )
 
     async def _cancel_orphan_pending_limits(self) -> None:
         """Cancel every resting limit order on Bybit at startup.

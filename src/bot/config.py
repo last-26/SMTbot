@@ -32,6 +32,17 @@ class RuntimeConfig(BaseModel):
     poll_interval_seconds: float = 5.0
     timezone: str = "UTC"
     starting_balance: float = 10_000.0
+    # 2026-04-28 — startup orphan-position reconciliation. SOL incident on
+    # this date: a pending limit filled DURING a bot restart; the new
+    # session's `_cancel_orphan_pending_limits` sweep saw status=Filled
+    # (no longer in `list_open_orders`) and the journal had no row for the
+    # filled position, so 13 SOL contracts ran unmanaged. With this flag
+    # on, `_reconcile_orphans` actively closes the gap: synthetic-inserts
+    # rows for live-without-DB positions, grows DB num_contracts when
+    # live size exceeds journal, and stamps `artifact_reason` so Pass 3
+    # GBT can drop them. Off = legacy log-only behaviour (operator must
+    # manually patch the DB on mismatch, like the 2026-04-28 SOL fix).
+    startup_orphan_reconcile_enabled: bool = True
 
 
 class TradingConfig(BaseModel):

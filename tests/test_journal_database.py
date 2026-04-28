@@ -637,3 +637,95 @@ async def test_list_on_chain_snapshots_filters_by_time_window():
             until=base + timedelta(hours=1, minutes=30),
         )
         assert [r["daily_macro_bias"] for r in rows] == ["neutral"]
+
+
+# ── Startup orphan-position reconciliation helpers (2026-04-28 SOL fix) ───
+
+
+@pytest.mark.asyncio
+async def test_record_open_synthetic_inserts_open_row_with_artifact_reason():
+    """`record_open_synthetic` produces an OPEN row stamped with
+    `artifact_reason` + `demo_artifact=True` so Pass 3 GBT can drop it
+    from feature analysis (matches phantom_cancel_synthetic precedent)."""
+    j = TradeJournal(":memory:")
+    async with j:
+        rec = await j.record_open_synthetic(
+            symbol="SOL-USDT-SWAP",
+            direction=Direction.BULLISH,
+            entry_price=145.20,
+            sl_price=143.50,
+            tp_price=148.00,
+            num_contracts=13,
+            position_size_usdt=145.20 * 13,
+            risk_amount_usdt=1.70 * 13,
+            leverage=10,
+            artifact_reason="startup_reconcile_synthetic_2026-04-28T015500Z",
+        )
+        loaded = await j.get_trade(rec.trade_id)
+
+    assert loaded is not None
+    assert loaded.outcome == TradeOutcome.OPEN
+    assert loaded.symbol == "SOL-USDT-SWAP"
+    assert loaded.direction == Direction.BULLISH
+    assert loaded.num_contracts == 13
+    assert loaded.entry_price == pytest.approx(145.20)
+    assert loaded.sl_price == pytest.approx(143.50)
+    assert loaded.tp_price == pytest.approx(148.00)
+    assert loaded.demo_artifact is True
+    assert loaded.artifact_reason == (
+        "startup_reconcile_synthetic_2026-04-28T015500Z"
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_open_position_size_grows_size_and_stamps_artifact():
+    """`update_open_position_size` mutates num_contracts +
+    position/risk + artifact_reason on an OPEN row so Pass 3 can drop
+    rows whose size shifted post-fill."""
+    j = TradeJournal(":memory:")
+    async with j:
+        rec = await j.record_open_synthetic(
+            symbol="SOL-USDT-SWAP",
+            direction=Direction.BULLISH,
+            entry_price=145.20,
+            sl_price=143.50,
+            tp_price=148.00,
+            num_contracts=14,
+            position_size_usdt=14 * 145.20,
+            risk_amount_usdt=14 * 1.70,
+            leverage=10,
+            artifact_reason="seed",
+        )
+        await j.update_open_position_size(
+            rec.trade_id,
+            num_contracts=27,
+            position_size_usdt=27 * 145.20,
+            risk_amount_usdt=27 * 1.70,
+            artifact_reason="startup_reconcile_size_grow_2026-04-28T015500Z",
+        )
+        updated = await j.get_trade(rec.trade_id)
+
+    assert updated is not None
+    assert updated.num_contracts == 27
+    assert updated.position_size_usdt == pytest.approx(27 * 145.20)
+    assert updated.risk_amount_usdt == pytest.approx(27 * 1.70)
+    assert updated.demo_artifact is True
+    assert updated.artifact_reason == (
+        "startup_reconcile_size_grow_2026-04-28T015500Z"
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_open_position_size_raises_on_unknown_trade_id():
+    """Stale `trade_id` should raise so the runner notices a desync
+    instead of silently swallowing the no-op UPDATE."""
+    j = TradeJournal(":memory:")
+    async with j:
+        with pytest.raises(KeyError):
+            await j.update_open_position_size(
+                "deadbeef" * 4,
+                num_contracts=10,
+                position_size_usdt=1_000.0,
+                risk_amount_usdt=10.0,
+                artifact_reason="should_fail",
+            )

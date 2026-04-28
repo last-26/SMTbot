@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Union
 
@@ -1238,6 +1238,102 @@ class TradeJournal:
                 None if demo_artifact is None else int(demo_artifact),
                 artifact_reason,
                 trade_id,
+            ),
+        )
+        await conn.commit()
+        if cur.rowcount == 0:
+            raise KeyError(f"No trade with id={trade_id!r}")
+
+    async def record_open_synthetic(
+        self,
+        *,
+        symbol: str,
+        direction: Direction,
+        entry_price: float,
+        sl_price: float,
+        tp_price: float,
+        num_contracts: int,
+        position_size_usdt: float,
+        risk_amount_usdt: float,
+        leverage: int,
+        artifact_reason: str,
+        rr_ratio: float = 0.0,
+        sl_source: str = "startup_reconcile",
+        reason: str = "startup_reconcile_synthetic",
+        entry_timestamp: Optional[datetime] = None,
+        signal_timestamp: Optional[datetime] = None,
+    ) -> TradeRecord:
+        """Insert an OPEN row for a position discovered at startup that has
+        no journal counterpart (2026-04-28 SOL incident: a pending limit
+        filled during a bot restart and the new session had no DB row).
+
+        Mirrors `record_open` semantics — caller-supplied identity fields
+        plus artifact_reason so Pass 3 GBT can drop the row from feature
+        analysis (matches the 2026-04-27 phantom_cancel_synthetic
+        precedent). signal/entry timestamps default to "now" since the
+        true placement time is unrecoverable.
+        """
+        conn = self._require_conn()
+        ts = entry_timestamp or datetime.now(tz=timezone.utc)
+        rec = TradeRecord(
+            trade_id=uuid.uuid4().hex,
+            symbol=symbol,
+            direction=direction,
+            outcome=TradeOutcome.OPEN,
+            signal_timestamp=signal_timestamp or ts,
+            entry_timestamp=ts,
+            entry_price=entry_price,
+            sl_price=sl_price,
+            tp_price=tp_price,
+            rr_ratio=rr_ratio,
+            leverage=leverage,
+            num_contracts=num_contracts,
+            position_size_usdt=position_size_usdt,
+            risk_amount_usdt=risk_amount_usdt,
+            sl_source=sl_source,
+            reason=reason,
+            confluence_score=0.0,
+            confluence_factors=[],
+            artifact_reason=artifact_reason,
+            demo_artifact=True,
+        )
+        placeholders = ", ".join("?" * len(_COLUMNS))
+        cols = ", ".join(_COLUMNS)
+        await conn.execute(
+            f"INSERT INTO trades ({cols}) VALUES ({placeholders})",
+            _record_to_row(rec),
+        )
+        await conn.commit()
+        return rec
+
+    async def update_open_position_size(
+        self,
+        trade_id: str,
+        *,
+        num_contracts: int,
+        position_size_usdt: float,
+        risk_amount_usdt: float,
+        artifact_reason: str,
+    ) -> None:
+        """Grow an OPEN row's size after startup reconcile detects the live
+        position is bigger than the journal (2026-04-28 SOL: DB had 14
+        contracts, live had 27 — second fill landed without a paired
+        bot-tracked open). Stamps `artifact_reason` so Pass 3 GBT can
+        drop the row from feature analysis. Raises KeyError on unknown
+        trade_id so the caller notices stale state.
+        """
+        conn = self._require_conn()
+        cur = await conn.execute(
+            """UPDATE trades SET
+                   num_contracts      = ?,
+                   position_size_usdt = ?,
+                   risk_amount_usdt   = ?,
+                   demo_artifact      = 1,
+                   artifact_reason    = ?
+               WHERE trade_id = ?""",
+            (
+                num_contracts, position_size_usdt, risk_amount_usdt,
+                artifact_reason, trade_id,
             ),
         )
         await conn.commit()

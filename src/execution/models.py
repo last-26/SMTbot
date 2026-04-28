@@ -96,6 +96,14 @@ class PositionSnapshot:
     mark_price: float
     unrealized_pnl: float
     leverage: int
+    # 2026-04-28 — position-attached TP/SL (Bybit V5 returns these on the
+    # `/v5/position/list` row). Used by the startup orphan-position
+    # reconciliation pass to decide whether a synthetic-inserted DB row's
+    # TP/SL must be re-attached or already covers the live position. 0.0
+    # means "no leg attached" on the live position. Hot-poll consumers
+    # (PositionMonitor.poll, runner snapshot writer) can ignore both.
+    take_profit: float = 0.0
+    stop_loss: float = 0.0
     sampled_at: datetime = field(default_factory=_utc_now)
 
     @property
