@@ -179,3 +179,201 @@ async def test_record_reject_pillar_bias_none_when_stale(make_ctx):
     rows = await ctx.journal.list_rejected_signals()
     assert rows[0].pillar_btc_bias is None
     assert rows[0].pillar_eth_bias == "BULLISH"
+
+
+# ── Pass 2.5 reject pegger plumbing ──────────────────────────────────────
+
+def _expected_sl_distance(cfg, *, symbol: str, price: float, atr: float) -> float:
+    """Mirror runner._compute_what_if_proposed_sltp's max(atr*1.5, floor)."""
+    floor_pct = cfg.min_sl_distance_pct_for(symbol)
+    return max(float(atr) * 1.5, float(price) * float(floor_pct))
+
+
+def _expected_target_rr(cfg) -> float:
+    return float(cfg.execution.target_rr_ratio or 0.0) or 1.5
+
+
+async def test_record_reject_what_if_proposed_sltp_long_pre_fill(make_ctx):
+    """Pre-fill rejects (below_confluence, hard-gate vetoes) must auto-
+    compute ATR-based what-if SL/TP. Pass 2.5 pegger forward-walks Bybit
+    klines from these targets to flag would-have-WIN/LOSS."""
+    ctx, _ = make_ctx()
+    await ctx.journal.connect()
+    runner = BotRunner(ctx)
+    state = _state_with_price(67_000.0, 500.0)  # large ATR → atr×1.5 dominates floor
+    conf = _conf(1.5, ["recent_sweep"], Direction.BULLISH)
+
+    await runner._record_reject(
+        symbol="BTC-USDT-SWAP",
+        reject_reason="below_confluence",
+        state=state,
+        conf=conf,
+    )
+
+    r = (await ctx.journal.list_rejected_signals())[0]
+    sl_distance = _expected_sl_distance(
+        ctx.config, symbol="BTC-USDT-SWAP", price=67_000.0, atr=500.0,
+    )
+    target_rr = _expected_target_rr(ctx.config)
+    assert r.proposed_sl_price == pytest.approx(67_000.0 - sl_distance)
+    assert r.proposed_tp_price == pytest.approx(67_000.0 + sl_distance * target_rr)
+    assert r.proposed_rr_ratio == pytest.approx(target_rr)
+
+
+async def test_record_reject_what_if_proposed_sltp_short_pre_fill(make_ctx):
+    """SHORT direction: SL above price, TP below."""
+    ctx, _ = make_ctx()
+    await ctx.journal.connect()
+    runner = BotRunner(ctx)
+    state = _state_with_price(67_000.0, 500.0)
+    conf = _conf(1.5, ["mss_alignment"], Direction.BEARISH)
+
+    await runner._record_reject(
+        symbol="BTC-USDT-SWAP",
+        reject_reason="ema_momentum_contra",
+        state=state,
+        conf=conf,
+    )
+
+    r = (await ctx.journal.list_rejected_signals())[0]
+    sl_distance = _expected_sl_distance(
+        ctx.config, symbol="BTC-USDT-SWAP", price=67_000.0, atr=500.0,
+    )
+    target_rr = _expected_target_rr(ctx.config)
+    assert r.proposed_sl_price == pytest.approx(67_000.0 + sl_distance)
+    assert r.proposed_tp_price == pytest.approx(67_000.0 - sl_distance * target_rr)
+    assert r.proposed_rr_ratio == pytest.approx(target_rr)
+
+
+async def test_record_reject_no_proposed_for_no_setup_zone_class(make_ctx):
+    """Reasons that short-circuit before SL math (no_setup_zone, no_sl_source,
+    session_filter, etc.) leave proposed_* NULL — pegger skips them."""
+    ctx, _ = make_ctx()
+    await ctx.journal.connect()
+    runner = BotRunner(ctx)
+    state = _state_with_price(67_000.0, 120.0)
+    conf = _conf(4.0, ["mss_alignment"], Direction.BULLISH)
+
+    await runner._record_reject(
+        symbol="BTC-USDT-SWAP",
+        reject_reason="no_setup_zone",
+        state=state,
+        conf=conf,
+    )
+
+    r = (await ctx.journal.list_rejected_signals())[0]
+    assert r.proposed_sl_price is None
+    assert r.proposed_tp_price is None
+    assert r.proposed_rr_ratio is None
+
+
+async def test_record_reject_no_proposed_for_undefined_direction(make_ctx):
+    """No direction = no SL/TP. Pegger has no side to forward-walk against."""
+    ctx, _ = make_ctx()
+    await ctx.journal.connect()
+    runner = BotRunner(ctx)
+    state = _state_with_price(67_000.0, 120.0)
+    conf = _conf(2.0, [], Direction.UNDEFINED)
+
+    await runner._record_reject(
+        symbol="BTC-USDT-SWAP",
+        reject_reason="below_confluence",
+        state=state,
+        conf=conf,
+    )
+
+    r = (await ctx.journal.list_rejected_signals())[0]
+    assert r.proposed_sl_price is None
+    assert r.proposed_tp_price is None
+    assert r.proposed_rr_ratio is None
+
+
+async def test_record_reject_caller_override_skips_what_if(make_ctx):
+    """Pending-cancel path: caller passes plan.sl_price/tp_price/rr_ratio
+    directly (more accurate than re-computing what-if). Helper must
+    forward those exact values, NOT auto-compute."""
+    ctx, _ = make_ctx()
+    await ctx.journal.connect()
+    runner = BotRunner(ctx)
+    state = _state_with_price(67_000.0, 120.0)
+    conf = _conf(3.5, ["mss_alignment"], Direction.BULLISH)
+
+    await runner._record_reject(
+        symbol="BTC-USDT-SWAP",
+        reject_reason="zone_timeout_cancel",
+        state=state,
+        conf=conf,
+        proposed_sl_price=66_500.0,  # caller-provided exact pending SL
+        proposed_tp_price=67_750.0,  # caller-provided exact pending TP
+        proposed_rr_ratio=1.5,
+    )
+
+    r = (await ctx.journal.list_rejected_signals())[0]
+    assert r.proposed_sl_price == pytest.approx(66_500.0)
+    assert r.proposed_tp_price == pytest.approx(67_750.0)
+    assert r.proposed_rr_ratio == pytest.approx(1.5)
+
+
+async def test_record_reject_what_if_uses_per_symbol_floor_when_atr_tiny(
+    make_ctx, monkeypatch,
+):
+    """ATR×1.5 < price×min_sl_distance_pct_per_symbol → floor binds.
+    SL widening parity with the live trade-plan path."""
+    ctx, _ = make_ctx()
+    await ctx.journal.connect()
+    # Inject a measurable floor for BTC so the floor branch is exercised
+    # regardless of test config defaults (which can be 0). 0.005 ≫ atr*1.5/price
+    # for the values below: 67000*0.005 = 335 vs atr*1.5 = 15.
+    monkeypatch.setitem(
+        ctx.config.analysis.min_sl_distance_pct_per_symbol,
+        "BTC-USDT-SWAP", 0.005,
+    )
+    runner = BotRunner(ctx)
+    state = _state_with_price(67_000.0, 10.0)
+    conf = _conf(1.0, ["recent_sweep"], Direction.BULLISH)
+
+    await runner._record_reject(
+        symbol="BTC-USDT-SWAP",
+        reject_reason="below_confluence",
+        state=state,
+        conf=conf,
+    )
+
+    r = (await ctx.journal.list_rejected_signals())[0]
+    expected_sl_distance = 67_000.0 * 0.005  # floor wins over atr*1.5=15
+    target_rr = _expected_target_rr(ctx.config)
+    assert r.proposed_sl_price == pytest.approx(67_000.0 - expected_sl_distance)
+    assert r.proposed_tp_price == pytest.approx(
+        67_000.0 + expected_sl_distance * target_rr
+    )
+
+
+async def test_update_rejected_outcome_stamps_pegger_result(make_ctx):
+    """`update_rejected_outcome` lets the pegger script flag a reject as
+    WIN/LOSS/TIMEOUT after Bybit kline forward-walk. Bar offsets only
+    populate on the matching side."""
+    ctx, _ = make_ctx()
+    await ctx.journal.connect()
+    runner = BotRunner(ctx)
+    state = _state_with_price(67_000.0, 100.0)
+    conf = _conf(1.5, ["recent_sweep"], Direction.BULLISH)
+
+    await runner._record_reject(
+        symbol="BTC-USDT-SWAP",
+        reject_reason="below_confluence",
+        state=state, conf=conf,
+    )
+    [r0] = await ctx.journal.list_rejected_signals()
+    assert r0.hypothetical_outcome is None
+
+    # Pegger says: would have been WIN at bar 7 (TP hit; no SL hit).
+    await ctx.journal.update_rejected_outcome(
+        r0.rejection_id,
+        outcome="WIN",
+        bars_to_tp=7,
+        bars_to_sl=None,
+    )
+    [r1] = await ctx.journal.list_rejected_signals()
+    assert r1.hypothetical_outcome == "WIN"
+    assert r1.hypothetical_bars_to_tp == 7
+    assert r1.hypothetical_bars_to_sl is None

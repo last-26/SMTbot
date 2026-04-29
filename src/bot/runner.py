@@ -1621,6 +1621,63 @@ class BotRunner:
         except (TypeError, ValueError):
             return None
 
+    # Reject reasons where proposed SL/TP would be meaningless — either no
+    # direction is established, or the rejection short-circuits before any
+    # SL hierarchy could fire. Pegger skips these (NULL proposed_*).
+    _NO_PROPOSED_SLTP_REASONS = frozenset({
+        "no_setup_zone", "no_sl_source", "zero_contracts", "tp_too_tight",
+        "session_filter", "macro_event_blackout", "crowded_skip",
+        "vwap_reset_blackout",
+    })
+
+    def _compute_what_if_proposed_sltp(
+        self,
+        *,
+        symbol: str,
+        state: MarketState,
+        conf,
+        reject_reason: str,
+    ) -> tuple[Optional[float], Optional[float], Optional[float]]:
+        """ATR-based what-if SL/TP for pre-fill rejects (Pass 2.5).
+
+        Returns (sl, tp, rr) the strategy WOULD HAVE planned if confluence
+        / hard-gate had not vetoed. `scripts/peg_rejected_outcomes.py`
+        forward-walks Bybit klines from `signal_timestamp` and flags each
+        row WIN/LOSS/TIMEOUT against these targets, populating Pass 3
+        GBT's counter-factual feature matrix.
+
+        SL distance: ``max(ATR × 1.5, price × per-symbol min_sl_distance_pct)``
+        — ATR-aware but floored by the same per-symbol floor used for live
+        SL widening. TP distance: ``sl_distance × target_rr_ratio`` (config
+        execution.target_rr_ratio, default 1.5 if unset).
+
+        Returns (None, None, None) if proposed SL/TP cannot be derived:
+        no direction (UNDEFINED), no price/atr, or reject_reason in
+        `_NO_PROPOSED_SLTP_REASONS`.
+        """
+        if reject_reason in self._NO_PROPOSED_SLTP_REASONS:
+            return None, None, None
+        direction = getattr(conf, "direction", Direction.UNDEFINED)
+        if direction == Direction.UNDEFINED:
+            return None, None, None
+        price = state.current_price
+        atr = state.atr
+        if not price or not atr:
+            return None, None, None
+        cfg = self.ctx.config
+        floor_pct = cfg.min_sl_distance_pct_for(symbol)
+        atr_distance = float(atr) * 1.5
+        floor_distance = float(price) * float(floor_pct)
+        sl_distance = max(atr_distance, floor_distance)
+        target_rr = float(cfg.execution.target_rr_ratio or 0.0) or 1.5
+        if direction == Direction.BULLISH:
+            sl = float(price) - sl_distance
+            tp = float(price) + sl_distance * target_rr
+        else:
+            sl = float(price) + sl_distance
+            tp = float(price) - sl_distance * target_rr
+        return float(sl), float(tp), float(target_rr)
+
     async def _record_reject(
         self,
         *,
@@ -1629,13 +1686,29 @@ class BotRunner:
         state: MarketState,
         conf,
         candles: Optional[list] = None,
+        proposed_sl_price: Optional[float] = None,
+        proposed_tp_price: Optional[float] = None,
+        proposed_rr_ratio: Optional[float] = None,
     ) -> None:
         """Persist a reject to `rejected_signals` (Phase 7.B1).
 
         Caller is responsible for try/except around this — any DB issue
         must never block the main cycle (reject logging is observational).
         All snapshot fields default to None so partial data is fine.
+
+        2026-04-29 Pass 2.5: when caller doesn't pass `proposed_*` (the
+        pre-fill reject path), runs `_compute_what_if_proposed_sltp` to
+        derive ATR-based what-if SL/TP. Pending-cancel caller passes the
+        original `plan.sl_price/tp_price/rr_ratio` directly (more accurate
+        than what-if since the limit was actually placed at those levels).
         """
+        if proposed_sl_price is None and proposed_tp_price is None:
+            proposed_sl_price, proposed_tp_price, proposed_rr_ratio = (
+                self._compute_what_if_proposed_sltp(
+                    symbol=symbol, state=state, conf=conf,
+                    reject_reason=reject_reason,
+                )
+            )
         cfg = self.ctx.config
         entry_tf_minutes = _timeframe_to_minutes(cfg.trading.entry_timeframe)
         enrichment = _derive_enrichment(
@@ -1655,6 +1728,11 @@ class BotRunner:
             atr=float(atr) if atr else None,
             confluence_score=float(getattr(conf, "score", 0.0) or 0.0),
             confluence_factors=list(getattr(conf, "factor_names", []) or []),
+            # 2026-04-29 Pass 2.5 — counter-factual targets. Caller-provided
+            # (pending-cancel path) or auto-computed via what-if helper above.
+            proposed_sl_price=proposed_sl_price,
+            proposed_tp_price=proposed_tp_price,
+            proposed_rr_ratio=proposed_rr_ratio,
             entry_timeframe=cfg.trading.entry_timeframe,
             htf_timeframe=cfg.trading.htf_timeframe,
             htf_bias=htf_trend.value if htf_trend != Direction.UNDEFINED else None,
@@ -3621,6 +3699,15 @@ class BotRunner:
                 atr=float(state.atr) if state.atr else None,
                 confluence_score=float(plan.confluence_score or 0.0),
                 confluence_factors=list(plan.confluence_factors),
+                # 2026-04-29 Pass 2.5 — pending was placed at these exact
+                # SL/TP levels, so use plan values directly (more accurate
+                # than re-computing what-if). Pegger forward-walks Bybit
+                # klines from `placed_at` to flag would-have-WIN/LOSS.
+                proposed_sl_price=float(plan.sl_price) if plan.sl_price else None,
+                proposed_tp_price=float(plan.tp_price) if plan.tp_price else None,
+                proposed_rr_ratio=(
+                    float(plan.rr_ratio) if plan.rr_ratio else None
+                ),
                 entry_timeframe=self.ctx.config.trading.entry_timeframe,
                 htf_timeframe=self.ctx.config.trading.htf_timeframe,
                 htf_bias=_bias_str(state),
