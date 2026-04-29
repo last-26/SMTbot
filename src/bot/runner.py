@@ -102,6 +102,10 @@ from src.strategy.setup_planner import (
     build_zone_setup,
 )
 from src.strategy.trade_plan import TradePlan
+from src.strategy.what_if_sltp import (
+    NO_PROPOSED_SLTP_REASONS,
+    compute_what_if_proposed_sltp,
+)
 
 
 def _utc_now() -> datetime:
@@ -1621,14 +1625,11 @@ class BotRunner:
         except (TypeError, ValueError):
             return None
 
-    # Reject reasons where proposed SL/TP would be meaningless — either no
-    # direction is established, or the rejection short-circuits before any
-    # SL hierarchy could fire. Pegger skips these (NULL proposed_*).
-    _NO_PROPOSED_SLTP_REASONS = frozenset({
-        "no_setup_zone", "no_sl_source", "zero_contracts", "tp_too_tight",
-        "session_filter", "macro_event_blackout", "crowded_skip",
-        "vwap_reset_blackout",
-    })
+    # Pure helper lives in src/strategy/what_if_sltp.py — `scripts/
+    # backfill_proposed_sl_tp.py` shares it for retroactive backfill of
+    # pre-Pass-2.5 reject rows. Same math both paths so live-insert
+    # outcomes and backfilled outcomes don't split spuriously by vintage.
+    _NO_PROPOSED_SLTP_REASONS = NO_PROPOSED_SLTP_REASONS
 
     def _compute_what_if_proposed_sltp(
         self,
@@ -1640,43 +1641,21 @@ class BotRunner:
     ) -> tuple[Optional[float], Optional[float], Optional[float]]:
         """ATR-based what-if SL/TP for pre-fill rejects (Pass 2.5).
 
-        Returns (sl, tp, rr) the strategy WOULD HAVE planned if confluence
-        / hard-gate had not vetoed. `scripts/peg_rejected_outcomes.py`
-        forward-walks Bybit klines from `signal_timestamp` and flags each
-        row WIN/LOSS/TIMEOUT against these targets, populating Pass 3
-        GBT's counter-factual feature matrix.
-
-        SL distance: ``max(ATR × 1.5, price × per-symbol min_sl_distance_pct)``
-        — ATR-aware but floored by the same per-symbol floor used for live
-        SL widening. TP distance: ``sl_distance × target_rr_ratio`` (config
-        execution.target_rr_ratio, default 1.5 if unset).
-
-        Returns (None, None, None) if proposed SL/TP cannot be derived:
-        no direction (UNDEFINED), no price/atr, or reject_reason in
-        `_NO_PROPOSED_SLTP_REASONS`.
+        Thin wrapper that pulls per-symbol floor + target_rr from config
+        and delegates to the pure helper. See
+        src/strategy/what_if_sltp.compute_what_if_proposed_sltp for the
+        actual SL/TP math contract.
         """
-        if reject_reason in self._NO_PROPOSED_SLTP_REASONS:
-            return None, None, None
-        direction = getattr(conf, "direction", Direction.UNDEFINED)
-        if direction == Direction.UNDEFINED:
-            return None, None, None
-        price = state.current_price
-        atr = state.atr
-        if not price or not atr:
-            return None, None, None
         cfg = self.ctx.config
-        floor_pct = cfg.min_sl_distance_pct_for(symbol)
-        atr_distance = float(atr) * 1.5
-        floor_distance = float(price) * float(floor_pct)
-        sl_distance = max(atr_distance, floor_distance)
-        target_rr = float(cfg.execution.target_rr_ratio or 0.0) or 1.5
-        if direction == Direction.BULLISH:
-            sl = float(price) - sl_distance
-            tp = float(price) + sl_distance * target_rr
-        else:
-            sl = float(price) + sl_distance
-            tp = float(price) - sl_distance * target_rr
-        return float(sl), float(tp), float(target_rr)
+        return compute_what_if_proposed_sltp(
+            symbol=symbol,
+            direction=getattr(conf, "direction", Direction.UNDEFINED),
+            price=state.current_price,
+            atr=state.atr,
+            reject_reason=reject_reason,
+            floor_pct=cfg.min_sl_distance_pct_for(symbol),
+            target_rr=cfg.execution.target_rr_ratio,
+        )
 
     async def _record_reject(
         self,
