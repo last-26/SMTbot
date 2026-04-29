@@ -4,7 +4,6 @@
 !.env.example
 
 algoritma.md
-docs/trade_lifecycle.md
 
 # Secret/key file formats
 *.pem

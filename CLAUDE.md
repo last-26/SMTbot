@@ -1671,8 +1671,6 @@ Modules have docstrings; a tour for orientation:
 - `src/journal/` — async SQLite, schema v3 trade records (+ `on_chain_context`, `demo_artifact`), `rejected_signals` + counter-factual stamps, `on_chain_snapshots` time-series, pure-function reporter.
 - `src/bot/` — YAML/env config, async outer loop (`BotRunner.run_once` — closes → snapshot → pending → per-symbol cycle), on-chain snapshot scheduler, CLI entry.
 
-End-to-end tick walkthrough: see `docs/trade_lifecycle.md`.
-
 ---
 
 ## Strategy (one-pager)
@@ -1832,7 +1830,9 @@ Adding a 6th+ pair: drop into `trading.symbols`, add `internal_to_tv_symbol()` p
 
 ## Forward roadmap
 
-Sequenced in "Pass" + "Phase" vocabulary. Pass 1 combined the original Phase 8 (data collection) + Phase 9 (GBT analysis) + a lightweight Phase 10 (Bayesian weight tuning, not deep RL). The original phase numbering survives only inside Phase 11 (live transition) and Phase 12 (post-stable experiments).
+Sequenced in **Pass** (data + tune cycles) + **Phase** (live deployment + post-stable) vocabulary. Pass 1 is complete; Pass 2 (data collection) is active. Pass 2.5 + Pass 3 + Arkham retirement land before Phase 11 (live transition); Phase 12 is post-stable.
+
+**Top-level RL/tune contract (operator decision 2026-04-29):** Pass 3 Bayesian tune **does NOT use Arkham features.** Arkham trial expires 2026-05-20; the project is migrating off Arkham before Phase 11. All on-chain columns continue to be journaled for archive purposes during Pass 2 / 2.5, but Pass 3 GBT's feature matrix excludes them and runtime soft-signals turn off via the retirement plan below.
 
 ### Pass 1 — COMPLETE (2026-04-22)
 
@@ -1844,41 +1844,85 @@ Combined on a 42-trade dataset (`rl.clean_since=2026-04-19T19:55:00Z`):
 - **Applied tune:** `min_confluence_score` 3 → 3.75 (curve plateau; +3.8pp WR on historical sample). No other knobs changed (Arkham coverage inconsistent, per-pillar + per-TF oscillator data not yet captured — both instrumented for Pass 2).
 - **Concurrent feature work:** whale hard gate removed, `flow_alignment_score` 6-input + `per_symbol_cex_flow_penalty` soft signals live, `whale_transfers` + `confluence_pillar_scores` + `oscillator_raw_values (1m/3m/15m)` journal instrumentation shipped. See changelog 2026-04-22 entry.
 
-### Pass 2 — Data collection (post-restart, active)
+### Pass 2 — Data collection (active)
 
-**Goal:** accumulate a uniform-feature dataset. Every new row post-restart carries full Arkham context + per-pillar scores + per-TF oscillator numerics + whale-transfer time-series. 5-day window targeted before Pass 2 tune runs.
+**Goal:** uniform-feature dataset on the post-Bybit cut. Trade rows carry strategy-internal feature columns (per-pillar scores, per-TF oscillator, derivatives enrichment, multi-TF MSS factors) that Pass 3 GBT will train on. Arkham columns continue to journal for archive but are NOT a Pass 2 gate criterion.
 
-- Operator restarts bot with fresh DB (backup preserved as `data/trades.db.pass1_backup_*`).
-- `rl.clean_since` bumped to restart-timestamp.
+- Operator restarted bot on 2026-04-25T21:45Z (Bybit migration cut). `rl.clean_since` anchored there; pre-migration DB archived.
+- 2026-04-28 scalp tighten + multi-TF MSS factors shipped — see changelog. Marker timestamp `2026-04-27T21:15:13Z` segments POST-REVERT (Bybit) vs POST-2026-04-28-TIGHTEN dataset windows.
 - Demo bot runs. No code changes unless factor-audit reveals a regression.
 - Run `scripts/factor_audit.py` every ~10 closed trades.
-- (Counter-factual pegging on rejected signals: legacy `peg_rejected_outcomes.py`
-  was removed in the 2026-04-26 post-migration cleanup; needs a Bybit-native rewrite
-  before Pass 3. Until then, post-migration rejected_signals carry NULL
-  `hypothetical_outcome`.)
-- Passive accumulation of `on_chain_snapshots`, `whale_transfers`, per-pillar + per-TF oscillator journal rows.
+- Passive accumulation of `confluence_pillar_scores`, `oscillator_raw_values`, `derivatives` enrichment, `position_snapshots` rows.
 
-**Gate to leave:** ≥30 closed trades, Arkham `on_chain_context` populated on 100% of rows, `confluence_pillar_scores` populated on 100%, `oscillator_raw_values` populated on ≥90% for each TF, net PnL ≥ 0, WR ≥ 45%.
+**Gate to leave (revised 2026-04-29):**
+- ≥30 closed trades (operator targets 50 for comfort margin)
+- `confluence_pillar_scores` populated on 100% of post-2026-04-26 rows (the 2026-04-26 zone-wrapped-plan fix forward)
+- `oscillator_raw_values` populated on ≥90% per TF (1m may dip; 3m + 15m ~100%)
+- Net PnL ≥ 0
+- WR ≥ 45%
+- **Arkham `on_chain_context` coverage is NOT a gate criterion** (RL won't use it)
 
-**If the gate fails:** factor-audit is diagnostic. Expect 1-2 iterations of per-symbol confluence threshold tuning before the gate holds. Do NOT start Pass 3 until the gate holds — overfitting a broken dataset is worse than collecting more clean data.
+**If the gate fails:** factor-audit is diagnostic. Expect 1-2 iterations of per-symbol confluence threshold tuning before the gate holds. Do NOT start Pass 2.5 / Pass 3 until the gate holds — overfitting a broken dataset is worse than collecting more clean data.
 
-### Pass 3 — Full Bayesian tuning on uniform data
+### Pass 2.5 — Pre-Pass-3 transition (after 50-trade gate)
 
-**Goal:** tune every knob Pass 1 deferred. Arkham coverage is now uniform; per-pillar + per-TF oscillator columns unlock richer continuous feature space.
+Single-task transition window between data collection and Bayesian tune. ~2-3 day scope. Triggered when Pass 2 gate clears.
 
-**Tunable knob set (all via Optuna TPE + walk-forward):**
-- Arkham modifier deltas: `daily_bias_modifier_delta`, `stablecoin_pulse_penalty`, `altcoin_index_penalty`.
-- Flow alignment: `flow_alignment_penalty`, `flow_alignment_noise_floor_usd`, plus all 6 input weights (stables, BTC, ETH, Coinbase, Binance, Bybit — currently hardcoded 0.25/0.25/0.15/0.15/0.10/0.10).
-- Per-symbol CEX flow: `per_symbol_cex_flow_penalty`, `per_symbol_cex_flow_noise_floor_usd`.
-- Per-pillar weights (5 pillars × continuous) using `confluence_pillar_scores` column.
-- Per-symbol confluence thresholds (Pass 1 kept global at 3.75).
-- 3 hard gate toggles (vwap_hard_veto, ema_veto, cross_asset_opposition).
+**Reject signal pegger Bybit-native rewrite.** Legacy `peg_rejected_outcomes.py` was deleted in the 2026-04-26 cleanup (it called pre-Bybit kline endpoints). Pass 3 GBT's counter-factual analysis ("which rejected signals would have actually won?") needs `rejected_signals.hypothetical_outcome` populated.
 
-**Method:** extend `scripts/replay_decisions.py` (scaffold already present) with pillar-reweight + Arkham-modifier replay paths. Run `scripts/tune_confluence.py` with expanded `suggest_config`.
+- Read every `rejected_signals` row with NULL `hypothetical_outcome` (~all post-2026-04-26 rows)
+- Fetch Bybit `/v5/market/kline` candles from the reject `signal_timestamp` forward (boundary translation `BTC-USDT-SWAP → BTCUSDT`)
+- Walk candle-by-candle: did the proposed SL or proposed TP hit first?
+- Stamp `WIN` / `LOSS` / `TIMEOUT` + `bars_to_outcome` on the row
+- Async batch fetch (rate-limit conscious)
 
-**GBT re-run:** `scripts/analyze.py` auto-expands feature matrix when `oscillator_raw_values` non-empty; Pass 3 GBT gets continuous features (WT magnitude, RSI position, Stoch K/D, momentum) + Arkham segments (now trustworthy with uniform coverage) + whale-transfer derived features (via join).
+**Output:** every Pass 2 reject row carries a hypothetical outcome; Pass 3 GBT can train hard-gate-toggle decisions on counter-factual outcome data instead of just on closed-trade outcomes.
 
-**Gate to leave:** Pass 3 Optuna OOS net_R ≥ 0.5 × IS net_R AND OOS WR ≥ IS WR − 5pp. Otherwise structural ceiling — hold on tuning, collect more data, proceed to Phase 11 stability rather than over-fitting a small dataset.
+**Note:** `proposed_sl_price` / `proposed_tp_price` columns were dropped in the 2026-04-27 schema cleanup. The pegger rewrite must also re-add a `_record_reject` plumbing path that computes proposed SL/TP at reject time and persists them, otherwise the pegger has nothing to walk against. This is part of the Pass 2.5 scope.
+
+### Pass 3 — Bayesian tune (Arkham-FREE)
+
+**Goal:** tune strategy-internal knobs on uniform-feature dataset. Arkham knobs are excluded by the top-level RL contract.
+
+**Tunable knob set (Optuna TPE + walk-forward 73/27 split):**
+
+- **Per-pillar weights** — 5 pillar continuous (`confluence_pillar_scores` column). Highest-leverage tune target.
+- **Per-symbol `min_confluence_score`** — Pass 1 kept global at 3.75; per-symbol override may be tuned (BTC vs altcoin scoring sensitivity differs).
+- **3 hard gate toggles** — `vwap_hard_veto_enabled`, `ema_veto_enabled`, `cross_asset_veto_enabled`. Counter-factual pegger output (Pass 2.5) drives this decision.
+- **Multi-TF MSS feature importance** — particularly `htf_mss_alignment` (currently weight=0 journal-only since 2026-04-28). GBT importance threshold decides whether to flip YAML default to 0.25.
+- **2026-04-28 tighten knobs:**
+  - Per-symbol `min_sl_distance_pct` floors (BTC 0.3% / ETH 0.6% / SOL 0.8% / DOGE+XRP 0.6% / BNB 0.4%)
+  - `target_rr_ratio` (currently 1.5)
+  - `sl_lock_mfe_r` (currently 1.0R)
+  - `zone_max_wait_bars` (currently 2)
+  - `tp_min_rr_floor` (currently 0.7)
+
+**Method:**
+- Extend `scripts/replay_decisions.py` with pillar-reweight replay path (scaffold present).
+- `scripts/tune_confluence.py` — Optuna TPE with expanded `suggest_config`.
+- `scripts/analyze.py` GBT auto-extends feature matrix when `oscillator_raw_values` non-empty: continuous features (WT magnitude, RSI band, Stoch K/D, momentum). **Arkham segments explicitly DROPPED** from feature matrix.
+
+**Gate to leave:** Pass 3 Optuna OOS net_R ≥ 0.5 × IS net_R AND OOS WR ≥ IS WR − 5pp. Otherwise structural ceiling — hold tuning, accumulate more data, proceed to Phase 11 stability rather than over-fitting a small dataset.
+
+### Arkham retirement plan
+
+Arkham trial key expires **2026-05-20**. Off-ramp on this schedule (operator-confirmed 2026-04-29):
+
+| Date (~) | Step |
+|---|---|
+| **2026-04-29** | Decision: Pass 3 trains Arkham-FREE; runtime soft-signals turn off ahead of trial expiry |
+| **~2026-05-01** | Pass 2 closes (50-trade gate clears) |
+| **~2026-05-04** | **Arkham runtime soft-retire:** YAML penalties → 0 (`flow_alignment_penalty: 0.0`, `stablecoin_pulse_penalty: 0.0`, `altcoin_index_modifier_delta: 0.0`, `daily_bias_modifier_delta: 0.0`, `per_symbol_cex_flow_penalty: 0.0`). **Journal writes continue** (operator wants archived DB snapshots). Code paths kept; effect zeroed via penalty knobs. |
+| **2026-05-04 → 2026-05-15** | Pass 3 Bayesian tune runs over Arkham-FREE strategy state — tuning results unbiased by Arkham penalty effects |
+| **~2026-05-15** | Pass 3 results applied; Phase 11 prep begins (mainnet sub-account, IP whitelist, key generation) |
+| **~2026-05-18** | **Arkham journal writes turn off** (`on_chain.enabled: false`). Label budget cleanly closed before trial-expiry deadline. WS listener stops, REST calls cease. |
+| **2026-05-20** | Arkham trial expires. API calls already 0 since 05-18; zero friction. |
+| **Post-Phase-11-stable** | **Hard removal:** delete `src/data/on_chain*.py`, `src/data/arkham_ws.py`, related config schema entries. **Schema columns kept in DB** (`on_chain_context`, `cex_*_netflow_24h_usd`, `whale_transfers` table, etc.) — drops not needed; archive value > schema simplicity. |
+
+**Re-eval triggers:**
+1. Soft-retire date can slip to 2026-05-08 if Pass 2 gate slips. Trial-expiry date is fixed; journal-off must precede it by ≥48h.
+2. If a Pass 2 / 2.5 bug needs Arkham state for diagnosis between soft-retire and journal-off, temporarily lift `enabled: true` for read-only inspection. Don't toggle penalty knobs back on (would corrupt the Arkham-FREE tune dataset).
+3. Schema column drops are **explicitly deferred indefinitely** — re-evaluate only if DB size becomes a problem (currently negligible).
 
 ### Phase 11 — Live transition + scaling
 
@@ -1887,26 +1931,30 @@ Combined on a 42-trade dataset (`rl.clean_since=2026-04-19T19:55:00Z`):
 - **Live transition:** Bybit mainnet account (separate sub-account recommended), API key Read+Trade only with IP whitelist. Flip `BYBIT_DEMO=0` in `.env` AND construct `BybitClient(allow_live=True)` in the runner — both are required (constructor refuses live by default). Start `RISK_AMOUNT_USDT=$10-20`, `max_concurrent_positions=2`, UTA cross margin, explicit notional cap.
 - **Stability period:** 2 weeks / 30 live trades with no code changes. Compare live WR + avg R to demo baseline within ±5%.
 - **Scaling rules:** only after 100 live trades. Double `RISK_AMOUNT_USDT` only if 30-day rolling WR ≥ demo WR − 3% AND drawdown ≤ 15%. Asymmetric: halve on any 10-trade rolling WR < 30%.
-- **Monitoring:** journal-backed dashboard (pure-Python or Streamlit). Alert on: drawdown >20%, 5-loss streak, Bybit `10006` rate-limit, fill latency P95 >2s, daily realized PnL < -2R, Arkham credit usage >80%/month.
+- **Monitoring:** journal-backed dashboard (already shipped). Alert on: drawdown >20%, 5-loss streak, Bybit `10006` rate-limit, fill latency P95 >2s, daily realized PnL < -2R.
 
-### Phase 12 — Future enhancements (post-stable)
+### Phase 12 — Post-Phase-11-stable enhancements
 
-Candidates, **not commitments.** Re-evaluate after Phase 11 stability.
+Two candidates only. Both data-gated; commitment is conditional on observed need.
 
-- **Deep RL (SB3/PPO) parameter tuner** — requires 100+ live-trade dataset. Phase 10 original deep-RL scope was superseded by Pass 1/3 Bayesian TPE which handles 6D-10D parameter search natively. Deep RL only if Bayesian plateau hits a structural ceiling AND the high-dim interaction effects are measurable.
-- **Arkham F4/F5** — per-entity flow divergence (Coinbase premium delta vs Binance inflow) + DEX swap volume. Deferred at integration; revisit if Pass 3 shows per-entity netflow alone has edge.
-- **Asymmetric Arkham penalties** — split symmetric penalties into `long_penalty` / `short_penalty` knobs. Depends on Pass 3 data showing direction asymmetry.
-- **Per-symbol Arkham overrides** — SOL vs DOGE may respond differently to BTC dominance / altcoin index. Pass 3 candidate.
-- **Whale transfer directional classification** — GBT on `whale_transfers` join reveals which flows predict direction. If signal exists, add `whale_directional_score` soft factor (replacement for the removed hard gate in a data-informed form).
-- **HTF Order Block re-add** — Pine 3m OBs failed post-pivot; 15m OBs may survive. Factor-audit confirms before re-enable.
-- **Additional pairs** — 6th+ Bybit perp. Coinalyze budget allows ~6 symbols at free tier.
-- **1m as zone source in `setup_planner`** — `ltf_fvg_entry` / `ltf_sweep_retest`. Pass 3 GBT confirms 1m factors carry weight first.
-- **1m-triggered dynamic trail / runner management** — dynamic exit after TP1 using 1m oscillator. Complements `ltf_reversal_close`.
-- **ATR-trailing SL after MFE threshold (Option B)** — continue trailing after 1.3R lock. Only if Option A's locked-and-fell-back data shows a meaningful "resumed then reversed" bucket.
-- **Pine overlay split** — `smt_overlay.pine` → `_structure.pine` + `_levels.pine`. Worth the refactor only if freshness-poll latency becomes a bottleneck.
-- **Multi-strategy ensemble** — scalper + swing module routing to shared execution layer. Only meaningful once scalper is provably stable.
-- **Auto-retrain loop** — monthly Optuna refresh on rolling window. Cron + CI pipeline. Meaningless until Phase 11 is steady.
-- **Alt-exchange support** — Bybit / Binance futures. Current execution layer Bybit-specific; abstracting `ExchangeClient` is 2-3 weeks careful refactor.
+- **Deep RL (SB3/PPO) parameter tuner** — only triggered if Pass 3 Bayesian TPE plateaus AND high-dimensional knob interactions are measurable in Pass 3 data. 1-2 weeks of sim env work + GPU. Requires 100+ live trades from Phase 11. Probably never triggers; placeholder for the structural-ceiling case.
+
+- **HTF Order Block + Breaker Block ecosystem** — operator-flagged as the primary scoring-quality candidate. Three sub-tasks:
+  1. **OB detection audit.** Pine emits OB drawings; verify drawing logic against price-action concepts (operator can do this as a side task during Pass 2 — visual review of how the bot is marking OBs, no code change required).
+  2. **OB drawing revision.** If audit finds mis-marking, fix Pine OB detection logic; possibly publish a focused single-purpose Pine script (OB-only or OB+Breaker) for visual confirmation.
+  3. **Breaker Block addition.** Breaker = an OB that price has broken through and now retests from the opposite side. Currently absent from the project. Pine detection + scoring integration (~3-5 days). Trigger: factor-audit shows 15m OB signals correlate with WR positively (3m OBs failed pre-Bybit pivot; 15m may survive).
+
+**Removed candidates (2026-04-29 cleanup):**
+- *Arkham-dependent (4):* Whale directional classification, Arkham F4/F5 (per-entity divergence + DEX swap), Asymmetric Arkham penalties, Per-symbol Arkham overrides — all dropped because Arkham is being retired.
+- *P/D + HTF ceiling SOFT re-add* — operator preference is to handle top/bottom awareness via different strategies rather than re-introducing this logic.
+- *Partial TP re-enable* — operator confirmed RR 1.5 + MFE 1.0R BE-lock makes partial unnecessary (positions either hit 1.5R full or stop at locked BE).
+- *ATR-trailing SL after MFE (Option B)* — RR 1.5 makes the 1.0R → 1.5R trail window too short to matter. Useful at RR 3+.
+- *6+ Bybit perp* — cycle latency cost outweighs setup-density benefit at current 5-pair load.
+- *1m TF activation (zone source / dynamic trail)* — already covered by `ltf_ribbon_alignment` + `ltf_mss_alignment` soft factors (2026-04-28); 3m stays the entry TF.
+- *Pine overlay split* — no perf bottleneck observed; speculative refactor.
+- *Multi-strategy ensemble* — out of scope; scalper-only.
+- *Auto-retrain loop* — manual tune is reliable for current scale; revisit if Phase 11 + 6 months stable surfaces a need.
+- *Alt-exchange support* — operator just migrated to Bybit; no demand.
 
 ### What is explicitly NOT on the roadmap
 
