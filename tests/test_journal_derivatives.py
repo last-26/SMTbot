@@ -68,12 +68,16 @@ async def test_migrations_idempotent_on_repeat_connect(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_record_open_persists_derivatives_enrichment():
+    # 2026-04-27 — `regime_at_entry` (DerivativesRegime classifier; was
+    # always 'BALANCED') was dropped. `trend_regime_at_entry` (ADX
+    # classifier: RANGING / WEAK_TREND / STRONG_TREND) is now the live
+    # regime field that the reporter buckets on.
     async with TradeJournal(":memory:") as j:
         rec = await j.record_open(
             _plan(), _report(),
             symbol="BTC-USDT-SWAP",
             signal_timestamp=datetime.now(tz=timezone.utc),
-            regime_at_entry="LONG_CROWDED",
+            trend_regime_at_entry="STRONG_TREND",
             funding_z_at_entry=2.7,
             ls_ratio_at_entry=1.9,
             oi_change_24h_at_entry=12.5,
@@ -83,7 +87,7 @@ async def test_record_open_persists_derivatives_enrichment():
             nearest_liq_cluster_above_notional=5_000_000.0,
             nearest_liq_cluster_below_notional=3_200_000.0,
         )
-        assert rec.regime_at_entry == "LONG_CROWDED"
+        assert rec.trend_regime_at_entry == "STRONG_TREND"
         assert rec.funding_z_at_entry == pytest.approx(2.7)
         # Round-trip via SQL.
         back = await j.get_trade(rec.trade_id)
@@ -99,7 +103,7 @@ async def test_record_close_preserves_derivatives_fields():
             _plan(), _report(),
             symbol="BTC-USDT-SWAP",
             signal_timestamp=datetime.now(tz=timezone.utc),
-            regime_at_entry="CAPITULATION",
+            trend_regime_at_entry="RANGING",
             funding_z_at_entry=-3.1,
         )
         fill = CloseFill(
@@ -110,26 +114,26 @@ async def test_record_close_preserves_derivatives_fields():
         closed = await j.record_close(rec.trade_id, fill)
         assert closed.outcome == TradeOutcome.WIN
         # Enrichment survives the close update.
-        assert closed.regime_at_entry == "CAPITULATION"
+        assert closed.trend_regime_at_entry == "RANGING"
         assert closed.funding_z_at_entry == pytest.approx(-3.1)
 
 
 @pytest.mark.asyncio
 async def test_regime_breakdown_aggregates_per_regime(monkeypatch):
-    """Two wins in LONG_CROWDED + one loss in BALANCED → regime stats split."""
+    """Two wins in STRONG_TREND + one loss in RANGING → regime stats split."""
     async with TradeJournal(":memory:") as j:
         # Seed 3 trades with different regimes.
         specs = [
-            ("LONG_CROWDED", 80.0),
-            ("LONG_CROWDED", 40.0),
-            ("BALANCED", -55.0),
+            ("STRONG_TREND", 80.0),
+            ("STRONG_TREND", 40.0),
+            ("RANGING", -55.0),
         ]
         for regime, pnl in specs:
             rec = await j.record_open(
                 _plan(), _report(),
                 symbol="BTC-USDT-SWAP",
                 signal_timestamp=datetime.now(tz=timezone.utc),
-                regime_at_entry=regime,
+                trend_regime_at_entry=regime,
             )
             await j.record_close(
                 rec.trade_id,
@@ -144,15 +148,15 @@ async def test_regime_breakdown_aggregates_per_regime(monkeypatch):
     assert len(closed) == 3
 
     stats = regime_breakdown(closed)
-    assert stats["LONG_CROWDED"]["num_trades"] == 2
-    assert stats["LONG_CROWDED"]["win_rate"] == pytest.approx(1.0)
-    assert stats["BALANCED"]["num_trades"] == 1
-    assert stats["BALANCED"]["win_rate"] == pytest.approx(0.0)
+    assert stats["STRONG_TREND"]["num_trades"] == 2
+    assert stats["STRONG_TREND"]["win_rate"] == pytest.approx(1.0)
+    assert stats["RANGING"]["num_trades"] == 1
+    assert stats["RANGING"]["win_rate"] == pytest.approx(0.0)
 
     # Full summary includes the breakdown key.
     s = summary(closed, starting_balance=10_000.0)
     assert "regime_breakdown" in s
-    assert "LONG_CROWDED" in s["regime_breakdown"]
+    assert "STRONG_TREND" in s["regime_breakdown"]
 
 
 @pytest.mark.asyncio
