@@ -175,12 +175,15 @@ CREATE TABLE IF NOT EXISTS rejected_signals (
     session             TEXT,
     market_structure    TEXT,
 
-    -- proposed_sl_price / proposed_tp_price / proposed_rr_ratio dropped
-    -- 2026-04-27 — entry path doesn't compute proposed SL/TP at reject
-    -- time. peg-script that would forward-walk and stamp outcomes was
-    -- deleted in the post-migration cleanup (Phase 3). Re-add as a
-    -- triple if a Bybit-native peg gets written AND _record_reject
-    -- computes ATR-based what-if SL/TP.
+    -- 2026-04-29 — Pass 2.5 reject pegger re-add. proposed_sl_price /
+    -- proposed_tp_price / proposed_rr_ratio populated by `_record_reject`
+    -- at reject time (ATR-based what-if for pre-fill rejects, pending
+    -- plan_sl/tp forward for pending-cancel rejects). Counter-factual
+    -- outcome (`hypothetical_*` below) stamped by Bybit-native pegger
+    -- (`scripts/peg_rejected_outcomes.py`).
+    proposed_sl_price   REAL,
+    proposed_tp_price   REAL,
+    proposed_rr_ratio   REAL,
 
     funding_z_at_entry                  REAL,
     ls_ratio_at_entry                   REAL,
@@ -196,9 +199,13 @@ CREATE TABLE IF NOT EXISTS rejected_signals (
     pillar_btc_bias     TEXT,
     pillar_eth_bias     TEXT,
 
-    -- hypothetical_outcome / hypothetical_bars_to_tp / hypothetical_bars_to_sl
-    -- dropped 2026-04-27 — counter-factual outcome stamping never ran
-    -- on Bybit-era rows; re-add as a triple if peg-script revived.
+    -- 2026-04-29 — Pass 2.5 reject pegger re-add. Forward-walk Bybit
+    -- klines from signal_timestamp; LONG → first SL hit = LOSS, first TP
+    -- hit = WIN; SHORT → mirrored. Same-bar SL+TP collision resolves
+    -- pessimistic (SL first). 100-bar lookforward → TIMEOUT.
+    hypothetical_outcome      TEXT,
+    hypothetical_bars_to_tp   INTEGER,
+    hypothetical_bars_to_sl   INTEGER,
 
     on_chain_context        TEXT,
 
@@ -236,7 +243,8 @@ CREATE TABLE IF NOT EXISTS rejected_signals (
 
 CREATE INDEX IF NOT EXISTS idx_rejected_symbol_ts  ON rejected_signals(symbol, signal_timestamp);
 CREATE INDEX IF NOT EXISTS idx_rejected_reason     ON rejected_signals(reject_reason);
--- idx_rejected_outcome dropped 2026-04-27 with hypothetical_outcome column.
+-- 2026-04-29 — Pass 2.5 reject pegger re-add (paired with hypothetical_outcome above).
+CREATE INDEX IF NOT EXISTS idx_rejected_outcome    ON rejected_signals(hypothetical_outcome);
 
 -- 2026-04-21 — Arkham on-chain snapshot time-series (Phase 8 data layer).
 -- One row per detected snapshot MUTATION (not per tick). Runner writes
@@ -413,10 +421,13 @@ _COLUMNS = [
 _REJECTED_COLUMNS = [
     "rejection_id", "symbol", "direction", "reject_reason", "signal_timestamp",
     "price", "atr", "confluence_score", "confluence_factors",
-    # 2026-04-27 drops on rejected_signals: entry_timeframe, htf_timeframe,
-    # regime_at_entry, proposed_sl_price, proposed_tp_price,
-    # proposed_rr_ratio, hypothetical_outcome, hypothetical_bars_to_tp,
-    # hypothetical_bars_to_sl.
+    # 2026-04-29 — Pass 2.5 reject pegger re-add. proposed_* set by
+    # `_record_reject` at reject time (ATR-based what-if for pre-fill,
+    # plan_sl/tp forward for pending-cancel). hypothetical_* set by
+    # `scripts/peg_rejected_outcomes.py` (Bybit kline forward-walk).
+    # 2026-04-27 drops still in effect: entry_timeframe, htf_timeframe,
+    # regime_at_entry (1-distinct constants).
+    "proposed_sl_price", "proposed_tp_price", "proposed_rr_ratio",
     "htf_bias", "session", "market_structure",
     "funding_z_at_entry", "ls_ratio_at_entry",
     "oi_change_24h_at_entry", "liq_imbalance_1h_at_entry",
@@ -424,6 +435,7 @@ _REJECTED_COLUMNS = [
     "nearest_liq_cluster_above_notional", "nearest_liq_cluster_below_notional",
     "nearest_liq_cluster_above_distance_atr", "nearest_liq_cluster_below_distance_atr",
     "pillar_btc_bias", "pillar_eth_bias",
+    "hypothetical_outcome", "hypothetical_bars_to_tp", "hypothetical_bars_to_sl",
     "on_chain_context",
     "confluence_pillar_scores",
     "oscillator_raw_values",
@@ -689,6 +701,18 @@ _MIGRATIONS = [
     "ALTER TABLE on_chain_snapshots DROP COLUMN snapshot_age_s",
     "ALTER TABLE on_chain_snapshots DROP COLUMN fresh",
     "ALTER TABLE on_chain_snapshots DROP COLUMN whale_blackout_active",
+    # 2026-04-29 — Pass 2.5 reject pegger re-add. Reverses the 2026-04-27
+    # rejected_signals proposed_*/hypothetical_* drops above. Order matters:
+    # the DROP statements run first (no-op on DBs that never had the
+    # columns), then the ADD COLUMN statements re-create them. Idempotent
+    # via the OperationalError swallow loop in `connect()`.
+    "ALTER TABLE rejected_signals ADD COLUMN proposed_sl_price REAL",
+    "ALTER TABLE rejected_signals ADD COLUMN proposed_tp_price REAL",
+    "ALTER TABLE rejected_signals ADD COLUMN proposed_rr_ratio REAL",
+    "ALTER TABLE rejected_signals ADD COLUMN hypothetical_outcome TEXT",
+    "ALTER TABLE rejected_signals ADD COLUMN hypothetical_bars_to_tp INTEGER",
+    "ALTER TABLE rejected_signals ADD COLUMN hypothetical_bars_to_sl INTEGER",
+    "CREATE INDEX IF NOT EXISTS idx_rejected_outcome ON rejected_signals(hypothetical_outcome)",
 ]
 
 
@@ -746,6 +770,7 @@ def _rejected_to_row(rec: RejectedSignal) -> tuple:
         _iso(rec.signal_timestamp),
         rec.price, rec.atr, rec.confluence_score,
         json.dumps(rec.confluence_factors),
+        rec.proposed_sl_price, rec.proposed_tp_price, rec.proposed_rr_ratio,
         rec.htf_bias, rec.session, rec.market_structure,
         rec.funding_z_at_entry, rec.ls_ratio_at_entry,
         rec.oi_change_24h_at_entry, rec.liq_imbalance_1h_at_entry,
@@ -753,6 +778,7 @@ def _rejected_to_row(rec: RejectedSignal) -> tuple:
         rec.nearest_liq_cluster_above_notional, rec.nearest_liq_cluster_below_notional,
         rec.nearest_liq_cluster_above_distance_atr, rec.nearest_liq_cluster_below_distance_atr,
         rec.pillar_btc_bias, rec.pillar_eth_bias,
+        rec.hypothetical_outcome, rec.hypothetical_bars_to_tp, rec.hypothetical_bars_to_sl,
         (json.dumps(rec.on_chain_context)
          if rec.on_chain_context is not None else None),
         json.dumps(rec.confluence_pillar_scores or {}),
@@ -781,6 +807,9 @@ def _row_to_rejected(row: aiosqlite.Row) -> RejectedSignal:
         atr=row["atr"],
         confluence_score=row["confluence_score"],
         confluence_factors=json.loads(row["confluence_factors"] or "[]"),
+        proposed_sl_price=_safe_col(row, "proposed_sl_price"),
+        proposed_tp_price=_safe_col(row, "proposed_tp_price"),
+        proposed_rr_ratio=_safe_col(row, "proposed_rr_ratio"),
         htf_bias=row["htf_bias"],
         session=row["session"],
         market_structure=row["market_structure"],
@@ -796,6 +825,9 @@ def _row_to_rejected(row: aiosqlite.Row) -> RejectedSignal:
         nearest_liq_cluster_below_distance_atr=row["nearest_liq_cluster_below_distance_atr"],
         pillar_btc_bias=row["pillar_btc_bias"],
         pillar_eth_bias=row["pillar_eth_bias"],
+        hypothetical_outcome=_safe_col(row, "hypothetical_outcome"),
+        hypothetical_bars_to_tp=_safe_col(row, "hypothetical_bars_to_tp"),
+        hypothetical_bars_to_sl=_safe_col(row, "hypothetical_bars_to_sl"),
         on_chain_context=_parse_on_chain_context(row),
         confluence_pillar_scores=_parse_pillar_scores(row),
         oscillator_raw_values=_parse_oscillator_raw_values(row),
@@ -1278,11 +1310,15 @@ class TradeJournal:
         entry_timeframe: Optional[str] = None,  # noqa: ARG002
         htf_timeframe: Optional[str] = None,  # noqa: ARG002
         regime_at_entry: Optional[str] = None,  # noqa: ARG002
-        # proposed_*/hypothetical_* kwargs dropped 2026-04-27 — entry
-        # path doesn't compute proposed SL/TP and the peg script that
-        # would forward-walk and stamp outcomes was deleted in the
-        # post-migration cleanup. Re-add as a pair if a Bybit-native
-        # peg gets written.
+        # 2026-04-29 — Pass 2.5 reject pegger re-add. proposed_* set here
+        # at insert time by `_record_reject` (caller computes ATR-based
+        # what-if for pre-fill rejects, plan_sl/tp forward for pending-
+        # cancel rejects). hypothetical_* NOT taken here — pegger
+        # (`scripts/peg_rejected_outcomes.py`) issues UPDATE statements
+        # against rejection_id after Bybit kline forward-walk.
+        proposed_sl_price: Optional[float] = None,
+        proposed_tp_price: Optional[float] = None,
+        proposed_rr_ratio: Optional[float] = None,
         htf_bias: Optional[str] = None,
         session: Optional[str] = None,
         market_structure: Optional[str] = None,
@@ -1316,10 +1352,11 @@ class TradeJournal:
 
         Only called by the runner on `plan is None` return. Never raises on
         duplicate — we generate a fresh uuid per call, the table is
-        append-only. Counter-factual outcome fields stay NULL until a
-        forward-walking pegger stamps them. (The legacy peg script was
-        removed 2026-04-26 in the post-migration cleanup; pre-migration
-        rows still carry stamps written before that date.)
+        append-only. Counter-factual `hypothetical_*` outcome fields stay
+        NULL on insert; `scripts/peg_rejected_outcomes.py` runs Bybit
+        kline forward-walk and stamps them via UPDATE statements (Pass 2.5
+        re-add of the 2026-04-27-dropped peg path; legacy OKX-era pegger
+        script was deleted in the post-migration cleanup).
         """
         conn = self._require_conn()
         rec = RejectedSignal(
@@ -1332,6 +1369,9 @@ class TradeJournal:
             atr=atr,
             confluence_score=confluence_score,
             confluence_factors=list(confluence_factors or []),
+            proposed_sl_price=proposed_sl_price,
+            proposed_tp_price=proposed_tp_price,
+            proposed_rr_ratio=proposed_rr_ratio,
             htf_bias=htf_bias,
             session=session,
             market_structure=market_structure,
@@ -1370,10 +1410,38 @@ class TradeJournal:
         await conn.commit()
         return rec
 
-    # 2026-04-27 — `update_rejected_outcome` removed alongside the
-    # hypothetical_outcome / hypothetical_bars_to_tp/sl column drops.
-    # Re-add when a Bybit-native peg script is written (alongside
-    # adding the columns back via _MIGRATIONS).
+    async def update_rejected_outcome(
+        self,
+        rejection_id: str,
+        *,
+        outcome: str,
+        bars_to_tp: Optional[int] = None,
+        bars_to_sl: Optional[int] = None,
+    ) -> None:
+        """Stamp counter-factual outcome on a `rejected_signals` row.
+
+        Called by `scripts/peg_rejected_outcomes.py` after Bybit kline
+        forward-walk resolves the row. `outcome` is one of `WIN`,
+        `LOSS`, `TIMEOUT`. `bars_to_tp` / `bars_to_sl` are bar offsets
+        from `signal_timestamp + 1 bar`; only the matching side is set
+        (the other stays NULL — peg's "didn't happen" signal).
+
+        Idempotent re-runs overwrite — `UPDATE` is unconditional. To
+        skip already-pegged rows, the pegger filters
+        `WHERE hypothetical_outcome IS NULL` at fetch time.
+        """
+        conn = self._require_conn()
+        await conn.execute(
+            """
+            UPDATE rejected_signals
+               SET hypothetical_outcome      = ?,
+                   hypothetical_bars_to_tp   = ?,
+                   hypothetical_bars_to_sl   = ?
+             WHERE rejection_id = ?
+            """,
+            (outcome, bars_to_tp, bars_to_sl, rejection_id),
+        )
+        await conn.commit()
 
     async def list_rejected_signals(
         self,

@@ -265,11 +265,14 @@ class RejectedSignal(BaseModel):
     session: Optional[str] = None
     market_structure: Optional[str] = None
 
-    # 2026-04-27 drops: proposed_sl_price / proposed_tp_price /
-    # proposed_rr_ratio. Entry path doesn't compute proposed SL/TP at
-    # reject time. Re-add as a triple if a Bybit-native peg script gets
-    # written AND _record_reject starts computing what-if SL/TP for
-    # counter-factual analysis.
+    # 2026-04-29 — Pass 2.5 reject pegger re-add. proposed_* set by
+    # `_record_reject` at reject time (ATR-based what-if for pre-fill
+    # rejects, plan_sl/tp forward for pending-cancel rejects). NULL on
+    # rows where SL/TP cannot be derived (no_setup_zone, no_sl_source,
+    # session_filter, macro_event_blackout, crowded_skip).
+    proposed_sl_price: Optional[float] = None
+    proposed_tp_price: Optional[float] = None
+    proposed_rr_ratio: Optional[float] = None
 
     # Derivatives snapshot — same fields as TradeRecord
     funding_z_at_entry: Optional[float] = None
@@ -288,17 +291,16 @@ class RejectedSignal(BaseModel):
     pillar_btc_bias: Optional[str] = None
     pillar_eth_bias: Optional[str] = None
 
-    # 2026-04-27 drops: hypothetical_outcome / hypothetical_bars_to_tp /
-    # hypothetical_bars_to_sl. Counter-factual outcome stamping never ran
-    # on Bybit-era rows (peg script was deleted in the post-migration
-    # cleanup, no Bybit-native rewrite). Re-add as a triple if a
-    # Bybit-native peg script gets written. Pre-migration rows in
-    # archived DBs still carry these stamps from the pre-migration pegger.
-    #
-    # Back-compat properties below return None so legacy callers
-    # (scripts/analyze.py, scripts/tune_confluence.py) keep running
-    # against post-2026-04-27 datasets — they just see "no peg outcome
-    # available" everywhere and skip those code paths.
+    # 2026-04-29 — Pass 2.5 reject pegger re-add. Stamped post-hoc by
+    # `scripts/peg_rejected_outcomes.py` (Bybit kline forward-walk from
+    # `signal_timestamp + 1 bar`). Values: `WIN` / `LOSS` / `TIMEOUT`,
+    # or None on rows where peg hasn't run yet OR proposed_sl/tp was
+    # NULL (peg has no targets to walk against). Bar offsets only set
+    # for the matching side (the other stays None — peg's "didn't
+    # happen" signal).
+    hypothetical_outcome: Optional[str] = None
+    hypothetical_bars_to_tp: Optional[int] = None
+    hypothetical_bars_to_sl: Optional[int] = None
 
     # 2026-04-21 — mirrors TradeRecord.on_chain_context. Carried on
     # rejects so factor_audit.py can segment reject reasons by on-chain
@@ -330,24 +332,6 @@ class RejectedSignal(BaseModel):
     price_change_1h_pct_at_entry: Optional[float] = None
     price_change_4h_pct_at_entry: Optional[float] = None
     liq_heatmap_top_clusters: dict = Field(default_factory=dict)
-
-    # 2026-04-27 — back-compat properties for the dropped peg-outcome
-    # columns. Always None on post-cleanup rows. Pre-migration rows in
-    # archived DBs (data/trades.db.pre_bybit_*) carry actual stamps but
-    # those DBs aren't loaded by the runtime journal. scripts/analyze.py
-    # and scripts/tune_confluence.py path-guard on these returning None
-    # and skip the counter-factual code branches gracefully.
-    @property
-    def hypothetical_outcome(self) -> Optional[str]:
-        return None
-
-    @property
-    def hypothetical_bars_to_tp(self) -> Optional[int]:
-        return None
-
-    @property
-    def hypothetical_bars_to_sl(self) -> Optional[int]:
-        return None
 
 
 class WhaleTransferRecord(BaseModel):
