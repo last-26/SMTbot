@@ -26,7 +26,7 @@ enableStructure = input.bool(true,  "Market Structure (MSS/BOS/Swings)", group="
 enableFVG       = input.bool(true,  "Fair Value Gaps",                   group="Modules")
 enableOB        = input.bool(true,  "Order Blocks",                      group="Modules")
 enableLiquidity = input.bool(true,  "Liquidity Sweeps",                  group="Modules")
-enableSessions  = input.bool(true,  "Session Levels (Asian/London/NY)",  group="Modules")
+enableSessions  = input.bool(false, "Session Levels (Asian/London/NY)",  group="Modules")
 enableVMC       = input.bool(true,  "VMC Cipher A (EMA ribbon + signals)", group="Modules")
 enableTable     = input.bool(true,  "Master Signal Table",               group="Modules")
 
