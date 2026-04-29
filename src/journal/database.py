@@ -1410,6 +1410,37 @@ class TradeJournal:
         await conn.commit()
         return rec
 
+    async def update_rejected_proposed_sltp(
+        self,
+        rejection_id: str,
+        *,
+        proposed_sl_price: float,
+        proposed_tp_price: float,
+        proposed_rr_ratio: float,
+    ) -> None:
+        """Stamp proposed SL/TP on an existing reject row (Pass 2.5 backfill).
+
+        Live reject path stamps these via `record_rejected_signal`'s
+        proposed_* kwargs at insert time. Pre-Pass-2.5 reject rows
+        inserted before that path landed have NULL proposed_* and need
+        a retroactive fill before the pegger can walk them; that's what
+        `scripts/backfill_proposed_sl_tp.py` does, calling this helper
+        per-row.
+        """
+        conn = self._require_conn()
+        await conn.execute(
+            """
+            UPDATE rejected_signals
+               SET proposed_sl_price = ?,
+                   proposed_tp_price = ?,
+                   proposed_rr_ratio = ?
+             WHERE rejection_id = ?
+            """,
+            (proposed_sl_price, proposed_tp_price, proposed_rr_ratio,
+             rejection_id),
+        )
+        await conn.commit()
+
     async def update_rejected_outcome(
         self,
         rejection_id: str,
