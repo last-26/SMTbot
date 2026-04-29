@@ -368,14 +368,20 @@ async def test_rehydrate_tolerates_tp_limit_place_failure(
 async def test_rehydrate_passes_be_already_moved_from_journal(monkeypatch, tmp_path, make_ctx):
     """If the journal row shows SL-to-BE already completed pre-restart, the
     rehydrate path must forward `be_already_moved=True` to the monitor so it
-    doesn't re-cancel the already-replaced TP2 on the next poll."""
+    doesn't re-attempt the BE move on the next poll.
+
+    2026-04-27: `algo_ids` column was dropped (Bybit V5 has position-attached
+    TP/SL, no separate algo orders). `update_algo_ids` is now a no-op for the
+    list itself but still stamps `sl_moved_to_be=1` — that flag is the only
+    thing rehydrate keys off, and the monitor receives `algo_ids=[]`.
+    """
     db = tmp_path / "trades.db"
     t0 = datetime(2026, 4, 16, 9, tzinfo=UTC)
     async with TradeJournal(str(db)) as seed:
         rec = await seed.record_open(make_plan(), make_report(),
                                      symbol="BTC-USDT-SWAP",
                                      signal_timestamp=t0, entry_timestamp=t0)
-        # Simulate TP1 firing pre-restart: algo_ids rewritten + flag stamped.
+        # Simulate TP1 firing pre-restart: stamps sl_moved_to_be=1.
         await seed.update_algo_ids(rec.trade_id, ["ALG-1", "NEW_BE"])
 
     cfg = make_config()
@@ -388,7 +394,7 @@ async def test_rehydrate_passes_be_already_moved_from_journal(monkeypatch, tmp_p
     assert len(fakes.monitor.register_extras) == 1
     extras = fakes.monitor.register_extras[0]
     assert extras["be_already_moved"] is True
-    assert extras["algo_ids"] == ["ALG-1", "NEW_BE"]
+    assert extras["algo_ids"] == []
 
 
 async def test_reconcile_logs_orphan_live_without_journal(monkeypatch, caplog, make_ctx):
@@ -413,57 +419,51 @@ async def test_reconcile_logs_orphan_live_without_journal(monkeypatch, caplog, m
         logger.remove(sink_id)
 
 
-# ── Startup orphan cancels (pending limits + surplus OCOs) ─────────────────
-
-
-class _TradeSubStub:
-    """Drop-in for `client.trade` — exposes get_order_list only."""
-    def __init__(self, rows: list[dict]):
-        self._rows = rows
-
-    def get_order_list(self, instType: str = "SWAP") -> dict:
-        return {"code": "0", "data": list(self._rows)}
+# ── Startup orphan cancels (pending limits) ────────────────────────────────
 
 
 class FakeBybitClientWithPending(FakeBybitClient):
-    """FakeBybitClient + the surfaces `_reconcile_orphans` touches:
-    `trade.get_order_list`, `cancel_order`, `list_pending_algos`,
-    plus call logs so tests can assert."""
+    """FakeBybitClient + the surface `_cancel_orphan_pending_limits` touches:
+    `list_open_orders` + `cancel_order`, with a call log so tests can assert.
+
+    2026-04-26 cleanup: pre-migration `_TradeSubStub.get_order_list` and
+    `list_pending_algos` shims were removed when the runner switched to
+    `bybit_client.list_open_orders()` (Bybit V5 native) and dropped the
+    OCO sweep (no separate algo orders on V5).
+    """
 
     def __init__(
         self, *,
         positions: Optional[list[PositionSnapshot]] = None,
         pending_limits: Optional[list[dict]] = None,
-        pending_algos: Optional[list[dict]] = None,
     ):
         super().__init__(positions=positions)
-        self.trade = _TradeSubStub(pending_limits or [])
-        self._pending_algos = pending_algos or []
+        self._open_orders = list(pending_limits or [])
         self.cancel_order_calls: list[tuple[str, str]] = []
-        self.list_pending_algos_calls: list[str] = []
+
+    def list_open_orders(
+        self, inst_id: Optional[str] = None, order_filter: str = "Order",
+    ) -> list[dict]:
+        return list(self._open_orders)
 
     def cancel_order(self, inst_id: str, order_id: str) -> dict:
         self.cancel_order_calls.append((inst_id, order_id))
         return {}
-
-    def list_pending_algos(
-        self, inst_id: Optional[str] = None, ord_type: str = "oco",
-    ) -> list[dict]:
-        self.list_pending_algos_calls.append(ord_type)
-        return list(self._pending_algos)
 
 
 async def test_reconcile_cancels_every_resting_pending_limit(make_ctx):
     """The monitor's in-memory _pending is empty at startup, so any resting
     limit on the exchange can't be tracked — reconcile must cancel them so they
     can't fill into an untracked (unprotected) position."""
-    # Need Optional import for the helper class
+    # Bybit V5 `list_open_orders` returns native key names (orderId / symbol
+    # / qty / price); the boundary translates `symbol` back to canonical
+    # internal form (`BTC-USDT-SWAP`) inside `bybit_client.list_open_orders`.
     client = FakeBybitClientWithPending(
         pending_limits=[
-            {"instId": "ETH-USDT-SWAP", "ordId": "ORPH_ETH",
-             "px": "2280.04", "sz": "29"},
-            {"instId": "BNB-USDT-SWAP", "ordId": "ORPH_BNB",
-             "px": "620.3", "sz": "1182"},
+            {"symbol": "ETH-USDT-SWAP", "orderId": "ORPH_ETH",
+             "price": "2280.04", "qty": "29"},
+            {"symbol": "BNB-USDT-SWAP", "orderId": "ORPH_BNB",
+             "price": "620.3", "qty": "1182"},
         ],
     )
     ctx, fakes = make_ctx(bybit_client=client)
@@ -510,4 +510,5 @@ async def test_dry_run_uses_dry_run_report_and_journals_dryrun_order_id(monkeypa
         rec = await ctx.journal.get_trade(trade_id)
     assert rec is not None
     assert rec.order_id == "DRYRUN"
-    assert rec.algo_id == "DRYRUN"
+    # 2026-04-27: `algo_id` column was dropped (Bybit V5 has position-attached
+    # TP/SL, no separate algo orders). Dry-run no longer journals one.

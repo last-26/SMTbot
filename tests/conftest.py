@@ -218,6 +218,16 @@ class FakeMonitor:
         self.revise_calls.append((inst_id, pos_side, new_tp))
         return True
 
+    def poll_pending(self) -> list:
+        # 2026-04-29 — runner.run_once now drains pending-limit events via
+        # `_process_pending` → `monitor.poll_pending()`. Default empty
+        # preserves the existing test contract (no pending events fired).
+        # Tests that need the pending path push events into
+        # `queued_pending_events` (initialised lazily here).
+        out = getattr(self, "queued_pending_events", [])
+        self.queued_pending_events = []
+        return out
+
 
 class FakeBybitClient:
     """Surface the runner touches: enrich_close_fill, get_positions,

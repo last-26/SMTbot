@@ -1278,17 +1278,23 @@ class TradeJournal:
             raise KeyError(f"No trade with id={trade_id!r}")
 
     async def update_algo_ids(self, trade_id: str, algo_ids: list[str]) -> None:
-        """Rewrite the `algo_ids` column AND stamp `sl_moved_to_be = 1`.
+        """Stamp `sl_moved_to_be = 1`. The `algo_ids` argument is ignored.
 
-        Used by the SL-to-BE path when the monitor replaces TP2 with a new
-        OCO (SL at entry + remainder TP). Persisting the flag is what lets
-        `_rehydrate_open_positions` skip the re-move after a restart — see
+        Used by the SL-to-BE path when the monitor locks SL at break-even.
+        Persisting the flag is what lets `_rehydrate_open_positions` skip
+        the re-move after a restart — see
         `PositionMonitor._detect_tp1_and_move_sl` for the consumer side.
+
+        2026-04-27: the `algo_ids` column was dropped (Bybit V5 has
+        position-attached TP/SL via `/v5/position/trading-stop`, not
+        separate algo orders to track). The parameter is kept on the
+        signature so the monitor → runner callback chain doesn't need a
+        coordinated rename, but it's not persisted anywhere.
         """
         conn = self._require_conn()
         cur = await conn.execute(
-            "UPDATE trades SET algo_ids = ?, sl_moved_to_be = 1 WHERE trade_id = ?",
-            (json.dumps(list(algo_ids)), trade_id),
+            "UPDATE trades SET sl_moved_to_be = 1 WHERE trade_id = ?",
+            (trade_id,),
         )
         await conn.commit()
         if cur.rowcount == 0:

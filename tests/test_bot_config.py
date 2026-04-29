@@ -362,9 +362,11 @@ def test_on_chain_defaults_master_and_subfeatures_all_off():
     assert cfg.on_chain.whale_threshold_usd == 150_000_000.0
     assert cfg.on_chain.whale_blackout_duration_s == 600
     assert cfg.on_chain.api_usage_auto_disable_pct == 95.0
-    # whale_tokens — 5 perps + 2 stablecoins, slug-format (Arkham coingecko ids).
+    # whale_tokens — 4 perps + 2 stablecoins, slug-format (Arkham coingecko ids).
+    # 2026-04-25 Bybit migration: BNB→XRP swap; XRP intentionally omitted because
+    # Arkham doesn't index XRPL per-token data (every XRP slug variant rejected).
     assert cfg.on_chain.whale_tokens == [
-        "bitcoin", "ethereum", "solana", "dogecoin", "binancecoin",
+        "bitcoin", "ethereum", "solana", "dogecoin",
         "tether", "usd-coin",
     ]
 
