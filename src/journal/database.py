@@ -686,17 +686,13 @@ _MIGRATIONS = [
     "ALTER TABLE trades DROP COLUMN entry_timeframe",
     "ALTER TABLE trades DROP COLUMN htf_timeframe",
     "ALTER TABLE trades DROP COLUMN regime_at_entry",
-    # idx_rejected_outcome targets the dropped hypothetical_outcome
-    # column. SQLite DROP COLUMN auto-removes column-bound indexes but
-    # explicit DROP INDEX is harmless and clearer.
-    "DROP INDEX IF EXISTS idx_rejected_outcome",
-    # rejected_signals drops (9)
-    "ALTER TABLE rejected_signals DROP COLUMN proposed_sl_price",
-    "ALTER TABLE rejected_signals DROP COLUMN proposed_tp_price",
-    "ALTER TABLE rejected_signals DROP COLUMN proposed_rr_ratio",
-    "ALTER TABLE rejected_signals DROP COLUMN hypothetical_outcome",
-    "ALTER TABLE rejected_signals DROP COLUMN hypothetical_bars_to_tp",
-    "ALTER TABLE rejected_signals DROP COLUMN hypothetical_bars_to_sl",
+    # rejected_signals drops (3 — proposed_*/hypothetical_* re-added 2026-04-29
+    # via Pass 2.5.B; their original 2026-04-27 DROP statements removed from
+    # this list 2026-04-29 because they were silently DESTROYING data on
+    # every connect: the migration loop ran DROP-then-ADD per session, so a
+    # backfilled `proposed_sl_price` value vanished on the next bot/script
+    # startup. The original DROP was a one-time op anyway — pre-2026-04-27
+    # DBs are now post-DROP, post-ADD, idempotent.)
     "ALTER TABLE rejected_signals DROP COLUMN entry_timeframe",
     "ALTER TABLE rejected_signals DROP COLUMN htf_timeframe",
     "ALTER TABLE rejected_signals DROP COLUMN regime_at_entry",
