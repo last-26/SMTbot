@@ -125,11 +125,9 @@ def _by_session(trades: list[TradeRecord]) -> dict[str, list[TradeRecord]]:
     return out
 
 
-def _by_regime(trades: list[TradeRecord]) -> dict[str, list[TradeRecord]]:
-    out: dict[str, list[TradeRecord]] = {}
-    for t in trades:
-        out.setdefault(t.regime_at_entry or "UNKNOWN", []).append(t)
-    return out
+# `_by_regime` removed 2026-04-29 — `regime_at_entry` was a 1-distinct
+# constant dropped from the schema 2026-04-27. `_by_trend_regime` (ADX
+# trend regime) carries the only remaining semantic regime split.
 
 
 def _by_trend_regime(trades: list[TradeRecord]) -> dict[str, list[TradeRecord]]:
@@ -360,9 +358,8 @@ def _render(
 
     lines.extend(_render_group("Per-symbol:", _by_symbol(trades)))
     lines.extend(_render_group("Per-session:", _by_session(trades)))
-    lines.extend(_render_group(
-        "Per-derivatives-regime (regime_at_entry):", _by_regime(trades),
-    ))
+    # `Per-derivatives-regime` section removed 2026-04-29 — column
+    # `regime_at_entry` was dropped 2026-04-27 (1-distinct constant).
     lines.extend(_render_group(
         "Per-ADX-trend-regime (trend_regime_at_entry):",
         _by_trend_regime(trades),

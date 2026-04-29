@@ -243,8 +243,13 @@ CREATE TABLE IF NOT EXISTS rejected_signals (
 
 CREATE INDEX IF NOT EXISTS idx_rejected_symbol_ts  ON rejected_signals(symbol, signal_timestamp);
 CREATE INDEX IF NOT EXISTS idx_rejected_reason     ON rejected_signals(reject_reason);
--- 2026-04-29 — Pass 2.5 reject pegger re-add (paired with hypothetical_outcome above).
-CREATE INDEX IF NOT EXISTS idx_rejected_outcome    ON rejected_signals(hypothetical_outcome);
+-- idx_rejected_outcome lives in _MIGRATIONS, NOT here. Reason: on a
+-- pre-Pass-2.5 DB the `hypothetical_outcome` column is still missing
+-- when `executescript(_SCHEMA)` runs (CREATE TABLE pas via IF NOT EXISTS,
+-- so the new column isn't materialized; ALTER TABLE ADD COLUMN runs
+-- AFTER, in _MIGRATIONS). Keeping the index in _SCHEMA would crash with
+-- "no such column: hypothetical_outcome" before the migration loop
+-- could fix it.
 
 -- 2026-04-21 — Arkham on-chain snapshot time-series (Phase 8 data layer).
 -- One row per detected snapshot MUTATION (not per tick). Runner writes
