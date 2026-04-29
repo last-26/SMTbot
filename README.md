@@ -16,7 +16,7 @@ ayarlar ve logları analiz eder.
 | **Bybit** | USDT vadeli (UTA, hedge mode, demo + live) | ✅ gerekli | [bybit.com](https://www.bybit.com) |
 | **TradingView Desktop** | Grafik, Pine indikatörleri (MCP ile okunur) | abonelik | [tradingview.com](https://www.tradingview.com) |
 | **Coinalyze** | Open Interest, funding, liquidation verisi | ✅ gerekli (free) | [coinalyze.net/api-access](https://coinalyze.net/api-access) |
-| **Arkham** | On-chain CEX akışları, whale transferleri | ✅ gerekli (trial) | [arkhamintelligence.com](https://www.arkhamintelligence.com) |
+| **Arkham** | On-chain CEX akışları, whale transferleri | ✅ gerekli ($6250) | [arkhamintelligence.com](https://www.arkhamintelligence.com) |
 | **Finnhub** | Makro ekonomik takvim (FOMC, CPI vb. blackout) | ✅ gerekli (free) | [finnhub.io](https://finnhub.io/dashboard) |
 | **FairEconomy** | Makro takvim (yedek, key gerekmez) | ❌ | [faireconomy.media](https://www.faireconomy.media) |
 | **Binance Public** | Fiyat cross-check (public API) | ❌ | [binance.com](https://www.binance.com) |
