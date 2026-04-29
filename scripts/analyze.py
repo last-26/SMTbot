@@ -160,7 +160,8 @@ def _trade_to_feature_row(t: TradeRecord, all_factors: list[str],
         "direction": t.direction.value,
         "session": t.session or "UNKNOWN",
         "trend_regime": t.trend_regime_at_entry or "UNKNOWN",
-        "regime": t.regime_at_entry or "UNKNOWN",
+        # `regime_at_entry` was dropped 2026-04-27 (1-distinct constant);
+        # only `trend_regime_at_entry` carries semantic info.
         "sl_source": t.sl_source or "UNKNOWN",
         "setup_zone_source": t.setup_zone_source or "UNKNOWN",
     }
@@ -267,8 +268,11 @@ def _render_gbt_importance(
         return lines, None, None, df
 
     # One-hot the categoricals. Drop target + outcome columns before dummies.
+    # `regime` removed 2026-04-29 (Pass 2.5.G) — `regime_at_entry` was dropped
+    # 2026-04-27 from the schema (1-distinct constant); _trade_to_feature_row
+    # no longer emits the column.
     categorical = [
-        "symbol", "direction", "session", "trend_regime", "regime",
+        "symbol", "direction", "session", "trend_regime",
         "sl_source", "setup_zone_source",
     ]
     X = pd.get_dummies(
@@ -789,6 +793,7 @@ def _render_pass2_hypotheses(trades: list[TradeRecord]) -> list[str]:
 def _assemble_report(
     trades: list[TradeRecord], rejects: list[RejectedSignal],
     *, since: Optional[datetime], generated_at: datetime,
+    arkham_free: bool = False,
 ) -> str:
     """Returns the full markdown report as a single string."""
     all_factors = _collect_factor_universe(trades)
@@ -802,6 +807,13 @@ def _assemble_report(
     out.append(f"- Window: {window}")
     out.append(f"- Trade rows: {len(trades)}   Reject rows: {len(rejects)}")
     out.append(f"- Pillars observed: {', '.join(all_pillars) or '(none)'}")
+    if arkham_free:
+        out.append(
+            "- **Mode: Arkham-FREE** — Section 7 (Arkham segmentation) + "
+            "Section 9 (Pass 2 Arkham-deferred hypotheses) skipped. "
+            "GBT feature matrix is already Arkham-FREE — `on_chain_context` "
+            "is never read into a feature column."
+        )
     if not all_pillars:
         out.append(
             "- _NOTE: no rows carry `confluence_pillar_scores` (pre-migration DB "
@@ -825,12 +837,14 @@ def _assemble_report(
         out.append("")
         out.extend(_render_rejected_counterfactual(rejects))
         out.append("")
-        out.extend(_render_arkham_segmentation(trades))
-        out.append("")
+        if not arkham_free:
+            out.extend(_render_arkham_segmentation(trades))
+            out.append("")
         out.extend(_render_pass1_recommendations(trades, rejects))
         out.append("")
-        out.extend(_render_pass2_hypotheses(trades))
-        out.append("")
+        if not arkham_free:
+            out.extend(_render_pass2_hypotheses(trades))
+            out.append("")
         return "\n".join(out)
 
     gbt_lines, clf, reg, X = _render_gbt_importance(trades, all_factors, all_pillars)
@@ -844,12 +858,14 @@ def _assemble_report(
     out.append("")
     out.extend(_render_rejected_counterfactual(rejects))
     out.append("")
-    out.extend(_render_arkham_segmentation(trades))
-    out.append("")
+    if not arkham_free:
+        out.extend(_render_arkham_segmentation(trades))
+        out.append("")
     out.extend(_render_pass1_recommendations(trades, rejects))
     out.append("")
-    out.extend(_render_pass2_hypotheses(trades))
-    out.append("")
+    if not arkham_free:
+        out.extend(_render_pass2_hypotheses(trades))
+        out.append("")
     return "\n".join(out)
 
 
@@ -863,12 +879,19 @@ async def run_analysis(
     since: Optional[datetime] = None,
     ignore_clean_since: bool = False,
     print_stdout: bool = True,
+    arkham_free: bool = False,
 ) -> str:
     """Runs the analysis end-to-end and writes the markdown report.
 
     Returns the report body. Exposed for the smoke test so we don't need
     to spawn a subprocess. Respects `rl.clean_since` by default; pass
     `ignore_clean_since=True` to include pre-cutoff rows.
+
+    `arkham_free=True` (Pass 2.5.G / Pass 3 prep): skip Section 7
+    (Arkham segmentation) and Section 9 (Pass 2 hypotheses, Arkham-
+    deferred candidates). GBT feature matrix `_trade_to_feature_row`
+    is already Arkham-FREE — `on_chain_context` is never read into a
+    feature column — so the classifier/regressor are unaffected.
     """
     if not ignore_clean_since:
         clean_since = _resolve_clean_since()
@@ -896,6 +919,7 @@ async def run_analysis(
         trades, rejects,
         since=since,
         generated_at=datetime.now(tz=timezone.utc),
+        arkham_free=arkham_free,
     )
     _write_output(output_path, body)
     if print_stdout:
@@ -934,6 +958,14 @@ def main() -> int:
         "--output", default=None,
         help=f"Output markdown path (default: {_default_output_path()})",
     )
+    parser.add_argument(
+        "--arkham-free", action="store_true",
+        help=(
+            "Pass 3 mode: skip Arkham segmentation (Section 7) + Pass 2 "
+            "Arkham-deferred hypotheses (Section 9). GBT feature matrix is "
+            "already Arkham-FREE — flag does NOT change classifier inputs."
+        ),
+    )
     args = parser.parse_args()
 
     db_path = _resolve_db_path(args.db)
@@ -965,6 +997,7 @@ def main() -> int:
         since=since,
         ignore_clean_since=args.ignore_clean_since,
         print_stdout=True,
+        arkham_free=args.arkham_free,
     ))
     print(f"\n[OK] Report written to {output_path}", file=sys.stderr)
     return 0

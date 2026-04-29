@@ -20,14 +20,10 @@ from pathlib import Path
 
 import pytest
 
-# 2026-04-27 — analyze.py's pegged-rejects section reads
-# `hypothetical_outcome` to bucket rejects into would-have-WON / LOST.
-# Column dropped this commit; the section's WR comparison no longer
-# fires. Re-enable when a Bybit-native peg script restores stamping.
-pytestmark = pytest.mark.skip(
-    reason="2026-04-27 peg-outcome columns dropped; re-enable when a "
-    "Bybit-native peg script restores hypothetical_outcome stamping.",
-)
+# 2026-04-29 — Pass 2.5.B re-added proposed_*/hypothetical_* columns;
+# 2026-04-27 skip pin removed. analyze.py's pegged-rejects section
+# (Section 6) again reads hypothetical_outcome, populated post-pegger
+# run by `scripts/peg_rejected_outcomes.py`.
 
 from src.data.models import Direction
 from src.execution.models import (
@@ -152,7 +148,6 @@ async def _seed_journal(db_path: Path) -> None:
                 entry_timestamp=signal_ts,
                 session=session,
                 trend_regime_at_entry=trend_regime,
-                regime_at_entry="BALANCED",
                 # Tag half of trades with on-chain context to exercise
                 # Arkham segmentation.
                 on_chain_context=(
@@ -185,12 +180,13 @@ async def _seed_journal(db_path: Path) -> None:
                 confluence_pillar_scores={"mss_alignment": 1.5},
                 on_chain_context={"daily_macro_bias": "bearish"},
             )
-            await j.update_rejected_outcome(
-                rej.rejection_id,
-                hypothetical_outcome=outcome,
-                bars_to_tp=5 if outcome == "WIN" else None,
-                bars_to_sl=5 if outcome == "LOSS" else None,
-            )
+            if outcome != "NEITHER":  # NEITHER → leave NULL (no peg outcome)
+                await j.update_rejected_outcome(
+                    rej.rejection_id,
+                    outcome=outcome,
+                    bars_to_tp=5 if outcome == "WIN" else None,
+                    bars_to_sl=5 if outcome == "LOSS" else None,
+                )
 
 
 # ── Tests ───────────────────────────────────────────────────────────────────
@@ -278,3 +274,102 @@ async def test_run_analysis_empty_journal_returns_dataset_only(tmp_path):
     assert "# Phase 9 GBT Analysis Report" in body
     assert "## 1. Dataset summary" in body
     assert "Insufficient data for GBT" in body
+
+
+# ── Pass 2.5.G — Arkham-FREE mode ────────────────────────────────────────────
+
+
+async def test_run_analysis_arkham_free_skips_sections_7_and_9(tmp_path):
+    """`arkham_free=True` (Pass 3 prep) drops Section 7 (Arkham
+    segmentation) + Section 9 (Pass 2 Arkham-deferred hypotheses).
+    Other sections must still render."""
+    from scripts.analyze import run_analysis
+
+    db_path = tmp_path / "trades.db"
+    await _seed_journal(db_path)
+
+    output_path = tmp_path / "arkham_free_report.md"
+    body = await run_analysis(
+        db_path=str(db_path),
+        output_path=str(output_path),
+        since=None,
+        ignore_clean_since=True,
+        print_stdout=False,
+        arkham_free=True,
+    )
+
+    # Skipped sections
+    assert "## 7. Arkham segmentation" not in body
+    assert "## 9. Pass 2 hypotheses" not in body
+    # Header note that arkham-free was active
+    assert "Mode: Arkham-FREE" in body
+    # Other sections still present
+    assert "## 1. Dataset summary" in body
+    assert "## 4. Per-factor WR" in body
+    assert "## 6. Rejected-signals counter-factual" in body
+    assert "## 8. Pass 1 tuning recommendations" in body
+
+
+async def test_run_analysis_arkham_free_default_off_renders_arkham_sections(
+    tmp_path,
+):
+    """Default arkham_free=False → Section 7 + 9 still rendered (back-
+    compat with existing Pass 1/2 reports). Mode banner absent."""
+    from scripts.analyze import run_analysis
+
+    db_path = tmp_path / "trades.db"
+    await _seed_journal(db_path)
+
+    output_path = tmp_path / "default_report.md"
+    body = await run_analysis(
+        db_path=str(db_path),
+        output_path=str(output_path),
+        since=None,
+        ignore_clean_since=True,
+        print_stdout=False,
+        # arkham_free omitted → default False
+    )
+
+    assert "## 7. Arkham segmentation" in body
+    assert "## 9. Pass 2 hypotheses" in body
+    assert "Mode: Arkham-FREE" not in body
+
+
+def test_trade_to_feature_row_excludes_on_chain_columns():
+    """GBT feature matrix MUST NOT carry Arkham-derived columns. Lock
+    the contract — `_trade_to_feature_row` row keys never include
+    on_chain_*, daily_macro_bias, altcoin_index, netflow, etc."""
+    from datetime import datetime, timezone
+
+    from scripts.analyze import _trade_to_feature_row
+    from src.data.models import Direction
+    from src.journal.models import TradeOutcome, TradeRecord
+
+    rec = TradeRecord(
+        trade_id="x",
+        symbol="BTC-USDT-SWAP",
+        direction=Direction.BULLISH,
+        outcome=TradeOutcome.WIN,
+        signal_timestamp=datetime(2026, 4, 28, 12, tzinfo=timezone.utc),
+        entry_timestamp=datetime(2026, 4, 28, 12, tzinfo=timezone.utc),
+        entry_price=67_000.0, sl_price=66_800.0, tp_price=67_300.0,
+        rr_ratio=1.5, leverage=10, num_contracts=3,
+        position_size_usdt=2010.0, risk_amount_usdt=10.0,
+        confluence_score=4.0,
+        # Carry an on_chain_context — feature row MUST NOT promote it.
+        on_chain_context={
+            "daily_macro_bias": "bullish",
+            "altcoin_index": 75,
+            "stablecoin_pulse_1h_usd": 1_000_000.0,
+            "cex_btc_netflow_24h_usd": -5_000_000.0,
+        },
+    )
+    row = _trade_to_feature_row(rec, all_factors=[], all_pillars=[])
+
+    arkham_keywords = (
+        "on_chain", "daily_macro_bias", "altcoin_index", "stablecoin_pulse",
+        "netflow", "arkham", "whale",
+    )
+    bad_keys = [k for k in row.keys()
+                if any(kw in k.lower() for kw in arkham_keywords)]
+    assert not bad_keys, f"GBT row leaked Arkham columns: {bad_keys}"
