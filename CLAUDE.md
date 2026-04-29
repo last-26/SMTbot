@@ -42,6 +42,8 @@ Per-commit detail lives in `git log`. This section captures high-level shifts on
 
 **2026-04-29 — Roadmap reset.** Pass 3 declared Arkham-FREE; Arkham retirement plan locked (soft 2026-05-04 → off 2026-05-18 → trial expires 2026-05-20). Phase 12 trimmed to two candidates: Deep RL + HTF Order Block / Breaker Block ecosystem. Saved to `project_roadmap_reset_2026-04-29.md`.
 
+**2026-04-29 — Pine TV resync + session drawings off.** TV resynced from `ae44ab9` (1156 lines) → HEAD (1175); activates 3m VWAP ±1σ band path that was inactive since `cce646e` (2026-04-19) — pre-resync `vwap_retest` zones (24/44 trades) all used ATR fallback, post-resync use Convention X band-anchor. `enableSessions` default `true→false` (PDH/PDL/PWH/PWL + Asia/London/NY drawings; no Python consumer; skips `request.security("D"/"W")` lookback for cycle perf).
+
 ---
 
 ## Prerequisites
