@@ -871,4 +871,9 @@ rl:
   #   - Post-fix qty/price quantization (no float noise rejections)
   #   - Arkham per_symbol_cex_flow only on 4 symbols (XRP omitted)
   #   - Idempotent leverage/mode/cancel handling
-  clean_since: "2026-04-26T00:29:30Z"
+  # 2026-04-29 — Pass 2 50-trade gate cleared (W26/L24, +9.77R, WR 52%);
+  # cut realigned 00:29:30Z → 21:30:00Z (Bybit ilk trade 21:38:07'nin 8 dk
+  # öncesi) tüm 50 Bybit-era trade dashboard'la sync olsun diye. Pre-cut-
+  # realignment DB archived as `data/trades.db.pre_pass25_2026-04-29T222601Z`
+  # (atomic sqlite3 backup). Cut realignment Pass 2.5 başlangıcı.
+  clean_since: "2026-04-25T21:30:00Z"

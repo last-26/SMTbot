@@ -1,6 +1,6 @@
 # CLAUDE.md — Crypto Futures Trading Bot
 
-AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT linear perps). Zone-based limit entries, 5-pillar confluence, cross-asset + regime-aware vetoes, Arkham on-chain soft signals (retiring before Phase 11). Demo-runnable end-to-end. The bot was initially piloted on OKX; demo-wick artefacts polluted fill data, so the venue switched to Bybit V5 Demo on 2026-04-25. Fresh dataset collection restarts under `rl.clean_since=2026-04-25T21:45:00Z`.
+AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT linear perps). Zone-based limit entries, 5-pillar confluence, cross-asset + regime-aware vetoes, Arkham on-chain soft signals (retiring before Phase 11). Demo-runnable end-to-end. The bot was initially piloted on OKX; demo-wick artefacts polluted fill data, so the venue switched to Bybit V5 Demo on 2026-04-25. Fresh dataset collection restarts under `rl.clean_since=2026-04-25T21:30:00Z`.
 
 **Architectural principle:** Claude Code is the *orchestrator* (writes Pine, runs tuning, debugs). Runtime decisions are made by the Python bot, **not** Claude. TradingView = eyes, Bybit = hands, Python = brain.
 
@@ -20,7 +20,7 @@ AI-driven crypto-futures scalper on **Bybit V5 Demo** (UTA, hedge mode, USDT lin
 - **On-chain (Arkham):** runtime soft signals only — daily bias ±15%, hourly stablecoin pulse +0.75 threshold penalty, altcoin-index +0.5 penalty on misaligned altcoin trades, **flow_alignment** 6-input directional score (stablecoin + BTC/ETH + Coinbase/Binance/Bybit 24h netflow; weights 0.25/0.25/0.15/0.15/0.10/0.10; default penalty 0.25), **per_symbol_cex_flow** binary penalty on misaligned symbol 1h volume (default 0.25, $5M floor). Bitfinex + Kraken + OKX 24h netflow captured journal-only (4th/5th/6th venues; not yet wired into `_flow_alignment_score`). Whale HARD GATE removed — WS listener feeds `whale_transfers` journal at $10M threshold. Per-symbol token_volume fallback for Arkham null returns. Per-entity netflow uses `/transfers/histogram` 1h-bucket (not `/flow/entity` daily-bucket — was freezing). Daily-bundle refresh on 5-min monotonic cadence. Credit-safe via v2 persistent WS streams + filter-fingerprint cache. **Arkham retires 2026-05-04 (soft) → 2026-05-18 (off) before trial expiry 2026-05-20 — see Forward roadmap.**
 - **Pass 2 instrumentation:** every trade / reject row captures `confluence_pillar_scores` (factor name → weight dict) and `oscillator_raw_values` (per-TF dict with 1m/3m/15m OscillatorTableData numerics). Both sourced from existing runner TF-switch cache — zero extra TV latency.
 - **Tests:** ~1060, mostly green. Demo-runnable end-to-end.
-- **Data cutoff (`rl.clean_since`):** `2026-04-25T21:45:00Z` — **Bybit migration cut**. Pre-migration DB archived as `data/trades.db.pre_bybit_2026-04-25T214500Z`. Pass 1 baseline before that: `data/trades.db.pass1_backup_2026-04-22T203324Z`.
+- **Data cutoff (`rl.clean_since`):** `2026-04-25T21:30:00Z` — **Bybit migration cut, dashboard ile sync**. Pre-Pass-2.5 DB archived as `data/trades.db.pre_pass25_2026-04-29T222601Z`. Pre-migration OKX DB still in `data/trades.db.pre_bybit_2026-04-25T214500Z`. Pass 1 baseline before that: `data/trades.db.pass1_backup_2026-04-22T203324Z`.
 
 ---
 
@@ -45,6 +45,8 @@ Per-commit detail lives in `git log`. This section captures high-level shifts on
 **2026-04-29 — Pine TV resync + session drawings off.** TV resynced from `ae44ab9` (1156 lines) → HEAD (1175); activates 3m VWAP ±1σ band path that was inactive since `cce646e` (2026-04-19) — pre-resync `vwap_retest` zones (24/44 trades) all used ATR fallback, post-resync use Convention X band-anchor. `enableSessions` default `true→false` (PDH/PDL/PWH/PWL + Asia/London/NY drawings; no Python consumer; skips `request.security("D"/"W")` lookback for cycle perf).
 
 **2026-04-29 — Macro blackout log throttle.** `_run_one_symbol` `macro_event_blackout` dalı per-symbol 60s throttle + blackout check `symbol_cycle_start` log'undan önceye taşındı. Fed Interest Rate Decision penceresinde gözlenen ~120 satır/dk → 5 satır/dk (sembol başına dakikada bir). Davranış aynı: blackout penceresi, decision, TV chart cycling tümü değişmedi.
+
+**2026-04-29 — Pass 2 50-trade gate clear + Pass 2.5 başlangıç (cut hizalama).** Bybit-era 50 closed trade (W26/L24, +9.77R, WR 52%, Sharpe 0.15, Profit Factor 1.34). `rl.clean_since` `2026-04-26T00:29:30Z` → `2026-04-25T21:30:00Z` (ilk Bybit trade `21:38:07`'den 8 dk önce; 50 trade'in tamamı dashboard ile sync). Bybit `closed_pnl` çapraz check'inde 1 ekstra row (manuel test trade `21:28`, 1.05 BTC -$86.83) bot başlamadan önce — DB doğru, ignore. Pre-Pass-2.5 DB archived `data/trades.db.pre_pass25_2026-04-29T222601Z` (atomic sqlite3 backup). Pass 2.5 scope: counter-factual reject pegger Bybit-native rewrite (proposed SL/TP write at reject time + Bybit kline forward-walk → `hypothetical_outcome`).
 
 ---
 
