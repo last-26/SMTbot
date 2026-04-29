@@ -44,6 +44,8 @@ Per-commit detail lives in `git log`. This section captures high-level shifts on
 
 **2026-04-29 — Pine TV resync + session drawings off.** TV resynced from `ae44ab9` (1156 lines) → HEAD (1175); activates 3m VWAP ±1σ band path that was inactive since `cce646e` (2026-04-19) — pre-resync `vwap_retest` zones (24/44 trades) all used ATR fallback, post-resync use Convention X band-anchor. `enableSessions` default `true→false` (PDH/PDL/PWH/PWL + Asia/London/NY drawings; no Python consumer; skips `request.security("D"/"W")` lookback for cycle perf).
 
+**2026-04-29 — Macro blackout log throttle.** `_run_one_symbol` `macro_event_blackout` dalı per-symbol 60s throttle + blackout check `symbol_cycle_start` log'undan önceye taşındı. Fed Interest Rate Decision penceresinde gözlenen ~120 satır/dk → 5 satır/dk (sembol başına dakikada bir). Davranış aynı: blackout penceresi, decision, TV chart cycling tümü değişmedi.
+
 ---
 
 ## Prerequisites

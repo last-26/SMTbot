@@ -750,6 +750,10 @@ class BotRunner:
         # Operator override: after _prime() replays the journal, also wipe any
         # halt state + daily counters that would block the very first tick.
         self.clear_halt = clear_halt
+        # Per-symbol throttle for macro_event_blackout log lines. Without it
+        # the blackout dal short-circuits each symbol cycle in ~6s, producing
+        # ~2 log lines/sec for the full ±window of a HIGH-impact event.
+        self._macro_blackout_log_ts: dict[str, float] = {}
 
     # ── Construction ────────────────────────────────────────────────────────
 
@@ -1813,12 +1817,13 @@ class BotRunner:
 
     async def _run_one_symbol(self, symbol: str) -> None:
         cfg = self.ctx.config
-        logger.info("symbol_cycle_start symbol={}", symbol)
 
         # 0. Macro event blackout — skip new entries inside ±window of a
         # scheduled HIGH-impact USD event (CPI/FOMC/NFP/PCE). Open positions
         # are untouched (their OCO algos already manage exit). Cheap sync
-        # check, runs before the expensive TV symbol/TF switching.
+        # check, runs before the expensive TV symbol/TF switching AND before
+        # the symbol_cycle_start log so the blackout dal does not spam the
+        # log file at ~2 lines/sec for the full ±window.
         if self.ctx.economic_calendar is not None:
             try:
                 blackout = self.ctx.economic_calendar.is_in_blackout(_utc_now())
@@ -1827,15 +1832,22 @@ class BotRunner:
                 blackout = None
             if blackout is not None and blackout.active and blackout.event is not None:
                 evt = blackout.event
-                logger.info(
-                    "symbol_decision symbol={} NO_TRADE reason=macro_event_blackout "
-                    "event={!r} country={} impact={} secs_to_event={} "
-                    "secs_after_event={} source={}",
-                    symbol, evt.title, evt.country, evt.impact.value,
-                    blackout.seconds_until_event, blackout.seconds_after_event,
-                    evt.source,
-                )
+                # Per-symbol throttle: at most one line per minute per symbol.
+                now_mono = time.monotonic()
+                last_mono = self._macro_blackout_log_ts.get(symbol, 0.0)
+                if now_mono - last_mono >= 60.0:
+                    logger.info(
+                        "symbol_decision symbol={} NO_TRADE reason=macro_event_blackout "
+                        "event={!r} country={} impact={} secs_to_event={} "
+                        "secs_after_event={} source={}",
+                        symbol, evt.title, evt.country, evt.impact.value,
+                        blackout.seconds_until_event, blackout.seconds_after_event,
+                        evt.source,
+                    )
+                    self._macro_blackout_log_ts[symbol] = now_mono
                 return
+
+        logger.info("symbol_cycle_start symbol={}", symbol)
 
         # 1. Switch the TV chart to this symbol (production has a bridge;
         # tests pass bridge=None and the reader fake already knows the symbol).
