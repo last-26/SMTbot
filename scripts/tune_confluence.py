@@ -147,14 +147,30 @@ def walk_forward_split(
 # ── Suggest / objective ─────────────────────────────────────────────────────
 
 
-def suggest_config(trial, symbols: tuple[str, ...] = _SYMBOLS) -> ConfigOverride:
+def suggest_config(
+    trial,
+    symbols: tuple[str, ...] = _SYMBOLS,
+    *,
+    pillars: Optional[list[str]] = None,
+    enable_target_rr: bool = False,
+    enable_zone_max_wait: bool = False,
+) -> ConfigOverride:
     """Draw one ConfigOverride from the Optuna trial.
 
-    Search space:
+    Pass 1 base search space:
       * ``confluence_threshold_global`` — continuous [2.0, 5.0]
       * ``confluence_threshold_per_symbol[S]`` — continuous [2.0, 5.0]
         drawn only when ``use_per_symbol`` flag is True; else left empty.
       * 3x bool gate toggles, independent categoricals.
+
+    Pass 3 Faz-A additions (gated on the ``pillars``/``enable_*`` kwargs
+    so existing Pass 1 callers keep working unchanged):
+      * ``pillar_weights[name]`` — continuous [0.0, 2.0] per pillar in
+        the supplied ``pillars`` list. 0=disable factor, 1=baseline,
+        2=double weight. None/empty → no pillar reweight.
+      * ``target_rr_ratio`` — continuous [1.0, 2.5] when enabled.
+      * ``zone_max_wait_bars`` — int [2, 5] when enabled. Baseline is
+        2 (current cfg); >2 unblocks zone_timeout_cancel rejects.
     """
     thr_global = trial.suggest_float("confluence_threshold_global", 2.0, 5.0)
     use_per_symbol = trial.suggest_categorical("use_per_symbol", [False, True])
@@ -167,12 +183,31 @@ def suggest_config(trial, symbols: tuple[str, ...] = _SYMBOLS) -> ConfigOverride
     vwap = trial.suggest_categorical("vwap_hard_veto_enabled", [False, True])
     ema = trial.suggest_categorical("ema_veto_enabled", [False, True])
     xopp = trial.suggest_categorical("cross_asset_opposition_enabled", [False, True])
+
+    pillar_weights: dict[str, float] = {}
+    if pillars:
+        for pname in pillars:
+            pillar_weights[pname] = trial.suggest_float(
+                f"pw_{pname}", 0.0, 2.0,
+            )
+
+    target_rr: Optional[float] = None
+    if enable_target_rr:
+        target_rr = trial.suggest_float("target_rr_ratio", 1.0, 2.5)
+
+    zone_max_wait: Optional[int] = None
+    if enable_zone_max_wait:
+        zone_max_wait = trial.suggest_int("zone_max_wait_bars", 2, 5)
+
     return ConfigOverride(
         confluence_threshold_global=thr_global,
         confluence_threshold_per_symbol=per_symbol,
         vwap_hard_veto_enabled=vwap,
         ema_veto_enabled=ema,
         cross_asset_opposition_enabled=xopp,
+        pillar_weights=pillar_weights,
+        target_rr_ratio=target_rr,
+        zone_max_wait_bars=zone_max_wait,
     )
 
 
@@ -198,9 +233,21 @@ def objective(
     train_rejects: list[RejectedSignal],
     *,
     min_trades: int = 5,
+    pillars: Optional[list[str]] = None,
+    enable_target_rr: bool = False,
+    enable_zone_max_wait: bool = False,
+    kline_cache=None,
 ) -> float:
-    cfg = suggest_config(trial)
-    m = replay_config(train_trades, train_rejects, cfg)
+    cfg = suggest_config(
+        trial,
+        pillars=pillars,
+        enable_target_rr=enable_target_rr,
+        enable_zone_max_wait=enable_zone_max_wait,
+    )
+    m = replay_config(
+        train_trades, train_rejects, cfg,
+        kline_cache=kline_cache,
+    )
     if m.n_trades_accepted < min_trades:
         return -1e6
     return score_metrics(m)
@@ -227,7 +274,7 @@ def _metrics_row(label: str, m: DatasetMetrics) -> str:
 
 def _yaml_diff_block(best: ConfigOverride, current: ConfigOverride) -> str:
     lines: list[str] = ["```yaml"]
-    lines.append(f"# Current vs. best tuned config (Pass 1)")
+    lines.append("# Current vs. best tuned config (Pass 3 Faz-A)")
     lines.append(f"confluence_threshold_global: {best.confluence_threshold_global:.3f}"
                  f"    # current: {current.confluence_threshold_global:.3f}")
     if best.confluence_threshold_per_symbol:
@@ -242,6 +289,18 @@ def _yaml_diff_block(best: ConfigOverride, current: ConfigOverride) -> str:
                  f"    # current: {current.ema_veto_enabled}")
     lines.append(f"cross_asset_opposition_enabled: {best.cross_asset_opposition_enabled}"
                  f"    # current: {current.cross_asset_opposition_enabled}")
+    if best.pillar_weights:
+        lines.append("pillar_weights:    # Pass 3 Faz-A — multiplier per pillar")
+        for pname, w in sorted(best.pillar_weights.items()):
+            lines.append(f"  {pname}: {w:.3f}")
+    if best.target_rr_ratio is not None:
+        lines.append(f"target_rr_ratio: {best.target_rr_ratio:.3f}    "
+                     f"# Pass 3 Faz-A; remember lockstep with per-symbol "
+                     f"min_sl_distance_pct floors")
+    if best.zone_max_wait_bars is not None:
+        lines.append(f"zone_max_wait_bars: {best.zone_max_wait_bars}    "
+                     f"# Pass 3 Faz-A; baseline {best.zone_max_wait_baseline}, "
+                     f">baseline unblocks zone_timeout_cancel rejects")
     lines.append("```")
     return "\n".join(lines)
 
@@ -368,6 +427,43 @@ def render_report(
 # ── Main runner ─────────────────────────────────────────────────────────────
 
 
+def _rebuild_best_config(
+    params: dict,
+    *,
+    pillars: Optional[list[str]] = None,
+    enable_target_rr: bool = False,
+    enable_zone_max_wait: bool = False,
+) -> ConfigOverride:
+    """Reconstruct a ConfigOverride from Optuna's best_trial.params.
+
+    Mirrors suggest_config exactly so train/validate metrics use the
+    same cfg the optimisation scored.
+    """
+    cfg = ConfigOverride(
+        confluence_threshold_global=params.get("confluence_threshold_global", 2.0),
+        vwap_hard_veto_enabled=params.get("vwap_hard_veto_enabled", True),
+        ema_veto_enabled=params.get("ema_veto_enabled", True),
+        cross_asset_opposition_enabled=params.get(
+            "cross_asset_opposition_enabled", True,
+        ),
+    )
+    if params.get("use_per_symbol"):
+        for sym in _SYMBOLS:
+            key = f"threshold_{sym}"
+            if key in params:
+                cfg.confluence_threshold_per_symbol[sym] = params[key]
+    if pillars:
+        for pname in pillars:
+            key = f"pw_{pname}"
+            if key in params:
+                cfg.pillar_weights[pname] = params[key]
+    if enable_target_rr and "target_rr_ratio" in params:
+        cfg.target_rr_ratio = params["target_rr_ratio"]
+    if enable_zone_max_wait and "zone_max_wait_bars" in params:
+        cfg.zone_max_wait_bars = params["zone_max_wait_bars"]
+    return cfg
+
+
 def run_tune(
     trades: list[TradeRecord],
     rejects: list[RejectedSignal],
@@ -375,6 +471,10 @@ def run_tune(
     n_trials: int = 300,
     train_frac: float = 0.73,
     seed: Optional[int] = 42,
+    pillars: Optional[list[str]] = None,
+    enable_target_rr: bool = False,
+    enable_zone_max_wait: bool = False,
+    kline_cache=None,
 ) -> dict:
     """Run Optuna search end-to-end on an in-memory dataset.
 
@@ -382,6 +482,14 @@ def run_tune(
     ``train_metrics``, ``validate_metrics``, ``study``, ``train_trades``,
     ``validate_trades``, ``train_rejects``, ``validate_rejects``. The
     dict shape is what the smoke test asserts against.
+
+    Pass 3 Faz-A kwargs:
+      * ``pillars`` — list of pillar names to include in suggest_config
+        (per-pillar weight tune). None/empty → Pass 1 behavior.
+      * ``enable_target_rr`` — flag to add target_rr_ratio knob.
+      * ``enable_zone_max_wait`` — flag to add zone_max_wait_bars knob.
+      * ``kline_cache`` — KlineCache instance for target_rr re-walk;
+        absent → reject re-walk falls back to stored hypothetical_outcome.
     """
     if not _HAS_OPTUNA:
         raise ImportError(
@@ -396,36 +504,34 @@ def run_tune(
     sampler = optuna.samplers.TPESampler(seed=seed)
     study = optuna.create_study(direction="maximize", sampler=sampler)
     study.optimize(
-        lambda trial: objective(trial, train_trades, train_rejects),
+        lambda trial: objective(
+            trial, train_trades, train_rejects,
+            pillars=pillars,
+            enable_target_rr=enable_target_rr,
+            enable_zone_max_wait=enable_zone_max_wait,
+            kline_cache=kline_cache,
+        ),
         n_trials=n_trials,
         show_progress_bar=False,
     )
 
-    # Rebuild ConfigOverride from the best trial's params. suggest_config
-    # does this inside the objective but Optuna doesn't cache the returned
-    # object — so we recreate deterministically from params.
-    best = study.best_trial
-    params = best.params
-    best_cfg = ConfigOverride(
-        confluence_threshold_global=params.get("confluence_threshold_global", 2.0),
-        vwap_hard_veto_enabled=params.get("vwap_hard_veto_enabled", True),
-        ema_veto_enabled=params.get("ema_veto_enabled", True),
-        cross_asset_opposition_enabled=params.get(
-            "cross_asset_opposition_enabled", True,
-        ),
+    best_cfg = _rebuild_best_config(
+        study.best_trial.params,
+        pillars=pillars,
+        enable_target_rr=enable_target_rr,
+        enable_zone_max_wait=enable_zone_max_wait,
     )
-    if params.get("use_per_symbol"):
-        for sym in _SYMBOLS:
-            key = f"threshold_{sym}"
-            if key in params:
-                best_cfg.confluence_threshold_per_symbol[sym] = params[key]
 
-    train_metrics = replay_config(train_trades, train_rejects, best_cfg)
-    validate_metrics = replay_config(validate_trades, validate_rejects, best_cfg)
+    train_metrics = replay_config(
+        train_trades, train_rejects, best_cfg, kline_cache=kline_cache,
+    )
+    validate_metrics = replay_config(
+        validate_trades, validate_rejects, best_cfg, kline_cache=kline_cache,
+    )
 
     return {
         "best_config": best_cfg,
-        "best_params": params,
+        "best_params": study.best_trial.params,
         "train_metrics": train_metrics,
         "validate_metrics": validate_metrics,
         "study": study,
@@ -435,6 +541,65 @@ def run_tune(
         "validate_rejects": validate_rejects,
         "n_trials": n_trials,
         "seed": seed,
+    }
+
+
+def run_multi_seed_tune(
+    trades: list[TradeRecord],
+    rejects: list[RejectedSignal],
+    *,
+    seeds: tuple[int, ...] = (42, 123, 456),
+    n_trials: int = 200,
+    train_frac: float = 0.73,
+    pillars: Optional[list[str]] = None,
+    enable_target_rr: bool = False,
+    enable_zone_max_wait: bool = False,
+    kline_cache=None,
+) -> dict:
+    """Run ``run_tune`` once per seed; return per-seed results +
+    aggregate stats.
+
+    TPE sampler is seed-dependent; running 3 different seeds and
+    looking at the spread of best-objective values is a cheap noise
+    check before trusting any single tune. If seeds disagree wildly,
+    the dataset is too small / objective too flat — back off knob
+    count or collect more data.
+
+    Returns dict with keys:
+      * ``per_seed``: list of run_tune result dicts (one per seed)
+      * ``best_objectives``: list of float, sorted descending
+      * ``mean_objective`` / ``stdev_objective``: spread summary
+      * ``best_overall``: the run_tune dict with the highest objective
+    """
+    per_seed: list[dict] = []
+    for seed in seeds:
+        res = run_tune(
+            trades, rejects,
+            n_trials=n_trials, train_frac=train_frac, seed=seed,
+            pillars=pillars,
+            enable_target_rr=enable_target_rr,
+            enable_zone_max_wait=enable_zone_max_wait,
+            kline_cache=kline_cache,
+        )
+        per_seed.append(res)
+
+    best_objectives = sorted(
+        (r["study"].best_value for r in per_seed), reverse=True,
+    )
+    mean = sum(best_objectives) / len(best_objectives) if best_objectives else 0.0
+    if len(best_objectives) >= 2:
+        var = sum((v - mean) ** 2 for v in best_objectives) / (len(best_objectives) - 1)
+        stdev = var ** 0.5
+    else:
+        stdev = 0.0
+    best_overall = max(per_seed, key=lambda r: r["study"].best_value)
+    return {
+        "per_seed": per_seed,
+        "best_objectives": best_objectives,
+        "mean_objective": mean,
+        "stdev_objective": stdev,
+        "best_overall": best_overall,
+        "seeds": list(seeds),
     }
 
 
@@ -453,9 +618,22 @@ def _default_output_path() -> str:
     return f"reports/tune_{stamp}.md"
 
 
+def _collect_pillars(trades: list[TradeRecord], rejects: list[RejectedSignal]) -> list[str]:
+    """Union of pillar names across trades + rejects, sorted for determinism."""
+    seen: set[str] = set()
+    for t in trades:
+        for k in (t.confluence_pillar_scores or {}).keys():
+            seen.add(k)
+    for r in rejects:
+        for k in (r.confluence_pillar_scores or {}).keys():
+            seen.add(k)
+    return sorted(seen)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Pass 1 Optuna tune — confluence threshold + hard gates",
+        description="Pass 3 Faz-A Optuna tune — confluence + gates + "
+                    "pillar weights + target_rr + zone_max_wait",
     )
     parser.add_argument("--db", default=None, help="Path to trades.db")
     parser.add_argument(
@@ -463,16 +641,40 @@ def main() -> int:
         help="Window: '7d', '14d', '30d', '12h', 'all' (default 30d)",
     )
     parser.add_argument("--n-trials", type=int, default=300,
-                        help="Optuna trials (default 300)")
+                        help="Optuna trials per seed (default 300)")
     parser.add_argument("--train-frac", type=float, default=0.73,
                         help="Walk-forward train fraction (default 0.73)")
     parser.add_argument("--seed", type=int, default=42,
-                        help="Optuna TPE sampler seed (default 42)")
+                        help="Optuna TPE sampler seed (single-seed mode; "
+                             "ignored when --seeds is set)")
+    parser.add_argument("--seeds", default=None,
+                        help="Comma-separated multi-seed list (e.g. '42,123,456'); "
+                             "triggers run_multi_seed_tune. Overrides --seed.")
     parser.add_argument("--output", default=None,
                         help="Report output path (default reports/tune_{TIMESTAMP}.md)")
     parser.add_argument(
         "--ignore-clean-since", action="store_true",
         help="Include rows before `rl.clean_since` (default: honour cutoff)",
+    )
+    parser.add_argument(
+        "--enable-pillar-weights", action="store_true",
+        help="Pass 3 Faz-A: tune per-pillar weight multipliers (collected "
+             "from trades+rejects confluence_pillar_scores)",
+    )
+    parser.add_argument(
+        "--enable-target-rr", action="store_true",
+        help="Pass 3 Faz-A: tune target_rr_ratio [1.0, 2.5]. Requires "
+             "--kline-cache-db pre-warmed for fresh re-walk.",
+    )
+    parser.add_argument(
+        "--enable-zone-max-wait", action="store_true",
+        help="Pass 3 Faz-A: tune zone_max_wait_bars [2, 5]; >2 unblocks "
+             "zone_timeout_cancel rejects.",
+    )
+    parser.add_argument(
+        "--kline-cache-db", default="data/kline_cache.db",
+        help="Path to KlineCache SQLite (default data/kline_cache.db). "
+             "Optional — only consulted when --enable-target-rr is set.",
     )
     args = parser.parse_args()
 
@@ -502,24 +704,77 @@ def main() -> int:
         print(f"No trades or rejects in window ({window}).")
         return 0
 
-    result = run_tune(
-        trades, rejects,
-        n_trials=args.n_trials,
-        train_frac=args.train_frac,
-        seed=args.seed,
-    )
+    pillars = _collect_pillars(trades, rejects) if args.enable_pillar_weights else None
+    if args.enable_pillar_weights and not pillars:
+        print("[WARN] --enable-pillar-weights requested but no rows carry "
+              "confluence_pillar_scores; falling back to Pass 1 search space.")
+
+    kline_cache = None
+    if args.enable_target_rr:
+        from src.data.kline_cache import KlineCache
+        kline_cache = KlineCache(args.kline_cache_db)
+        cache_stats = kline_cache.stats()
+        print(f"KlineCache: db={args.kline_cache_db} rows={cache_stats['n_rows']}")
+        if cache_stats["n_rows"] == 0:
+            print("[WARN] KlineCache empty; --enable-target-rr re-walks will "
+                  "all fall back to stored hypothetical_outcome. Run "
+                  "scripts/prewarm_kline_cache.py first to populate.")
+
+    seeds: tuple[int, ...]
+    if args.seeds:
+        seeds = tuple(int(s.strip()) for s in args.seeds.split(",") if s.strip())
+    else:
+        seeds = (args.seed,)
+
+    print(f"Tune config: n_trials={args.n_trials} train_frac={args.train_frac} "
+          f"seeds={seeds} pillars={'+' if pillars else 'off'} "
+          f"target_rr={'+' if args.enable_target_rr else 'off'} "
+          f"zone_max_wait={'+' if args.enable_zone_max_wait else 'off'}")
+
+    if len(seeds) == 1:
+        result = run_tune(
+            trades, rejects,
+            n_trials=args.n_trials,
+            train_frac=args.train_frac,
+            seed=seeds[0],
+            pillars=pillars,
+            enable_target_rr=args.enable_target_rr,
+            enable_zone_max_wait=args.enable_zone_max_wait,
+            kline_cache=kline_cache,
+        )
+        best_run = result
+        seed_label: object = seeds[0]
+    else:
+        multi = run_multi_seed_tune(
+            trades, rejects,
+            seeds=seeds,
+            n_trials=args.n_trials,
+            train_frac=args.train_frac,
+            pillars=pillars,
+            enable_target_rr=args.enable_target_rr,
+            enable_zone_max_wait=args.enable_zone_max_wait,
+            kline_cache=kline_cache,
+        )
+        best_run = multi["best_overall"]
+        seed_label = (
+            f"multi-seed {seeds} → best={best_run['seed']} "
+            f"(mean obj={multi['mean_objective']:+.3f}, "
+            f"stdev={multi['stdev_objective']:.3f})"
+        )
+        print(f"Multi-seed objectives (best→worst): "
+              f"{[f'{v:+.3f}' for v in multi['best_objectives']]}")
 
     report = render_report(
-        trades_train=result["train_trades"],
-        trades_validate=result["validate_trades"],
-        rejects_train=result["train_rejects"],
-        rejects_validate=result["validate_rejects"],
-        best_cfg=result["best_config"],
-        train_metrics=result["train_metrics"],
-        validate_metrics=result["validate_metrics"],
-        study=result["study"],
-        n_trials=result["n_trials"],
-        seed=result["seed"],
+        trades_train=best_run["train_trades"],
+        trades_validate=best_run["validate_trades"],
+        rejects_train=best_run["train_rejects"],
+        rejects_validate=best_run["validate_rejects"],
+        best_cfg=best_run["best_config"],
+        train_metrics=best_run["train_metrics"],
+        validate_metrics=best_run["validate_metrics"],
+        study=best_run["study"],
+        n_trials=best_run["n_trials"],
+        seed=seed_label,
     )
 
     out_path = args.output or _default_output_path()
@@ -527,9 +782,9 @@ def main() -> int:
     out_file.parent.mkdir(parents=True, exist_ok=True)
     out_file.write_text(report, encoding="utf-8")
     print(f"Wrote {out_file}")
-    print(f"Best objective: {result['study'].best_value:+.4f}")
-    tm = result["train_metrics"]
-    vm = result["validate_metrics"]
+    print(f"Best objective: {best_run['study'].best_value:+.4f}")
+    tm = best_run["train_metrics"]
+    vm = best_run["validate_metrics"]
     print(f"Train : n={tm.n_trades_accepted} net_r={tm.net_r:+.3f}R "
           f"wr={tm.win_rate*100:.2f}% sharpe={tm.sharpe_r:+.3f}")
     print(f"Valid.: n={vm.n_trades_accepted} net_r={vm.net_r:+.3f}R "
