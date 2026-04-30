@@ -51,7 +51,14 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional
 
+from src.data.kline_cache import KlineCache
+from src.execution.bybit_client import _INTERNAL_TO_BYBIT_SYMBOL
 from src.journal.models import RejectedSignal, TradeOutcome, TradeRecord
+from src.strategy.kline_walk import (
+    PegResult,
+    signal_ts_to_bar_start_ms,
+    walk_klines,
+)
 
 
 # ── Config override shape ───────────────────────────────────────────────────
@@ -86,10 +93,25 @@ class ConfigOverride:
     loss_r_estimate: float = -1.0
     neither_r_estimate: float = 0.0
 
-    # Pass 2 hook: empty dict today (journal column is almost entirely
-    # empty on the 41-trade dataset). Present so tune_confluence.py can
-    # plumb values in without changing the replay signature.
+    # 2026-04-22 hook, 2026-04-30 (Pass 3 Faz-A) ACTIVE: per-pillar score
+    # multiplier applied to `confluence_pillar_scores` JSON dict at replay
+    # time. cfg.pillar_weights[factor_name] = multiplier (0.0=disable,
+    # 1.0=baseline, 2.0=2x). Empty dict → fall back to stored
+    # confluence_score (Pass 1 behavior).
     pillar_weights: dict[str, float] = field(default_factory=dict)
+
+    # 2026-04-30 (Pass 3 Faz-A) — replay re-walk knobs.
+    # ``target_rr_ratio`` set → recompute proposed_tp from each reject's
+    # proposed_sl_price + reject.price using new RR, then re-walk Bybit
+    # klines via ``kline_cache`` to derive a fresh hypothetical_outcome.
+    # None → use the row's stored hypothetical_outcome (Pass 1 behavior).
+    target_rr_ratio: Optional[float] = None
+    # ``zone_max_wait_bars`` set + > zone_max_wait_baseline → reject_reason
+    # == "zone_timeout_cancel" rows ACCEPTED (treated like a gate-toggle:
+    # extended wait would have fired the fill before cancel). hypothetical
+    # outcome already pegged from signal_ts forward-walk; we just unblock.
+    zone_max_wait_bars: Optional[int] = None
+    zone_max_wait_baseline: int = 2
 
     def threshold_for(self, symbol: str) -> float:
         """Return the effective threshold for a symbol, falling back to
@@ -163,6 +185,44 @@ def _max_drawdown_r(returns: list[float]) -> float:
     return max_dd
 
 
+# ── Pillar reweighting helper ──────────────────────────────────────────────
+
+
+def _effective_score(
+    *,
+    stored_score: float,
+    pillar_scores: Optional[dict[str, float]],
+    pillar_weights: dict[str, float],
+) -> float:
+    """Apply per-pillar multiplier to a row's score.
+
+    pillar_weights[factor_name] = multiplier (0.0 = disable, 1.0 =
+    baseline, 2.0 = 2x). Factors NOT in pillar_weights keep their stored
+    weight (multiplier=1.0). Empty pillar_weights → return stored_score
+    unchanged (Pass 1 fallback).
+
+    pillar_scores dict comes from `confluence_pillar_scores` JSON
+    column. Empty / None → fall back to stored_score even if
+    pillar_weights set (the row was written before Pass 2
+    instrumentation).
+    """
+    if not pillar_weights:
+        return stored_score
+    if not pillar_scores:
+        return stored_score  # nothing to reweight
+    return sum(
+        weight * pillar_weights.get(factor, 1.0)
+        for factor, weight in pillar_scores.items()
+    )
+
+
+# ── Bybit-symbol helper for re-walk ────────────────────────────────────────
+
+
+def _to_bybit_symbol(internal: str) -> str:
+    return _INTERNAL_TO_BYBIT_SYMBOL.get(internal, internal)
+
+
 # ── Replay primitives ───────────────────────────────────────────────────────
 
 
@@ -186,30 +246,98 @@ def simulate_trade_outcome(
           OPEN is filtered by journal queries normally, but be defensive.
         * ``pnl_r is None`` on a row (shouldn't happen on a closed row
           but defensive) → treated as 0.0.
+        * Pass 3 Faz-A: pillar reweighting via ``cfg.pillar_weights``.
+          Empty dict → falls back to stored ``confluence_score``.
     """
     thr = cfg.threshold_for(trade.symbol)
-    if trade.confluence_score < thr:
+    score = _effective_score(
+        stored_score=float(trade.confluence_score or 0.0),
+        pillar_scores=trade.confluence_pillar_scores,
+        pillar_weights=cfg.pillar_weights,
+    )
+    if score < thr:
         return (False, "FILTERED", 0.0)
     outcome_str = trade.outcome.value if isinstance(trade.outcome, TradeOutcome) else str(trade.outcome)
     pnl_r = trade.pnl_r if trade.pnl_r is not None else 0.0
     return (True, outcome_str, pnl_r)
 
 
+def _rewalk_with_new_target_rr(
+    reject: RejectedSignal,
+    cfg: ConfigOverride,
+    *,
+    kline_cache: KlineCache,
+    interval_minutes: int,
+    walk_max_bars: int,
+) -> Optional[PegResult]:
+    """Recompute proposed_tp from cfg.target_rr_ratio and re-walk klines.
+
+    Returns None when the rewalk cannot run (missing inputs); caller
+    falls back to stored ``hypothetical_outcome``.
+    """
+    if (cfg.target_rr_ratio is None
+            or reject.proposed_sl_price is None
+            or reject.price is None
+            or reject.signal_timestamp is None):
+        return None
+    direction = reject.direction.value if hasattr(reject.direction, "value") else str(reject.direction)
+    price = float(reject.price)
+    sl = float(reject.proposed_sl_price)
+    if direction == "BULLISH":
+        sl_distance = price - sl
+        if sl_distance <= 0:
+            return None
+        tp = price + sl_distance * cfg.target_rr_ratio
+    elif direction == "BEARISH":
+        sl_distance = sl - price
+        if sl_distance <= 0:
+            return None
+        tp = price - sl_distance * cfg.target_rr_ratio
+    else:
+        return None
+    bybit_symbol = _to_bybit_symbol(reject.symbol)
+    start_ms = signal_ts_to_bar_start_ms(
+        reject.signal_timestamp, interval_minutes=interval_minutes,
+    )
+    klines = kline_cache.get(
+        bybit_symbol=bybit_symbol, interval_minutes=interval_minutes,
+        start_ms=start_ms, max_bars=walk_max_bars,
+    )
+    if klines is None:
+        return None  # cache miss — caller falls back to stored outcome
+    return walk_klines(
+        direction=direction, proposed_sl_price=sl,
+        proposed_tp_price=tp, klines=klines, max_bars=walk_max_bars,
+    )
+
+
 def simulate_reject_outcome(
     reject: RejectedSignal,
     cfg: ConfigOverride,
+    *,
+    kline_cache: Optional[KlineCache] = None,
+    interval_minutes: int = 3,
+    walk_max_bars: int = 100,
 ) -> tuple[bool, str, float]:
     """Replay one historical rejected signal under a hypothetical config.
 
-    Three ways a reject can now accept:
+    Acceptance paths:
       1. ``reject_reason`` is a gate name and that gate is now disabled.
-      2. ``reject_reason == 'below_confluence'`` and the new threshold
-         for this symbol is <= the reject's recorded confluence_score.
-      3. None of the above → still rejected, outcome 'STILL_REJECTED', 0R.
+      2. ``reject_reason == 'below_confluence'`` and the new (optionally
+         pillar-reweighted) score >= threshold for this symbol.
+      3. ``reject_reason == 'zone_timeout_cancel'`` and
+         ``cfg.zone_max_wait_bars > cfg.zone_max_wait_baseline`` —
+         extended wait would have fired the fill before cancel; we
+         unblock and apply the stored hypothetical_outcome (already
+         pegged from signal_ts forward-walk).
+      4. None of the above → still rejected.
 
-    When accepted, R comes from the row's ``hypothetical_outcome`` field
-    (stamped on pre-migration rows by the now-removed counter-factual
-    pegger). Missing / NEITHER → 0R.
+    Outcome R:
+      * If ``cfg.target_rr_ratio`` set + ``kline_cache`` provided +
+        reject has proposed_sl_price/price/signal_timestamp → re-walk
+        Bybit klines with recomputed proposed_tp → fresh outcome.
+      * Otherwise → row's stored ``hypothetical_outcome`` (Pass 2.5 peg).
+      * Missing / NEITHER → 0R.
     """
     now_accepted = False
 
@@ -218,22 +346,49 @@ def simulate_reject_outcome(
     if gate_attr is not None and not getattr(cfg, gate_attr):
         now_accepted = True
 
-    # Path 2 — confluence threshold loosening.
+    # Path 2 — confluence threshold loosening (with optional pillar reweight).
     if reject.reject_reason == "below_confluence":
         thr = cfg.threshold_for(reject.symbol)
-        if reject.confluence_score >= thr:
+        score = _effective_score(
+            stored_score=float(reject.confluence_score or 0.0),
+            pillar_scores=reject.confluence_pillar_scores,
+            pillar_weights=cfg.pillar_weights,
+        )
+        if score >= thr:
             now_accepted = True
+
+    # Path 3 — zone_max_wait_bars extended unblocks zone_timeout_cancel.
+    if (reject.reject_reason == "zone_timeout_cancel"
+            and cfg.zone_max_wait_bars is not None
+            and cfg.zone_max_wait_bars > cfg.zone_max_wait_baseline):
+        now_accepted = True
 
     if not now_accepted:
         return (False, "STILL_REJECTED", 0.0)
 
-    # Translate hypothetical counter-factual → R.
+    # Outcome resolution: prefer fresh re-walk if cfg.target_rr_ratio +
+    # kline_cache available; else fall back to stored hypothetical_outcome.
+    rewalk: Optional[PegResult] = None
+    if cfg.target_rr_ratio is not None and kline_cache is not None:
+        rewalk = _rewalk_with_new_target_rr(
+            reject, cfg,
+            kline_cache=kline_cache,
+            interval_minutes=interval_minutes,
+            walk_max_bars=walk_max_bars,
+        )
+    if rewalk is not None and rewalk.outcome in ("WIN", "LOSS", "TIMEOUT"):
+        if rewalk.outcome == "WIN":
+            return (True, "WIN", cfg.win_r_estimate)
+        if rewalk.outcome == "LOSS":
+            return (True, "LOSS", cfg.loss_r_estimate)
+        return (True, "NEITHER", cfg.neither_r_estimate)  # TIMEOUT → no R booked
+
+    # Fallback: stored peg outcome
     hypo = reject.hypothetical_outcome
     if hypo == "WIN":
         return (True, "WIN", cfg.win_r_estimate)
     if hypo == "LOSS":
         return (True, "LOSS", cfg.loss_r_estimate)
-    # NEITHER or None (unpegged) — accepted but no R booked.
     return (True, "NEITHER", cfg.neither_r_estimate)
 
 
@@ -241,6 +396,10 @@ def replay_config(
     trades: list[TradeRecord],
     rejects: list[RejectedSignal],
     cfg: ConfigOverride,
+    *,
+    kline_cache: Optional[KlineCache] = None,
+    interval_minutes: int = 3,
+    walk_max_bars: int = 100,
 ) -> DatasetMetrics:
     """Aggregate replay metrics across every row in the dataset.
 
@@ -253,6 +412,12 @@ def replay_config(
     Empty input → all-zero metrics (no trades accepted). The objective
     function in tune_confluence.py penalises tiny samples explicitly
     so this is safe.
+
+    Pass 3 Faz-A knobs (cfg.pillar_weights / cfg.target_rr_ratio /
+    cfg.zone_max_wait_bars) are applied automatically inside the
+    per-row simulate_*. ``kline_cache`` is forwarded to reject re-walk
+    when ``cfg.target_rr_ratio`` is set; if the cache is absent the
+    reject falls back to its stored ``hypothetical_outcome``.
     """
     returns: list[float] = []
     wins = 0
@@ -271,7 +436,12 @@ def replay_config(
             losses += 1
 
     for reject in rejects:
-        ok, outcome, pnl_r = simulate_reject_outcome(reject, cfg)
+        ok, outcome, pnl_r = simulate_reject_outcome(
+            reject, cfg,
+            kline_cache=kline_cache,
+            interval_minutes=interval_minutes,
+            walk_max_bars=walk_max_bars,
+        )
         if not ok:
             continue
         accepted += 1
@@ -296,29 +466,32 @@ def replay_config(
     )
 
 
-# ── Pass 2 scaffold (stub — not wired in Pass 1 CLI) ───────────────────────
+# ── Pass 2 scaffold (Pass 3 Faz-A: now lives inside replay_config) ─────────
 
 
 def replay_with_pillar_reweight(
     trades: list[TradeRecord],
     rejects: list[RejectedSignal],
     cfg: ConfigOverride,
+    *,
+    kline_cache: Optional[KlineCache] = None,
+    interval_minutes: int = 3,
+    walk_max_bars: int = 100,
 ) -> DatasetMetrics:
-    """Pass 2 entry point — re-weight per-pillar scores before thresholding.
+    """Backward-compat alias for replay_config (Pass 3 Faz-A).
 
-    Today this is a thin wrapper around ``replay_config``. Pass 2 fills
-    the body: iterate rows, consult ``trade.confluence_pillar_scores``
-    (now populated), multiply each pillar name by
-    ``cfg.pillar_weights[name]``, recompute the total, and use that
-    rescaled total as the thresholding input instead of the stored
-    ``confluence_score``. Zero-risk to land today because
-    ``cfg.pillar_weights`` defaults to empty dict.
+    Pass 2 hook scaffolding; pillar reweighting is now applied
+    transparently by ``replay_config`` itself via the active
+    ``cfg.pillar_weights`` field. This thin wrapper preserves the
+    public API for any caller that imported the Pass 2 entry point
+    directly. Prefer ``replay_config`` in new code.
     """
-    if not cfg.pillar_weights:
-        return replay_config(trades, rejects, cfg)
-    # Pass 2 lives here. For now, behave identically to replay_config
-    # so callers can plumb `pillar_weights` without breaking Pass 1.
-    return replay_config(trades, rejects, cfg)
+    return replay_config(
+        trades, rejects, cfg,
+        kline_cache=kline_cache,
+        interval_minutes=interval_minutes,
+        walk_max_bars=walk_max_bars,
+    )
 
 
 __all__ = [

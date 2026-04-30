@@ -18,17 +18,10 @@ from pathlib import Path
 
 import pytest
 
-# 2026-04-27 — peg-outcome columns (hypothetical_outcome,
-# hypothetical_bars_to_tp/sl) dropped alongside the pre-migration peg
-# script removal. `tune_confluence.simulate_reject_outcome` only produces
-# non-NEITHER outcomes when a row carries these stamps, so every test
-# here that asserts WIN/LOSS attribution against a fabricated reject is
-# stuck on NEITHER. Skipping the full file until a Bybit-native peg
-# script lands and the columns return.
-pytestmark = pytest.mark.skip(
-    reason="2026-04-27 peg-outcome columns dropped; re-enable when a "
-    "Bybit-native peg script restores hypothetical_outcome stamping.",
-)
+# 2026-04-29 — Pass 2.5.B re-added hypothetical_outcome columns; 2026-04-30
+# (Pass 3.2.2.b) replay engine gained pillar_weights / target_rr_ratio /
+# zone_max_wait_bars knobs. 2026-04-27 skip pin removed. Tests fabricate
+# rejects with `hypothetical_outcome=` and exercise the new knob paths.
 
 # Scripts directory isn't on sys.path by default — inject so we can import
 # the library module. Mirrors what the scripts themselves do for src.
@@ -38,9 +31,11 @@ from scripts.replay_decisions import (
     ConfigOverride,
     DatasetMetrics,
     replay_config,
+    replay_with_pillar_reweight,
     simulate_reject_outcome,
     simulate_trade_outcome,
 )
+from src.data.kline_cache import Kline, KlineCache
 from src.data.models import Direction
 from src.journal.models import (
     RejectedSignal,
@@ -214,6 +209,266 @@ def test_replay_config_aggregates_trades_and_rejects() -> None:
     assert m.n_losses == 1
     assert m.net_r == pytest.approx(2.0 + 1.8 - 1.0 + 1.5)
     assert m.win_rate == pytest.approx(0.75)
+
+
+# ── Pass 3 Faz-A: pillar_weights ───────────────────────────────────────────
+
+
+def _mk_trade_with_pillars(
+    *, pillar_scores: dict[str, float], confluence: float = 4.0,
+    outcome: TradeOutcome = TradeOutcome.WIN, pnl_r: float = 1.5,
+) -> TradeRecord:
+    t = _mk_trade(confluence=confluence, outcome=outcome, pnl_r=pnl_r)
+    return t.model_copy(update={"confluence_pillar_scores": pillar_scores})
+
+
+def _mk_reject_with_pillars(
+    *, pillar_scores: dict[str, float], confluence: float = 3.5,
+    reject_reason: str = "below_confluence", hypothetical: str = "WIN",
+) -> RejectedSignal:
+    r = _mk_reject(
+        reject_reason=reject_reason, confluence=confluence,
+        hypothetical=hypothetical,
+    )
+    return r.model_copy(update={"confluence_pillar_scores": pillar_scores})
+
+
+def test_pillar_weights_empty_falls_back_to_stored_score() -> None:
+    """No pillar_weights in cfg → score = stored confluence_score."""
+    trade = _mk_trade_with_pillars(
+        pillar_scores={"mss_alignment": 1.0, "vwap_composite": 1.0},
+        confluence=4.0,
+    )
+    cfg = ConfigOverride(confluence_threshold_global=3.5)  # 4.0 >= 3.5 → pass
+    ok, _, _ = simulate_trade_outcome(trade, cfg)
+    assert ok is True
+
+
+def test_pillar_weights_zero_disables_factor_filters_trade() -> None:
+    """pillar_weights[factor]=0 disables that factor; effective score
+    drops below threshold → FILTERED."""
+    trade = _mk_trade_with_pillars(
+        pillar_scores={"mss_alignment": 2.0, "vwap_composite": 2.0},
+        confluence=4.0,  # stored score
+    )
+    cfg = ConfigOverride(
+        confluence_threshold_global=3.5,
+        pillar_weights={"mss_alignment": 0.0, "vwap_composite": 0.0},
+    )
+    # Effective: 2.0*0 + 2.0*0 = 0.0 < 3.5 → FILTERED
+    ok, outcome, _ = simulate_trade_outcome(trade, cfg)
+    assert ok is False
+    assert outcome == "FILTERED"
+
+
+def test_pillar_weights_amplifier_lifts_below_confluence_reject() -> None:
+    """A reject with confluence_score=3.0 (below threshold 3.5) becomes
+    accepted when pillar_weights amplify pillar contributions to >= 3.5."""
+    reject = _mk_reject_with_pillars(
+        pillar_scores={"mss_alignment": 1.0, "divergence_signal": 1.0},
+        confluence=3.0,
+        reject_reason="below_confluence",
+        hypothetical="WIN",
+    )
+    cfg = ConfigOverride(
+        confluence_threshold_global=3.5,
+        pillar_weights={"mss_alignment": 2.0, "divergence_signal": 2.0},
+    )
+    # Effective: 1.0*2 + 1.0*2 = 4.0 >= 3.5 → accept
+    ok, outcome, r = simulate_reject_outcome(reject, cfg)
+    assert ok is True
+    assert outcome == "WIN"
+    assert r == pytest.approx(1.5)
+
+
+def test_pillar_weights_with_empty_pillar_scores_falls_back() -> None:
+    """Row with empty pillar_scores dict — pillar_weights ignored,
+    falls back to stored confluence_score."""
+    trade = _mk_trade_with_pillars(pillar_scores={}, confluence=4.0)
+    cfg = ConfigOverride(
+        confluence_threshold_global=3.5,
+        pillar_weights={"mss_alignment": 2.0},
+    )
+    ok, _, _ = simulate_trade_outcome(trade, cfg)
+    assert ok is True  # stored 4.0 >= 3.5
+
+
+# ── Pass 3 Faz-A: zone_max_wait_bars ───────────────────────────────────────
+
+
+def test_zone_max_wait_bars_extended_unblocks_zone_timeout_cancel() -> None:
+    """zone_max_wait_bars > baseline → zone_timeout_cancel reject ACCEPTED;
+    outcome from stored hypothetical_outcome."""
+    reject = _mk_reject(
+        reject_reason="zone_timeout_cancel", hypothetical="WIN",
+    )
+    cfg = ConfigOverride(
+        zone_max_wait_bars=5,  # baseline default 2
+    )
+    ok, outcome, r = simulate_reject_outcome(reject, cfg)
+    assert ok is True
+    assert outcome == "WIN"
+    assert r == pytest.approx(1.5)
+
+
+def test_zone_max_wait_bars_at_baseline_keeps_reject() -> None:
+    """zone_max_wait_bars == baseline → no unblock; STILL_REJECTED."""
+    reject = _mk_reject(
+        reject_reason="zone_timeout_cancel", hypothetical="WIN",
+    )
+    cfg = ConfigOverride(zone_max_wait_bars=2)  # == baseline
+    ok, outcome, _ = simulate_reject_outcome(reject, cfg)
+    assert ok is False
+    assert outcome == "STILL_REJECTED"
+
+
+def test_zone_max_wait_bars_none_keeps_reject() -> None:
+    """zone_max_wait_bars=None (Pass 1 default) → no unblock."""
+    reject = _mk_reject(
+        reject_reason="zone_timeout_cancel", hypothetical="WIN",
+    )
+    cfg = ConfigOverride()  # all defaults
+    ok, _, _ = simulate_reject_outcome(reject, cfg)
+    assert ok is False
+
+
+def test_zone_max_wait_bars_does_not_affect_other_reject_reasons() -> None:
+    """zone_max_wait_bars knob ONLY targets zone_timeout_cancel rows."""
+    reject = _mk_reject(
+        reject_reason="ema_momentum_contra", hypothetical="WIN",
+    )
+    cfg = ConfigOverride(zone_max_wait_bars=10)  # large value
+    ok, _, _ = simulate_reject_outcome(reject, cfg)
+    assert ok is False  # ema gate still ON, not unblocked
+
+
+# ── Pass 3 Faz-A: target_rr_ratio + kline_cache re-walk ────────────────────
+
+
+def _mk_reject_for_rewalk(
+    *, symbol: str = "BTC-USDT-SWAP",
+    direction: Direction = Direction.BULLISH,
+    price: float = 100.0,
+    proposed_sl: float = 99.0,
+    signal_ts: datetime = None,
+    reject_reason: str = "vwap_misaligned",
+    hypothetical: str = "LOSS",  # original peg outcome
+) -> RejectedSignal:
+    ts = signal_ts or datetime(2026, 4, 20, 12, 0, tzinfo=UTC)
+    return RejectedSignal(
+        rejection_id=f"rw_{symbol}_{ts.isoformat()}",
+        symbol=symbol,
+        direction=direction,
+        reject_reason=reject_reason,
+        signal_timestamp=ts,
+        price=price,
+        atr=0.5,
+        proposed_sl_price=proposed_sl,
+        proposed_tp_price=price + (price - proposed_sl) * 1.5,  # baseline 1:1.5
+        proposed_rr_ratio=1.5,
+        hypothetical_outcome=hypothetical,
+    )
+
+
+def _seed_kline_cache(
+    cache: KlineCache, *, signal_ts: datetime, klines: list[Kline],
+    bybit_symbol: str = "BTCUSDT",
+    interval_minutes: int = 3, max_bars: int = 100,
+) -> None:
+    from src.strategy.kline_walk import signal_ts_to_bar_start_ms
+    start_ms = signal_ts_to_bar_start_ms(
+        signal_ts, interval_minutes=interval_minutes,
+    )
+    cache.put(
+        bybit_symbol=bybit_symbol, interval_minutes=interval_minutes,
+        start_ms=start_ms, max_bars=max_bars, klines=klines,
+    )
+
+
+def test_target_rr_ratio_no_kline_cache_falls_back_to_stored_outcome(tmp_path) -> None:
+    """target_rr_ratio set but no kline_cache → stored hypothetical_outcome."""
+    reject = _mk_reject_for_rewalk(hypothetical="LOSS")
+    cfg = ConfigOverride(
+        vwap_hard_veto_enabled=False,  # unblock via gate toggle
+        target_rr_ratio=2.0,  # set but cache absent → fallback
+    )
+    ok, outcome, r = simulate_reject_outcome(reject, cfg, kline_cache=None)
+    assert ok is True
+    assert outcome == "LOSS"  # from stored hypothetical
+    assert r == pytest.approx(-1.0)
+
+
+def test_target_rr_ratio_with_cache_rewalks_to_fresh_outcome(tmp_path) -> None:
+    """target_rr_ratio set + kline_cache primed → fresh walk overrides
+    stored outcome. Test: original LOSS, but with extended target_rr=3.0
+    the new TP is far enough away that the SL hits first → still LOSS
+    BUT bars_to_sl semantics confirmed via fresh walk."""
+    cache = KlineCache(tmp_path / "kc.db")
+    sig_ts = datetime(2026, 4, 20, 12, 0, tzinfo=UTC)
+    # Klines: 100 bars, low gradually drops to 98 (hits sl=99 at bar 5),
+    # high never reaches the new 3.0R TP (103)
+    klines = []
+    for i in range(100):
+        # Bar i (0-indexed walk position): low = 100-0.5*i, high=100+0.1*i
+        low = 100.0 - 0.5 * i
+        high = 100.0 + 0.1 * i
+        klines.append(Kline(
+            bar_start_ms=int(sig_ts.timestamp() * 1000)
+            + (i + 1) * 3 * 60 * 1000,
+            open=low, high=high, low=low, close=high,
+        ))
+    _seed_kline_cache(cache, signal_ts=sig_ts, klines=klines)
+
+    reject = _mk_reject_for_rewalk(
+        signal_ts=sig_ts,
+        price=100.0, proposed_sl=99.0,
+        hypothetical="WIN",  # original peg said WIN, but fresh walk says LOSS
+    )
+    cfg = ConfigOverride(
+        vwap_hard_veto_enabled=False,  # unblock
+        target_rr_ratio=3.0,  # extended TP far away
+    )
+    ok, outcome, r = simulate_reject_outcome(
+        reject, cfg, kline_cache=cache,
+    )
+    assert ok is True
+    assert outcome == "LOSS"  # fresh walk overrode stored WIN
+    assert r == pytest.approx(-1.0)
+
+
+def test_target_rr_ratio_with_cache_miss_falls_back_to_stored(tmp_path) -> None:
+    """target_rr_ratio set + cache provided but cache MISS for this row
+    → fallback to stored hypothetical_outcome (no walk)."""
+    cache = KlineCache(tmp_path / "kc.db")  # empty cache
+    reject = _mk_reject_for_rewalk(hypothetical="WIN")
+    cfg = ConfigOverride(
+        vwap_hard_veto_enabled=False,
+        target_rr_ratio=2.0,
+    )
+    ok, outcome, r = simulate_reject_outcome(reject, cfg, kline_cache=cache)
+    assert ok is True
+    assert outcome == "WIN"  # stored hypothetical wins (no fresh walk possible)
+    assert r == pytest.approx(1.5)
+
+
+def test_replay_with_pillar_reweight_alias_delegates_to_replay_config() -> None:
+    """Backward-compat alias test — same dataset, both functions yield
+    identical metrics."""
+    trades = [
+        _mk_trade(outcome=TradeOutcome.WIN, pnl_r=2.0, confluence=4.0),
+        _mk_trade(outcome=TradeOutcome.LOSS, pnl_r=-1.0, confluence=3.5),
+    ]
+    rejects = [_mk_reject(hypothetical="WIN")]
+    cfg = ConfigOverride(
+        confluence_threshold_global=2.0,
+        vwap_hard_veto_enabled=False,
+        pillar_weights={"mss_alignment": 1.5},
+    )
+    m_a = replay_config(trades, rejects, cfg)
+    m_b = replay_with_pillar_reweight(trades, rejects, cfg)
+    assert m_a.net_r == m_b.net_r
+    assert m_a.n_trades_accepted == m_b.n_trades_accepted
+    assert m_a.win_rate == m_b.win_rate
 
 
 # ── Smoke test — run_tune end-to-end ────────────────────────────────────────
