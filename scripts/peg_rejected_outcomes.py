@@ -65,8 +65,14 @@ sys.path.insert(0, str(REPO_ROOT))
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
 
+from src.data.kline_cache import Kline, _normalize_kline_response
 from src.execution.bybit_client import _INTERNAL_TO_BYBIT_SYMBOL
 from src.journal.database import TradeJournal
+from src.strategy.kline_walk import (
+    PegResult,
+    signal_ts_to_bar_start_ms as _signal_ts_to_bar_start_ms,
+    walk_klines,
+)
 
 
 # ── Domain types ────────────────────────────────────────────────────────────
@@ -83,111 +89,11 @@ class PegInput:
     proposed_tp_price: float
 
 
-@dataclass(frozen=True)
-class PegResult:
-    outcome: str  # "WIN" / "LOSS" / "TIMEOUT" / "SKIP"
-    bars_to_tp: Optional[int] = None
-    bars_to_sl: Optional[int] = None
-    skip_reason: Optional[str] = None  # only set when outcome == "SKIP"
-
-
-@dataclass(frozen=True)
-class Kline:
-    """Normalized candle: bar_start_ms is the OPEN time."""
-    bar_start_ms: int
-    open: float
-    high: float
-    low: float
-    close: float
-
-
-# ── Algorithm (pure function — heavily unit-tested) ─────────────────────────
-
-
-def walk_klines(
-    *,
-    direction: str,
-    proposed_sl_price: float,
-    proposed_tp_price: float,
-    klines: list[Kline],
-    max_bars: int = 100,
-) -> PegResult:
-    """Walk klines forward, return WIN/LOSS/TIMEOUT.
-
-    ``klines`` MUST be sorted ASC by ``bar_start_ms`` and start with the
-    first bar AFTER ``signal_timestamp`` (caller drops the placement bar).
-    Same-bar SL+TP collision resolves pessimistic (SL first).
-
-    `max_bars` caps the lookforward — if neither target hits within that
-    window the row is TIMEOUT. Default 100 bars at 3m TF = 5 hours, plenty
-    of room for a typical 1.5R RR setup to resolve (most resolve in <20).
-    """
-    if not klines:
-        return PegResult(outcome="SKIP", skip_reason="no_klines")
-    is_long = direction == "BULLISH"
-    walked = 0
-    for bar in klines[:max_bars]:
-        walked += 1
-        if is_long:
-            sl_hit = bar.low <= proposed_sl_price
-            tp_hit = bar.high >= proposed_tp_price
-        else:
-            sl_hit = bar.high >= proposed_sl_price
-            tp_hit = bar.low <= proposed_tp_price
-        # Same-bar collision: SL first (pessimistic). Realistic worst-case
-        # since real exchanges process orders at trigger-price irrespective
-        # of bar high/low ordering and we cannot know intra-bar tick order.
-        if sl_hit:
-            return PegResult(
-                outcome="LOSS", bars_to_sl=walked - 1, bars_to_tp=None,
-            )
-        if tp_hit:
-            return PegResult(
-                outcome="WIN", bars_to_tp=walked - 1, bars_to_sl=None,
-            )
-    return PegResult(outcome="TIMEOUT")
-
-
 # ── Bybit kline fetch ───────────────────────────────────────────────────────
 
 
 def _to_bybit_symbol(internal: str) -> str:
     return _INTERNAL_TO_BYBIT_SYMBOL.get(internal, internal)
-
-
-def _signal_ts_to_bar_start_ms(
-    signal_ts: datetime, *, interval_minutes: int,
-) -> int:
-    """Floor `signal_ts` to its bar's open time, then add 1 bar.
-
-    The placement bar (bar containing signal_ts) is excluded — pegger
-    walks from the NEXT bar onward to avoid synthetic same-bar fill +
-    SL hit attribution.
-    """
-    bar_ms = interval_minutes * 60 * 1000
-    epoch_ms = int(signal_ts.timestamp() * 1000)
-    bar_start = (epoch_ms // bar_ms) * bar_ms
-    return bar_start + bar_ms
-
-
-def _normalize_kline_response(raw: dict) -> list[Kline]:
-    """Bybit V5 returns klines in DESC order (newest first); flip to ASC."""
-    rows = raw.get("result", {}).get("list", []) or []
-    klines: list[Kline] = []
-    for row in rows:
-        # Bybit row: [start, open, high, low, close, volume, turnover] (strings)
-        try:
-            klines.append(Kline(
-                bar_start_ms=int(row[0]),
-                open=float(row[1]),
-                high=float(row[2]),
-                low=float(row[3]),
-                close=float(row[4]),
-            ))
-        except (IndexError, TypeError, ValueError):
-            continue
-    klines.sort(key=lambda k: k.bar_start_ms)
-    return klines
 
 
 async def _fetch_klines_for_peg(

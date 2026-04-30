@@ -14,11 +14,13 @@ from datetime import datetime, timezone
 import pytest
 
 from scripts.peg_rejected_outcomes import (
-    Kline,
     PegInput,
     _expand_symbol_filter,
-    _normalize_kline_response,
-    _signal_ts_to_bar_start_ms,
+)
+# walk + normalize helpers extracted to src/ for replay tune sharing (Pass 3.2.2.a).
+from src.data.kline_cache import Kline, _normalize_kline_response
+from src.strategy.kline_walk import (
+    signal_ts_to_bar_start_ms as _signal_ts_to_bar_start_ms,
     walk_klines,
 )
 
