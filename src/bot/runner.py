@@ -2533,11 +2533,17 @@ class BotRunner:
         # if the journal write below errors out.
         algo_ids = [a.algo_id for a in report.algos if a.algo_id]
         runner_size = _runner_size(plan.num_contracts, cfg)
+        regime_str = (
+            trend_regime.value
+            if trend_regime and trend_regime != TrendRegime.UNKNOWN
+            else None
+        )
         self.ctx.monitor.register_open(
             symbol, pos_side, float(plan.num_contracts), plan.entry_price,
             algo_ids=algo_ids, tp2_price=plan.tp_price,
             sl_price=plan.sl_price, runner_size=runner_size,
             plan_sl_price=plan.sl_price,
+            regime_at_entry=regime_str,
         )
         self.ctx.risk_mgr.register_trade_opened()
 
@@ -3606,6 +3612,7 @@ class BotRunner:
             sl_price=plan.sl_price, runner_size=runner_size,
             plan_sl_price=plan.sl_price,
             tp_limit_order_id=tp_limit_order_id,
+            regime_at_entry=meta.trend_regime_at_entry,
         )
         self.ctx.risk_mgr.register_trade_opened()
 
@@ -4019,6 +4026,7 @@ class BotRunner:
                 sl_price=rec.sl_price, runner_size=runner_size,
                 plan_sl_price=plan_sl,
                 tp_limit_order_id=tp_limit_order_id,
+                regime_at_entry=rec.trend_regime_at_entry,
             )
             self.ctx.open_trade_ids[(rec.symbol, pos_side)] = rec.trade_id
             self.ctx.open_trade_opened_at[(rec.symbol, pos_side)] = rec.entry_timestamp

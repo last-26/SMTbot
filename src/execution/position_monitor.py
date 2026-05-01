@@ -92,6 +92,13 @@ class _Tracked:
     # mae_r_low is the most-negative R reached (deepest adverse).
     mfe_r_high: float = 0.0
     mae_r_low: float = 0.0
+    # 2026-05-02 — Phase A regime-aware exit policy. The ADX regime label
+    # captured at entry-time, snapshotted here so SL/TP mutations during
+    # the position's lifetime can look up regime-specific knobs (e.g.
+    # `target_rr_ratio_per_regime`) without re-classifying ADX or threading
+    # the value through every callback. None = unknown / pre-Phase-A
+    # rehydrate row → callers fall back to the global value.
+    regime_at_entry: Optional[str] = None
 
 
 @dataclass
@@ -184,6 +191,7 @@ class PositionMonitor:
         runner_size: int = 0,
         plan_sl_price: Optional[float] = None,
         tp_limit_order_id: str = "",
+        regime_at_entry: Optional[str] = None,
     ) -> None:
         # plan_sl_price semantics: None → caller didn't provide one, default to
         # sl_price (correct at fill time). An explicit 0.0 → "unknown, disable
@@ -196,6 +204,7 @@ class PositionMonitor:
             sl_price=sl_price, runner_size=runner_size or int(size),
             plan_sl_price=resolved_plan_sl,
             tp_limit_order_id=tp_limit_order_id,
+            regime_at_entry=regime_at_entry,
         )
 
     def poll(
@@ -460,6 +469,10 @@ class PositionMonitor:
             "be_already_moved": t.be_already_moved,
             "last_tp_revise_at": t.last_tp_revise_at,
             "sl_lock_applied": t.sl_lock_applied,
+            # 2026-05-02 — Phase A regime-aware exit policy. Lets the
+            # dynamic-TP gate look up `target_rr_ratio_per_regime` via
+            # `cfg.execution.effective_target_rr_ratio(regime)`.
+            "regime_at_entry": t.regime_at_entry,
         }
 
     def get_tracked(

@@ -46,6 +46,50 @@ def test_register_open_tracks_position():
     assert mon.state("BTC-USDT-SWAP", "long") == PositionState.OPEN
 
 
+# Phase A.2 (2026-05-02) — regime threading through _Tracked
+
+def test_register_open_default_regime_is_none():
+    """Backward compat: callers that don't pass regime get None (= use global)."""
+    mon = PositionMonitor(FakeClient())
+    mon.register_open("BTC-USDT-SWAP", "long", size=3.0, entry_price=67000.0)
+    tracked = mon.get_tracked("BTC-USDT-SWAP", "long")
+    assert tracked is not None
+    assert tracked.regime_at_entry is None
+
+
+def test_register_open_stores_regime_at_entry():
+    mon = PositionMonitor(FakeClient())
+    mon.register_open(
+        "BTC-USDT-SWAP", "long", size=3.0, entry_price=67000.0,
+        regime_at_entry="STRONG_TREND",
+    )
+    tracked = mon.get_tracked("BTC-USDT-SWAP", "long")
+    assert tracked is not None
+    assert tracked.regime_at_entry == "STRONG_TREND"
+
+
+def test_get_tracked_runner_exposes_regime():
+    """Dynamic-TP revise gate reads regime from this dict to look up the
+    per-regime target_rr_ratio. Regression-pin so a future _Tracked rename
+    can't silently drop it from the runner-facing surface."""
+    mon = PositionMonitor(FakeClient())
+    mon.register_open(
+        "ETH-USDT-SWAP", "short", size=10.0, entry_price=3500.0,
+        regime_at_entry="RANGING",
+    )
+    runner_view = mon.get_tracked_runner("ETH-USDT-SWAP", "short")
+    assert runner_view is not None
+    assert runner_view["regime_at_entry"] == "RANGING"
+
+
+def test_get_tracked_runner_regime_none_when_unset():
+    mon = PositionMonitor(FakeClient())
+    mon.register_open("BTC-USDT-SWAP", "long", size=3.0, entry_price=67000.0)
+    runner_view = mon.get_tracked_runner("BTC-USDT-SWAP", "long")
+    assert runner_view is not None
+    assert runner_view["regime_at_entry"] is None
+
+
 def test_poll_emits_no_fill_while_position_still_open():
     client = FakeClient()
     client.snapshots = [_snap()]
