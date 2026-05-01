@@ -1821,15 +1821,17 @@ class BotRunner:
           * None when veto disabled / `symbol` is a pillar / either pillar
             missing / neutral / stale.
 
-        Mode `eth_anchored` (2026-05-01 — pair-bound, OR for altcoins, fail-closed):
-          * BTC entry: target = [ETH]. ETH BULLISH → blocks BEARISH BTC; ETH
+        Mode `eth_anchored` (2026-05-01 — pair-bound, fail-closed):
+          * BTC entry: target = ETH. ETH BULLISH → blocks BEARISH BTC; ETH
             BEARISH → blocks BULLISH BTC.
-          * ETH entry: target = [BTC]. Symmetric to above.
-          * Altcoin entry: targets = [BTC, ETH]. If both biases agree, return
-            that direction (blocks opposite). If biases disagree, return
-            UNDEFINED (block-all sentinel — either direction has at least one
-            opposing pillar).
-          * Direction.UNDEFINED is also returned on missing / neutral / stale
+          * ETH entry: target = BTC. Symmetric to above.
+          * Altcoin entry: target = ETH (2026-05-01 ikinci tighten — operator
+            "altlar ETH yönüne göre poz almalı"). ETH BULLISH → blocks
+            BEARISH altcoin; ETH BEARISH → blocks BULLISH altcoin. BTC bias
+            no longer consulted for altcoins (was [BTC, ETH] AND-disagree
+            block-all; produced fail-closed storms whenever BTC range-chopped
+            independently of ETH).
+          * Direction.UNDEFINED is returned on missing / neutral / stale
             target bias (fail-CLOSED — operator wants definite pillar info).
           * Returns None only when veto disabled.
         """
@@ -1860,29 +1862,21 @@ class BotRunner:
             return None
 
         # mode == "eth_anchored"
-        if symbol == "BTC-USDT-SWAP":
-            targets = ("ETH-USDT-SWAP",)
-        elif symbol == "ETH-USDT-SWAP":
-            targets = ("BTC-USDT-SWAP",)
+        if symbol == "ETH-USDT-SWAP":
+            target = "BTC-USDT-SWAP"
         else:
-            targets = _PILLAR_SYMBOLS
+            # BTC + every altcoin → bound to ETH bias.
+            target = "ETH-USDT-SWAP"
         now = _utc_now()
-        biases: list[Direction] = []
-        for sym in targets:
-            item = self.ctx.pillar_bias.get(sym)
-            if item is None:
-                return Direction.UNDEFINED
-            bias, updated = item
-            if bias == Direction.UNDEFINED:
-                return Direction.UNDEFINED
-            if (now - updated).total_seconds() > cfg.cross_asset_veto_max_age_s:
-                return Direction.UNDEFINED
-            biases.append(bias)
-        if all(b == Direction.BULLISH for b in biases):
-            return Direction.BULLISH
-        if all(b == Direction.BEARISH for b in biases):
-            return Direction.BEARISH
-        return Direction.UNDEFINED
+        item = self.ctx.pillar_bias.get(target)
+        if item is None:
+            return Direction.UNDEFINED
+        bias, updated = item
+        if bias == Direction.UNDEFINED:
+            return Direction.UNDEFINED
+        if (now - updated).total_seconds() > cfg.cross_asset_veto_max_age_s:
+            return Direction.UNDEFINED
+        return bias
 
     def _pillar_bias_label(self, pillar_symbol: str) -> Optional[str]:
         """Current pillar bias as a string, or None if missing/stale.
