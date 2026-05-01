@@ -494,3 +494,146 @@ def test_journal_position_snapshot_can_be_disabled():
     raw["journal"]["position_snapshot_enabled"] = False
     cfg = BotConfig(**raw)
     assert cfg.journal.position_snapshot_enabled is False
+
+
+# ---------------------------------------------------------------------------
+# Phase A.1 (2026-05-02) — regime-aware target_rr_ratio + tp_min_rr_floor
+# ---------------------------------------------------------------------------
+
+def _raw_with_execution(execution_block: dict) -> dict:
+    raw = _valid_raw()
+    raw["execution"] = execution_block
+    return raw
+
+
+def test_target_rr_ratio_per_regime_default_empty():
+    cfg = BotConfig(**_valid_raw())
+    assert cfg.execution.target_rr_ratio_per_regime == {}
+    assert cfg.execution.tp_min_rr_floor_per_regime == {}
+
+
+def test_target_rr_ratio_per_regime_parsed_from_yaml():
+    raw = _raw_with_execution({
+        "target_rr_ratio": 1.5,
+        "tp_min_rr_floor": 0.7,
+        "target_rr_ratio_per_regime": {
+            "RANGING": 1.2,
+            "WEAK_TREND": 1.5,
+            "STRONG_TREND": 2.5,
+        },
+        "tp_min_rr_floor_per_regime": {
+            "RANGING": 0.6,
+            "WEAK_TREND": 0.7,
+            "STRONG_TREND": 1.2,
+        },
+    })
+    cfg = BotConfig(**raw)
+    assert cfg.execution.target_rr_ratio_per_regime["RANGING"] == 1.2
+    assert cfg.execution.target_rr_ratio_per_regime["WEAK_TREND"] == 1.5
+    assert cfg.execution.target_rr_ratio_per_regime["STRONG_TREND"] == 2.5
+    assert cfg.execution.tp_min_rr_floor_per_regime["STRONG_TREND"] == 1.2
+
+
+def test_target_rr_ratio_per_regime_rejects_invalid_regime_key():
+    raw = _raw_with_execution({
+        "target_rr_ratio_per_regime": {"BULL_TREND": 2.0},
+    })
+    with pytest.raises(ValidationError, match="not a valid TrendRegime"):
+        BotConfig(**raw)
+
+
+def test_target_rr_ratio_per_regime_rejects_out_of_range_value():
+    raw = _raw_with_execution({
+        "target_rr_ratio_per_regime": {"RANGING": 0.1},  # below 0.5 floor
+    })
+    with pytest.raises(ValidationError, match=r"out of \[0\.5, 5\.0\]"):
+        BotConfig(**raw)
+    raw2 = _raw_with_execution({
+        "target_rr_ratio_per_regime": {"STRONG_TREND": 6.0},  # above 5.0
+    })
+    with pytest.raises(ValidationError, match=r"out of \[0\.5, 5\.0\]"):
+        BotConfig(**raw2)
+
+
+def test_tp_min_rr_floor_per_regime_rejects_invalid_regime_key():
+    raw = _raw_with_execution({
+        "tp_min_rr_floor_per_regime": {"NOT_A_REGIME": 1.0},
+    })
+    with pytest.raises(ValidationError, match="not a valid TrendRegime"):
+        BotConfig(**raw)
+
+
+def test_tp_min_rr_floor_per_regime_rejects_out_of_range_value():
+    raw = _raw_with_execution({
+        "tp_min_rr_floor_per_regime": {"RANGING": 0.0},  # below 0.3 floor
+    })
+    with pytest.raises(ValidationError, match=r"out of \[0\.3, 3\.0\]"):
+        BotConfig(**raw)
+
+
+def test_effective_target_rr_ratio_falls_back_to_global_when_no_override():
+    from src.analysis.trend_regime import TrendRegime
+    raw = _raw_with_execution({"target_rr_ratio": 1.5})
+    cfg = BotConfig(**raw)
+    # No per-regime overrides → all regimes return global
+    assert cfg.execution.effective_target_rr_ratio(TrendRegime.RANGING) == 1.5
+    assert cfg.execution.effective_target_rr_ratio(TrendRegime.WEAK_TREND) == 1.5
+    assert cfg.execution.effective_target_rr_ratio(TrendRegime.STRONG_TREND) == 1.5
+    assert cfg.execution.effective_target_rr_ratio(TrendRegime.UNKNOWN) == 1.5
+    assert cfg.execution.effective_target_rr_ratio(None) == 1.5
+
+
+def test_effective_target_rr_ratio_uses_override_when_present():
+    from src.analysis.trend_regime import TrendRegime
+    raw = _raw_with_execution({
+        "target_rr_ratio": 1.5,
+        "target_rr_ratio_per_regime": {
+            "RANGING": 1.2,
+            "STRONG_TREND": 2.5,
+        },
+    })
+    cfg = BotConfig(**raw)
+    assert cfg.execution.effective_target_rr_ratio(TrendRegime.RANGING) == 1.2
+    assert cfg.execution.effective_target_rr_ratio(TrendRegime.STRONG_TREND) == 2.5
+    # WEAK_TREND missing from override → global
+    assert cfg.execution.effective_target_rr_ratio(TrendRegime.WEAK_TREND) == 1.5
+    # UNKNOWN/None always fall through to global
+    assert cfg.execution.effective_target_rr_ratio(TrendRegime.UNKNOWN) == 1.5
+    assert cfg.execution.effective_target_rr_ratio(None) == 1.5
+
+
+def test_effective_target_rr_ratio_accepts_regime_string():
+    raw = _raw_with_execution({
+        "target_rr_ratio": 1.5,
+        "target_rr_ratio_per_regime": {"STRONG_TREND": 2.5},
+    })
+    cfg = BotConfig(**raw)
+    # Plain string also resolves correctly (no enum required at the call-site).
+    assert cfg.execution.effective_target_rr_ratio("STRONG_TREND") == 2.5
+    assert cfg.execution.effective_target_rr_ratio("WEAK_TREND") == 1.5
+    assert cfg.execution.effective_target_rr_ratio("UNKNOWN") == 1.5
+
+
+def test_effective_tp_min_rr_floor_falls_back_to_global_when_no_override():
+    from src.analysis.trend_regime import TrendRegime
+    raw = _raw_with_execution({"tp_min_rr_floor": 0.7})
+    cfg = BotConfig(**raw)
+    assert cfg.execution.effective_tp_min_rr_floor(TrendRegime.RANGING) == 0.7
+    assert cfg.execution.effective_tp_min_rr_floor(TrendRegime.STRONG_TREND) == 0.7
+    assert cfg.execution.effective_tp_min_rr_floor(None) == 0.7
+
+
+def test_effective_tp_min_rr_floor_uses_override_when_present():
+    from src.analysis.trend_regime import TrendRegime
+    raw = _raw_with_execution({
+        "tp_min_rr_floor": 0.7,
+        "tp_min_rr_floor_per_regime": {
+            "RANGING": 0.6,
+            "STRONG_TREND": 1.2,
+        },
+    })
+    cfg = BotConfig(**raw)
+    assert cfg.execution.effective_tp_min_rr_floor(TrendRegime.RANGING) == 0.6
+    assert cfg.execution.effective_tp_min_rr_floor(TrendRegime.STRONG_TREND) == 1.2
+    assert cfg.execution.effective_tp_min_rr_floor(TrendRegime.WEAK_TREND) == 0.7
+    assert cfg.execution.effective_tp_min_rr_floor(TrendRegime.UNKNOWN) == 0.7

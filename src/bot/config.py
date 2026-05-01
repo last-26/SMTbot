@@ -479,6 +479,19 @@ class ExecutionConfig(BaseModel):
     tp_revise_min_delta_atr: float = 0.5
     tp_revise_cooldown_s: float = 30.0
 
+    # 2026-05-02 — regime-aware RR. Max-profit doctrine (operator decision):
+    # RANGING needs tight TP (price oscillates around VWAP, give-back risk),
+    # WEAK_TREND default RR, STRONG_TREND let-it-run. Per-regime overrides on
+    # `target_rr_ratio` and `tp_min_rr_floor`. Keys must be `TrendRegime`
+    # enum string values (RANGING / WEAK_TREND / STRONG_TREND / UNKNOWN);
+    # UNKNOWN / missing → fall back to the global value above. Empty dict =
+    # current behaviour (global RR for every regime). Lockstep mandate
+    # (2026-04-23/24 SL-floor postmortem): per-regime `target_rr_ratio`
+    # tightening must move with the per-symbol `min_sl_distance_pct` floor
+    # OR with `tp_min_rr_floor_per_regime`, never one without the other.
+    target_rr_ratio_per_regime: dict[str, float] = Field(default_factory=dict)
+    tp_min_rr_floor_per_regime: dict[str, float] = Field(default_factory=dict)
+
     # 2026-04-20 — MFE-triggered SL lock (Option A). When MFE (maximum favorable
     # excursion, measured in R multiples of plan_sl_distance) crosses
     # `sl_lock_mfe_r`, cancel + re-place the runner OCO with a new SL at
@@ -528,6 +541,71 @@ class ExecutionConfig(BaseModel):
     artefact_check_enabled: bool = True
     artefact_check_timeout_s: float = 5.0
     artefact_check_tolerance_pct: float = 0.0005   # 5 bps
+
+    @field_validator("target_rr_ratio_per_regime")
+    @classmethod
+    def _validate_target_rr_per_regime(
+        cls, v: dict[str, float]
+    ) -> dict[str, float]:
+        if not v:
+            return v
+        from src.analysis.trend_regime import TrendRegime
+        valid_keys = {r.value for r in TrendRegime}
+        for key, val in v.items():
+            if key not in valid_keys:
+                raise ValueError(
+                    f"target_rr_ratio_per_regime key '{key}' is not a valid "
+                    f"TrendRegime value (allowed: {sorted(valid_keys)})"
+                )
+            if not 0.5 <= float(val) <= 5.0:
+                raise ValueError(
+                    f"target_rr_ratio_per_regime[{key}]={val} out of [0.5, 5.0]"
+                )
+        return v
+
+    @field_validator("tp_min_rr_floor_per_regime")
+    @classmethod
+    def _validate_tp_min_rr_floor_per_regime(
+        cls, v: dict[str, float]
+    ) -> dict[str, float]:
+        if not v:
+            return v
+        from src.analysis.trend_regime import TrendRegime
+        valid_keys = {r.value for r in TrendRegime}
+        for key, val in v.items():
+            if key not in valid_keys:
+                raise ValueError(
+                    f"tp_min_rr_floor_per_regime key '{key}' is not a valid "
+                    f"TrendRegime value (allowed: {sorted(valid_keys)})"
+                )
+            if not 0.3 <= float(val) <= 3.0:
+                raise ValueError(
+                    f"tp_min_rr_floor_per_regime[{key}]={val} out of [0.3, 3.0]"
+                )
+        return v
+
+    def effective_target_rr_ratio(self, regime: object) -> float:
+        """Return the per-regime target_rr_ratio override or the global value.
+
+        `regime` may be a `TrendRegime` enum, its string value, or None /
+        UNKNOWN — all of which fall back to the global `target_rr_ratio`.
+        Helper exists so call-sites stay agnostic to regime presence.
+        """
+        if regime is None:
+            return self.target_rr_ratio
+        key = regime.value if hasattr(regime, "value") else str(regime)
+        if key == "UNKNOWN":
+            return self.target_rr_ratio
+        return self.target_rr_ratio_per_regime.get(key, self.target_rr_ratio)
+
+    def effective_tp_min_rr_floor(self, regime: object) -> float:
+        """Return the per-regime tp_min_rr_floor override or the global value."""
+        if regime is None:
+            return self.tp_min_rr_floor
+        key = regime.value if hasattr(regime, "value") else str(regime)
+        if key == "UNKNOWN":
+            return self.tp_min_rr_floor
+        return self.tp_min_rr_floor_per_regime.get(key, self.tp_min_rr_floor)
 
 
 class DerivativesConfig(BaseModel):
