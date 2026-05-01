@@ -44,3 +44,52 @@ def test_default_yaml_runner_tp_is_hard_1_n():
         f"execution.target_rr_ratio ({target_rr}). Keep them aligned so the "
         "entry_signals fallback path also enforces 1:1.5 when zones aren't used."
     )
+
+
+def test_default_yaml_target_rr_ratio_per_regime_lockstep():
+    """Phase A.4 (2026-05-02) — regime-aware RR YAML invariant.
+
+    Operator-decided per-regime targets:
+      RANGING       → 1.2  (tight TP, paired with VWAP-anchored SL in 4b)
+      WEAK_TREND    → 1.5  (matches global default — no behavior change)
+      STRONG_TREND  → 2.5  (let-it-run, paired with trailing SL in C5)
+
+    Lockstep mandate (2026-04-23/24 SL-floor postmortem): per-regime
+    `tp_min_rr_floor_per_regime` MUST move with `target_rr_ratio_per_regime`.
+    Each floor is ~50% of its target so dynamic-TP revise stays active even
+    on deep mark drift past entry. Pin both blocks here so a one-sided
+    YAML edit can't ship without the matching counterpart.
+    """
+    import pathlib
+    import yaml
+
+    cfg_path = pathlib.Path(__file__).parent.parent / "config" / "default.yaml"
+    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+
+    rr_per_regime = raw["execution"]["target_rr_ratio_per_regime"]
+    floor_per_regime = raw["execution"]["tp_min_rr_floor_per_regime"]
+
+    expected_rr = {"RANGING": 1.2, "WEAK_TREND": 1.5, "STRONG_TREND": 2.5}
+    expected_floor = {"RANGING": 0.6, "WEAK_TREND": 0.7, "STRONG_TREND": 1.2}
+
+    for regime, expected in expected_rr.items():
+        actual = float(rr_per_regime[regime])
+        assert actual == pytest.approx(expected), (
+            f"target_rr_ratio_per_regime[{regime}] = {actual}, expected "
+            f"{expected}. Phase A.4 max-profit doctrine YAML."
+        )
+    for regime, expected in expected_floor.items():
+        actual = float(floor_per_regime[regime])
+        assert actual == pytest.approx(expected), (
+            f"tp_min_rr_floor_per_regime[{regime}] = {actual}, expected "
+            f"{expected}. Lockstep mandate — must scale with target_rr."
+        )
+
+    # Floor ≤ target invariant (sub-floor proposals are clamped UP to floor;
+    # if floor > target, every revise binds at floor and per-regime target
+    # is meaningless).
+    for regime in expected_rr.keys():
+        assert float(floor_per_regime[regime]) <= float(rr_per_regime[regime]), (
+            f"floor[{regime}]={floor_per_regime[regime]} > target[{regime}]="
+            f"{rr_per_regime[regime]} — violates lockstep invariant."
+        )

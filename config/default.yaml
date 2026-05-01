@@ -533,6 +533,28 @@ execution:
   # locks this against trading.default_rr_ratio.
   target_rr_ratio: 1.5
 
+  # 2026-05-02 — Phase A max-profit doctrine: regime-aware target_rr_ratio.
+  # Operator decision (REPLACE the global target on a per-regime basis):
+  #   RANGING       → 1.2R: price oscillates around VWAP, give-back risk
+  #                   high; tighter TP fires before the move dies. SL is
+  #                   simultaneously narrowed via Commit 4b (VWAP-anchored
+  #                   3m band), so the 1:1.2 RR mechanics stay healthy.
+  #   WEAK_TREND    → 1.5R: matches the global default — no change vs. the
+  #                   pre-2026-05-02 baseline.
+  #   STRONG_TREND  → 2.5R: let-it-run target. Backed by the Commit 5
+  #                   trailing SL (arms at MFE 1.5R) — without trailing,
+  #                   2.5R rarely fills (counterfactual data from Pass 2.5
+  #                   showed 0/13 trades hitting 2.5R MFE in 13 STRONG
+  #                   regime trades; trailing is the safety net).
+  #   UNKNOWN / pre-Phase-A rehydrate → falls through to global 1.5R.
+  # Empty dict = current behaviour. Lockstep mandate: per-regime
+  # tp_min_rr_floor_per_regime below scales with these values
+  # (2026-04-23/24 SL-floor postmortem applies).
+  target_rr_ratio_per_regime:
+    RANGING: 1.2
+    WEAK_TREND: 1.5
+    STRONG_TREND: 2.5
+
   # Dynamic TP revision (live-data-driven). When true, the runner
   # periodically recomputes a fresh target from the live mark + the
   # SL distance fixed at fill (`target_rr_ratio × sl_dist applied to
@@ -552,6 +574,19 @@ execution:
   tp_min_rr_floor: 0.7
   tp_revise_min_delta_atr: 0.5
   tp_revise_cooldown_s: 30.0
+
+  # 2026-05-02 — Phase A lockstep: per-regime tp_min_rr_floor scales with
+  # target_rr_ratio_per_regime above. Each floor is ~50% of its target so
+  # mark-drift past entry can't push the revise into a vanishing-RR proposal:
+  #   RANGING       0.6R  (50% of 1.2R target)
+  #   WEAK_TREND    0.7R  (matches global default)
+  #   STRONG_TREND  1.2R  (50% of 2.5R target — keeps dynamic-TP active
+  #                        even on deep mark drift in trending regimes)
+  # UNKNOWN / missing → global tp_min_rr_floor (0.7R).
+  tp_min_rr_floor_per_regime:
+    RANGING: 0.6
+    WEAK_TREND: 0.7
+    STRONG_TREND: 1.2
 
   # 2026-04-20 — MFE-triggered SL lock (Option A). Once a position reaches
   # `sl_lock_mfe_r` in favor (measured as MFE / plan_sl_distance, i.e. R
