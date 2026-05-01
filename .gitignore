@@ -85,6 +85,24 @@ config/local.yaml
 config/*.local.yaml
 config/pairs/*.local.yaml
 
+# Privacy — operator-tuned strategy artefacts (see config/default.example.yaml
+# for a sanitised public starter). The real tuned configuration, internal
+# project notes, Pine indicators, RL/tune analysis scripts, and behaviour
+# tests are kept local only — clone-and-run is supported via the .example.yaml.
+CLAUDE.md
+config/default.yaml
+pine/
+tests/
+scripts/tune_confluence.py
+scripts/analyze.py
+scripts/factor_audit.py
+scripts/replay_decisions.py
+scripts/counterfactual_h3_trajectory.py
+scripts/counterfactual_max_profit.py
+scripts/peg_rejected_outcomes.py
+scripts/backfill_proposed_sl_tp.py
+scripts/prewarm_kline_cache.py
+
 # OS
 .DS_Store
 Thumbs.db
