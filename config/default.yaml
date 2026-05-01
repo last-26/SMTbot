@@ -402,15 +402,15 @@ analysis:
   # pendings inside [-pre, +post] min around UTC midnight. Disable by
   # flipping enabled to false (knob preserved for back-compat).
   vwap_reset_blackout_enabled: true
-  # 2026-04-27 — window tightened from 5/15 to 0/10. Pre-blackout window
-  # was cosmetic (UTC midnight hasn't happened yet, VWAP bands still
-  # stable) — operator flagged 5min-pre-midnight NO_TRADE traffic as
-  # confusing UX. Post-blackout 15→10: VWAP band stdev recovers fast
-  # on liquid majors at 3m TF; the last 5 min of the old 15-min post
-  # window were almost always trade-permitting anyway. Total daily
-  # downtime 20 min → 10 min.
+  # 2026-04-27 — window tightened from 5/15 to 0/10.
+  # 2026-05-01 — post window 10→60. DB evidence (Bybit-era 19 trade
+  # within UTC 00:00-02:00): WR 26.3%, -10.51R, -$139.33. UTC 00h alone
+  # 8 trade WR 25% / -5.30R; UTC 01h 8 trade WR 25% / -4.09R. Daily
+  # session-anchored VWAP soft-pillar reads near-noise far past the old
+  # 10-min cutoff on this venue/TF combo; extending to 60 min covers
+  # the actual band-stabilisation tail. Total daily downtime 10 → 60 min.
   vwap_reset_blackout_window_pre_min: 0
-  vwap_reset_blackout_window_post_min: 10
+  vwap_reset_blackout_window_post_min: 60
 
 bybit:
   base_url: https://api-demo.bybit.com
