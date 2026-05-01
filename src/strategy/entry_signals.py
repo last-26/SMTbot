@@ -381,20 +381,19 @@ def _cross_asset_opposes(
     pillar_opposition: Optional[Direction],
     direction: Direction,
 ) -> bool:
-    """True when caller supplied an opposition signal matching this direction.
+    """True when the caller's open-position lock direction opposes `direction`.
 
-    `pillar_opposition` is Direction.BULLISH when both pillars are BULLISH
-    (i.e. blocks a BEARISH entry), Direction.BEARISH when both are BEARISH
-    (blocks a BULLISH entry), Direction.UNDEFINED in eth_anchored mode as
-    a "block all directions" sentinel (fail-closed on missing/stale/undefined
-    bias, or biases that disagree across targets), or None when no veto
-    applies. Legacy "both" mode never returns UNDEFINED so the new sentinel
-    semantics are backward compatible.
+    `pillar_opposition` is the direction of the active OPEN-position lock
+    on BTC / ETH (resolved by the runner's `_pillar_opposition_for`):
+      * Direction.BULLISH → an open LONG context is set; a BEARISH entry
+        opposes it and is rejected.
+      * Direction.BEARISH → mirror.
+      * None → no active lock; entry passes (was the EMA-stack
+        "fail-closed UNDEFINED sentinel" pre-2026-05-01 ikinci tighten;
+        retired with that model).
     """
     if pillar_opposition is None:
         return False
-    if pillar_opposition == Direction.UNDEFINED:
-        return True
     if direction == Direction.BULLISH and pillar_opposition == Direction.BEARISH:
         return True
     if direction == Direction.BEARISH and pillar_opposition == Direction.BULLISH:

@@ -217,23 +217,15 @@ class AnalysisConfig(BaseModel):
     ema_veto_enabled: bool = False
     ema_veto_fast_period: int = 21
     ema_veto_slow_period: int = 55
-    # Phase 7.A6 — cross-asset BTC/ETH veto. When true, altcoin entries are
-    # rejected when BOTH BTC-USDT-SWAP and ETH-USDT-SWAP show opposing EMA
-    # stacks (i.e. an altcoin short fighting a clean bull tape on both
-    # pillars, or a long fighting a clean bear tape). Fails open when
-    # either pillar bias is missing, neutral, or older than
-    # `cross_asset_veto_max_age_s`. BTC / ETH cycles always fall through;
-    # they set the snapshot but the gate skips them by symbol.
+    # 2026-05-01 ikinci tighten revert — cross-asset BTC/ETH lock now uses
+    # OPEN POSITION direction (not the pre-2026-05-01 EMA-stack snapshot
+    # which fail-closed in chop). When true and BTC or ETH holds an open
+    # position, the other pillar — and any altcoin — cannot enter the
+    # opposite direction. No staleness, no bias snapshot — the lock is
+    # binary on live position state and decays only when the position
+    # closes. The legacy `cross_asset_veto_mode` and
+    # `cross_asset_veto_max_age_s` knobs were retired with the EMA model.
     cross_asset_veto_enabled: bool = False
-    cross_asset_veto_max_age_s: float = 300.0
-    # 2026-05-01 — cross-asset veto mode. "both" preserves the legacy logic
-    # described above (altcoins only, BTC AND ETH ters, fail-open). "eth_anchored"
-    # implements the operator pair-bound model: BTC <-> ETH symmetric (BTC
-    # entry rejected when ETH ters, ETH entry rejected when BTC ters); altcoin
-    # rejected when BTC OR ETH ters; fail-CLOSED on missing/stale/undefined
-    # bias (block all). Python default stays "both" for back-compat with
-    # existing test fixtures; YAML overrides to "eth_anchored" for production.
-    cross_asset_veto_mode: str = "both"
     # Phase 7.D1 — premium/discount zone veto. When true, reject longs that
     # enter above the last N-bar swing midpoint and shorts below it (the
     # "chase the move" pattern sprint 3 flagged). Midpoint = (N-bar high +
