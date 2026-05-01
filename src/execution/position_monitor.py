@@ -114,6 +114,14 @@ class _Tracked:
     mae_be_lock_armed: bool = False
     mae_be_lock_applied: bool = False
     mae_be_recovery_limit_order_id: str = ""
+    # 2026-05-02 — Phase A.8 cycle-on-cycle directional confluence history.
+    # Each runner cycle that visits the OPEN-position leg appends the
+    # score returned by `score_direction(state, position_direction)`.
+    # Truncated to `weakening_max_history` (config) on append. Used by
+    # `_maybe_close_on_momentum_fade` to detect declining-signal exit
+    # patterns. Memory-only; rehydrated positions restart with empty
+    # history — same caveat as MFE/MAE.
+    recent_confluence_history: list[float] = field(default_factory=list)
 
 
 @dataclass
@@ -504,6 +512,9 @@ class PositionMonitor:
             "mae_r_low": t.mae_r_low,
             "mae_be_lock_armed": t.mae_be_lock_armed,
             "mae_be_lock_applied": t.mae_be_lock_applied,
+            # Tuple to give the runner an immutable snapshot — the gate
+            # mustn't mutate the canonical _Tracked list via this view.
+            "recent_confluence_history": tuple(t.recent_confluence_history),
         }
 
     def get_tracked(
@@ -518,6 +529,28 @@ class PositionMonitor:
         the BE / lock flags in one shot.
         """
         return self._tracked.get((inst_id, pos_side))
+
+    def append_confluence_score(
+        self, inst_id: str, pos_side: str, score: float, max_history: int,
+    ) -> bool:
+        """Append a directional confluence score to the position's history
+        (Phase A.8, 2026-05-02). Truncates to `max_history` from the front
+        on overflow so the deque keeps the most recent N scores.
+
+        Returns True on append, False when the position isn't tracked
+        (closed mid-cycle, etc.) or `max_history <= 0`.
+        """
+        if max_history <= 0:
+            return False
+        t = self._tracked.get((inst_id, pos_side))
+        if t is None:
+            return False
+        t.recent_confluence_history.append(float(score))
+        # Truncate from the front to keep last `max_history` entries.
+        overflow = len(t.recent_confluence_history) - max_history
+        if overflow > 0:
+            del t.recent_confluence_history[:overflow]
+        return True
 
     def arm_mae_be_lock(self, inst_id: str, pos_side: str) -> bool:
         """Set the MAE-BE-lock armed flag (Phase A.6, 2026-05-02).

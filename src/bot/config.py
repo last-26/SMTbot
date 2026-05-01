@@ -559,6 +559,30 @@ class ExecutionConfig(BaseModel):
     mae_be_lock_recovery_band_r: float = 0.1
     mae_be_lock_disabled_regimes: list[str] = Field(default_factory=list)
 
+    # 2026-05-02 — Phase A.8 weakening-momentum exit. Defensive close when
+    # the cycle-on-cycle directional confluence score is monotonically
+    # falling AND the position is in profit. Operator: "longdaysak aynı
+    # yönlü daha düşük veriler gelmeye devam ediyorsa cyclelarda hareketin
+    # yavaşladığını düşünüp pozisyonda kalıcılığı istemeyeceğiz."
+    #
+    # Per-cycle history kept on `_Tracked.recent_confluence_history`
+    # (deque-style truncated list). Each cycle that runs the OPEN-position
+    # leg computes `score_direction(state, position_direction)` and
+    # appends the score. Once at least `weakening_min_cycles` entries
+    # exist AND every step-to-step delta exceeds `weakening_min_score_drop`,
+    # AND `mfe_r >= weakening_min_mfe_r` (only close from profit, not
+    # from MAE territory), runner fires `_defensive_close()` with
+    # `EARLY_CLOSE_MOMENTUM_FADE` close_reason.
+    #
+    # Conservative defaults — operator picked 3 cycles (~9 min on 3m TF)
+    # to start; can tighten to 2 once demo validates the gate isn't
+    # too noisy.
+    weakening_exit_enabled: bool = False
+    weakening_min_cycles: int = 3
+    weakening_min_score_drop: float = 0.5
+    weakening_min_mfe_r: float = 0.5
+    weakening_max_history: int = 8
+
     # Position-attached TP/SL trigger-price source. "mark" = index-weighted
     # price across the major real-market venues (cross-exchange VWAP).
     # "last" = last trade on the Bybit book (default in Bybit V5).

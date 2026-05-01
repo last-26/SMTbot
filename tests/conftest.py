@@ -247,6 +247,13 @@ class FakeMonitor:
         self.be_recovery_calls.append((inst_id, pos_side, limit_px, margin_mode))
         return f"BE-{inst_id}-{pos_side}"
 
+    def append_confluence_score(self, inst_id: str, pos_side: str,
+                                 score: float, max_history: int) -> bool:
+        if not hasattr(self, "confluence_appends"):
+            self.confluence_appends: list[tuple[str, str, float]] = []
+        self.confluence_appends.append((inst_id, pos_side, score))
+        return True
+
     def poll_pending(self) -> list:
         # 2026-04-29 — runner.run_once now drains pending-limit events via
         # `_process_pending` → `monitor.poll_pending()`. Default empty

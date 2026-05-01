@@ -650,6 +650,25 @@ execution:
   mae_be_lock_recovery_band_r: 0.1
   mae_be_lock_disabled_regimes: []
 
+  # 2026-05-02 — Phase A.8 weakening-momentum exit. Defensive close when
+  # cycle-on-cycle directional confluence falls monotonically AND the
+  # position is in profit. Operator: "aynı yönlü daha düşük veriler
+  # gelmeye devam ediyorsa cyclelarda hareketin yavaşladığını düşünüp
+  # pozisyonda kalıcılığı istemeyeceğiz."
+  #
+  # Operator-decided defaults (Q5: "3 iyi gibi evet. 2 biraz daha
+  # hassaslaştırabilir."):
+  #   weakening_min_cycles: 3       # ~9 min on 3m TF
+  #   weakening_min_score_drop: 0.5 # each step must drop >= 0.5
+  #   weakening_min_mfe_r: 0.5      # only close from profit (operator
+  #                                  intent: max-profit doctrine)
+  # Lower min_cycles to 2 once demo validates the gate isn't too noisy.
+  weakening_exit_enabled: true
+  weakening_min_cycles: 3
+  weakening_min_score_drop: 0.5
+  weakening_min_mfe_r: 0.5
+  weakening_max_history: 8
+
   # 2026-04-19 — Position-attached TP/SL trigger price source. "mark" uses
   # Bybit's index-weighted mark price (cross-exchange VWAP across the
   # major real-market venues), "last" uses the Bybit book's last trade.

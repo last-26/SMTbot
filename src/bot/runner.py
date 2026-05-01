@@ -32,7 +32,7 @@ from typing import Any, Optional
 from loguru import logger
 
 from src.analysis.liquidity_heatmap import build_heatmap
-from src.analysis.multi_timeframe import calculate_confluence
+from src.analysis.multi_timeframe import calculate_confluence, score_direction
 from src.analysis.support_resistance import detect_sr_zones
 from src.analysis.trend_regime import TrendRegime, classify_trend_regime
 from src.bot.config import BotConfig
@@ -1665,6 +1665,106 @@ class BotRunner:
                 symbol, pos_side, entry, limit_px, cur_r, mae_low,
             )
 
+    async def _maybe_close_on_momentum_fade(
+        self, symbol: str, pos_side: str, state: MarketState,
+        candles: Optional[list] = None,
+    ) -> bool:
+        """Weakening-momentum defensive close (Phase A.8, 2026-05-02).
+
+        Each call:
+          1. Compute the directional confluence score for the position's
+             direction via `score_direction(state, pos_direction, ...)`.
+             Same scoring path as the entry-side plan-builder, but for one
+             direction only (the position's). Cheap CPU; no TV/Bybit calls.
+          2. Append the score to `_Tracked.recent_confluence_history`
+             (truncated to `weakening_max_history`).
+          3. If history has >= `weakening_min_cycles` entries AND every
+             step-to-step delta is at least `weakening_min_score_drop`
+             (monotonic decline) AND `mfe_r_high >= weakening_min_mfe_r`
+             (only close from profit, not MAE), fire a defensive close
+             with the `momentum_fade` reason → journal stamps
+             `EARLY_CLOSE_MOMENTUM_FADE`.
+
+        Returns True when a close was fired, False otherwise. Caller uses
+        the return to short-circuit downstream gates (no point running
+        TP-revise on a position we just closed).
+        """
+        cfg = self.ctx.config
+        if not cfg.execution.weakening_exit_enabled:
+            return False
+        snap = self.ctx.monitor.get_tracked_runner(symbol, pos_side)
+        if snap is None:
+            return False
+        pos_direction = (
+            Direction.BULLISH if pos_side == "long" else Direction.BEARISH
+        )
+        try:
+            score_obj = score_direction(
+                state, pos_direction,
+                ltf_candles=candles,
+                allowed_sessions=cfg.allowed_sessions_for(symbol) or None,
+                ltf_state=self.ctx.ltf_cache.get(symbol),
+                htf_state=self.ctx.htf_state_cache.get(symbol),
+                weights=cfg.analysis.confluence_weights or None,
+                min_rsi_mfi_magnitude=cfg.analysis.min_rsi_mfi_magnitude,
+                liquidity_pool_max_atr_dist=(
+                    cfg.analysis.liquidity_pool_max_atr_dist
+                ),
+                displacement_atr_mult=cfg.analysis.displacement_atr_mult,
+                displacement_max_bars_ago=(
+                    cfg.analysis.displacement_max_bars_ago
+                ),
+                divergence_fresh_bars=cfg.analysis.divergence_fresh_bars,
+                divergence_decay_bars=cfg.analysis.divergence_decay_bars,
+                divergence_max_bars=cfg.analysis.divergence_max_bars,
+                trend_regime=None,  # regime modifiers stay off here — we
+                # want raw directional alignment trajectory, not regime-
+                # weighted (which biases the trend over time).
+                trend_regime_conditional_scoring_enabled=False,
+            )
+        except Exception:
+            logger.exception(
+                "weakening_score_compute_failed symbol={} side={}",
+                symbol, pos_side,
+            )
+            return False
+        score_now = float(score_obj.score)
+        self.ctx.monitor.append_confluence_score(
+            symbol, pos_side, score_now,
+            int(cfg.execution.weakening_max_history),
+        )
+        # Re-fetch tracked-runner snap so history reflects the just-appended
+        # value (the previous snap was a frozen tuple).
+        snap = self.ctx.monitor.get_tracked_runner(symbol, pos_side) or {}
+        history = list(snap.get("recent_confluence_history") or ())
+        min_cycles = int(cfg.execution.weakening_min_cycles)
+        if len(history) < min_cycles:
+            return False
+        # Only inspect the last `min_cycles` entries — once the run starts,
+        # we don't want a brief mid-trade dip that recovered to lock us in
+        # forever waiting for fresh decline.
+        recent = history[-min_cycles:]
+        drop_threshold = float(cfg.execution.weakening_min_score_drop)
+        for i in range(1, len(recent)):
+            if recent[i - 1] - recent[i] < drop_threshold:
+                # Step-to-step drop didn't clear the threshold → not a
+                # confirmed weakening pattern.
+                return False
+        # Profitability gate — operator-described "kar bölgesinde" exit.
+        # MFE check uses peak-favorable, not current PnL, so a brief MFE
+        # spike without retest still counts (we're close-by-default once
+        # we've seen good profits AND a fading signal).
+        mfe_r_high = float(snap.get("mfe_r_high") or 0.0)
+        if mfe_r_high < float(cfg.execution.weakening_min_mfe_r):
+            return False
+        logger.info(
+            "weakening_exit_fired symbol={} side={} history={} "
+            "mfe_r_high={:.3f}",
+            symbol, pos_side, recent, mfe_r_high,
+        )
+        await self._defensive_close(symbol, pos_side, "momentum_fade")
+        return True
+
     def _pillar_opposition_for(self, symbol: str) -> Optional[Direction]:
         """Cross-asset opposition signal for `symbol`.
 
@@ -2025,9 +2125,21 @@ class BotRunner:
             # close on its own; we don't want to spam the exchange.
             return
 
-        self.ctx.pending_close_reasons[key] = "EARLY_CLOSE_LTF_REVERSAL"
-        logger.info("defensive_close_triggered symbol={} side={} reason={}",
-                    symbol, side, reason)
+        # 2026-05-02 — close_reason now derived from the `reason` arg so
+        # journal can distinguish LTF reversal from momentum-fade exits
+        # (Phase A.8). Pre-2026-05-02 caller passed only "ltf_reversal" →
+        # mapping below preserves the old close_reason verbatim.
+        close_reason_map = {
+            "ltf_reversal": "EARLY_CLOSE_LTF_REVERSAL",
+            "momentum_fade": "EARLY_CLOSE_MOMENTUM_FADE",
+        }
+        close_reason = close_reason_map.get(
+            reason, f"EARLY_CLOSE_{reason.upper()}"
+        )
+        self.ctx.pending_close_reasons[key] = close_reason
+        logger.info("defensive_close_triggered symbol={} side={} reason={} "
+                    "close_reason={}",
+                    symbol, side, reason, close_reason)
 
     async def _read_last_bar(self) -> Optional[int]:
         """Best-effort read of the signal-table last_bar. None on any failure."""
@@ -2355,6 +2467,19 @@ class BotRunner:
         # (short). Maker exit, fee-positive close.
         if open_side:
             await self._maybe_lock_sl_on_mae_recovery(symbol, open_side, state)
+
+        # 2i. Phase A.8 (2026-05-02) — weakening-momentum exit. Computes
+        # directional confluence in the position's direction each cycle,
+        # tracks a short history, fires `_defensive_close()` with
+        # `momentum_fade` reason once N cycles of monotonic decline + MFE
+        # in profit confirm a fading signal. Returns True on close so we
+        # short-circuit downstream entry-side work.
+        if open_side:
+            closed = await self._maybe_close_on_momentum_fade(
+                symbol, open_side, state, candles,
+            )
+            if closed:
+                return
 
         # 3. Symbol-level dedup — skip open if we still hold anything OR
         # already have a pending limit entry waiting for fill (Phase 7.C4).
@@ -2980,6 +3105,15 @@ class BotRunner:
                     if atr > 0 and upper > 0 and lower > 0:
                         band_mid = (upper + lower) / 2.0
                         vwap_3m_dist_atr = (snap.mark_price - band_mid) / atr
+            # 2026-05-02 — Phase A.7/A.8 directional confluence at snap time.
+            # Reads the latest entry of the tracked deque populated by
+            # `_maybe_close_on_momentum_fade` each cycle. None when the
+            # weakening-exit gate hasn't run yet for this position
+            # (master flag off, or first cycle post-fill).
+            history = getattr(tracked, "recent_confluence_history", None) or []
+            confluence_score_now = (
+                float(history[-1]) if history else None
+            )
             try:
                 await self.ctx.journal.record_position_snapshot(
                     trade_id=trade_id,
@@ -3003,6 +3137,7 @@ class BotRunner:
                     on_chain_flow_alignment_now=flow_align_now,
                     oscillator_3m_now_json=osc_3m_json,
                     vwap_3m_distance_atr_now=vwap_3m_dist_atr,
+                    confluence_score_now=confluence_score_now,
                 )
                 wrote_any = True
             except Exception:
