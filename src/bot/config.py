@@ -531,6 +531,30 @@ class ExecutionConfig(BaseModel):
     # Validated against the same enum as the per-regime RR dicts above.
     trail_disabled_regimes: list[str] = Field(default_factory=list)
 
+    # 2026-05-02 — Phase A.6 MAE-triggered BE-lock with LIMIT-based exit.
+    # Distinct from MFE-lock (favorable side) and trailing (also favorable):
+    # this protects trades that went DEEP into MAE then recovered toward
+    # entry. Operator-described mechanic:
+    #   1. MAE crosses `mae_be_lock_threshold_r` (default -0.6R) → arm
+    #   2. Mark price recovers to within `mae_be_lock_recovery_band_r` of
+    #      entry (default 0.1R) → triggered
+    #   3. Cycle's LTF direction signal still adverse → confirm
+    #   4. Place a reduce-only post-only LIMIT at:
+    #         LONG : entry × (1 + sl_be_offset_pct)  (sell, micro-profit)
+    #         SHORT: entry × (1 - sl_be_offset_pct)  (buy,  micro-profit)
+    #      Operator: "kara geçtiğinde kapanacak şekilde, fee'den değil
+    #      kar bölgesinden". Limit fills as maker → no taker fee + small
+    #      profit covering the round-trip taker on entry.
+    #   5. Position-attached SL at -1R stays as backup (we don't move it).
+    # One-shot per position — `mae_be_lock_applied` blocks repeats.
+    # Disabled regimes: TBD via `mae_be_lock_disabled_regimes`; default
+    # empty (works in every regime — RANGING benefits the most since SL is
+    # tight under the VWAP-band override).
+    mae_be_lock_enabled: bool = False
+    mae_be_lock_threshold_r: float = -0.6
+    mae_be_lock_recovery_band_r: float = 0.1
+    mae_be_lock_disabled_regimes: list[str] = Field(default_factory=list)
+
     # Position-attached TP/SL trigger-price source. "mark" = index-weighted
     # price across the major real-market venues (cross-exchange VWAP).
     # "last" = last trade on the Bybit book (default in Bybit V5).
@@ -601,6 +625,33 @@ class ExecutionConfig(BaseModel):
                 )
         return v
 
+    @field_validator("mae_be_lock_disabled_regimes")
+    @classmethod
+    def _validate_mae_be_lock_disabled_regimes(
+        cls, v: list[str]
+    ) -> list[str]:
+        if not v:
+            return v
+        from src.analysis.trend_regime import TrendRegime
+        valid_keys = {r.value for r in TrendRegime}
+        for key in v:
+            if key not in valid_keys:
+                raise ValueError(
+                    f"mae_be_lock_disabled_regimes entry '{key}' is not a "
+                    f"valid TrendRegime value (allowed: {sorted(valid_keys)})"
+                )
+        return v
+
+    @field_validator("mae_be_lock_threshold_r")
+    @classmethod
+    def _validate_mae_threshold_negative(cls, v: float) -> float:
+        if v >= 0:
+            raise ValueError(
+                f"mae_be_lock_threshold_r must be < 0 (negative R = adverse "
+                f"excursion); got {v}"
+            )
+        return v
+
     def is_trailing_disabled_for(self, regime: object) -> bool:
         """Return True when trailing SL must be inert for `regime`.
 
@@ -611,6 +662,13 @@ class ExecutionConfig(BaseModel):
             return False
         key = regime.value if hasattr(regime, "value") else str(regime)
         return key in self.trail_disabled_regimes
+
+    def is_mae_be_lock_disabled_for(self, regime: object) -> bool:
+        """Mirror of `is_trailing_disabled_for` for MAE-BE-lock."""
+        if regime is None:
+            return False
+        key = regime.value if hasattr(regime, "value") else str(regime)
+        return key in self.mae_be_lock_disabled_regimes
 
     @field_validator("tp_min_rr_floor_per_regime")
     @classmethod

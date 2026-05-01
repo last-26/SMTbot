@@ -626,6 +626,24 @@ execution:
   trail_disabled_regimes:
     - RANGING
 
+  # 2026-05-02 — Phase A.6 MAE-triggered BE-lock with LIMIT-based exit.
+  # Operator-described mechanic:
+  #   1. MAE crosses `mae_be_lock_threshold_r` (-0.6R) → arm
+  #   2. Mark recovers within `mae_be_lock_recovery_band_r` (0.1R) of entry
+  #   3. Cycle's LTF direction signal still adverse to position
+  #   4. Place reduce-only post-only LIMIT at:
+  #         LONG : entry × (1 + sl_be_offset_pct)  (sell, micro-profit)
+  #         SHORT: entry × (1 - sl_be_offset_pct)  (buy,  micro-profit)
+  #      Maker fill on touch from below (long) / above (short) → fee-positive
+  #      close covering the round-trip taker on entry.
+  # One-shot per position. Position-attached SL at -1R stays as backup.
+  # Disabled regimes empty by default — works in every regime; RANGING
+  # benefits the most since SL is tight under the VWAP-band override.
+  mae_be_lock_enabled: true
+  mae_be_lock_threshold_r: -0.6
+  mae_be_lock_recovery_band_r: 0.1
+  mae_be_lock_disabled_regimes: []
+
   # 2026-04-19 — Position-attached TP/SL trigger price source. "mark" uses
   # Bybit's index-weighted mark price (cross-exchange VWAP across the
   # major real-market venues), "last" uses the Bybit book's last trade.

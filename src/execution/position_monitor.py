@@ -104,6 +104,16 @@ class _Tracked:
     # monotonic-only updates (a mark dip must NEVER widen SL backward).
     # 0.0 = trailing has not fired yet on this position.
     last_trail_lock_r: float = 0.0
+    # 2026-05-02 — Phase A.6 MAE-BE-lock state. Two-stage gate:
+    #   armed:    MAE crossed threshold; waiting for recovery
+    #   applied:  recovery + adverse-cycle confirmed → reduce-only post-only
+    #             limit placed at entry+fee_buffer (long) or entry-fee_buffer
+    #             (short). One-shot — applied=True blocks repeats.
+    # `recovery_limit_order_id` = the placed limit's Bybit order id, used
+    # for orphan cleanup on close.
+    mae_be_lock_armed: bool = False
+    mae_be_lock_applied: bool = False
+    mae_be_recovery_limit_order_id: str = ""
 
 
 @dataclass
@@ -253,6 +263,17 @@ class PositionMonitor:
                 if tracked.tp_limit_order_id:
                     self._cancel_tp_limit_best_effort(
                         tracked.inst_id, tracked.tp_limit_order_id,
+                    )
+                # 2026-05-02 — Phase A.6 MAE-BE-lock leaves a reduce-only
+                # post-only limit resting at entry+fee. If the position
+                # closed via something else (SL fire, manual close, TP
+                # limit fill), that BE-recovery limit is now an orphan —
+                # cancel best-effort. Reuses `_cancel_tp_limit_best_effort`
+                # since both are reduce-only limits cancelled by orderId.
+                if tracked.mae_be_recovery_limit_order_id:
+                    self._cancel_tp_limit_best_effort(
+                        tracked.inst_id,
+                        tracked.mae_be_recovery_limit_order_id,
                     )
                 # On Bybit V5 the position-attached TP/SL clears
                 # automatically when the position size hits zero — no
@@ -479,6 +500,10 @@ class PositionMonitor:
             # `cfg.execution.effective_target_rr_ratio(regime)`.
             "regime_at_entry": t.regime_at_entry,
             "last_trail_lock_r": t.last_trail_lock_r,
+            "mfe_r_high": t.mfe_r_high,
+            "mae_r_low": t.mae_r_low,
+            "mae_be_lock_armed": t.mae_be_lock_armed,
+            "mae_be_lock_applied": t.mae_be_lock_applied,
         }
 
     def get_tracked(
@@ -493,6 +518,78 @@ class PositionMonitor:
         the BE / lock flags in one shot.
         """
         return self._tracked.get((inst_id, pos_side))
+
+    def arm_mae_be_lock(self, inst_id: str, pos_side: str) -> bool:
+        """Set the MAE-BE-lock armed flag (Phase A.6, 2026-05-02).
+
+        Two-stage gate: this is stage 1 (MAE crossed threshold). Stage 2
+        is `place_be_recovery_limit` (recovery + adverse cycle). Idempotent
+        — calling repeatedly while already armed is a no-op.
+        """
+        t = self._tracked.get((inst_id, pos_side))
+        if t is None:
+            return False
+        if t.mae_be_lock_applied:
+            return False  # already past stage 2; arming is moot
+        t.mae_be_lock_armed = True
+        return True
+
+    def place_be_recovery_limit(
+        self,
+        inst_id: str,
+        pos_side: str,
+        limit_px: float,
+        margin_mode: str = "cross",
+    ) -> Optional[str]:
+        """Place a reduce-only post-only LIMIT at the BE-recovery price
+        (Phase A.6 stage 2, 2026-05-02).
+
+        Operator-described mechanic: when MAE went deep then recovered AND
+        the cycle's LTF direction is still adverse, place a maker exit at
+        a fee-positive level (slightly above entry for long, slightly below
+        for short). When mark touches that level the limit fills as a
+        maker, position closes at micro-profit covering the round-trip
+        taker on entry. The position-attached SL at -1R stays as backup.
+
+        One-shot per position. On success records the limit's order id on
+        the tracked row so the close path can clean it up if the SL fires
+        first.
+        """
+        t = self._tracked.get((inst_id, pos_side))
+        if t is None:
+            return None
+        if t.mae_be_lock_applied:
+            return None
+        if t.runner_size <= 0:
+            return None
+        try:
+            res = self.client.place_reduce_only_limit(
+                inst_id=t.inst_id,
+                pos_side=t.pos_side,
+                size_contracts=int(t.runner_size),
+                px=limit_px,
+                td_mode=margin_mode,
+                post_only=True,
+            )
+        except Exception as exc:
+            code = getattr(exc, "code", None)
+            payload = getattr(exc, "payload", None)
+            logger.warning(
+                "mae_be_lock_limit_place_failed inst={} side={} px={} "
+                "size={} err={!r} code={} payload={} — position-attached "
+                "SL still protects, will retry next cycle",
+                t.inst_id, t.pos_side, limit_px, t.runner_size,
+                exc, code, payload,
+            )
+            return None
+
+        t.mae_be_lock_applied = True
+        t.mae_be_recovery_limit_order_id = res.order_id
+        logger.info(
+            "mae_be_lock_limit_placed inst={} side={} px={} size={} ord={}",
+            t.inst_id, t.pos_side, limit_px, t.runner_size, res.order_id,
+        )
+        return res.order_id
 
     def trail_sl_to(
         self, inst_id: str, pos_side: str, new_sl: float, lock_r: float,

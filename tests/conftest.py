@@ -233,6 +233,20 @@ class FakeMonitor:
         self.lock_sl_calls.append((inst_id, pos_side, new_sl))
         return True
 
+    def arm_mae_be_lock(self, inst_id: str, pos_side: str) -> bool:
+        if not hasattr(self, "mae_arm_calls"):
+            self.mae_arm_calls: list[tuple[str, str]] = []
+        self.mae_arm_calls.append((inst_id, pos_side))
+        return True
+
+    def place_be_recovery_limit(self, inst_id: str, pos_side: str,
+                                 limit_px: float,
+                                 margin_mode: str = "cross") -> Optional[str]:
+        if not hasattr(self, "be_recovery_calls"):
+            self.be_recovery_calls: list[tuple[str, str, float, str]] = []
+        self.be_recovery_calls.append((inst_id, pos_side, limit_px, margin_mode))
+        return f"BE-{inst_id}-{pos_side}"
+
     def poll_pending(self) -> list:
         # 2026-04-29 — runner.run_once now drains pending-limit events via
         # `_process_pending` → `monitor.poll_pending()`. Default empty

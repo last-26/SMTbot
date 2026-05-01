@@ -1562,6 +1562,109 @@ class BotRunner:
                 symbol, pos_side,
             )
 
+    async def _maybe_lock_sl_on_mae_recovery(
+        self, symbol: str, pos_side: str, state: MarketState,
+    ) -> None:
+        """MAE-triggered BE-lock with LIMIT-based exit (Phase A.6, 2026-05-02).
+
+        Two-stage gate:
+          stage 1: arm when MAE crosses `mae_be_lock_threshold_r` (e.g. -0.6R).
+                   The position has been deep underwater; we mark it as
+                   "danger zone" but don't act yet.
+          stage 2: when mark recovers to within `mae_be_lock_recovery_band_r`
+                   of entry AND the cycle's LTF direction signal is still
+                   adverse to the position → place a reduce-only post-only
+                   LIMIT at entry + fee_buffer (long) or entry - fee_buffer
+                   (short). Touch from below (long) or above (short) fills
+                   the limit at micro-profit covering the round-trip taker
+                   on entry. Position-attached SL at -1R stays as backup.
+
+        One-shot per position via `mae_be_lock_applied` flag in monitor.
+        Disabled regimes skip the gate.
+
+        LTF "adverse" check: same direction model as `_is_ltf_reversal`
+        but softer — just `ltf.trend` opposing position; no `last_signal`
+        / `bars_ago` requirement (we want the gate to be sensitive to
+        the cycle's current bias, not its freshness).
+        """
+        cfg = self.ctx.config
+        if not cfg.execution.mae_be_lock_enabled:
+            return
+        snap = self.ctx.monitor.get_tracked_runner(symbol, pos_side)
+        if snap is None:
+            return
+        if snap.get("mae_be_lock_applied"):
+            return
+        regime = snap.get("regime_at_entry")
+        if cfg.execution.is_mae_be_lock_disabled_for(regime):
+            return
+        plan_sl = float(snap.get("plan_sl_price") or 0.0)
+        entry = float(snap.get("entry_price") or 0.0)
+        if plan_sl <= 0 or entry <= 0:
+            return
+        sl_distance = abs(entry - plan_sl)
+        if sl_distance <= 0:
+            return
+
+        threshold = float(cfg.execution.mae_be_lock_threshold_r)
+        mae_low = float(snap.get("mae_r_low") or 0.0)
+
+        # Stage 1: arm when MAE has reached the threshold (deeper than
+        # -0.6R). This is sticky — once armed, stays armed until applied
+        # or position closes.
+        if not snap.get("mae_be_lock_armed"):
+            if mae_low <= threshold:
+                self.ctx.monitor.arm_mae_be_lock(symbol, pos_side)
+                logger.info(
+                    "mae_be_lock_armed symbol={} side={} mae_r_low={:.3f} "
+                    "threshold={:.3f}",
+                    symbol, pos_side, mae_low, threshold,
+                )
+            return  # don't fire stage 2 in the same cycle as stage 1
+
+        # Stage 2 conditions: recovery to entry zone + adverse cycle.
+        current_px = float(getattr(state, "current_price", 0.0) or 0.0)
+        if current_px <= 0:
+            return
+        sign = 1 if pos_side == "long" else -1
+        cur_r = sign * (current_px - entry) / sl_distance
+        recovery_band = float(cfg.execution.mae_be_lock_recovery_band_r)
+        if abs(cur_r) > recovery_band:
+            return  # mark not close enough to entry yet
+
+        # Adverse-cycle check: LTF trend opposite to position direction.
+        ltf = self.ctx.ltf_cache.get(symbol)
+        if ltf is None or getattr(ltf, "trend", None) is None:
+            return  # no fresh LTF signal → conservative skip
+        if pos_side == "long" and ltf.trend != Direction.BEARISH:
+            return
+        if pos_side == "short" and ltf.trend != Direction.BULLISH:
+            return
+
+        # Fee buffer: same convention as MFE-lock / SL-to-BE — a hair past
+        # entry on the profit side. LONG sells slightly above entry,
+        # SHORT buys slightly below.
+        fee_buffer = entry * float(cfg.execution.sl_be_offset_pct)
+        limit_px = entry + sign * fee_buffer
+
+        try:
+            order_id = await asyncio.to_thread(
+                self.ctx.monitor.place_be_recovery_limit,
+                symbol, pos_side, limit_px, cfg.execution.margin_mode,
+            )
+        except Exception:
+            logger.exception(
+                "mae_be_lock_dispatch_failed symbol={} side={}",
+                symbol, pos_side,
+            )
+            return
+        if order_id:
+            logger.info(
+                "mae_be_lock_fired symbol={} side={} entry={:.4f} "
+                "limit_px={:.4f} cur_r={:.3f} mae_low={:.3f}",
+                symbol, pos_side, entry, limit_px, cur_r, mae_low,
+            )
+
     def _pillar_opposition_for(self, symbol: str) -> Optional[Direction]:
         """Cross-asset opposition signal for `symbol`.
 
@@ -2243,6 +2346,15 @@ class BotRunner:
         # by default (TP at 1.2R fires before trailing would arm at 1.5R).
         if open_side:
             await self._maybe_trail_sl_after_mfe(symbol, open_side, state)
+
+        # 2h. Phase A.6 (2026-05-02) — MAE-triggered BE-lock with LIMIT-based
+        # exit. Protects trades that went deep into MAE then recovered to
+        # entry zone with adverse cycle data. Two-stage: arm at -0.6R MAE,
+        # fire when mark recovers + LTF still adverse → place reduce-only
+        # post-only limit at entry+fee_buffer (long) / entry-fee_buffer
+        # (short). Maker exit, fee-positive close.
+        if open_side:
+            await self._maybe_lock_sl_on_mae_recovery(symbol, open_side, state)
 
         # 3. Symbol-level dedup — skip open if we still hold anything OR
         # already have a pending limit entry waiting for fill (Phase 7.C4).
