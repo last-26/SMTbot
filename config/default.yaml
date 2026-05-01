@@ -331,12 +331,17 @@ analysis:
   # stack. Reuses the ema_veto_* periods above. Fails open when either
   # pillar is missing / neutral / stale (> max_age_s). Rule #2 of the
   # pivot strategy: don't fight a united BTC+ETH tape on altcoins.
-  # 2026-04-30 Pass 3 Faz-A apply → 2026-05-01 REVERT. 19 trade post-apply
-  # window WR 36.8% (-5.02R, PF 0.65) vs PRE last-19 WR 63.2% (+5.85R).
-  # Altcoin tarafı (ETH+SOL+XRP) post-apply 1W/6L; gate kapalıyken altcoin
-  # koruması yok. Mevcut "BTC AND ETH ters" mantığı baseline; ETH-anchored
-  # tighten ayrı PR'da değerlendirilecek. Operator approval 2026-05-01.
+  # 2026-04-30 Pass 3 Faz-A apply → 2026-05-01 REVERT + mode tighten.
+  # Faz-A 19 trade post-window WR 36.8% (-5.02R) vs PRE son-19 63.2% (+5.85R).
+  # Operator pair-bound model (cross_asset_veto_mode: "eth_anchored"):
+  #   * BTC entry: ETH ters → reddet (yeni gate, "both" modunda yoktu)
+  #   * ETH entry: BTC ters → reddet (yeni gate, "both" modunda yoktu)
+  #   * Altcoin entry: BTC OR ETH ters → reddet (mevcut AND'den daha sıkı)
+  #   * Pillar bias missing / neutral / stale → fail-CLOSED (her yönü blokla)
+  # "both" mode = legacy davranış (altcoin only, BTC AND ETH ters, fail-open)
+  # — revert için YAML'da "both" yazıp restart yeter, kod değişmez.
   cross_asset_veto_enabled: true
+  cross_asset_veto_mode: eth_anchored
   cross_asset_veto_max_age_s: 300.0
   # Phase 7.D1 — premium/discount zone veto. When `true`, longs that sit
   # above the last N-bar swing midpoint and shorts below it are rejected

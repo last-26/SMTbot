@@ -226,6 +226,14 @@ class AnalysisConfig(BaseModel):
     # they set the snapshot but the gate skips them by symbol.
     cross_asset_veto_enabled: bool = False
     cross_asset_veto_max_age_s: float = 300.0
+    # 2026-05-01 — cross-asset veto mode. "both" preserves the legacy logic
+    # described above (altcoins only, BTC AND ETH ters, fail-open). "eth_anchored"
+    # implements the operator pair-bound model: BTC <-> ETH symmetric (BTC
+    # entry rejected when ETH ters, ETH entry rejected when BTC ters); altcoin
+    # rejected when BTC OR ETH ters; fail-CLOSED on missing/stale/undefined
+    # bias (block all). Python default stays "both" for back-compat with
+    # existing test fixtures; YAML overrides to "eth_anchored" for production.
+    cross_asset_veto_mode: str = "both"
     # Phase 7.D1 — premium/discount zone veto. When true, reject longs that
     # enter above the last N-bar swing midpoint and shorts below it (the
     # "chase the move" pattern sprint 3 flagged). Midpoint = (N-bar high +

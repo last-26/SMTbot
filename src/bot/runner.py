@@ -1484,36 +1484,76 @@ class BotRunner:
             )
 
     def _pillar_opposition_for(self, symbol: str) -> Optional[Direction]:
-        """Cross-asset opposition signal for `symbol` (Phase 7.A6).
+        """Cross-asset opposition signal for `symbol`.
 
-        Returns:
+        Mode `both` (legacy Phase 7.A6 — altcoins only, AND, fail-open):
           * Direction.BULLISH when both pillars are BULLISH → blocks BEARISH alts
           * Direction.BEARISH when both pillars are BEARISH → blocks BULLISH alts
-          * None when the veto is disabled, `symbol` is a pillar itself, either
-            pillar's bias is missing / neutral / stale.
+          * None when veto disabled / `symbol` is a pillar / either pillar
+            missing / neutral / stale.
+
+        Mode `eth_anchored` (2026-05-01 — pair-bound, OR for altcoins, fail-closed):
+          * BTC entry: target = [ETH]. ETH BULLISH → blocks BEARISH BTC; ETH
+            BEARISH → blocks BULLISH BTC.
+          * ETH entry: target = [BTC]. Symmetric to above.
+          * Altcoin entry: targets = [BTC, ETH]. If both biases agree, return
+            that direction (blocks opposite). If biases disagree, return
+            UNDEFINED (block-all sentinel — either direction has at least one
+            opposing pillar).
+          * Direction.UNDEFINED is also returned on missing / neutral / stale
+            target bias (fail-CLOSED — operator wants definite pillar info).
+          * Returns None only when veto disabled.
         """
         cfg = self.ctx.config.analysis
         if not cfg.cross_asset_veto_enabled:
             return None
-        if symbol in _PILLAR_SYMBOLS:
+        mode = getattr(cfg, "cross_asset_veto_mode", "both")
+
+        if mode == "both":
+            if symbol in _PILLAR_SYMBOLS:
+                return None
+            now = _utc_now()
+            biases: list[Direction] = []
+            for sym in _PILLAR_SYMBOLS:
+                item = self.ctx.pillar_bias.get(sym)
+                if item is None:
+                    return None
+                bias, updated = item
+                if bias == Direction.UNDEFINED:
+                    return None
+                if (now - updated).total_seconds() > cfg.cross_asset_veto_max_age_s:
+                    return None
+                biases.append(bias)
+            if all(b == Direction.BULLISH for b in biases):
+                return Direction.BULLISH
+            if all(b == Direction.BEARISH for b in biases):
+                return Direction.BEARISH
             return None
+
+        # mode == "eth_anchored"
+        if symbol == "BTC-USDT-SWAP":
+            targets = ("ETH-USDT-SWAP",)
+        elif symbol == "ETH-USDT-SWAP":
+            targets = ("BTC-USDT-SWAP",)
+        else:
+            targets = _PILLAR_SYMBOLS
         now = _utc_now()
         biases: list[Direction] = []
-        for sym in _PILLAR_SYMBOLS:
+        for sym in targets:
             item = self.ctx.pillar_bias.get(sym)
             if item is None:
-                return None
+                return Direction.UNDEFINED
             bias, updated = item
             if bias == Direction.UNDEFINED:
-                return None
+                return Direction.UNDEFINED
             if (now - updated).total_seconds() > cfg.cross_asset_veto_max_age_s:
-                return None
+                return Direction.UNDEFINED
             biases.append(bias)
         if all(b == Direction.BULLISH for b in biases):
             return Direction.BULLISH
         if all(b == Direction.BEARISH for b in biases):
             return Direction.BEARISH
-        return None
+        return Direction.UNDEFINED
 
     def _pillar_bias_label(self, pillar_symbol: str) -> Optional[str]:
         """Current pillar bias as a string, or None if missing/stale.

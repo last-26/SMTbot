@@ -385,11 +385,16 @@ def _cross_asset_opposes(
 
     `pillar_opposition` is Direction.BULLISH when both pillars are BULLISH
     (i.e. blocks a BEARISH entry), Direction.BEARISH when both are BEARISH
-    (blocks a BULLISH entry), or None/UNDEFINED when the caller decided
-    no veto applies.
+    (blocks a BULLISH entry), Direction.UNDEFINED in eth_anchored mode as
+    a "block all directions" sentinel (fail-closed on missing/stale/undefined
+    bias, or biases that disagree across targets), or None when no veto
+    applies. Legacy "both" mode never returns UNDEFINED so the new sentinel
+    semantics are backward compatible.
     """
-    if pillar_opposition is None or pillar_opposition == Direction.UNDEFINED:
+    if pillar_opposition is None:
         return False
+    if pillar_opposition == Direction.UNDEFINED:
+        return True
     if direction == Direction.BULLISH and pillar_opposition == Direction.BEARISH:
         return True
     if direction == Direction.BEARISH and pillar_opposition == Direction.BULLISH:
