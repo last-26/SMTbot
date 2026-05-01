@@ -331,13 +331,12 @@ analysis:
   # stack. Reuses the ema_veto_* periods above. Fails open when either
   # pillar is missing / neutral / stale (> max_age_s). Rule #2 of the
   # pivot strategy: don't fight a united BTC+ETH tape on altcoins.
-  # 2026-04-30 Pass 3 Faz-A apply: Pass 2.5.F counter-factual pegger 56
-  # cross_asset_opposition reject row'unun WR'ı %51.4 — bot bu gate'le
-  # neredeyse yarı yarıya kaybeden setup'ları reddediyor; fakat aynı %51
-  # kazanan setup'ları da reddediyor → net negatif. Optuna 3-seed tune
-  # da bağımsız aynı kararı verdi (cross_asset_opposition_enabled=False
-  # 10 trial'ın 9'unda en iyi). Operator approval 2026-04-30.
-  cross_asset_veto_enabled: false
+  # 2026-04-30 Pass 3 Faz-A apply → 2026-05-01 REVERT. 19 trade post-apply
+  # window WR 36.8% (-5.02R, PF 0.65) vs PRE last-19 WR 63.2% (+5.85R).
+  # Altcoin tarafı (ETH+SOL+XRP) post-apply 1W/6L; gate kapalıyken altcoin
+  # koruması yok. Mevcut "BTC AND ETH ters" mantığı baseline; ETH-anchored
+  # tighten ayrı PR'da değerlendirilecek. Operator approval 2026-05-01.
+  cross_asset_veto_enabled: true
   cross_asset_veto_max_age_s: 300.0
   # Phase 7.D1 — premium/discount zone veto. When `true`, longs that sit
   # above the last N-bar swing midpoint and shorts below it are rejected
@@ -482,15 +481,14 @@ execution:
   # at +6 min, the next cycle re-evaluates and places fresh. Re-eval after
   # 20 closed trades: zone_timeout_cancel rate <40% of total cancels = OK,
   # >60% = window too tight, raise to 3 bars.
-  # 2026-04-30 Pass 3 Faz-A apply: 2 → 4 (~12 dk on 3m TF). Pass 2.5.F
-  # pegger 606 zone_timeout_cancel reject row'unun WR'ı %45.7 (228W/271L
-  # /107T) — bot pending limit'i çok erken iptal edip fill-could-have-
-  # happened setup'ları kaçırmış. Optuna 3-seed tune da bağımsız 4 önerdi
-  # (top 10 trial'ın hepsinde 4). Risk: 12 dk wait penceresinde market
-  # zone'dan uzaklaşırsa stale-fill setup geçersiz olabilir; hard-gate
-  # invalidation her cycle koştuğu için soft drift yine yakalanır.
-  # Operator approval 2026-04-30.
-  zone_max_wait_bars: 4
+  # 2026-04-30 Pass 3 Faz-A apply: 2 → 4 → 2026-05-01 REVERT + tighten:
+  # 4 → 1 (~3 dk on 3m TF). Post-apply 19-trade window'da bars>2 dilimi
+  # WR 20% / -3.44R; bars=2 dilimi de hasarlı (WR 20% / -3.35R). PRE-FazA
+  # bars=1 sweet spot (n=18, WR 66.7%, +8.45R). Operator hipotezi: per-
+  # cycle yeniden değerlendirme — pending 3 dk fill olmazsa cancel + bir
+  # sonraki cycle setup_planner yeniden hesaplar. Kalite yüksek dilime
+  # (bars 0+1) odaklanır. Operator approval 2026-05-01.
+  zone_max_wait_bars: 1
   zone_buffer_atr: 0.25
   zone_sl_buffer_atr: 0.5
   # 2026-04-28: 2.0 → 1.5 in lockstep with trading.default_rr_ratio.
