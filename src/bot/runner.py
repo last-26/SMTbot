@@ -1365,11 +1365,18 @@ class BotRunner:
         cfg = self.ctx.config
         if not cfg.execution.tp_dynamic_enabled:
             return
-        target_rr = cfg.execution.target_rr_ratio
-        if target_rr <= 0:
-            return
         snap = self.ctx.monitor.get_tracked_runner(symbol, pos_side)
         if snap is None:
+            return
+        # 2026-05-02 — Phase A regime-aware RR. The position carries the ADX
+        # regime captured at entry-time; resolve the per-regime override
+        # (`target_rr_ratio_per_regime[regime]` if set, else global). UNKNOWN
+        # / pre-Phase-A rehydrate rows fall back to the global value via the
+        # `effective_*` helpers — same behavior as before this commit when
+        # `target_rr_ratio_per_regime` is empty (default).
+        regime = snap.get("regime_at_entry")
+        target_rr = cfg.execution.effective_target_rr_ratio(regime)
+        if target_rr <= 0:
             return
         # Use plan_sl_price (immutable, the SL at fill time) for ratio math —
         # after SL-to-BE the mutable sl_price collapses to ~0.1% of entry,
@@ -1386,8 +1393,9 @@ class BotRunner:
         new_tp = entry + sign * target_rr * sl_distance
         # Guard against revising into a sub-floor RR if mark drifted past
         # entry (post-BE move or unusual book) — tp_min_rr_floor is a
-        # hard backstop on the proposed RR.
-        floor = cfg.execution.tp_min_rr_floor
+        # hard backstop on the proposed RR. Per-regime override applies
+        # the same way as target_rr above.
+        floor = cfg.execution.effective_tp_min_rr_floor(regime)
         if floor > 0:
             min_tp = entry + sign * floor * sl_distance
             if sign > 0 and new_tp < min_tp:
