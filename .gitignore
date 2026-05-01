@@ -37,6 +37,7 @@ data/models/
 data/journal.db
 data/trades.db
 data/trades.db.*
+data/kline_cache.db
 data/screenshots/
 
 # SQLite helper files (crash-time artifacts)
