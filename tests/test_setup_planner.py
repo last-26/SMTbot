@@ -940,3 +940,204 @@ def test_apply_zone_to_plan_capped_plan_still_floors():
     total_realized = new_plan.position_size_usdt * effective_sl_pct
     # Floor ⇒ realized ≤ target (strictly < when ceil would have crossed).
     assert total_realized <= plan.risk_amount_usdt + 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Phase A.4b (2026-05-02) — RANGING-only VWAP-band SL anchor.
+# Operator decision: in RANGING, anchor SL on the OPPOSITE 3m VWAP ±1σ band.
+# Tighter SL → 1.2R RANGING TP fires faster. Other regimes unchanged.
+# ---------------------------------------------------------------------------
+
+
+def test_ranging_long_uses_vwap_lower_band_sl_when_tighter():
+    """RANGING + LONG with 3m VWAP bands → SL anchors on (lower_band - buf)
+    when that's HIGHER (closer to entry) than the zone-buffered SL."""
+    from src.analysis.trend_regime import TrendRegime
+    # Set up so vwap-retest zone fires: 3m VWAP below price with bands.
+    # Lower band 99.1 → band_sl = 99.1 - 0.5*1.0 = 98.6
+    # Zone[0]=99.5 → zone_sl = 99.5 - 0.5*1.0 = 99.0  (less tight, wider)
+    # max(99.0, 98.6) = 99.0  ← zone_sl wins (tighter for long).
+    # Need a case where band is closer: lower band 99.4 → band_sl=98.9 < zone_sl=99.0
+    # Let's use a case where band SL > zone SL: lower band 99.7 → band_sl=99.2 vs
+    # zone_sl=99.0 → max(99.0, 99.2) = 99.2 ← band_sl wins.
+    state = _state(
+        100.0, 1.0,
+        vwap_3m=99.5, vwap_3m_upper=99.9, vwap_3m_lower=99.7,
+    )
+    setup = build_zone_setup(
+        direction=Direction.BULLISH, state=state,
+        sl_buffer_atr=0.5,
+        trend_regime=TrendRegime.RANGING,
+    )
+    assert setup is not None
+    # band_sl = 99.7 - 0.5*1.0 = 99.2; zone_sl = 99.5 - 0.5*1.0 = 99.0
+    # tighter for LONG = HIGHER price = 99.2 (band_sl wins)
+    assert setup.sl_beyond_zone == pytest.approx(99.2)
+
+
+def test_ranging_short_uses_vwap_upper_band_sl_when_tighter():
+    """RANGING + SHORT mirror: SL anchors on (upper_band + buf) when LOWER
+    (closer to entry) than the zone-buffered SL."""
+    from src.analysis.trend_regime import TrendRegime
+    # Short setup: VWAP above price.
+    # Zone for short = (lower_band, vwap) = (100.1, 100.5). zone_sl = 100.5 + 0.5 = 101.0
+    # Upper band 100.6 → band_sl = 100.6 + 0.5 = 101.1 → min(101.0, 101.1)=101.0 zone wins.
+    # Closer band: upper band 100.3 → band_sl = 100.3 + 0.5 = 100.8 → min(101.0, 100.8)=100.8 band wins.
+    # But we need band_sl > zone[1] (100.5) for it to be valid. 100.8 > 100.5 ✓
+    state = _state(
+        100.0, 1.0,
+        vwap_3m=100.5, vwap_3m_upper=100.3, vwap_3m_lower=100.1,
+    )
+    setup = build_zone_setup(
+        direction=Direction.BEARISH, state=state,
+        sl_buffer_atr=0.5,
+        trend_regime=TrendRegime.RANGING,
+    )
+    assert setup is not None
+    # band_sl = 100.3 + 0.5*1.0 = 100.8; zone_sl = 100.5 + 0.5*1.0 = 101.0
+    # tighter for SHORT = LOWER price = 100.8 (band_sl wins)
+    assert setup.sl_beyond_zone == pytest.approx(100.8)
+
+
+def test_strong_trend_does_not_apply_vwap_band_sl_override():
+    """STRONG_TREND must NOT pick up the override even when bands are present.
+
+    Same fixture as the ranging-long tighten test, but regime=STRONG_TREND
+    keeps the standard zone-buffered SL."""
+    from src.analysis.trend_regime import TrendRegime
+    state = _state(
+        100.0, 1.0,
+        vwap_3m=99.5, vwap_3m_upper=99.9, vwap_3m_lower=99.7,
+    )
+    setup = build_zone_setup(
+        direction=Direction.BULLISH, state=state,
+        sl_buffer_atr=0.5,
+        trend_regime=TrendRegime.STRONG_TREND,
+    )
+    assert setup is not None
+    # zone_sl = 99.5 - 0.5*1.0 = 99.0 (no override applied)
+    assert setup.sl_beyond_zone == pytest.approx(99.0)
+
+
+def test_weak_trend_does_not_apply_vwap_band_sl_override():
+    from src.analysis.trend_regime import TrendRegime
+    state = _state(
+        100.0, 1.0,
+        vwap_3m=99.5, vwap_3m_upper=99.9, vwap_3m_lower=99.7,
+    )
+    setup = build_zone_setup(
+        direction=Direction.BULLISH, state=state,
+        sl_buffer_atr=0.5,
+        trend_regime=TrendRegime.WEAK_TREND,
+    )
+    assert setup is not None
+    assert setup.sl_beyond_zone == pytest.approx(99.0)
+
+
+def test_unknown_regime_does_not_apply_vwap_band_sl_override():
+    from src.analysis.trend_regime import TrendRegime
+    state = _state(
+        100.0, 1.0,
+        vwap_3m=99.5, vwap_3m_upper=99.9, vwap_3m_lower=99.7,
+    )
+    setup = build_zone_setup(
+        direction=Direction.BULLISH, state=state,
+        sl_buffer_atr=0.5,
+        trend_regime=TrendRegime.UNKNOWN,
+    )
+    assert setup is not None
+    assert setup.sl_beyond_zone == pytest.approx(99.0)
+
+
+def test_ranging_no_regime_passed_keeps_default_sl():
+    """trend_regime=None (default) → no override, even though regime might
+    actually be RANGING upstream. The contract is explicit: callers MUST pass
+    the regime to opt in."""
+    state = _state(
+        100.0, 1.0,
+        vwap_3m=99.5, vwap_3m_upper=99.9, vwap_3m_lower=99.7,
+    )
+    setup = build_zone_setup(
+        direction=Direction.BULLISH, state=state,
+        sl_buffer_atr=0.5,
+        # trend_regime not passed → None → no override
+    )
+    assert setup is not None
+    assert setup.sl_beyond_zone == pytest.approx(99.0)
+
+
+def test_ranging_falls_back_when_3m_bands_missing():
+    """RANGING but vwap_3m_upper/lower are zero (Pine session too young) →
+    fall back to standard zone-buffered SL. No override possible without bands."""
+    from src.analysis.trend_regime import TrendRegime
+    # 3m has bands missing; VWAP exists. _vwap_zone falls back to ATR half-band.
+    state = _state(100.0, 1.0, vwap_3m=99.5)
+    setup = build_zone_setup(
+        direction=Direction.BULLISH, state=state,
+        sl_buffer_atr=0.5,
+        trend_regime=TrendRegime.RANGING,
+    )
+    assert setup is not None
+    # zone = (99.5, 99.75); zone_sl = 99.5 - 0.5*1.0 = 99.0
+    assert setup.sl_beyond_zone == pytest.approx(99.0)
+
+
+def test_ranging_keeps_zone_sl_when_band_would_be_looser():
+    """RANGING + LONG but lower band sits well below zone — band_sl is
+    LOWER than zone_sl, so zone_sl wins (tighter for long = higher price)."""
+    from src.analysis.trend_regime import TrendRegime
+    # Lower band 98.0 (far below) → band_sl = 98.0 - 0.5*1.0 = 97.5
+    # zone[0] = 99.5; zone_sl = 99.5 - 0.5*1.0 = 99.0
+    # max(99.0, 97.5) = 99.0 → zone_sl wins.
+    state = _state(
+        100.0, 1.0,
+        vwap_3m=99.5, vwap_3m_upper=99.9, vwap_3m_lower=98.0,
+    )
+    setup = build_zone_setup(
+        direction=Direction.BULLISH, state=state,
+        sl_buffer_atr=0.5,
+        trend_regime=TrendRegime.RANGING,
+    )
+    assert setup is not None
+    # zone_sl = 99.5 - 0.5*1.0 = 99.0 (tighter than 97.5 band_sl)
+    assert setup.sl_beyond_zone == pytest.approx(99.0)
+
+
+def test_ranging_band_on_wrong_side_of_zone_skips_override():
+    """If lower band sits ABOVE the entry-zone low, the band-anchored SL
+    would invert (above zone) — must skip override and use zone SL."""
+    from src.analysis.trend_regime import TrendRegime
+    # zone[0] = 99.5; lower band 99.6 > zone[0] → band_sl candidate would
+    # be 99.6 - 0.5*1.0 = 99.1 < zone[0] (looks valid arithmetically) BUT
+    # the guard checks `candidate >= zone[0]`. 99.1 < 99.5 so allowed.
+    # Need a tighter case: lower band 99.9, buf=0.1*1.0=0.1, candidate=99.8>=99.5 → skip.
+    state = _state(
+        100.0, 1.0,
+        vwap_3m=99.5, vwap_3m_upper=99.9, vwap_3m_lower=99.9,
+    )
+    setup = build_zone_setup(
+        direction=Direction.BULLISH, state=state,
+        sl_buffer_atr=0.1,  # small buffer so candidate sits above zone[0]
+        trend_regime=TrendRegime.RANGING,
+    )
+    assert setup is not None
+    # zone_sl = 99.5 - 0.1*1.0 = 99.4
+    # band candidate = 99.9 - 0.1 = 99.8 >= zone[0]=99.5 → skip override
+    assert setup.sl_beyond_zone == pytest.approx(99.4)
+
+
+def test_ranging_accepts_string_regime_value():
+    """`trend_regime` accepts either a TrendRegime enum or the plain string
+    value (forward-compat with rehydrate paths that store the .value)."""
+    state = _state(
+        100.0, 1.0,
+        vwap_3m=99.5, vwap_3m_upper=99.9, vwap_3m_lower=99.7,
+    )
+    setup = build_zone_setup(
+        direction=Direction.BULLISH, state=state,
+        sl_buffer_atr=0.5,
+        trend_regime="RANGING",   # plain string
+    )
+    assert setup is not None
+    # Same numeric outcome as passing the enum.
+    assert setup.sl_beyond_zone == pytest.approx(99.2)

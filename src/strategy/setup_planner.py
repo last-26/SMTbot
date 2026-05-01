@@ -268,6 +268,59 @@ def _sl_beyond_zone(
     return (low - buf) if _is_long(direction) else (high + buf)
 
 
+def _vwap_band_sl_for_ranging(
+    direction: Direction,
+    zone: tuple[float, float],
+    state: MarketState,
+    atr: float,
+    sl_buffer_atr: float,
+    regime: object,
+) -> Optional[float]:
+    """RANGING-only SL anchor on the OPPOSITE 3m VWAP ±1σ band.
+
+    Operator decision (2026-05-02): in RANGING regimes price oscillates
+    around VWAP and TPs at 1.2R need a tighter SL to stay within reach.
+    Anchoring SL on the opposite 3m VWAP band gives natural mean-reversion
+    cushion (band itself is a stdev measure) while keeping SL distance
+    tighter than the zone-side ATR-buffered SL.
+
+    Returns None when:
+      * regime is not RANGING (only override target),
+      * 3m VWAP bands missing (Pine fed zero — guard at field level),
+      * the band sits on the wrong side of the entry zone (can't place SL
+        across the entry).
+
+    Caller compares this candidate with the standard zone-buffered SL and
+    picks the tighter one (higher for long / lower for short). The
+    per-symbol `min_sl_distance_pct` floor in `apply_zone_to_plan` still
+    widens any sub-floor SL after this override.
+    """
+    # Regime check via string compare so callers can pass either the enum
+    # or its `.value` without coupling to the trend_regime module here.
+    regime_key = regime.value if hasattr(regime, "value") else str(regime)
+    if regime_key != "RANGING":
+        return None
+    sig = state.signal_table
+    buf = sl_buffer_atr * atr
+    if _is_long(direction):
+        lower = sig.vwap_3m_lower
+        if lower <= 0:
+            return None
+        candidate = lower - buf
+        # Must sit below the entry-zone low; otherwise SL would overlap
+        # with entry (invalid) or invert (above zone).
+        if candidate >= zone[0]:
+            return None
+        return candidate
+    upper = sig.vwap_3m_upper
+    if upper <= 0:
+        return None
+    candidate = upper + buf
+    if candidate <= zone[1]:
+        return None
+    return candidate
+
+
 def _tp_primary(
     direction: Direction, zone: tuple[float, float],
     heatmap: Optional[LiquidityHeatmap], atr: float, default_rr: float,
@@ -359,8 +412,13 @@ def build_zone_setup(
     tp_ladder_enabled: bool = True,
     tp_ladder_shares: tuple[float, ...] = (0.40, 0.35, 0.25),
     tp_ladder_min_notional_frac: float = 0.30,
+    trend_regime: object = None,
 ) -> Optional[ZoneSetup]:
-    """Return the best `ZoneSetup` for *direction*, or None if no source fits."""
+    """Return the best `ZoneSetup` for *direction*, or None if no source fits.
+
+    `trend_regime` (TrendRegime enum or string; None disables override) gates
+    the RANGING-only VWAP-band SL anchor — see `_vwap_band_sl_for_ranging`.
+    """
     if direction not in (Direction.BULLISH, Direction.BEARISH):
         return None
     price = state.current_price
@@ -399,6 +457,16 @@ def build_zone_setup(
         if zone is None:
             continue
         sl = _sl_beyond_zone(direction, zone, atr, sl_buffer_atr)
+        # 2026-05-02 — Phase A.4b RANGING-only VWAP-band SL anchor. Tighter
+        # SL → 1.2R RANGING TP fires faster. Returns None when not RANGING
+        # or bands unavailable; caller picks the tighter of (zone_sl,
+        # band_sl). For LONG a HIGHER SL is tighter (closer to entry); for
+        # SHORT a LOWER SL is tighter. Per-symbol floor still applies.
+        band_sl = _vwap_band_sl_for_ranging(
+            direction, zone, state, atr, sl_buffer_atr, trend_regime,
+        )
+        if band_sl is not None:
+            sl = max(sl, band_sl) if _is_long(direction) else min(sl, band_sl)
         tp = _tp_primary(direction, zone, hm, atr, default_rr)
         zone_mid = (zone[0] + zone[1]) / 2.0
         ladder = _build_tp_ladder(

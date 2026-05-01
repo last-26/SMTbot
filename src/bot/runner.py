@@ -3357,6 +3357,9 @@ class BotRunner:
                 tp_ladder_enabled=cfg.execution.tp_ladder_enabled,
                 tp_ladder_shares=tuple(cfg.execution.tp_ladder_shares),
                 tp_ladder_min_notional_frac=cfg.execution.tp_ladder_min_notional_frac,
+                # 2026-05-02 — Phase A.4b RANGING-only VWAP-band SL anchor.
+                # No-op for WEAK_TREND / STRONG_TREND / UNKNOWN.
+                trend_regime=trend_regime,
             )
         except Exception:
             logger.exception("zone_setup_build_failed symbol={}", symbol)
