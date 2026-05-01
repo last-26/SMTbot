@@ -639,6 +639,30 @@ class BybitClient:
             return 0.0
         return float(rows[0].get("markPrice") or 0.0)
 
+    def get_top_book(self, inst_id: str) -> tuple[float, float, float]:
+        """Return `(bid1, ask1, mark)` from `/v5/market/tickers`.
+
+        Used by the maker-first defensive close (Phase A.10) to place a
+        post-only LIMIT just outside the spread on the closing side
+        (ask + N*tick for long-close SELL, bid - N*tick for short-close
+        BUY) so the post-only validation always passes. Returns
+        `(0.0, 0.0, 0.0)` on missing rows / malformed payload — caller
+        falls back to market on any zero.
+        """
+        resp = self.session.get_tickers(
+            category=self.category, symbol=_to_bybit_symbol(inst_id),
+        )
+        result = _check(resp, "get_tickers")
+        rows = result.get("list") or []
+        if not rows:
+            return (0.0, 0.0, 0.0)
+        row = rows[0]
+        return (
+            float(row.get("bid1Price") or 0.0),
+            float(row.get("ask1Price") or 0.0),
+            float(row.get("markPrice") or 0.0),
+        )
+
     def get_contract_size(self, inst_id: str) -> float:
         """Per-contract base-coin multiplier (internal canonical convention,
         carried over from the pre-migration sizing layer).

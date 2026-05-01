@@ -575,6 +575,26 @@ class ExecutionConfig(BaseModel):
     weakening_min_mfe_r: float = 0.5
     weakening_max_history: int = 8
 
+    # 2026-05-02 — Phase A.10 maker-first defensive close. Replaces the
+    # `close_position()` market reduce on `_defensive_close()` (momentum_fade,
+    # ltf_reversal) with a post-only reduce-only LIMIT at mark ± offset_ticks,
+    # falling back to market after `defensive_close_maker_timeout_s` seconds
+    # if the limit hasn't filled. Operator-driven (post-2.31 fee audit):
+    # taker fees on close-side were dominating low-volatility exits.
+    #
+    #   defensive_close_use_maker — master toggle. False = legacy market behavior.
+    #   defensive_close_maker_offset_ticks — placement offset above mark for
+    #     long-close (SELL) / below mark for short-close (BUY). 1 tick is
+    #     enough to clear post-only validation in normal spreads; if the
+    #     offset is too tight Bybit returns 110047 (post-only-would-cross)
+    #     and the runner falls back to market immediately.
+    #   defensive_close_maker_timeout_s — wait window before market fallback.
+    #     30s ≈ 10 polls at 3s cadence; on a defensive trigger we already saw
+    #     N cycles of weakness, so a 30s maker attempt is acceptable risk.
+    defensive_close_use_maker: bool = True
+    defensive_close_maker_offset_ticks: int = 1
+    defensive_close_maker_timeout_s: int = 30
+
     # Position-attached TP/SL trigger-price source. "mark" = index-weighted
     # price across the major real-market venues (cross-exchange VWAP).
     # "last" = last trade on the Bybit book (default in Bybit V5).

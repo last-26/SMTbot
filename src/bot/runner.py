@@ -1140,6 +1140,13 @@ class BotRunner:
     # ── One tick ────────────────────────────────────────────────────────────
 
     async def run_once(self) -> None:
+        # 2026-05-02 — Phase A.10. Before draining closes, finalise any
+        # maker-first defensive close LIMIT that has passed its deadline
+        # without filling — cancel the limit + fire market fallback. The
+        # market reduce shows up as a CloseFill in the same cycle's
+        # _process_closes() drain below.
+        await self._finalize_expired_defensive_closes()
+
         # Drain closes once at the start — frees slots, updates risk manager.
         # Monitor polls all tracked (inst_id, pos_side) pairs regardless of
         # which symbol the chart currently shows, so this is symbol-agnostic.
@@ -2073,15 +2080,52 @@ class BotRunner:
         Idempotent via `defensive_close_in_flight`. The monitor will emit a
         CloseFill on its next poll, and `_handle_close` will stamp the reason
         on the journal row.
+
+        2026-05-02 — Phase A.10 maker-first close. When
+        `execution.defensive_close_use_maker=true` (default), tries to place
+        a post-only reduce-only LIMIT just outside the spread first
+        (ask+N*tick for long-close, bid-N*tick for short-close). On post-only
+        reject / placement failure / book-quote unavailable, falls back to
+        the legacy `close_position()` market reduce. The maker LIMIT is
+        timeout-cancelled by `_finalize_expired_defensive_closes()` in
+        run_once if it doesn't fill within
+        `defensive_close_maker_timeout_s`.
         """
         key = (symbol, side)
         if key in self.ctx.defensive_close_in_flight:
             return
         self.ctx.defensive_close_in_flight.add(key)
 
-        # On Bybit V5 the position-attached TP/SL clears automatically when
-        # the position closes — no separate algo cancel needed (compare the
-        # pre-migration cancel_algo loop that used to live here).
+        # 2026-05-02 — close_reason set BEFORE any close attempt so the
+        # journal stamping path has the reason regardless of which leg
+        # (maker LIMIT fill vs market fallback) actually closes.
+        close_reason_map = {
+            "ltf_reversal": "EARLY_CLOSE_LTF_REVERSAL",
+            "momentum_fade": "EARLY_CLOSE_MOMENTUM_FADE",
+        }
+        close_reason = close_reason_map.get(
+            reason, f"EARLY_CLOSE_{reason.upper()}"
+        )
+        self.ctx.pending_close_reasons[key] = close_reason
+
+        cfg_exec = self.ctx.config.execution
+        # Phase A.10 maker-first attempt. Skipped on master-toggle off; falls
+        # through to legacy market reduce.
+        if cfg_exec.defensive_close_use_maker:
+            placed = await self._try_place_defensive_maker_limit(
+                symbol, side, cfg_exec,
+            )
+            if placed:
+                logger.info(
+                    "defensive_close_triggered symbol={} side={} reason={} "
+                    "close_reason={} mode=maker_limit",
+                    symbol, side, reason, close_reason,
+                )
+                return  # market fallback fires only on timeout
+
+        # Legacy / fallback: market reduce. On Bybit V5 the position-attached
+        # TP/SL clears automatically when the position closes — no separate
+        # algo cancel needed.
         try:
             await asyncio.to_thread(
                 self.ctx.bybit_client.close_position, symbol, side,
@@ -2093,21 +2137,125 @@ class BotRunner:
             # close on its own; we don't want to spam the exchange.
             return
 
-        # 2026-05-02 — close_reason now derived from the `reason` arg so
-        # journal can distinguish LTF reversal from momentum-fade exits
-        # (Phase A.8). Pre-2026-05-02 caller passed only "ltf_reversal" →
-        # mapping below preserves the old close_reason verbatim.
-        close_reason_map = {
-            "ltf_reversal": "EARLY_CLOSE_LTF_REVERSAL",
-            "momentum_fade": "EARLY_CLOSE_MOMENTUM_FADE",
-        }
-        close_reason = close_reason_map.get(
-            reason, f"EARLY_CLOSE_{reason.upper()}"
-        )
-        self.ctx.pending_close_reasons[key] = close_reason
         logger.info("defensive_close_triggered symbol={} side={} reason={} "
-                    "close_reason={}",
+                    "close_reason={} mode=market",
                     symbol, side, reason, close_reason)
+
+    async def _try_place_defensive_maker_limit(
+        self, symbol: str, side: str, cfg_exec,
+    ) -> bool:
+        """Phase A.10 — try to place a post-only reduce-only LIMIT for a
+        defensive close. Returns True on placement success (caller skips
+        market fallback), False on any failure (caller market-closes
+        immediately). Failure modes:
+          * book quote unavailable (zero bid/ask)
+          * tick_size unknown
+          * post-only reject (110047) or other Bybit error
+        """
+        try:
+            bid, ask, _mark = await asyncio.to_thread(
+                self.ctx.bybit_client.get_top_book, symbol,
+            )
+        except Exception:
+            logger.exception(
+                "defensive_close_top_book_failed symbol={} side={} — "
+                "falling back to market", symbol, side,
+            )
+            return False
+        if bid <= 0 or ask <= 0:
+            return False
+        try:
+            spec = await asyncio.to_thread(
+                self.ctx.bybit_client.get_instrument_spec, symbol,
+            )
+        except Exception:
+            logger.exception(
+                "defensive_close_spec_failed symbol={} side={} — falling "
+                "back to market", symbol, side,
+            )
+            return False
+        tick = float(spec.get("tick_size") or 0.0)
+        if tick <= 0:
+            return False
+        offset_ticks = max(1, int(cfg_exec.defensive_close_maker_offset_ticks))
+        # LONG close = SELL above ask. SHORT close = BUY below bid.
+        # Both placements are guaranteed post-only valid (above ask /
+        # below bid is on the maker side of the book by definition).
+        if side == "long":
+            limit_px = ask + tick * offset_ticks
+        else:
+            limit_px = bid - tick * offset_ticks
+            if limit_px <= 0:
+                return False
+        try:
+            order_id = await asyncio.to_thread(
+                self.ctx.monitor.place_defensive_close_maker_limit,
+                symbol, side, limit_px,
+                int(cfg_exec.defensive_close_maker_timeout_s),
+            )
+        except Exception:
+            logger.exception(
+                "defensive_close_maker_place_exception symbol={} side={}",
+                symbol, side,
+            )
+            return False
+        return bool(order_id)
+
+    async def _finalize_expired_defensive_closes(self) -> None:
+        """Phase A.10 (2026-05-02). Run at the start of every `run_once`.
+
+        For each tracked position whose defensive-close maker LIMIT has
+        passed its deadline without filling: cancel the limit, then call
+        `close_position()` market reduce as fallback. The next
+        `_process_closes()` drain in the same cycle picks up the resulting
+        CloseFill (close_reason was already stamped in
+        `pending_close_reasons` at original `_defensive_close()` time).
+
+        No-op when nothing is in flight. Best-effort on cancel + market —
+        any exchange error is logged and `defensive_close_in_flight` stays
+        set so the runner doesn't re-fire defensive logic against the same
+        position before its close is observed.
+        """
+        try:
+            expired = self.ctx.monitor.iter_expired_defensive_close_limits()
+        except Exception:
+            logger.exception("iter_expired_defensive_close_limits_failed")
+            return
+        for inst_id, pos_side, order_id in expired:
+            logger.info(
+                "defensive_close_maker_timeout inst={} side={} ord={} — "
+                "cancel + market fallback", inst_id, pos_side, order_id,
+            )
+            try:
+                await asyncio.to_thread(
+                    self.ctx.bybit_client.cancel_order, inst_id, order_id,
+                )
+            except Exception as exc:
+                # Already-gone codes are fine (the limit may have just
+                # filled in a race with the deadline check). Other errors
+                # are logged but we still attempt the market fallback —
+                # if the limit DID just fill, market-reduce on a closed
+                # position returns empty + the next poll surfaces the
+                # close normally.
+                logger.warning(
+                    "defensive_close_maker_cancel_failed inst={} side={} "
+                    "ord={} err={!r} — proceeding with market fallback",
+                    inst_id, pos_side, order_id, exc,
+                )
+            try:
+                await asyncio.to_thread(
+                    self.ctx.bybit_client.close_position, inst_id, pos_side,
+                )
+            except Exception:
+                logger.exception(
+                    "defensive_close_market_fallback_failed inst={} side={}",
+                    inst_id, pos_side,
+                )
+            # Clear monitor state regardless — if market fallback failed,
+            # the next cycle's poll either sees the position still open
+            # (defensive_close_in_flight prevents re-firing maker LIMIT)
+            # or sees it closed and emits CloseFill normally.
+            self.ctx.monitor.clear_defensive_close_state(inst_id, pos_side)
 
     async def _read_last_bar(self) -> Optional[int]:
         """Best-effort read of the signal-table last_bar. None on any failure."""

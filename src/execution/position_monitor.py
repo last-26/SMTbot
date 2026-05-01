@@ -21,7 +21,7 @@ pos_side) key so it can detect the edge.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
 from loguru import logger
@@ -122,6 +122,15 @@ class _Tracked:
     # patterns. Memory-only; rehydrated positions restart with empty
     # history — same caveat as MFE/MAE.
     recent_confluence_history: list[float] = field(default_factory=list)
+    # 2026-05-02 — Phase A.10 maker-first defensive close in-flight state.
+    # Set when `_defensive_close()` places a post-only reduce-only LIMIT
+    # instead of a market reduce. The runner re-checks `deadline` each
+    # cycle and falls back to market if the limit hasn't filled. On
+    # successful maker fill, the existing close-detection path emits
+    # CloseFill normally; orphan cleanup cancels the limit if SL/TP fired
+    # first. Empty string / None when no maker-first close is pending.
+    defensive_close_limit_order_id: str = ""
+    defensive_close_deadline: Optional[datetime] = None
 
 
 @dataclass
@@ -282,6 +291,18 @@ class PositionMonitor:
                     self._cancel_tp_limit_best_effort(
                         tracked.inst_id,
                         tracked.mae_be_recovery_limit_order_id,
+                    )
+                # 2026-05-02 — Phase A.10 maker-first defensive close. If
+                # the position closed via another path (SL hit, TP limit
+                # fill, manual close, etc.) while a defensive maker LIMIT
+                # was still resting, cancel it best-effort. The limit was
+                # reduce-only so it stays inert post-close, but leaving
+                # it behind trips the next startup's orphan-pending-limit
+                # sweep.
+                if tracked.defensive_close_limit_order_id:
+                    self._cancel_tp_limit_best_effort(
+                        tracked.inst_id,
+                        tracked.defensive_close_limit_order_id,
                     )
                 # On Bybit V5 the position-attached TP/SL clears
                 # automatically when the position size hits zero — no
@@ -623,6 +644,100 @@ class PositionMonitor:
             t.inst_id, t.pos_side, limit_px, t.runner_size, res.order_id,
         )
         return res.order_id
+
+    def place_defensive_close_maker_limit(
+        self,
+        inst_id: str,
+        pos_side: str,
+        limit_px: float,
+        timeout_s: int,
+        margin_mode: str = "cross",
+    ) -> Optional[str]:
+        """Place a reduce-only post-only LIMIT to close the position as maker
+        (Phase A.10, 2026-05-02).
+
+        Used by `_defensive_close()` to capture maker fee on momentum_fade /
+        ltf_reversal exits instead of paying taker via market reduce. The
+        runner sets `defensive_close_deadline` to `now + timeout_s`; if the
+        limit hasn't filled by then a per-cycle finalisation step cancels
+        the limit and falls back to `close_position()` market.
+
+        Returns the order_id on success, or None on placement failure
+        (post-only would-cross / Bybit reject / position untracked). On
+        None, the caller MUST fall back to market close — the defensive
+        intent is to exit ASAP, so no retries here.
+        """
+        t = self._tracked.get((inst_id, pos_side))
+        if t is None:
+            return None
+        if t.runner_size <= 0:
+            return None
+        if t.defensive_close_limit_order_id:
+            # Already in flight — caller raced, idempotent no-op.
+            return t.defensive_close_limit_order_id
+        try:
+            res = self.client.place_reduce_only_limit(
+                inst_id=t.inst_id,
+                pos_side=t.pos_side,
+                size_contracts=int(t.runner_size),
+                px=limit_px,
+                td_mode=margin_mode,
+                post_only=True,
+            )
+        except Exception as exc:
+            code = getattr(exc, "code", None)
+            payload = getattr(exc, "payload", None)
+            logger.warning(
+                "defensive_close_maker_limit_place_failed inst={} side={} "
+                "px={} size={} err={!r} code={} payload={} — caller will "
+                "fall back to market reduce",
+                t.inst_id, t.pos_side, limit_px, t.runner_size,
+                exc, code, payload,
+            )
+            return None
+
+        t.defensive_close_limit_order_id = res.order_id
+        t.defensive_close_deadline = _utc_now() + timedelta(seconds=timeout_s)
+        logger.info(
+            "defensive_close_maker_limit_placed inst={} side={} px={} "
+            "size={} ord={} deadline_s={}",
+            t.inst_id, t.pos_side, limit_px, t.runner_size, res.order_id,
+            timeout_s,
+        )
+        return res.order_id
+
+    def iter_expired_defensive_close_limits(
+        self, now: Optional[datetime] = None,
+    ) -> list[tuple[str, str, str]]:
+        """Yield `(inst_id, pos_side, order_id)` triples for tracked
+        positions whose maker defensive-close LIMIT has passed its
+        deadline without filling.
+
+        Caller (runner) cancels the limit + fires `close_position()` market,
+        then calls `clear_defensive_close_state()` to reset tracking.
+        """
+        cutoff = now or _utc_now()
+        expired: list[tuple[str, str, str]] = []
+        for (inst_id, pos_side), t in self._tracked.items():
+            if not t.defensive_close_limit_order_id:
+                continue
+            if t.defensive_close_deadline is None:
+                continue
+            if cutoff >= t.defensive_close_deadline:
+                expired.append((inst_id, pos_side, t.defensive_close_limit_order_id))
+        return expired
+
+    def clear_defensive_close_state(
+        self, inst_id: str, pos_side: str,
+    ) -> None:
+        """Reset the maker defensive-close in-flight fields after the
+        runner has cancelled the limit and fired the market fallback (or
+        the limit filled and close-detection emitted CloseFill)."""
+        t = self._tracked.get((inst_id, pos_side))
+        if t is None:
+            return
+        t.defensive_close_limit_order_id = ""
+        t.defensive_close_deadline = None
 
     def trail_sl_to(
         self, inst_id: str, pos_side: str, new_sl: float, lock_r: float,
