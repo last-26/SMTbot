@@ -130,6 +130,19 @@ class TradeRecord(BaseModel):
     zone_wait_bars: Optional[int] = None
     zone_fill_latency_bars: Optional[int] = None
     trend_regime_at_entry: Optional[str] = None
+    # 2026-05-02 — Phase A.9 ADX numeric capture. The label-only
+    # `trend_regime_at_entry` discretizes ADX into 3 buckets; the raw triad
+    # (adx, +di, -di) for entry TF (3m) AND HTF (15m) gives Pass 3 GBT
+    # continuous regime features and direction-strength signal it can't get
+    # from the bucket label alone. NULL when the regime classifier returned
+    # UNKNOWN (insufficient bars / flat prices) or on rows written before
+    # the column landed.
+    adx_3m_at_entry: Optional[float] = None
+    plus_di_3m_at_entry: Optional[float] = None
+    minus_di_3m_at_entry: Optional[float] = None
+    adx_15m_at_entry: Optional[float] = None
+    plus_di_15m_at_entry: Optional[float] = None
+    minus_di_15m_at_entry: Optional[float] = None
     # 2026-04-27 drops: funding_z_6h / funding_z_24h (Phase 12 deferred,
     # never populated; RL pipeline computes rolling z over
     # derivatives_snapshots directly).
@@ -290,6 +303,17 @@ class RejectedSignal(BaseModel):
     # `cross_asset_opposition` rejects: were BTC + ETH really opposing?
     pillar_btc_bias: Optional[str] = None
     pillar_eth_bias: Optional[str] = None
+
+    # 2026-05-02 — Phase A.9 ADX numeric capture. Mirrors TradeRecord.* triad
+    # so reject counter-factuals carry the same continuous regime features
+    # as accepted trades. Pass 3 GBT can then condition reject-vs-accept
+    # WR splits on raw ADX rather than the 3-bucket label.
+    adx_3m_at_entry: Optional[float] = None
+    plus_di_3m_at_entry: Optional[float] = None
+    minus_di_3m_at_entry: Optional[float] = None
+    adx_15m_at_entry: Optional[float] = None
+    plus_di_15m_at_entry: Optional[float] = None
+    minus_di_15m_at_entry: Optional[float] = None
 
     # 2026-04-29 — Pass 2.5 reject pegger re-add. Stamped post-hoc by
     # `scripts/peg_rejected_outcomes.py` (Bybit kline forward-walk from

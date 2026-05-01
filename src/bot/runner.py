@@ -34,7 +34,11 @@ from loguru import logger
 from src.analysis.liquidity_heatmap import build_heatmap
 from src.analysis.multi_timeframe import calculate_confluence, score_direction
 from src.analysis.support_resistance import detect_sr_zones
-from src.analysis.trend_regime import TrendRegime, classify_trend_regime
+from src.analysis.trend_regime import (
+    TrendRegime,
+    TrendRegimeResult,
+    classify_trend_regime,
+)
 from src.bot.config import BotConfig
 from src.bot.lifecycle import install_shutdown_handlers
 from src.data.candle_buffer import MultiTFBuffer
@@ -411,6 +415,33 @@ def _top_n_heatmap_clusters(
     return out
 
 
+def _adx_triad_kwargs(
+    prefix: str,
+    result: Optional["TrendRegimeResult"],
+) -> dict:
+    """Phase A.9 — build the 3-key journal kwargs dict for an ADX result.
+
+    Emits `{adx_<prefix>_at_entry, plus_di_<prefix>_at_entry,
+    minus_di_<prefix>_at_entry}` with raw `compute_adx` values. UNKNOWN
+    (insufficient bars / flat prices) → all three NULL: the classifier
+    returns `adx=0.0` in that case but 0 is a legitimate computed value
+    elsewhere, so persist NULL to keep "insufficient data" distinguishable
+    from "computed zero" downstream.
+    """
+    keys = (
+        f"adx_{prefix}_at_entry",
+        f"plus_di_{prefix}_at_entry",
+        f"minus_di_{prefix}_at_entry",
+    )
+    if result is None or result.regime == TrendRegime.UNKNOWN:
+        return {k: None for k in keys}
+    return {
+        keys[0]: float(result.adx),
+        keys[1]: float(result.plus_di),
+        keys[2]: float(result.minus_di),
+    }
+
+
 def _derive_enrichment(
     state: MarketState,
     candles: Optional[list] = None,
@@ -540,6 +571,16 @@ class PendingSetupMeta:
     # caches were unavailable at placement (bridge=None, LTF timeout,
     # already-open HTF skip).
     oscillator_raw_values_at_placement: dict[str, dict] = field(default_factory=dict)
+    # 2026-05-02 — Phase A.9 ADX result captured at PLACEMENT TIME for
+    # entry TF + HTF. Carried through to fill's record_open and
+    # pending-cancel's record_rejected_signal so the journal row reflects
+    # the regime when the limit was placed (not when it filled / was
+    # canceled). None when the classifier returned no result for that TF
+    # (cache cold at placement, e.g. already-open skip on the same symbol
+    # in a prior cycle that the planner re-evaluated). The downstream
+    # `_adx_triad_kwargs` helper turns None / UNKNOWN into NULL columns.
+    adx_3m_result_at_placement: Optional[TrendRegimeResult] = None
+    adx_15m_result_at_placement: Optional[TrendRegimeResult] = None
 
 
 @dataclass
@@ -567,6 +608,12 @@ class BotContext:
     # so the zone-entry planner (Phase 7.C1) can source HTF FVGs / OBs / trend
     # without another TF switch. Cleared on already-open skip or refresh error.
     htf_state_cache: dict[str, MarketState] = field(default_factory=dict)
+    # 2026-05-02 — Phase A.9 HTF ADX result cached per-symbol after the HTF
+    # pass. Computed from the same htf_candles buffer used for S/R + state,
+    # so zero extra TV/Bybit calls. Pop'd alongside `htf_state_cache` on
+    # already-open skip / refresh error so a stale 15m regime never
+    # accompanies a fresh 3m row.
+    htf_adx_cache: dict[str, TrendRegimeResult] = field(default_factory=dict)
     # Latest LTF snapshot per-symbol (Madde B → F)
     ltf_cache: dict[str, LTFState] = field(default_factory=dict)
     # Last close per (symbol, side) — reentry gate (Madde C)
@@ -1990,6 +2037,8 @@ class BotRunner:
         proposed_sl_price: Optional[float] = None,
         proposed_tp_price: Optional[float] = None,
         proposed_rr_ratio: Optional[float] = None,
+        adx_3m_result: Optional[TrendRegimeResult] = None,
+        adx_15m_result: Optional[TrendRegimeResult] = None,
     ) -> None:
         """Persist a reject to `rejected_signals` (Phase 7.B1).
 
@@ -2081,6 +2130,9 @@ class BotRunner:
             price_change_1h_pct_at_entry=enrichment["price_change_1h_pct_at_entry"],
             price_change_4h_pct_at_entry=enrichment["price_change_4h_pct_at_entry"],
             liq_heatmap_top_clusters=enrichment["liq_heatmap_top_clusters"],
+            # 2026-05-02 — Phase A.9 ADX numeric capture (entry TF + HTF).
+            **_adx_triad_kwargs("3m", adx_3m_result),
+            **_adx_triad_kwargs("15m", adx_15m_result),
         )
 
     def _is_ltf_reversal(self, ltf: LTFState, open_side: str, max_age: int) -> bool:
@@ -2306,11 +2358,23 @@ class BotRunner:
                         min_touches=cfg.analysis.sr_min_touches,
                         zone_atr_mult=cfg.analysis.sr_zone_atr_mult,
                     )
+                    # 2026-05-02 — Phase A.9 HTF ADX numeric capture. Reuses
+                    # the same htf_candles buffer (no extra TV/Bybit call).
+                    # UNKNOWN result is still stashed so consumers can
+                    # disambiguate "computed but undefined" from "missing".
+                    self.ctx.htf_adx_cache[symbol] = classify_trend_regime(
+                        htf_candles,
+                        period=cfg.analysis.adx_period,
+                        ranging_threshold=cfg.analysis.trend_regime_ranging_threshold,
+                        strong_threshold=cfg.analysis.trend_regime_strong_threshold,
+                    )
                 else:
                     self.ctx.htf_sr_cache.pop(symbol, None)
+                    self.ctx.htf_adx_cache.pop(symbol, None)
             except Exception:
                 logger.exception("htf_refresh_failed symbol={}", symbol)
                 self.ctx.htf_sr_cache.pop(symbol, None)
+                self.ctx.htf_adx_cache.pop(symbol, None)
 
             # Phase 7.B4 — snapshot HTF MarketState (Pine tables for 15m) so
             # the zone-entry planner can read HTF FVG / OB / trend without a
@@ -2329,6 +2393,10 @@ class BotRunner:
             # Already-open skip: stale HTF state must not feed a later setup
             # planner when this symbol's position closes and the gate reopens.
             self.ctx.htf_state_cache.pop(symbol, None)
+            # Same rationale for the 15m ADX cache — when the position closes
+            # and the symbol reopens for entries, a stale regime from N
+            # cycles ago must not stamp the new trade row.
+            self.ctx.htf_adx_cache.pop(symbol, None)
 
         # 2b. LTF pass — read oscillator into LTFState, cache for Madde F.
         if self.ctx.bridge is not None and self.ctx.ltf_reader is not None:
@@ -2568,6 +2636,11 @@ class BotRunner:
             strong_threshold=cfg.analysis.trend_regime_strong_threshold,
         )
         trend_regime = trend_regime_result.regime
+        # 2026-05-02 — Phase A.9 HTF ADX numeric pulled from cache populated
+        # in the HTF pass above. None when this is the already-open skip
+        # branch or HTF refresh failed; downstream `_adx_triad_kwargs` then
+        # writes NULLs for the 15m triad.
+        htf_regime_result = self.ctx.htf_adx_cache.get(symbol)
 
         try:
             plan, reject_reason = build_trade_plan_with_reason(
@@ -2742,6 +2815,8 @@ class BotRunner:
                         state=state,
                         conf=conf,
                         candles=candles,
+                        adx_3m_result=trend_regime_result,
+                        adx_15m_result=htf_regime_result,
                     )
                 except Exception:
                     logger.debug("record_rejected_signal_failed symbol={}", symbol)
@@ -2796,6 +2871,8 @@ class BotRunner:
                 state=state,
                 candles=candles,
                 trend_regime=trend_regime,
+                adx_3m_result=trend_regime_result,
+                adx_15m_result=htf_regime_result,
             )
             if placed:
                 return  # wait for fill event
@@ -2831,6 +2908,8 @@ class BotRunner:
                     await self._record_reject(
                         symbol=symbol, reject_reason="no_setup_zone",
                         state=state, conf=conf, candles=candles,
+                        adx_3m_result=trend_regime_result,
+                        adx_15m_result=htf_regime_result,
                     )
                 except Exception:
                     logger.debug("no_setup_zone_reject_log_failed symbol={}", symbol)
@@ -2887,6 +2966,9 @@ class BotRunner:
                     if trend_regime and trend_regime != TrendRegime.UNKNOWN
                     else None
                 ),
+                # 2026-05-02 — Phase A.9 ADX numeric capture (entry + HTF).
+                **_adx_triad_kwargs("3m", trend_regime_result),
+                **_adx_triad_kwargs("15m", htf_regime_result),
                 on_chain_context=self._on_chain_context_dict(),
                 confluence_pillar_scores=dict(plan.confluence_pillar_scores or {}),
                 oscillator_raw_values=self._build_oscillator_raw_values(
@@ -3656,6 +3738,8 @@ class BotRunner:
         state: MarketState,
         candles: Optional[list] = None,
         trend_regime: Optional[TrendRegime] = None,
+        adx_3m_result: Optional[TrendRegimeResult] = None,
+        adx_15m_result: Optional[TrendRegimeResult] = None,
     ) -> bool:
         """Try to place a zone-based limit entry. Return True if a pending
         was registered, False otherwise (caller falls back to market path).
@@ -3785,6 +3869,11 @@ class BotRunner:
             oscillator_raw_values_at_placement=(
                 self._build_oscillator_raw_values(symbol, state)
             ),
+            # 2026-05-02 — Phase A.9 ADX results captured at placement time
+            # for entry TF + HTF. Same lock-the-decision-moment rationale
+            # as the oscillator snapshot.
+            adx_3m_result_at_placement=adx_3m_result,
+            adx_15m_result_at_placement=adx_15m_result,
         )
         logger.info(
             "zone_limit_placed symbol={} side={} order_id={} entry={:.4f} "
@@ -3980,6 +4069,17 @@ class BotRunner:
                 session=_session_str(state),
                 market_structure=_structure_str(state),
                 trend_regime_at_entry=meta.trend_regime_at_entry,
+                # 2026-05-02 — Phase A.9 ADX numeric stamped from PLACEMENT
+                # TIME (mirrors `trend_regime_at_entry` provenance, not from
+                # the current fill-moment cache). Fill may land minutes
+                # after placement; the regime that drove the decision is
+                # the one we want on the row.
+                **_adx_triad_kwargs(
+                    "3m", meta.adx_3m_result_at_placement,
+                ),
+                **_adx_triad_kwargs(
+                    "15m", meta.adx_15m_result_at_placement,
+                ),
                 on_chain_context=self._on_chain_context_dict(),
                 confluence_pillar_scores=dict(plan.confluence_pillar_scores or {}),
                 # 2026-04-22 (gece, late) — journal oscillator snapshot
@@ -4115,6 +4215,16 @@ class BotRunner:
                 price_change_1h_pct_at_entry=enrichment["price_change_1h_pct_at_entry"],
                 price_change_4h_pct_at_entry=enrichment["price_change_4h_pct_at_entry"],
                 liq_heatmap_top_clusters=enrichment["liq_heatmap_top_clusters"],
+                # 2026-05-02 — Phase A.9 ADX numeric stamped from PLACEMENT
+                # TIME (cancel may fire many bars after placement; the
+                # decision-moment regime is what we want for the
+                # counter-factual).
+                **_adx_triad_kwargs(
+                    "3m", meta.adx_3m_result_at_placement,
+                ),
+                **_adx_triad_kwargs(
+                    "15m", meta.adx_15m_result_at_placement,
+                ),
             )
         except Exception:
             logger.debug(

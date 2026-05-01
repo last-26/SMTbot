@@ -101,6 +101,20 @@ CREATE TABLE IF NOT EXISTS trades (
     zone_wait_bars          INTEGER,
     zone_fill_latency_bars  INTEGER,
     trend_regime_at_entry   TEXT,
+    -- 2026-05-02 — Phase A.9 ADX numeric capture. The `trend_regime_at_entry`
+    -- label discretizes ADX into 3 buckets via 20/30 thresholds; the raw
+    -- value lets Pass 3 GBT learn its own optimal boundary AND captures
+    -- direction strength independently via +DI / -DI. Persisted for entry
+    -- TF (3m) and HTF (15m) so multi-TF divergence patterns (e.g. 3m strong
+    -- but 15m flat) are reachable as continuous features. NULL on rows
+    -- written before this column or when the buffer was too short
+    -- (UNKNOWN regime → ADX undefined).
+    adx_3m_at_entry         REAL,
+    plus_di_3m_at_entry     REAL,
+    minus_di_3m_at_entry    REAL,
+    adx_15m_at_entry        REAL,
+    plus_di_15m_at_entry    REAL,
+    minus_di_15m_at_entry   REAL,
     -- funding_z_6h / funding_z_24h dropped 2026-04-27 (Phase 12 deferred,
     -- never populated; RL pipeline computes rolling z over
     -- derivatives_snapshots directly).
@@ -198,6 +212,18 @@ CREATE TABLE IF NOT EXISTS rejected_signals (
 
     pillar_btc_bias     TEXT,
     pillar_eth_bias     TEXT,
+
+    -- 2026-05-02 — Phase A.9 ADX numeric capture. Mirrors trades.* triad.
+    -- Rejected-signal counter-factual feeds Pass 3 GBT with the same
+    -- continuous regime features as accepted trades, so threshold tuning
+    -- of `cross_asset_veto_enabled` etc. can condition on raw ADX (not
+    -- the 3-bucket label). NULL on rows written before this column.
+    adx_3m_at_entry         REAL,
+    plus_di_3m_at_entry     REAL,
+    minus_di_3m_at_entry    REAL,
+    adx_15m_at_entry        REAL,
+    plus_di_15m_at_entry    REAL,
+    minus_di_15m_at_entry   REAL,
 
     -- 2026-04-29 — Pass 2.5 reject pegger re-add. Forward-walk Bybit
     -- klines from signal_timestamp; LONG → first SL hit = LOSS, first TP
@@ -415,6 +441,9 @@ _COLUMNS = [
     "nearest_liq_cluster_above_distance_atr", "nearest_liq_cluster_below_distance_atr",
     "setup_zone_source", "zone_wait_bars", "zone_fill_latency_bars",
     "trend_regime_at_entry",
+    # 2026-05-02 — Phase A.9 ADX numeric capture (trades + rejected mirror).
+    "adx_3m_at_entry", "plus_di_3m_at_entry", "minus_di_3m_at_entry",
+    "adx_15m_at_entry", "plus_di_15m_at_entry", "minus_di_15m_at_entry",
     "real_market_entry_valid", "real_market_exit_valid",
     "demo_artifact", "artifact_reason",
     "on_chain_context",
@@ -448,6 +477,9 @@ _REJECTED_COLUMNS = [
     "nearest_liq_cluster_above_notional", "nearest_liq_cluster_below_notional",
     "nearest_liq_cluster_above_distance_atr", "nearest_liq_cluster_below_distance_atr",
     "pillar_btc_bias", "pillar_eth_bias",
+    # 2026-05-02 — Phase A.9 ADX numeric capture (trades + rejected mirror).
+    "adx_3m_at_entry", "plus_di_3m_at_entry", "minus_di_3m_at_entry",
+    "adx_15m_at_entry", "plus_di_15m_at_entry", "minus_di_15m_at_entry",
     "hypothetical_outcome", "hypothetical_bars_to_tp", "hypothetical_bars_to_sl",
     "on_chain_context",
     "confluence_pillar_scores",
@@ -726,6 +758,23 @@ _MIGRATIONS = [
     "ALTER TABLE rejected_signals ADD COLUMN hypothetical_bars_to_tp INTEGER",
     "ALTER TABLE rejected_signals ADD COLUMN hypothetical_bars_to_sl INTEGER",
     "CREATE INDEX IF NOT EXISTS idx_rejected_outcome ON rejected_signals(hypothetical_outcome)",
+    # 2026-05-02 — Phase A.9 ADX numeric capture. Idempotent ALTERs (swallowed
+    # by `_apply_migrations` when the column already exists). Same triad
+    # (adx, +di, -di) for entry TF (3m) and HTF (15m). NULL on legacy rows;
+    # writer fills going forward whenever the regime classifier returns a
+    # non-UNKNOWN result for that TF.
+    "ALTER TABLE trades ADD COLUMN adx_3m_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN plus_di_3m_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN minus_di_3m_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN adx_15m_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN plus_di_15m_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN minus_di_15m_at_entry REAL",
+    "ALTER TABLE rejected_signals ADD COLUMN adx_3m_at_entry REAL",
+    "ALTER TABLE rejected_signals ADD COLUMN plus_di_3m_at_entry REAL",
+    "ALTER TABLE rejected_signals ADD COLUMN minus_di_3m_at_entry REAL",
+    "ALTER TABLE rejected_signals ADD COLUMN adx_15m_at_entry REAL",
+    "ALTER TABLE rejected_signals ADD COLUMN plus_di_15m_at_entry REAL",
+    "ALTER TABLE rejected_signals ADD COLUMN minus_di_15m_at_entry REAL",
 ]
 
 
@@ -756,6 +805,8 @@ def _record_to_row(rec: TradeRecord) -> tuple:
         rec.nearest_liq_cluster_above_distance_atr, rec.nearest_liq_cluster_below_distance_atr,
         rec.setup_zone_source, rec.zone_wait_bars, rec.zone_fill_latency_bars,
         rec.trend_regime_at_entry,
+        rec.adx_3m_at_entry, rec.plus_di_3m_at_entry, rec.minus_di_3m_at_entry,
+        rec.adx_15m_at_entry, rec.plus_di_15m_at_entry, rec.minus_di_15m_at_entry,
         (None if rec.real_market_entry_valid is None
          else int(rec.real_market_entry_valid)),
         (None if rec.real_market_exit_valid is None
@@ -791,6 +842,8 @@ def _rejected_to_row(rec: RejectedSignal) -> tuple:
         rec.nearest_liq_cluster_above_notional, rec.nearest_liq_cluster_below_notional,
         rec.nearest_liq_cluster_above_distance_atr, rec.nearest_liq_cluster_below_distance_atr,
         rec.pillar_btc_bias, rec.pillar_eth_bias,
+        rec.adx_3m_at_entry, rec.plus_di_3m_at_entry, rec.minus_di_3m_at_entry,
+        rec.adx_15m_at_entry, rec.plus_di_15m_at_entry, rec.minus_di_15m_at_entry,
         rec.hypothetical_outcome, rec.hypothetical_bars_to_tp, rec.hypothetical_bars_to_sl,
         (json.dumps(rec.on_chain_context)
          if rec.on_chain_context is not None else None),
@@ -838,6 +891,12 @@ def _row_to_rejected(row: aiosqlite.Row) -> RejectedSignal:
         nearest_liq_cluster_below_distance_atr=row["nearest_liq_cluster_below_distance_atr"],
         pillar_btc_bias=row["pillar_btc_bias"],
         pillar_eth_bias=row["pillar_eth_bias"],
+        adx_3m_at_entry=_safe_col(row, "adx_3m_at_entry"),
+        plus_di_3m_at_entry=_safe_col(row, "plus_di_3m_at_entry"),
+        minus_di_3m_at_entry=_safe_col(row, "minus_di_3m_at_entry"),
+        adx_15m_at_entry=_safe_col(row, "adx_15m_at_entry"),
+        plus_di_15m_at_entry=_safe_col(row, "plus_di_15m_at_entry"),
+        minus_di_15m_at_entry=_safe_col(row, "minus_di_15m_at_entry"),
         hypothetical_outcome=_safe_col(row, "hypothetical_outcome"),
         hypothetical_bars_to_tp=_safe_col(row, "hypothetical_bars_to_tp"),
         hypothetical_bars_to_sl=_safe_col(row, "hypothetical_bars_to_sl"),
@@ -989,6 +1048,12 @@ def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
         zone_wait_bars=_safe_col(row, "zone_wait_bars"),
         zone_fill_latency_bars=_safe_col(row, "zone_fill_latency_bars"),
         trend_regime_at_entry=_safe_col(row, "trend_regime_at_entry"),
+        adx_3m_at_entry=_safe_col(row, "adx_3m_at_entry"),
+        plus_di_3m_at_entry=_safe_col(row, "plus_di_3m_at_entry"),
+        minus_di_3m_at_entry=_safe_col(row, "minus_di_3m_at_entry"),
+        adx_15m_at_entry=_safe_col(row, "adx_15m_at_entry"),
+        plus_di_15m_at_entry=_safe_col(row, "plus_di_15m_at_entry"),
+        minus_di_15m_at_entry=_safe_col(row, "minus_di_15m_at_entry"),
         real_market_entry_valid=_safe_bool(row, "real_market_entry_valid"),
         real_market_exit_valid=_safe_bool(row, "real_market_exit_valid"),
         demo_artifact=_safe_bool(row, "demo_artifact"),
@@ -1111,6 +1176,13 @@ class TradeJournal:
         nearest_liq_cluster_above_distance_atr: Optional[float] = None,
         nearest_liq_cluster_below_distance_atr: Optional[float] = None,
         trend_regime_at_entry: Optional[str] = None,
+        # 2026-05-02 — Phase A.9 ADX numeric capture (entry TF + HTF triad).
+        adx_3m_at_entry: Optional[float] = None,
+        plus_di_3m_at_entry: Optional[float] = None,
+        minus_di_3m_at_entry: Optional[float] = None,
+        adx_15m_at_entry: Optional[float] = None,
+        plus_di_15m_at_entry: Optional[float] = None,
+        minus_di_15m_at_entry: Optional[float] = None,
         on_chain_context: Optional[dict] = None,
         confluence_pillar_scores: Optional[dict[str, float]] = None,
         oscillator_raw_values: Optional[dict[str, dict]] = None,
@@ -1189,6 +1261,12 @@ class TradeJournal:
             nearest_liq_cluster_above_distance_atr=nearest_liq_cluster_above_distance_atr,
             nearest_liq_cluster_below_distance_atr=nearest_liq_cluster_below_distance_atr,
             trend_regime_at_entry=trend_regime_at_entry,
+            adx_3m_at_entry=adx_3m_at_entry,
+            plus_di_3m_at_entry=plus_di_3m_at_entry,
+            minus_di_3m_at_entry=minus_di_3m_at_entry,
+            adx_15m_at_entry=adx_15m_at_entry,
+            plus_di_15m_at_entry=plus_di_15m_at_entry,
+            minus_di_15m_at_entry=minus_di_15m_at_entry,
             on_chain_context=on_chain_context,
             confluence_pillar_scores=dict(confluence_pillar_scores or {}),
             oscillator_raw_values=dict(oscillator_raw_values or {}),
@@ -1353,6 +1431,13 @@ class TradeJournal:
         nearest_liq_cluster_below_distance_atr: Optional[float] = None,
         pillar_btc_bias: Optional[str] = None,
         pillar_eth_bias: Optional[str] = None,
+        # 2026-05-02 — Phase A.9 ADX numeric capture (entry TF + HTF triad).
+        adx_3m_at_entry: Optional[float] = None,
+        plus_di_3m_at_entry: Optional[float] = None,
+        minus_di_3m_at_entry: Optional[float] = None,
+        adx_15m_at_entry: Optional[float] = None,
+        plus_di_15m_at_entry: Optional[float] = None,
+        minus_di_15m_at_entry: Optional[float] = None,
         on_chain_context: Optional[dict] = None,
         confluence_pillar_scores: Optional[dict[str, float]] = None,
         oscillator_raw_values: Optional[dict[str, dict]] = None,
@@ -1406,6 +1491,12 @@ class TradeJournal:
             nearest_liq_cluster_below_distance_atr=nearest_liq_cluster_below_distance_atr,
             pillar_btc_bias=pillar_btc_bias,
             pillar_eth_bias=pillar_eth_bias,
+            adx_3m_at_entry=adx_3m_at_entry,
+            plus_di_3m_at_entry=plus_di_3m_at_entry,
+            minus_di_3m_at_entry=minus_di_3m_at_entry,
+            adx_15m_at_entry=adx_15m_at_entry,
+            plus_di_15m_at_entry=plus_di_15m_at_entry,
+            minus_di_15m_at_entry=minus_di_15m_at_entry,
             on_chain_context=on_chain_context,
             confluence_pillar_scores=dict(confluence_pillar_scores or {}),
             oscillator_raw_values=dict(oscillator_raw_values or {}),

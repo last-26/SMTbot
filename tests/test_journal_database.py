@@ -313,6 +313,92 @@ async def test_record_open_persists_zone_metadata_when_provided():
         assert fetched.zone_fill_latency_bars == 3
 
 
+async def test_schema_has_adx_columns_on_both_tables():
+    """Phase A.9 — entry-TF + HTF ADX numeric columns must materialize on
+    fresh DBs (schema) AND on legacy DBs (idempotent migrations)."""
+    async with TradeJournal(":memory:") as j:
+        conn = j._require_conn()
+        async with conn.execute("PRAGMA table_info(trades)") as cur:
+            trades_cols = {r["name"] for r in await cur.fetchall()}
+        async with conn.execute("PRAGMA table_info(rejected_signals)") as cur:
+            rej_cols = {r["name"] for r in await cur.fetchall()}
+    expected = {
+        "adx_3m_at_entry", "plus_di_3m_at_entry", "minus_di_3m_at_entry",
+        "adx_15m_at_entry", "plus_di_15m_at_entry", "minus_di_15m_at_entry",
+    }
+    assert expected.issubset(trades_cols)
+    assert expected.issubset(rej_cols)
+
+
+async def test_record_open_persists_adx_triads():
+    """Phase A.9 — record_open round-trips both entry-TF (3m) and HTF (15m)
+    ADX triads. Operator wants raw ADX + DI components for Pass 3 GBT
+    instead of just the 3-bucket label."""
+    async with TradeJournal(":memory:") as j:
+        rec = await j.record_open(
+            _plan(), _report(), symbol="BTC-USDT-SWAP",
+            signal_timestamp=datetime(2026, 5, 2, tzinfo=UTC),
+            adx_3m_at_entry=32.4,
+            plus_di_3m_at_entry=27.0,
+            minus_di_3m_at_entry=12.5,
+            adx_15m_at_entry=22.1,
+            plus_di_15m_at_entry=18.0,
+            minus_di_15m_at_entry=14.3,
+        )
+        fetched = await j.get_trade(rec.trade_id)
+    assert fetched.adx_3m_at_entry == 32.4
+    assert fetched.plus_di_3m_at_entry == 27.0
+    assert fetched.minus_di_3m_at_entry == 12.5
+    assert fetched.adx_15m_at_entry == 22.1
+    assert fetched.plus_di_15m_at_entry == 18.0
+    assert fetched.minus_di_15m_at_entry == 14.3
+
+
+async def test_record_open_adx_defaults_null_when_omitted():
+    """Phase A.9 — back-compat. Callers that don't pass ADX kwargs get
+    NULLs in journal, matching legacy rows."""
+    async with TradeJournal(":memory:") as j:
+        rec = await j.record_open(
+            _plan(), _report(), symbol="BTC-USDT-SWAP",
+            signal_timestamp=datetime(2026, 5, 2, tzinfo=UTC),
+        )
+        fetched = await j.get_trade(rec.trade_id)
+    assert fetched.adx_3m_at_entry is None
+    assert fetched.plus_di_3m_at_entry is None
+    assert fetched.minus_di_3m_at_entry is None
+    assert fetched.adx_15m_at_entry is None
+    assert fetched.plus_di_15m_at_entry is None
+    assert fetched.minus_di_15m_at_entry is None
+
+
+async def test_record_rejected_signal_persists_adx_triads():
+    """Phase A.9 — reject path mirrors trades for counter-factual GBT.
+    Pass 3 needs raw ADX on both reject and trade rows so threshold
+    boundary tuning conditions on the same continuous feature."""
+    async with TradeJournal(":memory:") as j:
+        await j.record_rejected_signal(
+            symbol="ETH-USDT-SWAP",
+            direction=Direction.BEARISH,
+            reject_reason="below_confluence",
+            signal_timestamp=datetime(2026, 5, 2, 12, tzinfo=UTC),
+            adx_3m_at_entry=18.0,
+            plus_di_3m_at_entry=15.0,
+            minus_di_3m_at_entry=18.5,
+            adx_15m_at_entry=33.5,
+            plus_di_15m_at_entry=30.0,
+            minus_di_15m_at_entry=10.0,
+        )
+        rejs = await j.list_rejected_signals()
+    assert len(rejs) == 1
+    r = rejs[0]
+    assert r.adx_3m_at_entry == 18.0
+    assert r.plus_di_3m_at_entry == 15.0
+    assert r.minus_di_3m_at_entry == 18.5
+    assert r.adx_15m_at_entry == 33.5
+    assert r.plus_di_15m_at_entry == 30.0
+    assert r.minus_di_15m_at_entry == 10.0
+
+
 # ── record_rejected_signal ──────────────────────────────────────────────────
 
 
