@@ -379,7 +379,11 @@ class JournalConfig(BaseModel):
     # zero extra Bybit / TV calls. RL trajectory analysis only — never feeds
     # entry/exit decisions.
     position_snapshot_enabled: bool = True
-    position_snapshot_cadence_s: int = 300
+    # 2026-05-02 — Phase A.7 default 300 → 180. Operator: snapshots more
+    # frequent than the cycle (~3 min) carry no extra information; align
+    # to cycle cadence. All snapshot data comes from cached state (no
+    # extra TV/Bybit calls regardless of cadence).
+    position_snapshot_cadence_s: int = 180
 
     @field_validator("position_snapshot_cadence_s")
     @classmethod

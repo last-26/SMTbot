@@ -291,3 +291,64 @@ async def test_returned_record_is_pydantic_model():
         )
         out = await j.get_position_snapshots("trade-pydantic")
         assert isinstance(out[0], PositionSnapshotRecord)
+
+
+# Phase A.7 (2026-05-02) — confluence_score_now column
+
+async def test_confluence_score_now_round_trip():
+    """Writer accepts the new column; reader returns the value."""
+    async with TradeJournal(":memory:") as j:
+        await j.record_position_snapshot(
+            trade_id="trade-conf",
+            captured_at=datetime(2026, 5, 2, 12, tzinfo=UTC),
+            mark_price=100.0, unrealized_pnl_usdt=0.0,
+            unrealized_pnl_r=0.0, mfe_r_so_far=0.5, mae_r_so_far=-0.3,
+            current_sl_price=99.0,
+            confluence_score_now=3.25,
+        )
+        out = await j.get_position_snapshots("trade-conf")
+        assert len(out) == 1
+        assert out[0].confluence_score_now == pytest.approx(3.25)
+
+
+async def test_confluence_score_now_defaults_to_null():
+    """Callers that don't pass `confluence_score_now` get NULL → reader
+    surfaces None. Pre-Phase-A.7 rows on existing DBs read this way too."""
+    async with TradeJournal(":memory:") as j:
+        await j.record_position_snapshot(
+            trade_id="trade-no-conf",
+            captured_at=datetime(2026, 5, 2, 12, tzinfo=UTC),
+            mark_price=100.0, unrealized_pnl_usdt=0.0,
+            unrealized_pnl_r=0.0, mfe_r_so_far=0.0, mae_r_so_far=0.0,
+            current_sl_price=99.0,
+        )
+        out = await j.get_position_snapshots("trade-no-conf")
+        assert out[0].confluence_score_now is None
+
+
+async def test_confluence_score_now_supports_signed_values():
+    """Sign carries direction: positive = aligned with position, negative
+    = opposing. Stored as REAL so both signs round-trip cleanly."""
+    async with TradeJournal(":memory:") as j:
+        # Aligned (positive)
+        await j.record_position_snapshot(
+            trade_id="trade-aligned",
+            captured_at=datetime(2026, 5, 2, 12, tzinfo=UTC),
+            mark_price=100.0, unrealized_pnl_usdt=0.0,
+            unrealized_pnl_r=0.0, mfe_r_so_far=0.0, mae_r_so_far=0.0,
+            current_sl_price=99.0,
+            confluence_score_now=4.5,
+        )
+        # Opposing (negative)
+        await j.record_position_snapshot(
+            trade_id="trade-opposed",
+            captured_at=datetime(2026, 5, 2, 12, tzinfo=UTC),
+            mark_price=100.0, unrealized_pnl_usdt=0.0,
+            unrealized_pnl_r=0.0, mfe_r_so_far=0.0, mae_r_so_far=0.0,
+            current_sl_price=99.0,
+            confluence_score_now=-2.75,
+        )
+        aligned = await j.get_position_snapshots("trade-aligned")
+        opposed = await j.get_position_snapshots("trade-opposed")
+        assert aligned[0].confluence_score_now == pytest.approx(4.5)
+        assert opposed[0].confluence_score_now == pytest.approx(-2.75)

@@ -425,7 +425,13 @@ journal:
   # derivatives/on-chain/oscillator drift every cadence_s seconds for every
   # OPEN position. Reuses cached state — zero extra Bybit / TV calls.
   position_snapshot_enabled: true
-  position_snapshot_cadence_s: 300       # 5 min; validator clamps [60, 3600]
+  # 2026-05-02 — Phase A.7 cadence 300 → 180s (= 1 cycle). Snapshot data
+  # all comes from cached state, no extra TV/Bybit calls. Higher cadence
+  # gives a 5x better intra-trade trajectory for Pass 3 GBT (max-profit
+  # objective needs the MFE/MAE peaks the old 5-min snap was missing).
+  # Operator: cycle is ~3 min anyway; snaps faster than cycle have no
+  # extra information.
+  position_snapshot_cadence_s: 180       # 3 min; validator clamps [60, 3600]
 
 reentry:
   min_bars_after_close: 3             # cooldown in bars of entry_timeframe

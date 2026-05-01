@@ -376,7 +376,15 @@ CREATE TABLE IF NOT EXISTS position_snapshots (
     -- Oscillator + VWAP drift (from BotContext.last_market_state_per_symbol,
     -- NULL on first cycle for that symbol post-restart).
     oscillator_3m_now_json          TEXT,
-    vwap_3m_distance_atr_now        REAL
+    vwap_3m_distance_atr_now        REAL,
+
+    -- 2026-05-02 — Phase A.7 directional confluence score at snapshot time
+    -- (signed: positive = aligned with position direction, negative =
+    -- opposing). Used by the Phase A.8 weakening-momentum exit gate to
+    -- detect "same-direction signal weakening over cycles" trajectories.
+    -- NULL when the cycle didn't compute a confluence score for this
+    -- symbol (e.g. position open path skips plan-builder).
+    confluence_score_now            REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_position_snapshots_trade_id    ON position_snapshots(trade_id);
@@ -621,6 +629,10 @@ _MIGRATIONS = [
     "ON position_snapshots(trade_id)",
     "CREATE INDEX IF NOT EXISTS idx_position_snapshots_captured_at "
     "ON position_snapshots(captured_at)",
+    # 2026-05-02 — Phase A.7 directional confluence score at snap time.
+    # Idempotent ALTER on existing DBs (swallowed by _apply_migrations
+    # when the column already exists).
+    "ALTER TABLE position_snapshots ADD COLUMN confluence_score_now REAL",
     # 2026-04-27 — schema cleanup pass. Drop 27 columns that audit
     # confirmed are either 100% NULL across the Bybit dataset
     # (kod doldurmuyor) or 1-distinct constants (no information).
@@ -1755,6 +1767,7 @@ class TradeJournal:
         on_chain_flow_alignment_now: Optional[float] = None,
         oscillator_3m_now_json: Optional[dict] = None,
         vwap_3m_distance_atr_now: Optional[float] = None,
+        confluence_score_now: Optional[float] = None,
     ) -> int:
         """Append one row to `position_snapshots` — intra-trade time-series.
 
@@ -1781,8 +1794,9 @@ class TradeJournal:
                    derivatives_long_liq_1h_now, derivatives_short_liq_1h_now,
                    on_chain_btc_netflow_now_usd, on_chain_stablecoin_pulse_now,
                    on_chain_flow_alignment_now,
-                   oscillator_3m_now_json, vwap_3m_distance_atr_now
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   oscillator_3m_now_json, vwap_3m_distance_atr_now,
+                   confluence_score_now
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 trade_id,
                 _iso(captured_at),
@@ -1806,6 +1820,7 @@ class TradeJournal:
                 (None if oscillator_3m_now_json is None
                  else json.dumps(oscillator_3m_now_json)),
                 vwap_3m_distance_atr_now,
+                confluence_score_now,
             ),
         )
         await conn.commit()
@@ -1857,6 +1872,10 @@ class TradeJournal:
                 on_chain_flow_alignment_now=r["on_chain_flow_alignment_now"],
                 oscillator_3m_now_json=parsed_osc,
                 vwap_3m_distance_atr_now=r["vwap_3m_distance_atr_now"],
+                confluence_score_now=(
+                    r["confluence_score_now"]
+                    if "confluence_score_now" in r.keys() else None
+                ),
             ))
         return out
 

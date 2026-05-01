@@ -401,3 +401,10 @@ class PositionSnapshotRecord(BaseModel):
     on_chain_flow_alignment_now: Optional[float] = None
     oscillator_3m_now_json: dict[str, Any] = Field(default_factory=dict)
     vwap_3m_distance_atr_now: Optional[float] = None
+    # 2026-05-02 — Phase A.7. Signed directional confluence score at the
+    # snapshot moment. Positive = aligned with position direction (bullish
+    # for long, bearish for short); negative = opposing. Used by the Phase
+    # A.8 weakening-momentum exit gate to detect declining-confluence
+    # trajectories. None when the cycle didn't compute confluence (legacy
+    # rows pre-Phase-A.7, or first cycle for a symbol post-restart).
+    confluence_score_now: Optional[float] = None

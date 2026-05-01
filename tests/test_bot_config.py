@@ -462,7 +462,8 @@ def test_journal_position_snapshot_defaults_match_yaml_intent():
     raw = _valid_raw()
     cfg = BotConfig(**raw)
     assert cfg.journal.position_snapshot_enabled is True
-    assert cfg.journal.position_snapshot_cadence_s == 300
+    # 2026-05-02 — Phase A.7: 300 → 180s (= ~1 cycle).
+    assert cfg.journal.position_snapshot_cadence_s == 180
 
 
 def test_journal_position_snapshot_cadence_rejects_below_floor():
