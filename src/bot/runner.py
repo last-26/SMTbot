@@ -1491,6 +1491,77 @@ class BotRunner:
                 "sl_lock_dispatch_failed symbol={} side={}", symbol, pos_side,
             )
 
+    async def _maybe_trail_sl_after_mfe(
+        self, symbol: str, pos_side: str, state: MarketState,
+    ) -> None:
+        """Multi-step trailing SL after MFE-lock (Phase A.5, 2026-05-02).
+
+        Where MFE-lock (`_maybe_lock_sl_on_mfe`) is a one-shot move-to-BE
+        at MFE 1.0R, this gate pulls SL forward in `trail_step_r`-sized
+        increments AFTER the position passes `trail_arm_at_mfe_r` (default
+        1.5R, i.e. at least 0.5R past BE-lock). On each cycle:
+
+          1. Read current MFE in plan-R units.
+          2. Snap to a step-aligned target lock R: floor((mfe_r - dist) / step) * step.
+          3. If target ≤ last_trail_lock_r → no-op (monotonic guard).
+          4. Else compute new_sl = entry + sign × target_lock_r × plan_sl_dist
+             and call `monitor.trail_sl_to(...)`.
+
+        Disabled regimes (default RANGING) skip the gate entirely — TP at
+        1.2R fires before trailing would arm at 1.5R, so trailing in
+        RANGING is wasted churn.
+
+        Distance = 0.5R behind MFE gives wick clearance: a typical 3m
+        candle wick from peak can't reach the locked SL.
+        """
+        cfg = self.ctx.config
+        if not cfg.execution.trail_sl_enabled:
+            return
+        snap = self.ctx.monitor.get_tracked_runner(symbol, pos_side)
+        if snap is None:
+            return
+        regime = snap.get("regime_at_entry")
+        if cfg.execution.is_trailing_disabled_for(regime):
+            return
+        plan_sl = float(snap.get("plan_sl_price") or 0.0)
+        entry = float(snap.get("entry_price") or 0.0)
+        if plan_sl <= 0 or entry <= 0:
+            return
+        sl_distance = abs(entry - plan_sl)
+        if sl_distance <= 0:
+            return
+        current_px = float(getattr(state, "current_price", 0.0) or 0.0)
+        if current_px <= 0:
+            return
+        sign = 1 if pos_side == "long" else -1
+        mfe_r = sign * (current_px - entry) / sl_distance
+        arm = float(cfg.execution.trail_arm_at_mfe_r)
+        if mfe_r < arm:
+            return
+        step = float(cfg.execution.trail_step_r)
+        distance = float(cfg.execution.trail_distance_r)
+        if step <= 0 or distance < 0:
+            return
+        # Snap MFE-distance to step-aligned R-grid. floor() means we lock at
+        # a CONSERVATIVE level (always behind current MFE), never overshoot.
+        import math as _math
+        raw_target = mfe_r - distance
+        target_lock_r = _math.floor(raw_target / step) * step
+        last_lock = float(snap.get("last_trail_lock_r") or 0.0)
+        if target_lock_r <= last_lock:
+            return
+        new_sl = entry + sign * target_lock_r * sl_distance
+        try:
+            await asyncio.to_thread(
+                self.ctx.monitor.trail_sl_to, symbol, pos_side, new_sl,
+                target_lock_r,
+            )
+        except Exception:
+            logger.exception(
+                "sl_trail_dispatch_failed symbol={} side={}",
+                symbol, pos_side,
+            )
+
     def _pillar_opposition_for(self, symbol: str) -> Optional[Direction]:
         """Cross-asset opposition signal for `symbol`.
 
@@ -2165,6 +2236,13 @@ class BotRunner:
         # One-shot per position.
         if open_side:
             await self._maybe_lock_sl_on_mfe(symbol, open_side, state)
+
+        # 2g. Phase A.5 (2026-05-02) — multi-step trailing SL after MFE-lock.
+        # Distinct from 2f: this runs after BE-lock fires and pulls SL
+        # forward in 0.5R steps as MFE keeps growing. Disabled in RANGING
+        # by default (TP at 1.2R fires before trailing would arm at 1.5R).
+        if open_side:
+            await self._maybe_trail_sl_after_mfe(symbol, open_side, state)
 
         # 3. Symbol-level dedup — skip open if we still hold anything OR
         # already have a pending limit entry waiting for fill (Phase 7.C4).

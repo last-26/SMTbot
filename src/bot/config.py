@@ -508,6 +508,29 @@ class ExecutionConfig(BaseModel):
     sl_lock_mfe_r: float = 1.3
     sl_lock_at_r: float = 0.0
 
+    # 2026-05-02 — Phase A.5 multi-step trailing SL after MFE-lock.
+    # MFE-lock (above) is a one-shot move-to-BE. Trailing SL kicks in AFTER
+    # BE-lock and pulls SL forward in 0.5R steps as MFE keeps growing,
+    # locking incremental profit. Wick-safe: trail_distance_r=0.5R behind
+    # MFE, so a typical 3m-candle wick from peak can't take us out.
+    # Disabled in RANGING by default (TP at 1.2R fires before trailing
+    # would arm at 1.5R; trailing in RANGING is wasted churn).
+    #
+    # Math (with arm=1.5R, step=0.5R, distance=0.5R):
+    #   MFE 1.0R: BE-lock fires (separate gate) → SL=entry+fee_buffer
+    #   MFE 1.5R: trail arms → SL = entry+1.0R (= 1.5R - 0.5R distance)
+    #   MFE 2.0R: SL = entry+1.5R
+    #   MFE 2.5R: SL = entry+2.0R (or TP fires for STRONG_TREND)
+    # Monotonic-only: each step asserts target_r > last_trail_lock_r so a
+    # mark dip can't widen SL backward.
+    trail_sl_enabled: bool = False
+    trail_arm_at_mfe_r: float = 1.5
+    trail_step_r: float = 0.5
+    trail_distance_r: float = 0.5
+    # Regime keys (TrendRegime enum string values) where trailing is OFF.
+    # Validated against the same enum as the per-regime RR dicts above.
+    trail_disabled_regimes: list[str] = Field(default_factory=list)
+
     # Position-attached TP/SL trigger-price source. "mark" = index-weighted
     # price across the major real-market venues (cross-exchange VWAP).
     # "last" = last trade on the Bybit book (default in Bybit V5).
@@ -562,6 +585,32 @@ class ExecutionConfig(BaseModel):
                     f"target_rr_ratio_per_regime[{key}]={val} out of [0.5, 5.0]"
                 )
         return v
+
+    @field_validator("trail_disabled_regimes")
+    @classmethod
+    def _validate_trail_disabled_regimes(cls, v: list[str]) -> list[str]:
+        if not v:
+            return v
+        from src.analysis.trend_regime import TrendRegime
+        valid_keys = {r.value for r in TrendRegime}
+        for key in v:
+            if key not in valid_keys:
+                raise ValueError(
+                    f"trail_disabled_regimes entry '{key}' is not a valid "
+                    f"TrendRegime value (allowed: {sorted(valid_keys)})"
+                )
+        return v
+
+    def is_trailing_disabled_for(self, regime: object) -> bool:
+        """Return True when trailing SL must be inert for `regime`.
+
+        UNKNOWN / None / missing → False (trailing allowed by default; the
+        caller's `trail_sl_enabled` master flag still gates everything).
+        """
+        if regime is None:
+            return False
+        key = regime.value if hasattr(regime, "value") else str(regime)
+        return key in self.trail_disabled_regimes
 
     @field_validator("tp_min_rr_floor_per_regime")
     @classmethod

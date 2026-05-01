@@ -99,6 +99,11 @@ class _Tracked:
     # the value through every callback. None = unknown / pre-Phase-A
     # rehydrate row → callers fall back to the global value.
     regime_at_entry: Optional[str] = None
+    # 2026-05-02 — Phase A.5 multi-step trailing SL state. Tracks the
+    # highest R-level SL has been pulled to so the trailing gate can guard
+    # monotonic-only updates (a mark dip must NEVER widen SL backward).
+    # 0.0 = trailing has not fired yet on this position.
+    last_trail_lock_r: float = 0.0
 
 
 @dataclass
@@ -473,6 +478,7 @@ class PositionMonitor:
             # dynamic-TP gate look up `target_rr_ratio_per_regime` via
             # `cfg.execution.effective_target_rr_ratio(regime)`.
             "regime_at_entry": t.regime_at_entry,
+            "last_trail_lock_r": t.last_trail_lock_r,
         }
 
     def get_tracked(
@@ -487,6 +493,74 @@ class PositionMonitor:
         the BE / lock flags in one shot.
         """
         return self._tracked.get((inst_id, pos_side))
+
+    def trail_sl_to(
+        self, inst_id: str, pos_side: str, new_sl: float, lock_r: float,
+    ) -> bool:
+        """Multi-step trailing-SL update (Phase A.5, 2026-05-02).
+
+        Distinct from `lock_sl_at` (BE-lock one-shot): this is called
+        repeatedly as MFE keeps growing, each call pulling SL forward by
+        `trail_step_r`. Monotonic-only — the new SL must be more
+        conservative (higher for long, lower for short) than the current
+        cached SL, otherwise this is a no-op.
+
+        Returns True when trading-stop was successfully updated;
+        False when the call was skipped (degenerate state, monotonic
+        violation) or rejected (Bybit error). On rejection the cached
+        SL stays at its prior value and `last_trail_lock_r` is NOT
+        bumped, so the next cycle retries.
+        """
+        key = (inst_id, pos_side)
+        t = self._tracked.get(key)
+        if t is None:
+            return False
+        if t.runner_size <= 0:
+            return False
+        if t.tp2_price is None or t.tp2_price <= 0:
+            return False
+        # Same TP-side guard as lock_sl_at — never tighten past TP.
+        if t.pos_side == "long" and new_sl >= t.tp2_price:
+            return False
+        if t.pos_side == "short" and new_sl <= t.tp2_price:
+            return False
+        # Monotonic SL guard — must be MORE protective than current SL.
+        cur_sl = float(t.sl_price or 0.0)
+        if cur_sl > 0:
+            if t.pos_side == "long" and new_sl <= cur_sl:
+                return False
+            if t.pos_side == "short" and new_sl >= cur_sl:
+                return False
+        # Monotonic R-level guard (caller passes the proposed lock_r;
+        # we re-check here as a defensive belt against drift).
+        if lock_r <= t.last_trail_lock_r:
+            return False
+        try:
+            self.client.set_position_tpsl(
+                inst_id=t.inst_id,
+                pos_side=t.pos_side,
+                stop_loss=new_sl,
+                trigger_px_type=self.algo_trigger_px_type,
+            )
+        except Exception as exc:
+            code = getattr(exc, "code", None)
+            payload = getattr(exc, "payload", None)
+            logger.warning(
+                "sl_trail_trading_stop_failed inst={} side={} new_sl={} "
+                "lock_r={} tp={} err={!r} code={} payload={} — keeping "
+                "previous SL, will retry next cycle",
+                t.inst_id, t.pos_side, new_sl, lock_r, t.tp2_price,
+                exc, code, payload,
+            )
+            return False
+
+        t.sl_price = new_sl
+        t.last_trail_lock_r = lock_r
+        logger.info(
+            "sl_trailed inst={} side={} size={} new_sl={} lock_r={} tp={}",
+            t.inst_id, t.pos_side, t.runner_size, new_sl, lock_r, t.tp2_price,
+        )
+        return True
 
     def lock_sl_at(
         self, inst_id: str, pos_side: str, new_sl: float,

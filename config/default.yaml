@@ -608,6 +608,24 @@ execution:
   sl_lock_mfe_r: 1.0
   sl_lock_at_r: 0.0
 
+  # 2026-05-02 — Phase A.5 multi-step trailing SL. Kicks in AFTER the
+  # MFE-lock at 1.0R. Once MFE >= trail_arm_at_mfe_r (1.5R), every
+  # additional trail_step_r (0.5R) advance pulls SL forward to
+  # `MFE - trail_distance_r` (locked profit grows in 0.5R chunks).
+  # Wick-safe: 0.5R behind MFE clears typical 3m candle wicks from peak.
+  # Disabled in RANGING — TP at 1.2R fires before trailing would arm at
+  # 1.5R, so trailing in RANGING is wasted churn. STRONG_TREND is the
+  # main beneficiary (TP=2.5R, MFE often runs to 2R+ when active).
+  # Monotonic: never widens SL backward; an MFE dip doesn't release locked
+  # profit. Per-cycle gate (calls trading-stop only when target_lock_r
+  # advances; no API churn on flat MFE).
+  trail_sl_enabled: true
+  trail_arm_at_mfe_r: 1.5
+  trail_step_r: 0.5
+  trail_distance_r: 0.5
+  trail_disabled_regimes:
+    - RANGING
+
   # 2026-04-19 — Position-attached TP/SL trigger price source. "mark" uses
   # Bybit's index-weighted mark price (cross-exchange VWAP across the
   # major real-market venues), "last" uses the Bybit book's last trade.

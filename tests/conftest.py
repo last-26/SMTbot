@@ -220,6 +220,19 @@ class FakeMonitor:
         self.revise_calls.append((inst_id, pos_side, new_tp))
         return True
 
+    def trail_sl_to(self, inst_id: str, pos_side: str, new_sl: float,
+                    lock_r: float) -> bool:
+        if not hasattr(self, "trail_calls"):
+            self.trail_calls: list[tuple[str, str, float, float]] = []
+        self.trail_calls.append((inst_id, pos_side, new_sl, lock_r))
+        return True
+
+    def lock_sl_at(self, inst_id: str, pos_side: str, new_sl: float) -> bool:
+        if not hasattr(self, "lock_sl_calls"):
+            self.lock_sl_calls: list[tuple[str, str, float]] = []
+        self.lock_sl_calls.append((inst_id, pos_side, new_sl))
+        return True
+
     def poll_pending(self) -> list:
         # 2026-04-29 — runner.run_once now drains pending-limit events via
         # `_process_pending` → `monitor.poll_pending()`. Default empty
