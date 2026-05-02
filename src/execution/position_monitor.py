@@ -131,6 +131,11 @@ class _Tracked:
     # first. Empty string / None when no maker-first close is pending.
     defensive_close_limit_order_id: str = ""
     defensive_close_deadline: Optional[datetime] = None
+    # 2026-05-02 — Position open timestamp. Threaded into CloseFill so
+    # `bybit_client.enrich_close_fill` can reject `/v5/position/closed-pnl`
+    # rows whose `createdTime` predates this open (those are from previous
+    # closes on the same symbol+side and would mis-stamp the journal).
+    opened_at: datetime = field(default_factory=_utc_now)
 
 
 @dataclass
@@ -224,11 +229,13 @@ class PositionMonitor:
         plan_sl_price: Optional[float] = None,
         tp_limit_order_id: str = "",
         regime_at_entry: Optional[str] = None,
+        opened_at: Optional[datetime] = None,
     ) -> None:
         # plan_sl_price semantics: None → caller didn't provide one, default to
         # sl_price (correct at fill time). An explicit 0.0 → "unknown, disable
         # dynamic-TP revise" (rehydrate path for post-BE positions).
         resolved_plan_sl = sl_price if plan_sl_price is None else plan_sl_price
+        resolved_opened_at = opened_at if opened_at is not None else _utc_now()
         self._tracked[(inst_id, pos_side)] = _Tracked(
             inst_id=inst_id, pos_side=pos_side, size=size, entry_price=entry_price,
             initial_size=size, algo_ids=list(algo_ids or []), tp2_price=tp2_price,
@@ -237,6 +244,7 @@ class PositionMonitor:
             plan_sl_price=resolved_plan_sl,
             tp_limit_order_id=tp_limit_order_id,
             regime_at_entry=regime_at_entry,
+            opened_at=resolved_opened_at,
         )
 
     def poll(
@@ -930,6 +938,7 @@ class PositionMonitor:
             exit_price=0.0,
             size=t.size,
             pnl_usdt=0.0,
+            opened_at=t.opened_at,
         )
 
     @property

@@ -114,3 +114,10 @@ class CloseFill:
     pnl_usdt: float
     fee_usdt: float = 0.0
     closed_at: datetime = field(default_factory=_utc_now)
+    # Position open time, threaded through from `_Tracked.opened_at`. Used by
+    # `bybit_client.enrich_close_fill` to filter stale `/v5/position/closed-pnl`
+    # rows: a row whose `createdTime` predates the position's open is from a
+    # previous close on the same symbol+side, never the current one. Without
+    # this filter a Bybit lag in writing the new close row causes enrich to
+    # latch onto the previous close and stamp wrong exit/PnL on the journal.
+    opened_at: Optional[datetime] = None

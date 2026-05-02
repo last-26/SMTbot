@@ -2991,6 +2991,7 @@ class BotRunner:
             sl_price=plan.sl_price, runner_size=runner_size,
             plan_sl_price=plan.sl_price,
             regime_at_entry=regime_str,
+            opened_at=_utc_now(),
         )
         self.ctx.risk_mgr.register_trade_opened()
 
@@ -4083,6 +4084,7 @@ class BotRunner:
             plan_sl_price=plan.sl_price,
             tp_limit_order_id=tp_limit_order_id,
             regime_at_entry=meta.trend_regime_at_entry,
+            opened_at=_utc_now(),
         )
         self.ctx.risk_mgr.register_trade_opened()
 
@@ -4518,6 +4520,7 @@ class BotRunner:
                 plan_sl_price=plan_sl,
                 tp_limit_order_id=tp_limit_order_id,
                 regime_at_entry=rec.trend_regime_at_entry,
+                opened_at=rec.entry_timestamp,
             )
             self.ctx.open_trade_ids[(rec.symbol, pos_side)] = rec.trade_id
             self.ctx.open_trade_opened_at[(rec.symbol, pos_side)] = rec.entry_timestamp

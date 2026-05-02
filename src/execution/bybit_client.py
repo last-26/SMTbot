@@ -37,6 +37,7 @@ Out of scope:
 from __future__ import annotations
 
 import socket
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1081,29 +1082,47 @@ class BybitClient:
             ))
         return snapshots
 
+    # Slack subtracted from `fill.opened_at` when filtering closed-pnl rows.
+    # Bybit's `createdTime` for the close-row is the time the closing fill
+    # printed; the bot's `opened_at` is wall-clock at register_open. A few
+    # seconds of clock drift between the two is normal; widen the cutoff
+    # slightly so we don't drop a legitimate close that printed a hair before
+    # `opened_at`. A genuinely stale row (previous close on the same symbol)
+    # will be many minutes / hours older, far past this slack.
+    _ENRICH_OPENED_AT_SLACK_S = 5.0
+    # Retry budget when no closed-pnl row newer than `opened_at` is returned.
+    # Bybit occasionally lags writing the close row by 1-3s after the
+    # position size hits 0; without retry the enrich falls through to the
+    # previous close on the same symbol+side and stamps wrong PnL/exit. Two
+    # short retries keep the loop responsive while clearing realistic lag.
+    _ENRICH_RETRY_DELAYS_S: tuple[float, ...] = (1.5, 3.0)
+
     def enrich_close_fill(self, fill: CloseFill) -> CloseFill:
         """Replace the PositionMonitor's zeroed PnL/exit fields with real
         values from /v5/position/closed-pnl.
 
         PositionMonitor.poll() emits CloseFill with pnl_usdt=0 / exit_price=0
         because it only knows the position disappeared. Here we fetch the
-        most recent closed-pnl row matching this symbol + posIdx and fill in
-        `closedPnl` / `avgExitPrice` / `closeFee + openFee`. When no matching
-        row is returned we pass the fill through unchanged so the caller can
-        still log / decide; zero-PnL closes are never silently accepted up
-        the stack.
+        most recent closed-pnl rows matching this symbol + posIdx and fill in
+        `closedPnl` / `avgExitPrice` / `closeFee + openFee`.
+
+        When `fill.opened_at` is set, we filter out rows whose `createdTime`
+        predates the position's open (with a small slack). This guards
+        against a Bybit lag in writing the new close row: without the filter
+        the function would latch onto the previous close on the same
+        symbol+side and stamp wrong values on the journal. If no row newer
+        than `opened_at` is visible on the first call we retry briefly
+        before giving up — a genuine maker-fill close usually surfaces in
+        closed-pnl within ~3s.
+
+        When no matching row is returned (or only stale rows survive the
+        filter after retries) we pass the fill through unchanged so the
+        caller can still log / decide; zero-PnL closes are never silently
+        accepted up the stack.
         """
         bybit_sym = _to_bybit_symbol(fill.inst_id)
-        try:
-            resp = self.session.get_closed_pnl(
-                category=self.category, symbol=bybit_sym, limit=5,
-            )
-        except Exception as exc:
-            raise BybitError(f"get_closed_pnl: {exc}") from exc
-        result = _check(resp, "get_closed_pnl")
-        rows = result.get("list") or []
-
         target_idx = _pos_idx(fill.pos_side) if fill.pos_side else 0
+
         # closed-pnl rows include `side` (the closing side) — for a long
         # position the close is "Sell", for short it's "Buy". Match either via
         # explicit positionIdx (newer Bybit responses) or derive from side.
@@ -1121,17 +1140,56 @@ class BybitClient:
                 return 2  # closed a short
             return 0
 
-        matches = [
-            r for r in rows
-            if r.get("symbol") == bybit_sym and (
-                target_idx == 0 or _row_pos_idx(r) == target_idx
-            )
-        ]
-        if not matches:
-            return fill
-
         def _ts(r: dict) -> int:
             return int(r.get("updatedTime") or r.get("createdTime") or "0")
+
+        # Compute the cutoff once per call: rows older than this are stale
+        # leftovers from previous closes on the same symbol+side and must be
+        # rejected. None disables the filter (back-compat for callers that
+        # haven't threaded opened_at yet).
+        opened_at_cutoff_ms: Optional[int] = None
+        if fill.opened_at is not None:
+            opened_at_cutoff_ms = int(
+                (fill.opened_at.timestamp() - self._ENRICH_OPENED_AT_SLACK_S) * 1000
+            )
+
+        def _fetch_and_filter() -> list[dict]:
+            try:
+                # limit=20 (was 5) leaves headroom: a single symbol with a
+                # burst of closes (e.g. multiple defensive-close fills in
+                # one session) can otherwise push the latest row off the
+                # window, leaving only stale ones to match.
+                resp = self.session.get_closed_pnl(
+                    category=self.category, symbol=bybit_sym, limit=20,
+                )
+            except Exception as exc:
+                raise BybitError(f"get_closed_pnl: {exc}") from exc
+            result = _check(resp, "get_closed_pnl")
+            rows = result.get("list") or []
+            base = [
+                r for r in rows
+                if r.get("symbol") == bybit_sym and (
+                    target_idx == 0 or _row_pos_idx(r) == target_idx
+                )
+            ]
+            if opened_at_cutoff_ms is None:
+                return base
+            return [r for r in base if _ts(r) >= opened_at_cutoff_ms]
+
+        matches = _fetch_and_filter()
+        for delay_s in self._ENRICH_RETRY_DELAYS_S:
+            if matches:
+                break
+            time.sleep(delay_s)
+            matches = _fetch_and_filter()
+
+        if not matches:
+            # No row newer than opened_at after retries. Returning the raw
+            # fill (zero PnL/exit) is the lesser evil: caller logs it as a
+            # missing-enrichment row rather than the journal absorbing a
+            # stale previous-close's numbers.
+            return fill
+
         row = max(matches, key=_ts)
 
         exit_price = float(row.get("avgExitPrice") or fill.exit_price)
@@ -1157,6 +1215,7 @@ class BybitClient:
             pnl_usdt=pnl,
             fee_usdt=fee_signed,
             closed_at=closed_at,
+            opened_at=fill.opened_at,
         )
 
 
