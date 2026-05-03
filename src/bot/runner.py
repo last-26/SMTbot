@@ -1317,18 +1317,30 @@ class BotRunner:
                     symbol_, pos_side,
                 )
                 continue
-            # `cancel_pending` returns the CANCELED event but does NOT
-            # queue it — only `poll_pending` events flow through
-            # `_process_pending`. We must dispatch the handler ourselves
-            # so the journal records a `pending_hard_gate_invalidated`
-            # rejected_signals row + the pending_setups slot is cleared.
+            # `cancel_pending` usually returns CANCELED, but the
+            # 2026-04-27 phantom-cancel resistance path can also return
+            # FILLED with reason="phantom_cancel_recovery" — Bybit gone-
+            # codes cover BOTH "already cancelled" AND "already filled",
+            # and `_verify_cancel_terminal_state` discovers the latter.
+            # Route by event_type: FILLED → fill flow (attach TP/SL +
+            # register + journal) so the live position is tracked, NOT
+            # silently lost. CANCELED → journal the
+            # `pending_hard_gate_invalidated` rejected_signals row.
+            #
+            # Why dispatch ourselves: only `poll_pending` events flow
+            # through `_process_pending`; cancel_pending's return is
+            # synchronous and out-of-band.
             if ev is not None:
                 try:
-                    await self._handle_pending_canceled(ev)
+                    if ev.event_type == "FILLED":
+                        await self._handle_pending_filled(ev)
+                    else:
+                        await self._handle_pending_canceled(ev)
                 except Exception:
                     logger.exception(
-                        "pending_hard_gate_handler_failed symbol={} side={}",
-                        symbol_, pos_side,
+                        "pending_hard_gate_handler_failed symbol={} "
+                        "side={} event_type={}",
+                        symbol_, pos_side, ev.event_type,
                     )
 
     async def _maybe_revise_tp_dynamic(
