@@ -2518,6 +2518,160 @@ class BotRunner:
         # the new TF (Operatör 2026-05-04 dinamik settle).
         return await self._wait_for_pine_settle_dual(baselines)
 
+    async def _audit_ha_native_decision(
+        self, symbol: str, market_state: MarketState,
+    ) -> None:
+        """Run HA-native planner in audit-only mode + write decision_log row.
+
+        Operatör 2026-05-04 HA-native runner integration üçüncü adımı.
+        Bu cycle'da bot'un HA-native gate'i ne dediği kayıt edilir;
+        karar mekanizması mevcut (5-pillar) path ile devam eder. Pass 3
+        GBT için zengin substrat — her cycle her sembol için 1 row.
+
+        Failure tolerated: any exception logs + skips (bu cycle audit
+        atlanır, runner cycle devam eder). HA-native primary mode için
+        sıradaki adımda evaluate_entry sonucu TradePlan'a beslenecek.
+        """
+        try:
+            from src.data.models import Direction
+            from src.strategy.ha_native_planner import (
+                EntryContext,
+                HANativeConfig,
+                evaluate_entry,
+            )
+
+            ha_state = self.ctx.ha_state_registry.get(symbol)
+            if ha_state is None:
+                return  # state pump henüz çalışmadı bu sembol için
+
+            sig = market_state.signal_table
+
+            # MSS direction parse: "BULLISH@69450" → Direction.BULLISH
+            last_mss_dir: Optional[Direction] = None
+            if sig.last_mss:
+                upper = sig.last_mss.upper()
+                if "BULL" in upper:
+                    last_mss_dir = Direction.BULLISH
+                elif "BEAR" in upper:
+                    last_mss_dir = Direction.BEARISH
+
+            # Best bid/ask from Bybit ticker (cached snapshot, fast)
+            best_bid: Optional[float] = None
+            best_ask: Optional[float] = None
+            if self.ctx.bybit_client is not None:
+                try:
+                    bid, ask, _mark = await asyncio.to_thread(
+                        self.ctx.bybit_client.get_top_book, symbol,
+                    )
+                    if bid > 0 and ask > 0:
+                        best_bid, best_ask = bid, ask
+                except Exception:
+                    pass  # ticker fail — gates'le ilgili değil
+
+            # Swing levels from MarketState liquidity (proxy: nearest above/below)
+            last_swing_low: Optional[float] = None
+            last_swing_high: Optional[float] = None
+            if sig.liquidity_below:
+                # Yakın seviye = price'ın altındaki en yüksek değer
+                last_swing_low = max(sig.liquidity_below)
+            if sig.liquidity_above:
+                # Yakın seviye = price'ın üstündeki en düşük değer
+                last_swing_high = min(sig.liquidity_above)
+
+            # Pending + open pairs from BotContext state
+            def _side_to_dir(pos_side: str) -> Direction:
+                s = (pos_side or "").lower()
+                if s in ("buy", "long", "bullish"):
+                    return Direction.BULLISH
+                return Direction.BEARISH
+
+            pending_pairs = frozenset(
+                (sym, _side_to_dir(side))
+                for (sym, side) in self.ctx.pending_setups.keys()
+            )
+            open_pairs = frozenset(
+                (sym, _side_to_dir(side))
+                for (sym, side) in self.ctx.open_trade_ids.keys()
+            )
+
+            ctx = EntryContext(
+                symbol=symbol,
+                market_state=market_state,
+                ha_state=ha_state,
+                last_mss_direction=last_mss_dir,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                last_swing_low=last_swing_low,
+                last_swing_high=last_swing_high,
+                pending_pairs=pending_pairs,
+                open_pairs=open_pairs,
+                # adx_3m, plus_di_3m, minus_di_3m, mss_count_recent —
+                # not yet wired (sıradaki commit'te ADX cache + MSS density
+                # counter eklenecek). Şu an None bırakılır; gate'leri
+                # etkilemez (mss_count_recent default 0 → mss_density gate
+                # PASS; adx artık planner gate'lerinde değil — kaldırıldı
+                # operatör 2026-05-04 revize'sinde).
+            )
+
+            ha_cfg = HANativeConfig()  # default knobs
+            decision = evaluate_entry(ctx, ha_cfg)
+
+            # Map planner decision → decision_log enum
+            if decision.is_take:
+                decision_str = "ENTRY_TAKEN"
+            elif decision.decision == "REJECT":
+                decision_str = "ENTRY_REJECTED"
+            else:  # NO_SETUP
+                decision_str = "NO_ACTION"
+
+            osc = market_state.oscillator
+            session_name = (
+                sig.session.value if hasattr(sig.session, "value") else None
+            )
+            vwap_3m_side = (
+                "above" if sig.price > sig.vwap_3m and sig.vwap_3m > 0
+                else "below" if sig.vwap_3m > 0
+                else None
+            )
+
+            await self.ctx.journal.record_decision_log(
+                timestamp=_utc_now(),
+                symbol=symbol,
+                decision=decision_str,
+                decision_reason=decision.reason,
+                price=sig.price,
+                atr_14=sig.atr_14,
+                ha_color_1m=sig.ha_color_1m,
+                ha_color_3m=sig.ha_color_3m,
+                ha_color_15m=sig.ha_color_15m,
+                ha_color_4h=sig.ha_color_4h,
+                ha_streak_1m=sig.ha_streak_1m,
+                ha_streak_3m=sig.ha_streak_3m,
+                ha_streak_15m=sig.ha_streak_15m,
+                ha_streak_4h=sig.ha_streak_4h,
+                ha_no_lower_shadow_3m=sig.ha_no_lower_shadow_3m,
+                ha_no_upper_shadow_3m=sig.ha_no_upper_shadow_3m,
+                ha_body_pct_3m=sig.ha_body_pct_3m,
+                ema200_3m=sig.ema200_3m,
+                ha_mfi_1m=osc.ha_mfi_1m,
+                ha_mfi_3m=osc.ha_mfi_3m,
+                ha_mfi_15m=osc.ha_mfi_15m,
+                ha_rsi_1m=osc.ha_rsi_1m,
+                ha_rsi_3m=osc.ha_rsi_3m,
+                ha_rsi_15m=osc.ha_rsi_15m,
+                # 3-bar deltas from runtime ha_state (None if <3 history)
+                mfi_3m_delta_dir=ha_state.mfi_3m_delta_dir,
+                rsi_3m_delta_dir=ha_state.rsi_3m_delta_dir,
+                mfi_3m_delta_value=ha_state.mfi_3m_delta_value,
+                rsi_3m_delta_value=ha_state.rsi_3m_delta_value,
+                gate_results=decision.gate_results,
+                confluence_score=float(sig.confluence) if sig.confluence else None,
+                session=session_name,
+                vwap_3m_side=vwap_3m_side,
+            )
+        except Exception:
+            logger.exception("ha_native_audit_failed symbol={}", symbol)
+
     async def _run_one_symbol(self, symbol: str) -> None:
         cfg = self.ctx.config
 
@@ -2744,6 +2898,11 @@ class BotRunner:
             self.ctx.ha_state_registry.update(symbol, state, _utc_now())
         except Exception:
             logger.exception("ha_state_registry_update_failed symbol={}", symbol)
+        # 2026-05-04 — HA-native planner audit + decision_log row.
+        # Audit-only path: sonuç decision_log'a yazılır, mevcut karar
+        # mekanizması (5-pillar) etkilenmez. Sıradaki commit HA-native
+        # primary mode'a alacak.
+        await self._audit_ha_native_decision(symbol, state)
         buf = self.ctx.multi_tf.get_buffer(tf_key)
         # 100 candles is enough for EMA55 seeding in the zone builder's
         # ema21_pullback source; legacy confluence consumers only read the tail.
