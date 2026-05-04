@@ -243,6 +243,9 @@ def _build_signal_data(kv: dict[str, str]) -> SignalTableData:
         ha_no_upper_shadow_3m=kv.get("ha_no_upper_shadow_3m", "NO").strip().upper() == "YES",
         ha_body_pct_3m=_parse_float((kv.get("ha_body_pct_3m", "0") or "0").rstrip("%").strip()) or 0.0,
         ema200_3m=_parse_leading_float(kv.get("ema200_3m")),
+        # Volume pulse (operatör 2026-05-04 — RCS gate input)
+        volume_3m=_parse_float(kv.get("volume_3m", "0")) or 0.0,
+        volume_3m_ratio=_parse_float(kv.get("volume_3m_ratio", "1")) or 1.0,
         last_bar=_parse_int(kv.get("last_bar")),
     )
 

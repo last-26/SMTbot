@@ -145,6 +145,13 @@ class SignalTableData(BaseModel):
     # EMA200 3m macro trend filter (journal-only Faz 1; gate Faz 2'de).
     ema200_3m: float = 0.0
 
+    # 3m volume pulse — current bar + 10-bar SMA ratio (operatör 2026-05-04).
+    # RCS gate input: HA color flip exit'inde ratio ≥ 1.3 → confirm reversal;
+    # ≤ 0.8 → noise (pozisyonda kal). Pine chart-context'tan emit edilir,
+    # multi-TF security yok — marjinal Pine cost.
+    volume_3m: float = 0.0
+    volume_3m_ratio: float = 1.0
+
     last_bar: Optional[int] = None  # bar_index of last Pine update — used
                                     # by the runner's freshness-poll to
                                     # detect when a symbol / timeframe
