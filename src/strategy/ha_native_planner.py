@@ -265,6 +265,33 @@ def _gate_15m_alignment(
     return ha_state.latest.ha_color_15m == target
 
 
+def _gate_dominant_color_alignment(
+    ha_state: HASymbolState, direction: Direction,
+) -> bool:
+    """Gate: 3m HA dominant color son 30 barda trend yönüne ters DEĞİL.
+
+    Operatör 2026-05-04: "5 yeşil mum varsa kırmızıyı bekle short için —
+    düşüş ara düzeltme olabilir". 3m HA mum şu an kırmızı (SHORT direction)
+    olsa bile, son 30 bar yeşil dominant ise = ara düzeltme = short skip.
+
+    Liberal yorum (default):
+      LONG için: dominant_3m != "RED" (yukarı baskın veya balanced OK)
+      SHORT için: dominant_3m != "GREEN" (aşağı baskın veya balanced OK)
+
+    Balanced (None) durumunda OK — operatör "biraz daha verilerle destekleniyorsa"
+    dedi; balanced = ters baskı yok = entry OK. Strict'e çevirmek istersek:
+    dominant_3m == direction'ın renk ekvivalenti zorunlu yaparız.
+
+    15m destekleyici (operatör spec) ayrıca `_gate_15m_alignment` ile zaten
+    current color check ediliyor; 15m dominant audit için decision_log'a yazılır.
+    """
+    dominant_3m = ha_state.dominant_color_3m()
+    if dominant_3m is None:
+        return True  # balanced = ters baskı yok = OK
+    opposite = "RED" if direction == Direction.BULLISH else "GREEN"
+    return dominant_3m != opposite
+
+
 def _gate_no_duplicate(
     symbol: str,
     direction: Direction,
@@ -336,8 +363,8 @@ def evaluate_entry(
             gate_results={},
         )
 
-    # Run all 8 gates; collect results. Operatör 2026-05-04: ADX + fresh_mss
-    # gate'ten çıkarıldı, 15m_alignment eklendi.
+    # Run all 9 gates; collect results. Operatör 2026-05-04: ADX + fresh_mss
+    # gate'ten çıkarıldı; 15m_alignment + dominant_color_alignment eklendi.
     results: dict[str, bool] = {
         "mss_density": _gate_mss_density(
             ctx.mss_count_recent, config.mss_density_max,
@@ -351,6 +378,9 @@ def evaluate_entry(
         "rsi_delta": _gate_rsi_delta(ctx.ha_state, direction),
         "two_bar_color": _gate_two_bar_color(ctx.ha_state, direction),
         "fifteen_min_alignment": _gate_15m_alignment(ctx.ha_state, direction),
+        "dominant_color_alignment": _gate_dominant_color_alignment(
+            ctx.ha_state, direction,
+        ),
         "no_duplicate": _gate_no_duplicate(
             ctx.symbol, direction, ctx.pending_pairs, ctx.open_pairs,
         ),
