@@ -819,7 +819,71 @@ def _score_continuation(
     return score
 
 
-# ── Tip 3: Micro Reversal score (STUB + DISABLED) ─────────────────────────
+# ── Tip 3: Micro Reversal score (FULL kod, DISABLED default) ──────────────
+
+
+def _gate_1m_streak_new_direction(
+    ha_state: HASymbolState, direction: Direction, min_abs: int,
+) -> bool:
+    """1m HA streak yeni yönde abs(>=) min."""
+    if ha_state.latest is None:
+        return False
+    streak = ha_state.latest.ha_streak_1m
+    if direction == Direction.BULLISH:
+        return streak >= min_abs
+    if direction == Direction.BEARISH:
+        return streak <= -min_abs
+    return False
+
+
+def _gate_rsi_extreme(
+    ha_state: HASymbolState, direction: Direction,
+) -> bool:
+    """3m RSI extreme: LONG için ≤30 (oversold), SHORT için ≥70 (overbought).
+
+    Reversal entry candidate — extreme'den dönüş bekliyor.
+    """
+    if ha_state.latest is None:
+        return False
+    rsi = ha_state.latest.ha_rsi_3m
+    if direction == Direction.BULLISH:
+        return rsi <= 30.0
+    if direction == Direction.BEARISH:
+        return rsi >= 70.0
+    return False
+
+
+def _gate_divergence_present(state: MarketState, direction: Direction) -> bool:
+    """3m oscillator'da divergence sinyali var mı?
+
+    Pine'dan oscillator_table.last_wt_div emit ediliyor: "BULL@<bars_ago>"
+    veya "BEAR@<bars_ago>" formatında. LONG için BULL divergence aranır,
+    SHORT için BEAR.
+    """
+    osc = state.oscillator
+    if osc is None:
+        return False
+    div = getattr(osc, "last_wt_div", "") or ""
+    if direction == Direction.BULLISH:
+        return div.startswith("BULL")
+    if direction == Direction.BEARISH:
+        return div.startswith("BEAR")
+    return False
+
+
+def _gate_vwap_distant(
+    state: MarketState, atr_units: float = 0.5,
+) -> bool:
+    """Price vs vwap_3m mesafesi ≥ atr_units × ATR.
+
+    Mean reversion candidate: VWAP'tan uzakta = aşırı uzaklaşma
+    sinyali, geri dönüş ihtimali yüksek.
+    """
+    sig = state.signal_table
+    if sig is None or sig.vwap_3m <= 0 or sig.atr_14 <= 0 or sig.price <= 0:
+        return False
+    distance = abs(sig.price - sig.vwap_3m)
+    return distance >= atr_units * sig.atr_14
 
 
 def _score_micro_reversal(
@@ -827,24 +891,143 @@ def _score_micro_reversal(
 ) -> EntryTypeScore:
     """Tip 3 — Micro Reversal (1m mss dip/tepe avcılığı).
 
-    DISABLED ilk fazda (operatör profili: WR + perfectionist).
-    config.micro_reversal_enabled=False olduğu sürece score=0.
+    DISABLED default (operatör profili: WR + perfectionist). Schema +
+    kod hazır; `config.micro_reversal_enabled=True` ile aktif olur.
+    Dataset birikince + Pass 3 GBT analizinde re-enable kararı.
+
+    Mandatory gates (fail = score 0):
+      - HA color clear (3m DOJI değil) → direction
+      - 1m streak yeni yönde ≥ 2 (whipsaw guard)
+      - 1m MSS direction yeni yön (Pine'dan)
+      - 3m RSI extreme VEYA divergence sinyali (en az biri)
+      - no_duplicate, body_size ≥ 30%
+
+    Soft skor faktörleri (threshold ≥ 4.5):
+      - 1m MSS güçlü break (last_mss == direction): +2.0
+      - 3m RSI/MFI divergence: +2.0
+      - 3m RSI extreme (≤30 long / ≥70 short): +1.5
+      - 1m streak ≥ 3 yeni yön: +1.0
+      - VWAP'ten ≥ 0.5 ATR uzakta: +1.0
+      - 15m hâlâ eski yönlü (chop guard): +0.5
+
+    Plan: 0.7R RR, 0.5 risk multiplier (yarı R = $12.5).
     """
     direction = _infer_direction_from_3m(ctx)
+    score = EntryTypeScore(score=0.0, direction=direction)
+
+    # DISABLED check (operatör profili default)
     if not config.micro_reversal_enabled:
-        return EntryTypeScore(
-            score=0.0,
-            direction=direction,
-            gate_results={},
-            failed_mandatory="micro_reversal_disabled",
-        )
-    # Faz 3'te full implementation
-    return EntryTypeScore(
-        score=0.0,
-        direction=direction,
-        gate_results={},
-        failed_mandatory="not_implemented_yet",
+        score.failed_mandatory = "micro_reversal_disabled"
+        return score
+
+    if direction is None:
+        score.failed_mandatory = "no_ha_direction"
+        return score
+
+    gates: dict[str, bool] = {}
+
+    # Mandatory: 1m streak yeni yönde ≥ 2
+    gates["1m_streak_new"] = _gate_1m_streak_new_direction(
+        ctx.ha_state, direction, 2,
     )
+    if not gates["1m_streak_new"]:
+        score.failed_mandatory = "1m_streak_new"
+        score.gate_results = gates
+        return score
+
+    # Mandatory: 1m MSS direction yeni yön (Pine'dan, last_mss_direction reuse)
+    # Şimdilik 1m MSS field ayrı emit edilmiyor; last_mss_direction 3m chart'tan.
+    # Yeni Pine field ileride emit edilirse buraya geçer. Mevcut behavior:
+    # mss_direction == direction → True (en az MSS yön onayı var).
+    gates["1m_mss_direction"] = _gate_mss_direction_alignment(
+        ctx.last_mss_direction, direction,
+    )
+    if not gates["1m_mss_direction"]:
+        score.failed_mandatory = "1m_mss_direction"
+        score.gate_results = gates
+        return score
+
+    # Mandatory: RSI extreme veya divergence (en az biri)
+    rsi_extreme = _gate_rsi_extreme(ctx.ha_state, direction)
+    div_present = _gate_divergence_present(ctx.market_state, direction)
+    gates["rsi_extreme_or_divergence"] = rsi_extreme or div_present
+    if not gates["rsi_extreme_or_divergence"]:
+        score.failed_mandatory = "rsi_extreme_or_divergence"
+        score.gate_results = gates
+        return score
+
+    # Mandatory: no_duplicate, body_size
+    gates["no_duplicate"] = _gate_no_duplicate(
+        ctx.symbol, direction, ctx.pending_pairs, ctx.open_pairs,
+    )
+    if not gates["no_duplicate"]:
+        score.failed_mandatory = "no_duplicate"
+        score.gate_results = gates
+        return score
+
+    gates["body_size"] = _gate_body_size(ctx.ha_state, config.min_body_pct_3m)
+    if not gates["body_size"]:
+        score.failed_mandatory = "body_size"
+        score.gate_results = gates
+        return score
+
+    # Soft factors
+    score_value = 0.0
+
+    gates["1m_mss_strong"] = (ctx.last_mss_direction == direction)
+    if gates["1m_mss_strong"]:
+        score_value += 2.0
+
+    gates["divergence"] = div_present
+    if div_present:
+        score_value += 2.0
+
+    gates["rsi_extreme"] = rsi_extreme
+    if rsi_extreme:
+        score_value += 1.5
+
+    gates["1m_streak_strong"] = _gate_1m_streak_new_direction(
+        ctx.ha_state, direction, 3,
+    )
+    if gates["1m_streak_strong"]:
+        score_value += 1.0
+
+    gates["vwap_distant"] = _gate_vwap_distant(ctx.market_state, 0.5)
+    if gates["vwap_distant"]:
+        score_value += 1.0
+
+    # 15m hâlâ eski yönlü → reversal candidate güçlü
+    prev_dir = (
+        Direction.BEARISH if direction == Direction.BULLISH
+        else Direction.BULLISH
+    )
+    gates["15m_aligned_old"] = _gate_15m_alignment(ctx.ha_state, prev_dir)
+    if gates["15m_aligned_old"]:
+        score_value += 0.5
+
+    score.score = score_value
+    score.gate_results = gates
+
+    # Build entry parameters if soft threshold passes
+    if score_value >= config.micro_reversal_threshold:
+        if ctx.best_bid is None or ctx.best_ask is None:
+            score.failed_mandatory = "missing_orderbook"
+            return score
+        sl = _structural_sl_price(direction, ctx)
+        if sl is None:
+            score.failed_mandatory = "missing_swing_anchor"
+            return score
+        entry = _marketable_entry_price(
+            direction, ctx.best_bid, ctx.best_ask, config.marketable_offset_pct,
+        )
+        tp = _tp_price(direction, entry, sl, config.micro_reversal_target_rr)
+        score.entry_price = entry
+        score.sl_price = sl
+        score.tp_price = tp
+        score.target_rr = config.micro_reversal_target_rr
+        score.risk_multiplier = config.micro_reversal_risk_multiplier  # 0.5
+
+    return score
 
 
 # ── Main dispatcher ────────────────────────────────────────────────────────
