@@ -2053,6 +2053,7 @@ class BotRunner:
         self,
         plan: TradePlan,
         state: Optional[MarketState],
+        decision: Optional[Any] = None,
     ) -> dict:
         """2026-05-04 — Build the HA-native journal-field kwargs for
         `record_open`. Returns a dict with `is_ha_native` boolean +
@@ -2069,11 +2070,79 @@ class BotRunner:
         from plan.reason. State present → HA snapshot fields populated
         from `state.signal_table`. None / 0.0 defaults are kept on the
         write side (downstream Pass 3 reads NULLs via _safe_col).
+
+        2026-05-05 — Faz 6 ek: decision parametresi 3-tip dispatcher
+        çıktısını taşır (entry_path + skor'lar + mss_break_detected +
+        target_rr + risk_multiplier). NOT NULL DB constraint sebebiyle
+        tüm field'lar default değerlerle dolu döner.
         """
         is_ha_native = bool(
             plan.reason and plan.reason.startswith("ha_native:")
         )
         kwargs: dict = {"is_ha_native": is_ha_native}
+
+        # 2026-05-05 — Faz 6 dispatcher fields. decision varsa entry_path
+        # + skorlar + mss_break + per-tip RR/risk; yoksa default'lar
+        # (legacy 5-pillar entry zaten flag=False ile segmente).
+        if decision is not None:
+            entry_path = getattr(decision, "entry_path", None) or ""
+            mss_results = (
+                getattr(decision, "gate_results", {}) or {}
+            ).get(entry_path, {}) if entry_path else {}
+            mss_break = bool(
+                mss_results.get("mss_direction_aligned")
+                or mss_results.get("mss_direction_main")
+            )
+            kwargs.update({
+                "entry_path": entry_path,
+                "major_reversal_score": float(
+                    getattr(decision, "major_reversal_score", 0.0) or 0.0
+                ),
+                "continuation_score": float(
+                    getattr(decision, "continuation_score", 0.0) or 0.0
+                ),
+                "micro_reversal_score": float(
+                    getattr(decision, "micro_reversal_score", 0.0) or 0.0
+                ),
+                "mss_break_detected": mss_break,
+                "target_rr_ratio_at_entry": float(
+                    getattr(decision, "target_rr", 1.0) or 1.0
+                ),
+                "risk_multiplier_at_entry": float(
+                    getattr(decision, "risk_multiplier", 1.0) or 1.0
+                ),
+            })
+        else:
+            # Legacy / pending-fill rehydrate — defaults (NOT NULL guarantee).
+            # plan.reason format: "ha_native:<entry_path>:<reason>" — buradan
+            # entry_path parse edilir ki Pass 3 GBT segmentation kaybolmasın.
+            entry_path = ""
+            if plan.reason and plan.reason.startswith("ha_native:"):
+                parts = plan.reason.split(":", 2)
+                if len(parts) >= 2:
+                    entry_path = parts[1]
+            # target_rr + risk_mult plan üzerinden çıkarılamaz, default
+            # entry_path'e göre map edilir
+            rr_map = {
+                "major_reversal": 1.5,
+                "continuation": 1.0,
+                "micro_reversal": 0.7,
+            }
+            risk_map = {
+                "major_reversal": 1.0,
+                "continuation": 1.0,
+                "micro_reversal": 0.5,
+            }
+            kwargs.update({
+                "entry_path": entry_path,
+                "major_reversal_score": 0.0,
+                "continuation_score": 0.0,
+                "micro_reversal_score": 0.0,
+                "mss_break_detected": False,
+                "target_rr_ratio_at_entry": rr_map.get(entry_path, 1.0),
+                "risk_multiplier_at_entry": risk_map.get(entry_path, 1.0),
+            })
+
         if state is None or state.signal_table is None:
             return kwargs
         sig = state.signal_table
@@ -2875,12 +2944,14 @@ class BotRunner:
         decision: Any,  # EntryDecision (avoid circular import in type hint)
         symbol: str,
     ) -> Optional[TradePlan]:
-        """Build a TradePlan from HA-native EntryDecision.
+        """Build a TradePlan from HA-native EntryDecision (3-tip differansiyel).
 
-        Operatör 2026-05-04 Yol A primary mode: planner TAKE_LONG/SHORT
-        döndüğünde mevcut zone-planner / 5-pillar yerine bu helper
-        TradePlan oluşturur. `rr_system.calculate_trade_plan` reuse
-        edilir (sizing + leverage + contract math).
+        Operatör 2026-05-05 Yol A primary mode: planner 3 entry tipinden
+        en yüksek skoru olanı seçer (entry_path = "major_reversal" /
+        "continuation" / "micro_reversal"). Her tipin kendine özgü:
+          * `target_rr` (1.5 / 1.0 / 0.7)
+          * `risk_multiplier` (1.0 / 1.0 / 0.5 — Tip 3 yarı R)
+        TradePlan bu per-tip parametreler ile inşa edilir.
 
         Returns:
             TradePlan if decision.is_take and pricing valid, else None.
@@ -2896,8 +2967,16 @@ class BotRunner:
             return None
 
         cfg = self.ctx.config
-        # Sizing inputs
-        risk_amount = cfg.trading.risk_amount_usdt  # operator flat-$ override
+        # 2026-05-05 — Faz 6: per-tip risk + RR differansiyel.
+        # decision.target_rr ve decision.risk_multiplier dispatcher'da
+        # entry_path'e göre set edildi (Major Reversal=1.5/1.0,
+        # Continuation=1.0/1.0, Micro Reversal=0.7/0.5). risk_amount
+        # base'i operatör flat-$ override ($25) — risk_multiplier ile
+        # ölçülür: Tip 3'te $12.5, diğerlerinde $25.
+        base_risk = cfg.trading.risk_amount_usdt
+        risk_amount = base_risk * float(decision.risk_multiplier or 1.0)
+        target_rr = float(decision.target_rr or 1.0)
+
         margin_balance = (
             self.ctx.last_margin_balance
             if self.ctx.last_margin_balance > 0
@@ -2910,11 +2989,17 @@ class BotRunner:
             symbol, cfg.trading.max_leverage,
         )
 
-        # HA-native uses 1.0R target by default (operatör scalp doctrine).
-        # TP from EntryDecision is consistent with this — calculate_trade_plan
-        # will recompute identically via rr_ratio param.
-        from src.strategy.ha_native_planner import HANativeConfig
-        ha_cfg = HANativeConfig()
+        # SL source per-tip differansiyel:
+        #   major_reversal → "ha_mss_swing" (structural swing SL)
+        #   continuation → "ha_mss_swing" (aynı, ana trend swing)
+        #   micro_reversal → "ha_micro_swing" (kısa pozisyon, küçük SL)
+        entry_path = decision.entry_path or "major_reversal"
+        sl_source = (
+            "ha_micro_swing" if entry_path == "micro_reversal"
+            else "ha_mss_swing"
+        )
+        # Reason includes entry_path for full traceability + journal segmentation
+        plan_reason = f"ha_native:{entry_path}:{decision.reason}"
 
         try:
             plan = calculate_trade_plan(
@@ -2923,14 +3008,14 @@ class BotRunner:
                 sl_price=decision.suggested_sl_price,
                 account_balance=margin_balance,
                 risk_pct=cfg.trading.risk_per_trade_pct / 100.0,
-                rr_ratio=ha_cfg.target_rr_ratio,
+                rr_ratio=target_rr,
                 max_leverage=max_leverage,
                 contract_size=contract_size,
                 margin_balance=margin_balance,
                 fee_reserve_pct=cfg.trading.fee_reserve_pct,
                 risk_amount_usdt_override=risk_amount,
-                sl_source="ha_mss_swing",
-                reason=f"ha_native:{decision.reason}",
+                sl_source=sl_source,
+                reason=plan_reason,
             )
             return plan
         except Exception:
@@ -3772,7 +3857,11 @@ class BotRunner:
                 # planner produced the plan; HA snapshot fields read off
                 # state.signal_table at entry-time. Pass 3 GBT segments by
                 # is_ha_native and consumes HA continuous features directly.
-                **self._ha_native_record_kwargs(plan, state),
+                # 2026-05-05 — Faz 6: ha_decision parametresi de geçilir,
+                # 3-tip dispatcher field'ları (entry_path + skor'lar +
+                # mss_break + target_rr + risk_mult) NOT NULL DB
+                # constraint sayesinde dolu yazılır.
+                **self._ha_native_record_kwargs(plan, state, ha_decision),
             )
             self.ctx.open_trade_ids[(symbol, pos_side)] = rec.trade_id
             self.ctx.open_trade_opened_at[(symbol, pos_side)] = _utc_now()
