@@ -2152,66 +2152,57 @@ class BotRunner:
         )
         kwargs: dict = {"is_ha_native": is_ha_native}
 
-        # 2026-05-05 — Faz 6 dispatcher fields. decision varsa entry_path
-        # + skorlar + mss_break + per-tip RR/risk; yoksa default'lar
-        # (legacy 5-pillar entry zaten flag=False ile segmente).
+        # 2026-05-05 — Faz 6/8 dispatcher fields. Operatör 2026-05-05
+        # düzeltme: 0.0 fallback YANLIŞ — gerçek 0.0 score (mandatory
+        # fail) NULL ile karışıyor. None geçerse DB'ye NULL yazılır
+        # (semantik: "veri yok"). decision varsa runner gerçek değerleri
+        # yazar; pending-fill rehydrate path'i sadece entry_path parse
+        # eder (plan.reason'dan), diğer alanlar NULL kalır.
         if decision is not None:
-            entry_path = getattr(decision, "entry_path", None) or ""
+            entry_path = getattr(decision, "entry_path", None)
             mss_results = (
                 getattr(decision, "gate_results", {}) or {}
-            ).get(entry_path, {}) if entry_path else {}
+            ).get(entry_path or "", {}) if entry_path else {}
             mss_break = bool(
                 mss_results.get("mss_direction_aligned")
                 or mss_results.get("mss_direction_main")
-            )
+            ) if mss_results else None
             kwargs.update({
                 "entry_path": entry_path,
-                "major_reversal_score": float(
-                    getattr(decision, "major_reversal_score", 0.0) or 0.0
+                "major_reversal_score": getattr(
+                    decision, "major_reversal_score", None,
                 ),
-                "continuation_score": float(
-                    getattr(decision, "continuation_score", 0.0) or 0.0
+                "continuation_score": getattr(
+                    decision, "continuation_score", None,
                 ),
-                "micro_reversal_score": float(
-                    getattr(decision, "micro_reversal_score", 0.0) or 0.0
+                "micro_reversal_score": getattr(
+                    decision, "micro_reversal_score", None,
                 ),
                 "mss_break_detected": mss_break,
-                "target_rr_ratio_at_entry": float(
-                    getattr(decision, "target_rr", 1.0) or 1.0
+                "target_rr_ratio_at_entry": getattr(
+                    decision, "target_rr", None,
                 ),
-                "risk_multiplier_at_entry": float(
-                    getattr(decision, "risk_multiplier", 1.0) or 1.0
+                "risk_multiplier_at_entry": getattr(
+                    decision, "risk_multiplier", None,
                 ),
             })
         else:
-            # Legacy / pending-fill rehydrate — defaults (NOT NULL guarantee).
-            # plan.reason format: "ha_native:<entry_path>:<reason>" — buradan
-            # entry_path parse edilir ki Pass 3 GBT segmentation kaybolmasın.
-            entry_path = ""
+            # Pending-fill rehydrate — plan.reason'dan entry_path parse
+            # ("ha_native:<entry_path>:<reason>" format). Diğer field'lar
+            # decision snapshot olmadan rehidrate edilemez → NULL.
+            entry_path = None
             if plan.reason and plan.reason.startswith("ha_native:"):
                 parts = plan.reason.split(":", 2)
                 if len(parts) >= 2:
-                    entry_path = parts[1]
-            # target_rr + risk_mult plan üzerinden çıkarılamaz, default
-            # entry_path'e göre map edilir
-            rr_map = {
-                "major_reversal": 1.5,
-                "continuation": 1.0,
-                "micro_reversal": 0.7,
-            }
-            risk_map = {
-                "major_reversal": 1.0,
-                "continuation": 1.0,
-                "micro_reversal": 0.5,
-            }
+                    entry_path = parts[1] or None
             kwargs.update({
                 "entry_path": entry_path,
-                "major_reversal_score": 0.0,
-                "continuation_score": 0.0,
-                "micro_reversal_score": 0.0,
-                "mss_break_detected": False,
-                "target_rr_ratio_at_entry": rr_map.get(entry_path, 1.0),
-                "risk_multiplier_at_entry": risk_map.get(entry_path, 1.0),
+                "major_reversal_score": None,
+                "continuation_score": None,
+                "micro_reversal_score": None,
+                "mss_break_detected": None,
+                "target_rr_ratio_at_entry": None,
+                "risk_multiplier_at_entry": None,
             })
 
         if state is None or state.signal_table is None:
@@ -2799,6 +2790,24 @@ class BotRunner:
         # the new TF (Operatör 2026-05-04 dinamik settle).
         return await self._wait_for_pine_settle_dual(baselines)
 
+    def _compute_btc_eth_open_directions(self) -> tuple[Optional[str], Optional[str]]:
+        """2026-05-05 Faz 8: BTC + ETH OPEN-position direction'larını
+        decision_log'a yazmak için compute eder. None = no open position.
+
+        Cross-asset open-position lock'un audit görünümü — Pass 3 GBT
+        bu segmentation ile "BTC long açıkken ETH short açtı mı?" gibi
+        pattern'leri öğrenir.
+        """
+        btc_dir: Optional[str] = None
+        eth_dir: Optional[str] = None
+        for (sym, pos_side) in self.ctx.open_trade_ids.keys():
+            side_str = "BULLISH" if (pos_side or "").lower() == "long" else "BEARISH"
+            if sym == "BTC-USDT-SWAP" and btc_dir is None:
+                btc_dir = side_str
+            elif sym == "ETH-USDT-SWAP" and eth_dir is None:
+                eth_dir = side_str
+        return btc_dir, eth_dir
+
     async def _compute_first_entry_missed_for(
         self, symbol: str, ha_state: Any,
     ) -> bool:
@@ -2970,9 +2979,62 @@ class BotRunner:
                 else None
             )
 
+            # 2026-05-05 — Faz 8: NULL cleanup. Entry-TF (3m) ADX inline
+            # hesabı — _run_one_symbol'de ileride yapılan classify_trend_regime
+            # call'undan ÖNCE bu fonksiyon çağrıldığı için cache yok. ~5ms
+            # ek hesap, decision_log'da Pass 3 GBT için continuous regime
+            # features doldurmak değer var.
+            adx_3m_val: Optional[float] = None
+            plus_di_3m_val: Optional[float] = None
+            minus_di_3m_val: Optional[float] = None
+            trend_regime_label: Optional[str] = None
+            try:
+                buf = self.ctx.multi_tf.get_buffer("3m")
+                if buf is not None:
+                    candles_for_adx = buf.last(50)
+                    if candles_for_adx and len(candles_for_adx) >= 15:
+                        cfg_analysis = self.ctx.config.analysis
+                        regime_result = classify_trend_regime(
+                            candles_for_adx,
+                            period=cfg_analysis.adx_period,
+                            ranging_threshold=(
+                                cfg_analysis.trend_regime_ranging_threshold
+                            ),
+                            strong_threshold=(
+                                cfg_analysis.trend_regime_strong_threshold
+                            ),
+                        )
+                        adx_3m_val = float(regime_result.adx)
+                        plus_di_3m_val = float(regime_result.plus_di)
+                        minus_di_3m_val = float(regime_result.minus_di)
+                        regime_obj = regime_result.regime
+                        if regime_obj is not None:
+                            trend_regime_label = (
+                                regime_obj.value if hasattr(regime_obj, "value")
+                                else str(regime_obj)
+                            )
+            except Exception:
+                pass  # ADX hesap hatası — NULL kal (gerçek "veri yok")
+
+            btc_open_dir, eth_open_dir = self._compute_btc_eth_open_directions()
+
+            # cycle_id: per-bot-instance monotonic counter
+            self._decision_log_cycle_counter = (
+                getattr(self, "_decision_log_cycle_counter", 0) + 1
+            )
+            cycle_id = f"cyc-{self._decision_log_cycle_counter:08d}"
+
+            # confluence_score: 0 valid değer; None sadece sig.confluence
+            # gerçekten None ise (Pine'dan gelmezse). Pine her zaman 0+
+            # int emit ediyor, yani normalde 0 dolu (gerçek skor 0).
+            confluence_val = (
+                float(sig.confluence) if sig.confluence is not None else None
+            )
+
             await self.ctx.journal.record_decision_log(
                 timestamp=_utc_now(),
                 symbol=symbol,
+                cycle_id=cycle_id,
                 decision=decision_str,
                 decision_reason=decision.reason,
                 price=sig.price,
@@ -2995,15 +3057,35 @@ class BotRunner:
                 ha_rsi_1m=osc.ha_rsi_1m,
                 ha_rsi_3m=osc.ha_rsi_3m,
                 ha_rsi_15m=osc.ha_rsi_15m,
-                # 3-bar deltas from runtime ha_state (None if <3 history)
+                # 3-bar deltas from runtime ha_state (None if <3 history
+                # — gerçek "veri yok" semantiği, NULL kalmasına izin ver).
                 mfi_3m_delta_dir=ha_state.mfi_3m_delta_dir,
                 rsi_3m_delta_dir=ha_state.rsi_3m_delta_dir,
                 mfi_3m_delta_value=ha_state.mfi_3m_delta_value,
                 rsi_3m_delta_value=ha_state.rsi_3m_delta_value,
                 gate_results=decision.gate_results,
-                confluence_score=float(sig.confluence) if sig.confluence else None,
+                confluence_score=confluence_val,
+                # 2026-05-05 Faz 8: ADX triad + trend regime + open dirs
+                adx_3m=adx_3m_val,
+                plus_di_3m=plus_di_3m_val,
+                minus_di_3m=minus_di_3m_val,
+                trend_regime=trend_regime_label,
+                btc_open_direction=btc_open_dir,
+                eth_open_direction=eth_open_dir,
                 session=session_name,
                 vwap_3m_side=vwap_3m_side,
+                # 2026-05-05 Faz 5: dispatcher fields (per-tip skor +
+                # entry_path winner). Decision'dan direkt geçer.
+                entry_path=getattr(decision, "entry_path", None),
+                major_reversal_score=getattr(
+                    decision, "major_reversal_score", None,
+                ),
+                continuation_score=getattr(
+                    decision, "continuation_score", None,
+                ),
+                micro_reversal_score=getattr(
+                    decision, "micro_reversal_score", None,
+                ),
             )
             return decision
         except Exception:

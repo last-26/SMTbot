@@ -242,21 +242,18 @@ class TradeRecord(BaseModel):
     ema200_3m_at_entry: Optional[float] = None
     volume_3m_ratio_at_entry: Optional[float] = None
 
-    # 2026-05-05 — Yol A Faz 5: 3 entry tipi dispatcher fields. Operatör
-    # spec: NOT NULL DB constraint, NULL kalmasın. Default değerler
-    # legacy rehydrate path (pre-Yol-A trade'leri) için non-None:
-    #   entry_path: "" (legacy/audit-only — runner her TAKE'de set)
-    #   *_score: 0.0 (legacy hesaplanmadı; TAKE'de skor yazılır)
-    #   mss_break_detected: False (default)
-    #   target_rr_ratio_at_entry: 1.0 (Yol A scalp default)
-    #   risk_multiplier_at_entry: 1.0 (full R default)
-    entry_path: str = ""
-    major_reversal_score: float = 0.0
-    continuation_score: float = 0.0
-    micro_reversal_score: float = 0.0
-    mss_break_detected: bool = False
-    target_rr_ratio_at_entry: float = 1.0
-    risk_multiplier_at_entry: float = 1.0
+    # 2026-05-05 — Yol A Faz 5/8: 3 entry tipi dispatcher fields, nullable.
+    # Operatör 2026-05-05 düzeltme: NOT NULL DEFAULT yanlış, çünkü 0.0
+    # gerçek mandatory-fail score ile NULL ("hesaplanmadı") karışıyor.
+    # Şimdi Optional — runner gerçek değerleri yazar; legacy/test path
+    # default None (semantik: "veri yok", 0.0 değil).
+    entry_path: Optional[str] = None
+    major_reversal_score: Optional[float] = None
+    continuation_score: Optional[float] = None
+    micro_reversal_score: Optional[float] = None
+    mss_break_detected: Optional[bool] = None
+    target_rr_ratio_at_entry: Optional[float] = None
+    risk_multiplier_at_entry: Optional[float] = None
 
     @property
     def is_open(self) -> bool:

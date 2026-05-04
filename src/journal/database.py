@@ -184,23 +184,19 @@ CREATE TABLE IF NOT EXISTS trades (
     ema200_3m_at_entry       REAL,
     volume_3m_ratio_at_entry REAL,
 
-    -- 2026-05-05 — Yol A Faz 5: 3 entry tipi dispatcher journal fields.
-    -- Operatör spec: NULL kalmamalı, NOT NULL DEFAULT ile schema
-    -- doluluk garantisi. TAKE durumunda dispatcher tarafından dolduruyor;
-    -- per-tip differansiyel (RR + risk multiplier) ile Pass 3 GBT
-    -- segmentasyonu için kritik. Default values:
-    --   entry_path: '' (legacy rehydrate; runner her TAKE'de set eder)
-    --   *_score: 0.0 (TAKE'te dolduruyor; pre-Yol A'da hesaplanmadı)
-    --   mss_break_detected: 0 (false default; mss yön onayı yoksa)
-    --   target_rr_ratio_at_entry: 1.0 (Yol A scalp default)
-    --   risk_multiplier_at_entry: 1.0 (full R default)
-    entry_path                  TEXT NOT NULL DEFAULT '',
-    major_reversal_score        REAL NOT NULL DEFAULT 0.0,
-    continuation_score          REAL NOT NULL DEFAULT 0.0,
-    micro_reversal_score        REAL NOT NULL DEFAULT 0.0,
-    mss_break_detected          INTEGER NOT NULL DEFAULT 0,
-    target_rr_ratio_at_entry    REAL NOT NULL DEFAULT 1.0,
-    risk_multiplier_at_entry    REAL NOT NULL DEFAULT 1.0
+    -- 2026-05-05 — Yol A Faz 5/8: 3 entry tipi dispatcher journal fields.
+    -- Operatör 2026-05-05 düzeltme: NOT NULL DEFAULT yaklaşımı yanlıştı —
+    -- 0.0 (gerçek mandatory-fail score) ile NULL (hesaplanmadı) karışıyor.
+    -- Şimdi nullable; runner her TAKE'de gerçek değerleri yazar, REJECT
+    -- durumunda dispatcher 0.0 hesaplar (bu valid değerdir, NULL değil).
+    -- Pre-Yol A rows için NULL kalır (gerçek anlam: "veri yok").
+    entry_path                  TEXT,
+    major_reversal_score        REAL,
+    continuation_score          REAL,
+    micro_reversal_score        REAL,
+    mss_break_detected          INTEGER,
+    target_rr_ratio_at_entry    REAL,
+    risk_multiplier_at_entry    REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_trades_outcome      ON trades(outcome);
@@ -501,9 +497,11 @@ CREATE TABLE IF NOT EXISTS decision_log (
     rsi_3m_delta_value              REAL,
     -- Gate eval JSON ({gate_name: bool})
     gate_results_json               TEXT,
-    -- Confluence (passive layer)
+    -- Confluence (passive layer). 2026-05-05: confluence_factors_json
+    -- DROPPED — Yol A primary mode'da legacy 5-pillar factor isimleri
+    -- entry kararına etki etmiyor; entry_path + 3 skor + gate_results_json
+    -- zaten tüm bilgiyi taşıyor. Operatör onayı.
     confluence_score                REAL,
-    confluence_factors_json         TEXT,
     -- Regime
     adx_3m                          REAL,
     plus_di_3m                      REAL,
@@ -515,15 +513,14 @@ CREATE TABLE IF NOT EXISTS decision_log (
     -- Session + VWAP side
     session                         TEXT,
     vwap_3m_side                    TEXT,
-    -- 2026-05-05 — Yol A Faz 5: 3 entry tipi dispatcher audit fields.
-    -- Operatör spec: NOT NULL DEFAULT, NULL bırakılmıyor. Her cycle her
-    -- 3 tipi de skor; entry_path dispatcher'ın seçtiği winner ya da
-    -- "" (no-take). Pass 3 GBT bu ayrımdan tip-spesifik WR / R / gate
-    -- importance çıkartır.
-    entry_path                      TEXT NOT NULL DEFAULT '',
-    major_reversal_score            REAL NOT NULL DEFAULT 0.0,
-    continuation_score              REAL NOT NULL DEFAULT 0.0,
-    micro_reversal_score            REAL NOT NULL DEFAULT 0.0
+    -- 2026-05-05 — Yol A Faz 5/8: 3 entry tipi dispatcher audit fields.
+    -- Nullable (operatör 2026-05-05 düzeltme): score 0.0 (mandatory fail
+    -- gerçek değeri) NULL ile karışmamalı. Yeni satırlar runner'da hep
+    -- doldurulur; eski/legacy NULL kalır = "veri yok" semantiği korunur.
+    entry_path                      TEXT,
+    major_reversal_score            REAL,
+    continuation_score              REAL,
+    micro_reversal_score            REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_decision_log_timestamp  ON decision_log(timestamp);
@@ -950,24 +947,32 @@ _MIGRATIONS = [
     "ALTER TABLE trades ADD COLUMN ema200_3m_at_entry REAL",
     "ALTER TABLE trades ADD COLUMN volume_3m_ratio_at_entry REAL",
     "CREATE INDEX IF NOT EXISTS idx_trades_is_ha_native ON trades(is_ha_native)",
-    # 2026-05-05 — Yol A Faz 5: 3 entry tipi dispatcher fields. Operatör
-    # spec: NULL kalmasın, NOT NULL DEFAULT ile schema doluluk garantisi.
-    # SQLite ALTER TABLE ADD COLUMN with NOT NULL DEFAULT works for both
-    # fresh schema (CREATE) ve idempotent migration (varsa skip).
-    "ALTER TABLE trades ADD COLUMN entry_path TEXT NOT NULL DEFAULT ''",
-    "ALTER TABLE trades ADD COLUMN major_reversal_score REAL NOT NULL DEFAULT 0.0",
-    "ALTER TABLE trades ADD COLUMN continuation_score REAL NOT NULL DEFAULT 0.0",
-    "ALTER TABLE trades ADD COLUMN micro_reversal_score REAL NOT NULL DEFAULT 0.0",
-    "ALTER TABLE trades ADD COLUMN mss_break_detected INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE trades ADD COLUMN target_rr_ratio_at_entry REAL NOT NULL DEFAULT 1.0",
-    "ALTER TABLE trades ADD COLUMN risk_multiplier_at_entry REAL NOT NULL DEFAULT 1.0",
+    # 2026-05-05 — Yol A Faz 5/8: 3 entry tipi dispatcher fields. Operatör
+    # 2026-05-05 düzeltme: NOT NULL DEFAULT yanlış (0.0 valid değer ile
+    # NULL "veri yok" karışıyor). Şimdi nullable. Yeni satırlar runner'da
+    # her zaman dolu yazılır; eski (pre-Faz-5) rows NULL kalır = doğru
+    # semantik. SQLite ADD COLUMN nullable default → tüm satırlar NULL
+    # olarak başlar (pre-existing fresh DB için zaten boş tablo).
+    "ALTER TABLE trades ADD COLUMN entry_path TEXT",
+    "ALTER TABLE trades ADD COLUMN major_reversal_score REAL",
+    "ALTER TABLE trades ADD COLUMN continuation_score REAL",
+    "ALTER TABLE trades ADD COLUMN micro_reversal_score REAL",
+    "ALTER TABLE trades ADD COLUMN mss_break_detected INTEGER",
+    "ALTER TABLE trades ADD COLUMN target_rr_ratio_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN risk_multiplier_at_entry REAL",
     "CREATE INDEX IF NOT EXISTS idx_trades_entry_path ON trades(entry_path)",
     # decision_log Faz 5 fields (mirror trades, audit cycle-by-cycle).
-    "ALTER TABLE decision_log ADD COLUMN entry_path TEXT NOT NULL DEFAULT ''",
-    "ALTER TABLE decision_log ADD COLUMN major_reversal_score REAL NOT NULL DEFAULT 0.0",
-    "ALTER TABLE decision_log ADD COLUMN continuation_score REAL NOT NULL DEFAULT 0.0",
-    "ALTER TABLE decision_log ADD COLUMN micro_reversal_score REAL NOT NULL DEFAULT 0.0",
+    "ALTER TABLE decision_log ADD COLUMN entry_path TEXT",
+    "ALTER TABLE decision_log ADD COLUMN major_reversal_score REAL",
+    "ALTER TABLE decision_log ADD COLUMN continuation_score REAL",
+    "ALTER TABLE decision_log ADD COLUMN micro_reversal_score REAL",
     "CREATE INDEX IF NOT EXISTS idx_decision_log_entry_path ON decision_log(entry_path)",
+    # 2026-05-05 — Faz 8: confluence_factors_json DROP. Yol A primary
+    # mode'da legacy 5-pillar factor names entry kararına etki etmiyor;
+    # entry_path + 3 skor + gate_results_json zaten tüm bilgiyi taşıyor.
+    # SQLite 3.35+ DROP COLUMN destekler. Idempotent fail OK (kolon
+    # zaten yoksa OperationalError, _apply_migrations swallow eder).
+    "ALTER TABLE decision_log DROP COLUMN confluence_factors_json",
 ]
 
 
@@ -1029,15 +1034,19 @@ def _record_to_row(rec: TradeRecord) -> tuple:
         rec.ha_body_pct_3m_at_entry,
         rec.ema200_3m_at_entry,
         rec.volume_3m_ratio_at_entry,
-        # 2026-05-05 — Faz 5: 3 entry tipi dispatcher fields. NOT NULL
-        # constraint — None gelmemeli; default'lara fallback.
-        rec.entry_path or "",
-        float(rec.major_reversal_score or 0.0),
-        float(rec.continuation_score or 0.0),
-        float(rec.micro_reversal_score or 0.0),
-        int(rec.mss_break_detected or 0),
-        float(rec.target_rr_ratio_at_entry or 1.0),
-        float(rec.risk_multiplier_at_entry or 1.0),
+        # 2026-05-05 — Faz 5/8: dispatcher fields, nullable. Operatör
+        # spec: gerçek değer / NULL ayrımı korunmalı, 0.0 ile karıştırma.
+        # None geçerse DB'ye NULL yazılır (semantik: "veri yok"); runner
+        # her zaman gerçek değer geçer (TAKE'te dispatcher computed,
+        # REJECT'te de hesaplanmış 0.0 — bu valid değerdir, NULL değil).
+        rec.entry_path,
+        rec.major_reversal_score,
+        rec.continuation_score,
+        rec.micro_reversal_score,
+        (None if rec.mss_break_detected is None
+         else int(rec.mss_break_detected)),
+        rec.target_rr_ratio_at_entry,
+        rec.risk_multiplier_at_entry,
     )
 
 
@@ -1293,19 +1302,15 @@ def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
         ha_body_pct_3m_at_entry=_safe_col(row, "ha_body_pct_3m_at_entry"),
         ema200_3m_at_entry=_safe_col(row, "ema200_3m_at_entry"),
         volume_3m_ratio_at_entry=_safe_col(row, "volume_3m_ratio_at_entry"),
-        # 2026-05-05 — Faz 5: 3 entry tipi dispatcher fields. NOT NULL
-        # garantili kolonlar; pre-Faz-5 rows için DEFAULT değerler okunur.
-        entry_path=_safe_col(row, "entry_path") or "",
-        major_reversal_score=float(_safe_col(row, "major_reversal_score") or 0.0),
-        continuation_score=float(_safe_col(row, "continuation_score") or 0.0),
-        micro_reversal_score=float(_safe_col(row, "micro_reversal_score") or 0.0),
-        mss_break_detected=bool(_safe_col(row, "mss_break_detected") or 0),
-        target_rr_ratio_at_entry=float(
-            _safe_col(row, "target_rr_ratio_at_entry") or 1.0
-        ),
-        risk_multiplier_at_entry=float(
-            _safe_col(row, "risk_multiplier_at_entry") or 1.0
-        ),
+        # 2026-05-05 — Faz 5/8: dispatcher fields, nullable. NULL "veri yok"
+        # semantiği korunur; runner her zaman gerçek değer yazar.
+        entry_path=_safe_col(row, "entry_path"),
+        major_reversal_score=_safe_col(row, "major_reversal_score"),
+        continuation_score=_safe_col(row, "continuation_score"),
+        micro_reversal_score=_safe_col(row, "micro_reversal_score"),
+        mss_break_detected=_safe_bool(row, "mss_break_detected"),
+        target_rr_ratio_at_entry=_safe_col(row, "target_rr_ratio_at_entry"),
+        risk_multiplier_at_entry=_safe_col(row, "risk_multiplier_at_entry"),
     )
 
 
@@ -1460,15 +1465,16 @@ class TradeJournal:
         ha_body_pct_3m_at_entry: Optional[float] = None,
         ema200_3m_at_entry: Optional[float] = None,
         volume_3m_ratio_at_entry: Optional[float] = None,
-        # 2026-05-05 — Yol A Faz 5 dispatcher fields. NOT NULL constraint
-        # ile DB'ye yazılır; default değerler legacy rehydrate path için.
-        entry_path: str = "",
-        major_reversal_score: float = 0.0,
-        continuation_score: float = 0.0,
-        micro_reversal_score: float = 0.0,
-        mss_break_detected: bool = False,
-        target_rr_ratio_at_entry: float = 1.0,
-        risk_multiplier_at_entry: float = 1.0,
+        # 2026-05-05 — Yol A Faz 5/8 dispatcher fields, nullable. Operatör
+        # 2026-05-05 düzeltme: 0.0 fallback NULL ile karışıyor; runner
+        # gerçek değerleri yazar, default None semantik = "veri yok".
+        entry_path: Optional[str] = None,
+        major_reversal_score: Optional[float] = None,
+        continuation_score: Optional[float] = None,
+        micro_reversal_score: Optional[float] = None,
+        mss_break_detected: Optional[bool] = None,
+        target_rr_ratio_at_entry: Optional[float] = None,
+        risk_multiplier_at_entry: Optional[float] = None,
         # Back-compat tail: callers may still pass these via direct kwargs
         # or `**enrichment` unpacking. Accepted but silently ignored
         # (kwargs no longer forwarded into TradeRecord — columns dropped
@@ -2227,7 +2233,7 @@ class TradeJournal:
         rsi_3m_delta_value: Optional[float] = None,
         gate_results: Optional[dict] = None,
         confluence_score: Optional[float] = None,
-        confluence_factors: Optional[list[str]] = None,
+        # 2026-05-05 Faz 8: confluence_factors DROPPED (Yol A'da kullanılmıyor)
         adx_3m: Optional[float] = None,
         plus_di_3m: Optional[float] = None,
         minus_di_3m: Optional[float] = None,
@@ -2236,12 +2242,13 @@ class TradeJournal:
         eth_open_direction: Optional[str] = None,
         session: Optional[str] = None,
         vwap_3m_side: Optional[str] = None,
-        # 2026-05-05 — Yol A Faz 5: 3 entry tipi dispatcher fields
-        # NOT NULL DB constraint, default değerler ile.
-        entry_path: str = "",
-        major_reversal_score: float = 0.0,
-        continuation_score: float = 0.0,
-        micro_reversal_score: float = 0.0,
+        # 2026-05-05 — Yol A Faz 5/8: 3 entry tipi dispatcher fields,
+        # nullable (Optional). Runner her cycle'da gerçek değerleri
+        # geçer; legacy/test path'leri default None ile çalışır.
+        entry_path: Optional[str] = None,
+        major_reversal_score: Optional[float] = None,
+        continuation_score: Optional[float] = None,
+        micro_reversal_score: Optional[float] = None,
     ) -> int:
         """Append one row to `decision_log` — per-cycle per-symbol audit trail.
 
@@ -2250,6 +2257,8 @@ class TradeJournal:
         row id; caller usually ignores. JSON columns serialized inline.
         """
         conn = self._require_conn()
+        # 2026-05-05 Faz 8: confluence_factors_json DROPPED. INSERT statement
+        # eski kolonu yazmıyor artık.
         cur = await conn.execute(
             """INSERT INTO decision_log (
                    timestamp, symbol, cycle_id, decision, decision_reason,
@@ -2263,14 +2272,14 @@ class TradeJournal:
                    mfi_3m_delta_dir, rsi_3m_delta_dir,
                    mfi_3m_delta_value, rsi_3m_delta_value,
                    gate_results_json,
-                   confluence_score, confluence_factors_json,
+                   confluence_score,
                    adx_3m, plus_di_3m, minus_di_3m, trend_regime,
                    btc_open_direction, eth_open_direction,
                    session, vwap_3m_side,
                    entry_path,
                    major_reversal_score, continuation_score, micro_reversal_score
                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                          ?, ?, ?, ?)""",
             (
                 _iso(timestamp),
@@ -2292,15 +2301,17 @@ class TradeJournal:
                 mfi_3m_delta_value, rsi_3m_delta_value,
                 (None if gate_results is None else json.dumps(gate_results)),
                 confluence_score,
-                (None if confluence_factors is None else json.dumps(confluence_factors)),
+                # 2026-05-05 Faz 8: confluence_factors_json DROPPED
                 adx_3m, plus_di_3m, minus_di_3m, trend_regime,
                 btc_open_direction, eth_open_direction,
                 session, vwap_3m_side,
-                # 2026-05-05 — Faz 5 dispatcher fields (NOT NULL guaranteed)
-                str(entry_path or ""),
-                float(major_reversal_score or 0.0),
-                float(continuation_score or 0.0),
-                float(micro_reversal_score or 0.0),
+                # 2026-05-05 — Faz 5/8 dispatcher fields, nullable.
+                # Runner gerçek değerleri geçer; None gelen NULL kalır
+                # (semantik: "veri yok").
+                entry_path,
+                major_reversal_score,
+                continuation_score,
+                micro_reversal_score,
             ),
         )
         await conn.commit()
