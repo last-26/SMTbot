@@ -1919,6 +1919,77 @@ class BotRunner:
         await self._defensive_close(symbol, pos_side, "ha_flip_reversal")
         return True
 
+    async def _maybe_close_on_counter_reversal(
+        self, symbol: str, pos_side: str, state: MarketState,
+    ) -> bool:
+        """2026-05-05 — Faz 7: "İp üstündeki cambaz" exit (operatör spec).
+
+        Pozisyondayken yeni cycle'da Major Reversal sinyali pozisyonun
+        TERSİ yönde (ve yeterince güçlü skorla) gelirse → hemen close.
+        Bir sonraki cycle yeni yönde entry alabilir → hızlı yön değişimi.
+
+        Çift taraflı kazanç hedefi: trend dönüşünü kaçırmadan yakala.
+        Mevcut HA-flip exit gate'inden ÖNCE çalışır (öncelik): yapısal
+        Major Reversal sinyali HA-flip'ten daha güvenilir.
+
+        Şartlar (hepsi pass = close):
+          * Pozisyon HA-native (`is_ha_native=True`)
+          * Yeni `evaluate_entry()` çağrısı:
+              - decision.entry_path == "major_reversal"
+              - decision.direction != current_pos_direction
+              - decision.major_reversal_score ≥ counter_reversal_score_min
+                (sıkı eşik 5.0 — chop'tan korunmak için)
+          * config.counter_reversal_exit_enabled
+
+        Returns True when close fired.
+        """
+        cfg = self.ctx.config
+        if not getattr(
+            cfg.execution, "counter_reversal_exit_enabled", True,
+        ):
+            return False
+
+        tracked = self.ctx.monitor.get_tracked(symbol, pos_side)
+        if tracked is None or not getattr(tracked, "is_ha_native", False):
+            return False
+
+        # Yeni evaluate_entry çağrısı — context inşa et
+        try:
+            decision = await self._evaluate_ha_native_entry(symbol, state)
+        except Exception:
+            logger.exception(
+                "counter_reversal_evaluate_failed symbol={}", symbol,
+            )
+            return False
+        if decision is None:
+            return False
+
+        # Sadece Major Reversal sinyali + ters yön + sıkı skor eşiği
+        if getattr(decision, "entry_path", None) != "major_reversal":
+            return False
+        pos_dir = (
+            Direction.BULLISH if pos_side == "long" else Direction.BEARISH
+        )
+        if decision.direction == pos_dir:
+            return False  # aynı yön — counter değil
+        score_min = getattr(
+            cfg.execution, "counter_reversal_score_min", 5.0,
+        )
+        if decision.major_reversal_score < score_min:
+            return False
+
+        logger.info(
+            "counter_reversal_exit_fired symbol={} side={} new_dir={} "
+            "score={:.2f} threshold={:.2f}",
+            symbol, pos_side,
+            decision.direction.value if decision.direction else "?",
+            decision.major_reversal_score, score_min,
+        )
+        await self._defensive_close(
+            symbol, pos_side, "counter_reversal_signal",
+        )
+        return True
+
     def _open_position_direction(self, symbol: str) -> Optional[Direction]:
         """Direction of the OPEN position on `symbol`, or None.
 
@@ -3356,6 +3427,17 @@ class BotRunner:
         # at register_open). Legacy 5-pillar positions retain their
         # pre-existing exit suite (momentum_fade above already ran);
         # this gate is purely additive for HA-native trades.
+        # 2026-05-05 — Faz 7: counter-reversal exit ha_flip'ten ÖNCE.
+        # "İp üstündeki cambaz" — pozisyonun TERSİ yönde güçlü Major
+        # Reversal sinyali gelirse hemen close, sonraki cycle yeni yönde
+        # entry alabilir. HA-flip'ten daha sıkı (skor ≥ 5.0 + structural
+        # MR confirmation).
+        if open_side:
+            cr_closed = await self._maybe_close_on_counter_reversal(
+                symbol, open_side, state,
+            )
+            if cr_closed:
+                return
         if open_side:
             ha_closed = await self._maybe_close_on_ha_flip(
                 symbol, open_side, state,
@@ -3597,20 +3679,51 @@ class BotRunner:
         # buradan plan üretilir; aksi halde plan None kalır → NO_TRADE
         # branch'ı reject_reason="ha_native_no_setup" damgalar.
         if ha_decision is not None and ha_decision.is_take:
-            ha_plan = self._build_ha_native_trade_plan(ha_decision, symbol)
-            if ha_plan is not None:
-                old_reject = reject_reason
-                plan = ha_plan
-                reject_reason = None
-                logger.info(
-                    "ha_native_plan_override symbol={} dir={} entry={} "
-                    "sl={} tp={} contracts={} prev_5pillar_reject={}",
-                    symbol,
-                    ha_plan.direction.value if hasattr(ha_plan.direction, "value")
-                    else ha_plan.direction,
-                    ha_plan.entry_price, ha_plan.sl_price, ha_plan.tp_price,
-                    ha_plan.num_contracts, old_reject,
+            # 2026-05-05 — Faz 7: ema200_warmup gate. Operatör DB null
+            # kuralı: ema200_3m=0.0 (Pine henüz 200-bar warmup'ta) →
+            # trade alma. Aksi halde journal'a 0.0 yazılır ki bu
+            # null-equivalent (Pine emit edemedi). Production'da TV
+            # chart 200+ bar açıldığı için pratik olarak hep dolu, ama
+            # edge case için savunmacı kontrol.
+            ema200 = float(state.signal_table.ema200_3m or 0.0)
+            if (
+                cfg.execution.ema200_warmup_gate_enabled
+                and ema200 <= 0.0
+            ):
+                logger.warning(
+                    "ema200_warmup_gate_blocked symbol={} ema200={} — "
+                    "skipping HA-native entry (Pine henüz 200-bar warmup'ta)",
+                    symbol, ema200,
                 )
+                reject_reason = "ema200_warmup_not_ready"
+            else:
+                ha_plan = self._build_ha_native_trade_plan(
+                    ha_decision, symbol,
+                )
+                if ha_plan is not None:
+                    old_reject = reject_reason
+                    plan = ha_plan
+                    reject_reason = None
+                    logger.info(
+                        "ha_native_plan_override symbol={} dir={} "
+                        "entry_path={} entry={} sl={} tp={} contracts={} "
+                        "rr={:.2f} risk_mult={:.2f} "
+                        "scores=(MR={:.2f},C={:.2f},MicR={:.2f}) "
+                        "prev_5pillar_reject={}",
+                        symbol,
+                        ha_plan.direction.value if hasattr(
+                            ha_plan.direction, "value"
+                        ) else ha_plan.direction,
+                        ha_decision.entry_path,
+                        ha_plan.entry_price, ha_plan.sl_price,
+                        ha_plan.tp_price, ha_plan.num_contracts,
+                        ha_decision.target_rr,
+                        ha_decision.risk_multiplier,
+                        ha_decision.major_reversal_score,
+                        ha_decision.continuation_score,
+                        ha_decision.micro_reversal_score,
+                        old_reject,
+                    )
 
         if plan is None:
             # 2026-05-04 — Yol A: derive a sensible reject_reason for the

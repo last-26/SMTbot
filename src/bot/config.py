@@ -610,6 +610,21 @@ class ExecutionConfig(BaseModel):
     ha_native_exit_rcs_noise: float = 0.8
     ha_native_exit_min_bars_held: int = 1
 
+    # 2026-05-05 — Faz 7: counter-reversal exit ("ip üstündeki cambaz").
+    # Pozisyondayken TERS yönde Major Reversal sinyali ≥ score_min ile
+    # gelirse hemen close → bir sonraki cycle yeni yönde entry. Hızlı
+    # yön değişimi + çift taraflı kazanç. HA-flip'ten daha sıkı:
+    # structural MR confirmation + sıkı skor eşiği (chop guard).
+    counter_reversal_exit_enabled: bool = True
+    counter_reversal_score_min: float = 5.0
+
+    # 2026-05-05 — Faz 7: ema200_3m warmup gate (operatör DB null kuralı).
+    # Pine ema200(close, 200) 200-bar warmup gerektirir. Eğer ema200=0.0
+    # geliyor (Pine henüz yeterli history'ye ulaşmadı) trade alma —
+    # journal'a 0.0 NULL-equivalent yazmamak için. Bot başlatma sonrası
+    # nadir edge case (TV chart 200+ bar açıyor genelde).
+    ema200_warmup_gate_enabled: bool = True
+
     # Position-attached TP/SL trigger-price source. "mark" = index-weighted
     # price across the major real-market venues (cross-exchange VWAP).
     # "last" = last trade on the Bybit book (default in Bybit V5).
