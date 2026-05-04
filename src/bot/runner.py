@@ -725,6 +725,14 @@ class _DryRunRouter:
 
 
 class BotRunner:
+    # 2026-05-04 — Yol A: HA-native primary mode. The legacy 5-pillar entry
+    # path (build_trade_plan_with_reason call in _run_one_symbol) is disabled
+    # by default. Confluence scoring still runs in the NO_TRADE branch as a
+    # supportive journal signal, but does NOT create a TradePlan. Flip this
+    # to True for emergency revert (single-flag switch — no other change
+    # needed; the legacy block is preserved verbatim).
+    _LEGACY_5PILLAR_ENABLED: bool = False
+
     def __init__(
         self,
         ctx: BotContext,
@@ -3159,135 +3167,146 @@ class BotRunner:
         # writes NULLs for the 15m triad.
         htf_regime_result = self.ctx.htf_adx_cache.get(symbol)
 
-        try:
-            plan, reject_reason = build_trade_plan_with_reason(
-                state, risk_balance,
-                candles=candles,
-                min_confluence_score=cfg.analysis.min_confluence_score,
-                weights=cfg.analysis.confluence_weights or None,
-                risk_pct=cfg.risk_pct_fraction(),
-                rr_ratio=cfg.trading.default_rr_ratio,
-                min_rr_ratio=cfg.trading.min_rr_ratio,
-                max_leverage=min(
-                    cfg.trading.max_leverage,
-                    self.ctx.max_leverage_per_symbol.get(
-                        symbol, cfg.trading.max_leverage),
-                    cfg.trading.symbol_leverage_caps.get(
-                        symbol, cfg.trading.max_leverage),
-                ),
-                contract_size=self.ctx.contract_sizes.get(
-                    symbol, cfg.trading.contract_size),
-                margin_balance=margin_balance,
-                risk_amount_usdt_override=risk_amount_override,
-                swing_lookback=cfg.swing_lookback_for(symbol),
-                allowed_sessions=cfg.allowed_sessions_for(symbol) or None,
-                htf_sr_zones=self.ctx.htf_sr_cache.get(symbol),
-                htf_sr_ceiling_enabled=cfg.analysis.htf_sr_ceiling_enabled,
-                htf_sr_buffer_atr=cfg.htf_sr_buffer_atr_for(symbol),
-                crowded_skip_enabled=cfg.derivatives.crowded_skip_enabled,
-                crowded_skip_z_threshold=cfg.derivatives.crowded_skip_z_threshold,
-                ltf_state=self.ctx.ltf_cache.get(symbol),
-                htf_state=self.ctx.htf_state_cache.get(symbol),
-                min_tp_distance_pct=cfg.analysis.min_tp_distance_pct,
-                min_sl_distance_pct=cfg.min_sl_distance_pct_for(symbol),
-                fee_reserve_pct=cfg.trading.fee_reserve_pct,
-                partial_tp_enabled=cfg.execution.partial_tp_enabled,
-                partial_tp_ratio=cfg.execution.partial_tp_ratio,
-                min_rsi_mfi_magnitude=cfg.analysis.min_rsi_mfi_magnitude,
-                liquidity_pool_max_atr_dist=cfg.analysis.liquidity_pool_max_atr_dist,
-                vwap_hard_veto_enabled=cfg.analysis.vwap_hard_veto_enabled,
-                ema_veto_enabled=cfg.analysis.ema_veto_enabled,
-                ema_veto_fast_period=cfg.analysis.ema_veto_fast_period,
-                ema_veto_slow_period=cfg.analysis.ema_veto_slow_period,
-                pillar_opposition=self._pillar_opposition_for(symbol),
-                premium_discount_veto_enabled=cfg.analysis.premium_discount_veto_enabled,
-                premium_discount_lookback=cfg.analysis.premium_discount_lookback,
-                displacement_atr_mult=cfg.analysis.displacement_atr_mult,
-                displacement_max_bars_ago=cfg.analysis.displacement_max_bars_ago,
-                divergence_fresh_bars=cfg.analysis.divergence_fresh_bars,
-                divergence_decay_bars=cfg.analysis.divergence_decay_bars,
-                divergence_max_bars=cfg.analysis.divergence_max_bars,
-                trend_regime=trend_regime,
-                trend_regime_conditional_scoring_enabled=
-                    cfg.analysis.trend_regime_conditional_scoring_enabled,
-                daily_bias_enabled=(
-                    cfg.on_chain.enabled
-                    and cfg.on_chain.daily_bias_enabled
-                ),
-                daily_bias_delta=cfg.on_chain.daily_bias_modifier_delta,
-                stablecoin_pulse_enabled=(
-                    cfg.on_chain.enabled
-                    and cfg.on_chain.stablecoin_pulse_enabled
-                ),
-                stablecoin_pulse_usd=self.ctx.stablecoin_pulse_1h_usd,
-                stablecoin_pulse_threshold_usd=(
-                    cfg.on_chain.stablecoin_pulse_threshold_usd),
-                stablecoin_pulse_penalty=(
-                    cfg.on_chain.stablecoin_pulse_penalty),
-                altcoin_index_enabled=(
-                    cfg.on_chain.enabled
-                    and cfg.on_chain.altcoin_index_enabled
-                ),
-                altcoin_index_value=self.ctx.altcoin_index_value,
-                altcoin_index_is_altcoin=(symbol not in _PILLAR_SYMBOLS),
-                altcoin_index_bearish_threshold=(
-                    cfg.on_chain.altcoin_index_bearish_threshold),
-                altcoin_index_bullish_threshold=(
-                    cfg.on_chain.altcoin_index_bullish_threshold),
-                altcoin_index_penalty=(
-                    cfg.on_chain.altcoin_index_modifier_delta),
-                # 2026-04-22 — flow_alignment soft directional signal.
-                # Replaces the whale hard gate; penalty defaults to 0.25
-                # in Pass 1 (tuned in Pass 2).
-                flow_alignment_enabled=(
-                    cfg.on_chain.enabled
-                    and cfg.on_chain.flow_alignment_enabled
-                ),
-                flow_alignment_penalty=cfg.on_chain.flow_alignment_penalty,
-                flow_alignment_noise_floor_usd=(
-                    cfg.on_chain.flow_alignment_noise_floor_usd),
-                flow_alignment_btc_netflow_24h_usd=(
-                    self.ctx.on_chain_snapshot.cex_btc_netflow_24h_usd
-                    if self.ctx.on_chain_snapshot is not None else None
-                ),
-                flow_alignment_eth_netflow_24h_usd=(
-                    self.ctx.on_chain_snapshot.cex_eth_netflow_24h_usd
-                    if self.ctx.on_chain_snapshot is not None else None
-                ),
-                flow_alignment_coinbase_netflow_24h_usd=(
-                    self.ctx.on_chain_snapshot.cex_coinbase_netflow_24h_usd
-                    if self.ctx.on_chain_snapshot is not None else None
-                ),
-                flow_alignment_binance_netflow_24h_usd=(
-                    self.ctx.on_chain_snapshot.cex_binance_netflow_24h_usd
-                    if self.ctx.on_chain_snapshot is not None else None
-                ),
-                flow_alignment_bybit_netflow_24h_usd=(
-                    self.ctx.on_chain_snapshot.cex_bybit_netflow_24h_usd
-                    if self.ctx.on_chain_snapshot is not None else None
-                ),
-                # 2026-04-22 (gece, late) — per-symbol 1h CEX volume penalty.
-                # Looked up per-symbol from the snapshot's JSON dict.
-                per_symbol_cex_flow_enabled=(
-                    cfg.on_chain.enabled
-                    and cfg.on_chain.per_symbol_cex_flow_enabled
-                ),
-                per_symbol_cex_flow_usd=self._per_symbol_cex_flow_for(symbol),
-                per_symbol_cex_flow_noise_floor_usd=(
-                    cfg.on_chain.per_symbol_cex_flow_noise_floor_usd),
-                per_symbol_cex_flow_penalty=(
-                    cfg.on_chain.per_symbol_cex_flow_penalty),
-            )
-        except Exception:
-            logger.exception("plan_build_failed symbol={}", symbol)
-            return
+        # 2026-05-04 — Yol A: legacy 5-pillar entry path is now BACKUP
+        # ONLY. HA-native primary mode (see OVERRIDE block below) owns
+        # entry decisions. The full call below is preserved verbatim and
+        # gated by `self._LEGACY_5PILLAR_ENABLED` — flip to True to revert
+        # to the prior behavior with zero diff. Confluence scoring still
+        # runs in the NO_TRADE branch as a supportive journal signal
+        # (operator: "destekleyici olarak tutabilirsin"); only the entry
+        # path is HA-native-exclusive now.
+        plan: Optional[TradePlan] = None
+        reject_reason: Optional[str] = None
+        if self._LEGACY_5PILLAR_ENABLED:
+            try:
+                plan, reject_reason = build_trade_plan_with_reason(
+                    state, risk_balance,
+                    candles=candles,
+                    min_confluence_score=cfg.analysis.min_confluence_score,
+                    weights=cfg.analysis.confluence_weights or None,
+                    risk_pct=cfg.risk_pct_fraction(),
+                    rr_ratio=cfg.trading.default_rr_ratio,
+                    min_rr_ratio=cfg.trading.min_rr_ratio,
+                    max_leverage=min(
+                        cfg.trading.max_leverage,
+                        self.ctx.max_leverage_per_symbol.get(
+                            symbol, cfg.trading.max_leverage),
+                        cfg.trading.symbol_leverage_caps.get(
+                            symbol, cfg.trading.max_leverage),
+                    ),
+                    contract_size=self.ctx.contract_sizes.get(
+                        symbol, cfg.trading.contract_size),
+                    margin_balance=margin_balance,
+                    risk_amount_usdt_override=risk_amount_override,
+                    swing_lookback=cfg.swing_lookback_for(symbol),
+                    allowed_sessions=cfg.allowed_sessions_for(symbol) or None,
+                    htf_sr_zones=self.ctx.htf_sr_cache.get(symbol),
+                    htf_sr_ceiling_enabled=cfg.analysis.htf_sr_ceiling_enabled,
+                    htf_sr_buffer_atr=cfg.htf_sr_buffer_atr_for(symbol),
+                    crowded_skip_enabled=cfg.derivatives.crowded_skip_enabled,
+                    crowded_skip_z_threshold=cfg.derivatives.crowded_skip_z_threshold,
+                    ltf_state=self.ctx.ltf_cache.get(symbol),
+                    htf_state=self.ctx.htf_state_cache.get(symbol),
+                    min_tp_distance_pct=cfg.analysis.min_tp_distance_pct,
+                    min_sl_distance_pct=cfg.min_sl_distance_pct_for(symbol),
+                    fee_reserve_pct=cfg.trading.fee_reserve_pct,
+                    partial_tp_enabled=cfg.execution.partial_tp_enabled,
+                    partial_tp_ratio=cfg.execution.partial_tp_ratio,
+                    min_rsi_mfi_magnitude=cfg.analysis.min_rsi_mfi_magnitude,
+                    liquidity_pool_max_atr_dist=cfg.analysis.liquidity_pool_max_atr_dist,
+                    vwap_hard_veto_enabled=cfg.analysis.vwap_hard_veto_enabled,
+                    ema_veto_enabled=cfg.analysis.ema_veto_enabled,
+                    ema_veto_fast_period=cfg.analysis.ema_veto_fast_period,
+                    ema_veto_slow_period=cfg.analysis.ema_veto_slow_period,
+                    pillar_opposition=self._pillar_opposition_for(symbol),
+                    premium_discount_veto_enabled=cfg.analysis.premium_discount_veto_enabled,
+                    premium_discount_lookback=cfg.analysis.premium_discount_lookback,
+                    displacement_atr_mult=cfg.analysis.displacement_atr_mult,
+                    displacement_max_bars_ago=cfg.analysis.displacement_max_bars_ago,
+                    divergence_fresh_bars=cfg.analysis.divergence_fresh_bars,
+                    divergence_decay_bars=cfg.analysis.divergence_decay_bars,
+                    divergence_max_bars=cfg.analysis.divergence_max_bars,
+                    trend_regime=trend_regime,
+                    trend_regime_conditional_scoring_enabled=
+                        cfg.analysis.trend_regime_conditional_scoring_enabled,
+                    daily_bias_enabled=(
+                        cfg.on_chain.enabled
+                        and cfg.on_chain.daily_bias_enabled
+                    ),
+                    daily_bias_delta=cfg.on_chain.daily_bias_modifier_delta,
+                    stablecoin_pulse_enabled=(
+                        cfg.on_chain.enabled
+                        and cfg.on_chain.stablecoin_pulse_enabled
+                    ),
+                    stablecoin_pulse_usd=self.ctx.stablecoin_pulse_1h_usd,
+                    stablecoin_pulse_threshold_usd=(
+                        cfg.on_chain.stablecoin_pulse_threshold_usd),
+                    stablecoin_pulse_penalty=(
+                        cfg.on_chain.stablecoin_pulse_penalty),
+                    altcoin_index_enabled=(
+                        cfg.on_chain.enabled
+                        and cfg.on_chain.altcoin_index_enabled
+                    ),
+                    altcoin_index_value=self.ctx.altcoin_index_value,
+                    altcoin_index_is_altcoin=(symbol not in _PILLAR_SYMBOLS),
+                    altcoin_index_bearish_threshold=(
+                        cfg.on_chain.altcoin_index_bearish_threshold),
+                    altcoin_index_bullish_threshold=(
+                        cfg.on_chain.altcoin_index_bullish_threshold),
+                    altcoin_index_penalty=(
+                        cfg.on_chain.altcoin_index_modifier_delta),
+                    # 2026-04-22 — flow_alignment soft directional signal.
+                    # Replaces the whale hard gate; penalty defaults to 0.25
+                    # in Pass 1 (tuned in Pass 2).
+                    flow_alignment_enabled=(
+                        cfg.on_chain.enabled
+                        and cfg.on_chain.flow_alignment_enabled
+                    ),
+                    flow_alignment_penalty=cfg.on_chain.flow_alignment_penalty,
+                    flow_alignment_noise_floor_usd=(
+                        cfg.on_chain.flow_alignment_noise_floor_usd),
+                    flow_alignment_btc_netflow_24h_usd=(
+                        self.ctx.on_chain_snapshot.cex_btc_netflow_24h_usd
+                        if self.ctx.on_chain_snapshot is not None else None
+                    ),
+                    flow_alignment_eth_netflow_24h_usd=(
+                        self.ctx.on_chain_snapshot.cex_eth_netflow_24h_usd
+                        if self.ctx.on_chain_snapshot is not None else None
+                    ),
+                    flow_alignment_coinbase_netflow_24h_usd=(
+                        self.ctx.on_chain_snapshot.cex_coinbase_netflow_24h_usd
+                        if self.ctx.on_chain_snapshot is not None else None
+                    ),
+                    flow_alignment_binance_netflow_24h_usd=(
+                        self.ctx.on_chain_snapshot.cex_binance_netflow_24h_usd
+                        if self.ctx.on_chain_snapshot is not None else None
+                    ),
+                    flow_alignment_bybit_netflow_24h_usd=(
+                        self.ctx.on_chain_snapshot.cex_bybit_netflow_24h_usd
+                        if self.ctx.on_chain_snapshot is not None else None
+                    ),
+                    # 2026-04-22 (gece, late) — per-symbol 1h CEX volume penalty.
+                    # Looked up per-symbol from the snapshot's JSON dict.
+                    per_symbol_cex_flow_enabled=(
+                        cfg.on_chain.enabled
+                        and cfg.on_chain.per_symbol_cex_flow_enabled
+                    ),
+                    per_symbol_cex_flow_usd=self._per_symbol_cex_flow_for(symbol),
+                    per_symbol_cex_flow_noise_floor_usd=(
+                        cfg.on_chain.per_symbol_cex_flow_noise_floor_usd),
+                    per_symbol_cex_flow_penalty=(
+                        cfg.on_chain.per_symbol_cex_flow_penalty),
+                )
+            except Exception:
+                logger.exception("plan_build_failed symbol={}", symbol)
+                return
 
         # 2026-05-04 — HA-native primary mode (Yol A) OVERRIDE.
-        # Operatör spec: planner ENTRY_TAKEN → mevcut 5-pillar plan'ı
-        # bypass, HA-native plan'ı kullan. Eski path her durumda hesaplandı
-        # (CPU yedi) ama sonuç ezilir — kademeli geçiş; tam yorum satırı
-        # backup sıradaki commit'te. NO_SETUP/REJECT/None ise eski plan
-        # kalır (mevcut davranış korunur, regression yok).
+        # Operatör spec: planner ENTRY_TAKEN → HA-native plan oluştur.
+        # _LEGACY_5PILLAR_ENABLED=False olduğu için yukarıdaki block
+        # atlandı; plan/reject_reason None geldi. HA-native ENTRY ise
+        # buradan plan üretilir; aksi halde plan None kalır → NO_TRADE
+        # branch'ı reject_reason="ha_native_no_setup" damgalar.
         if ha_decision is not None and ha_decision.is_take:
             ha_plan = self._build_ha_native_trade_plan(ha_decision, symbol)
             if ha_plan is not None:
@@ -3305,12 +3324,30 @@ class BotRunner:
                 )
 
         if plan is None:
-            # reject_reason taxonomy: below_confluence / session_filter /
-            # no_sl_source / vwap_misaligned / ema_momentum_contra /
-            # cross_asset_opposition / wrong_side_of_premium_discount /
-            # crowded_skip / zero_contracts / htf_tp_ceiling / tp_too_tight /
-            # insufficient_contracts_for_split / macro_event_blackout.
-            # Sub-floor SL distances are widened, not rejected.
+            # 2026-05-04 — Yol A: derive a sensible reject_reason for the
+            # NO_TRADE branch when HA-native is the sole entry path.
+            # reject_reason will be None whenever _LEGACY_5PILLAR_ENABLED is
+            # False AND HA-native didn't take (the legacy taxonomy below
+            # only fires when the legacy block ran). Map ha_decision outcome
+            # to a clean reason so journal/audit lines stay searchable.
+            if reject_reason is None:
+                if ha_decision is None:
+                    reject_reason = "ha_native_audit_skipped"
+                elif ha_decision.decision == "REJECT":
+                    reject_reason = (
+                        f"ha_native_reject:{ha_decision.reason}"
+                        if ha_decision.reason else "ha_native_reject"
+                    )
+                else:
+                    reject_reason = "ha_native_no_setup"
+            # Legacy 5-pillar reject_reason taxonomy (only fires when
+            # _LEGACY_5PILLAR_ENABLED is True): below_confluence /
+            # session_filter / no_sl_source / vwap_misaligned /
+            # ema_momentum_contra / cross_asset_opposition /
+            # wrong_side_of_premium_discount / crowded_skip / zero_contracts
+            # / htf_tp_ceiling / tp_too_tight / insufficient_contracts_for_split
+            # / macro_event_blackout. Sub-floor SL distances are widened,
+            # not rejected.
             try:
                 conf = calculate_confluence(
                     state,
