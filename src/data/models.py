@@ -193,6 +193,12 @@ class OscillatorTableData(BaseModel):
     ha_rsi_3m: float = 50.0
     ha_rsi_15m: float = 50.0
 
+    # Pine's bar_index emitted as the LAST row beacon — used by the runner's
+    # dual-table freshness poll so a TF/symbol switch unblocks as soon as
+    # BOTH tables (Signals + Oscillator) reflect the new chart. None when
+    # the table isn't present yet (first boot or Pine version mismatch).
+    last_bar: Optional[int] = None
+
 
 # ── Unified Market State ────────────────────────────────────────────────────
 

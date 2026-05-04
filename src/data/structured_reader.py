@@ -386,6 +386,7 @@ def _build_oscillator_data(kv: dict[str, str]) -> OscillatorTableData:
         ha_rsi_1m=_parse_float(kv.get("ha_rsi_1m", "50")) or 50.0,
         ha_rsi_3m=_parse_float(kv.get("ha_rsi_3m", "50")) or 50.0,
         ha_rsi_15m=_parse_float(kv.get("ha_rsi_15m", "50")) or 50.0,
+        last_bar=_parse_int(kv.get("last_bar")),
     )
 
 
