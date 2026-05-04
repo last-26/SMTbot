@@ -2306,14 +2306,43 @@ class BotRunner:
         return False
 
     async def _read_last_bars(self) -> tuple[Optional[int], Optional[int]]:
-        """Read both Signals.last_bar and Oscillator.last_bar in one shot.
+        """Lightweight freshness probe — Pine tables ONLY, parse last_bar.
+
+        Operatör 2026-05-04: önceki implementation `read_market_state()`
+        çağırıyordu — bu 5 paralel node subprocess fırlatıyor (tables +
+        labels + boxes + lines + status), polling sırasında %80'i çöp.
+        Şimdi sadece `get_pine_tables()` (1 subprocess), parse, last_bar
+        çıkarımı. Polling overhead'i %80 azalır; cycle başına ~100s tasarruf.
+
+        Tests without a bridge (or with a recording-only bridge that lacks
+        `get_pine_tables`) fall back to the legacy `reader.read_market_state()`
+        path so the freshness invariants the test suite checks still trigger.
 
         Returns (signals_lb, oscillator_lb) tuple. Either side may be None
         when that table isn't present (first boot, Pine version mismatch,
-        fake reader in tests). The dual-poll uses both as freshness beacons
-        so a TF/symbol switch unblocks only after BOTH tables re-render —
-        eliminates the Oscillator-lag tail of the legacy single-table poll.
+        fake reader in tests).
         """
+        bridge = self.ctx.bridge
+        # Fast path — production bridge with get_pine_tables. One subprocess
+        # (or one daemon round-trip) instead of full read_market_state.
+        if bridge is not None and hasattr(bridge, "get_pine_tables"):
+            try:
+                tables = await bridge.get_pine_tables()
+                from src.data.structured_reader import (
+                    parse_oscillator_table,
+                    parse_signal_table,
+                )
+                sig_table = parse_signal_table(tables)
+                osc_table = parse_oscillator_table(tables)
+                sig_lb = sig_table.last_bar if sig_table else None
+                osc_lb = osc_table.last_bar if osc_table else None
+                return (sig_lb, osc_lb)
+            except Exception:
+                # Fall through to reader-based fallback if the bridge call
+                # blew up (mock bridge in tests, transient daemon error, etc).
+                pass
+        # Fallback — read_market_state via the reader. Heavier but covers
+        # test mocks and any environment where the bridge is unavailable.
         try:
             state = await self.ctx.reader.read_market_state()
             sig_lb = state.signal_table.last_bar if state.signal_table else None
@@ -2323,34 +2352,63 @@ class BotRunner:
             return (None, None)
 
     async def _wait_for_pine_settle_dual(
-        self, baselines: tuple[Optional[int], Optional[int]],
+        self,
+        baselines: tuple[Optional[int], Optional[int]],
+        max_wait_s: Optional[float] = None,
     ) -> bool:
-        """Poll both tables until BOTH last_bar values differ from baselines.
+        """Poll until Pine tables show fresh data (data-ready check).
 
-        Operatör 2026-05-04 dinamik settle — verileri gelir gelmez next TF /
-        symbol'a geç, sabit sleep'le zaman kaybetme. Hızlı yüklenen TF'lerde
-        ~0.3-1.0s'de döner; yavaşlarda `pine_settle_max_wait_s` timeout.
+        Operatör 2026-05-04 v3: önceki "last_bar baseline comparison" mantığı
+        bozuktu — TV chart'ın `bar_index` (= last_bar) sembol switch'te aynı
+        kalır (her sembol aynı bar count'lu history yükler), TF switch'te
+        de yeni bar print etmedikçe değişmez. Polling baseline-eşleşmesini
+        ASLA göremedi → her seferinde timeout fire etti.
 
-        None baseline = "table not present" → o taraf otomatik fresh sayılır
-        (Pine'da ilgili tablonun olmadığı durum deadlock yapmasın).
+        Yeni mantık: tablo doluluk check. Pine yeni sembol/TF için render
+        bitirdiğinde `signal_table.price` ve `last_bar` populate olur; bot
+        bunu doğrudan görür ve exit eder. Tipik gerçek timing'ler:
+          - Symbol switch:  set_symbol 10s + Pine settle ~100ms = ~10.1s
+          - TF switch:      set_timeframe 1.5-2.5s + settle ~100ms = ~1.6-2.6s
+        Bot bu süreleri set_*'in `await`'inde zaten harcıyor; dual-poll
+        artık ek 100-300ms eklemeli, tüm timeout'u değil.
 
-        Returns True on dual-fresh, False on timeout.
+        Args:
+            baselines: (signals_lb, osc_lb) — IGNORED (legacy compat).
+            max_wait_s: override config default for slow Pine cold starts.
+
+        Returns True on data-ready, False on timeout.
         """
-        sig_baseline, osc_baseline = baselines
-        if sig_baseline is None and osc_baseline is None:
-            return True
         cfg = self.ctx.config.trading
-        deadline = time.monotonic() + cfg.pine_settle_max_wait_s
+        wait_s = max_wait_s if max_wait_s is not None else cfg.pine_settle_max_wait_s
+        deadline = time.monotonic() + wait_s
+        bridge = self.ctx.bridge
+        use_bridge = bridge is not None and hasattr(bridge, "get_pine_tables")
+
         while time.monotonic() < deadline:
-            sig_lb, osc_lb = await self._read_last_bars()
-            sig_ok = sig_baseline is None or (
-                sig_lb is not None and sig_lb != sig_baseline
-            )
-            osc_ok = osc_baseline is None or (
-                osc_lb is not None and osc_lb != osc_baseline
-            )
-            if sig_ok and osc_ok:
-                return True
+            try:
+                if use_bridge:
+                    tables = await bridge.get_pine_tables()
+                    from src.data.structured_reader import (
+                        parse_oscillator_table,
+                        parse_signal_table,
+                    )
+                    sig = parse_signal_table(tables)
+                    osc = parse_oscillator_table(tables)
+                else:
+                    # Test fallback — no bridge or recording-only mock.
+                    state = await self.ctx.reader.read_market_state()
+                    sig = state.signal_table
+                    osc = state.oscillator
+                if (
+                    sig is not None
+                    and sig.last_bar is not None
+                    and sig.price > 0
+                    and osc is not None
+                    and osc.last_bar is not None
+                ):
+                    return True
+            except Exception:
+                pass  # transient bridge error — keep polling
             await asyncio.sleep(cfg.pine_settle_poll_interval_s)
         return False
 
@@ -2384,8 +2442,13 @@ class BotRunner:
         except Exception:
             logger.exception("set_timeframe_failed tf={}", tf)
             return False
-        # Dynamic settle — no static sleep; dual-poll exits as soon as both
-        # tables reflect the new TF.
+        # Floor — Pine needs ~200-300ms to start re-rendering after the TF
+        # switch; without this gap the polling loop reads the same baseline
+        # immediately and the dual-poll burns the full timeout despite Pine
+        # being mid-render. Same pattern as set_symbol path (2026-05-04 fix).
+        await asyncio.sleep(0.3)
+        # Dynamic settle — dual-poll exits as soon as both tables reflect
+        # the new TF (Operatör 2026-05-04 dinamik settle).
         return await self._wait_for_pine_settle_dual(baselines)
 
     async def _run_one_symbol(self, symbol: str) -> None:
@@ -2432,26 +2495,47 @@ class BotRunner:
         # symbol switches each cycle even though the trade decision is
         # skipped; the operator can keep eyeballing the chart.
         if self.ctx.bridge is not None:
-            # Operatör 2026-05-04 dinamik settle: capture pre-switch dual
-            # baselines and replace the static `symbol_settle_seconds` sleep
-            # with a dual-poll wait. Bot bir sonraki sembole geçtiği anda
-            # Signals + Oscillator tabloları fresh olunca cycle devam eder.
-            sym_baselines = await self._read_last_bars()
+            tv_symbol = internal_to_tv_symbol(symbol)
+            # Short-circuit: chart already on this symbol → set_symbol would be
+            # a no-op and Pine wouldn't re-render, so dual-poll burns the full
+            # max_wait_s timeout watching an unchanged last_bar (2026-05-04 fix).
+            skip_switch = False
             try:
-                await self.ctx.bridge.set_symbol(internal_to_tv_symbol(symbol))
+                status = await self.ctx.bridge.status()
+                skip_switch = status.get("chart_symbol") == tv_symbol
             except Exception:
-                logger.exception("set_symbol_failed symbol={}", symbol)
-                return
-            settled = await self._wait_for_pine_settle_dual(sym_baselines)
-            if not settled:
-                logger.warning(
-                    "symbol_settle_timeout symbol={} max_wait_s={}",
-                    symbol, cfg.trading.pine_settle_max_wait_s,
+                pass  # status() failed — fall through to full switch+poll
+            if not skip_switch:
+                # Operatör 2026-05-04 dinamik settle: capture pre-switch dual
+                # baselines and replace the static `symbol_settle_seconds`
+                # sleep with a dual-poll wait. Bir sonraki sembole geçtiği
+                # anda Signals + Oscillator fresh olunca cycle devam eder.
+                sym_baselines = await self._read_last_bars()
+                try:
+                    await self.ctx.bridge.set_symbol(tv_symbol)
+                except Exception:
+                    logger.exception("set_symbol_failed symbol={}", symbol)
+                    return
+                # set_symbol already waits ~10s for chart settle (Node side
+                # blocks on TV CDP until chart re-render completes). After
+                # it returns, Pine table fills within ~100ms — the data-ready
+                # poll below catches that quickly. No floor sleep needed.
+                # Symbol switch may still need 2× cap on slow Pine cold starts
+                # (HA recursion + multi-TF security recompute beyond the chart
+                # render Node already waited for). Operatör 2026-05-04 v3.
+                symbol_max_wait = cfg.trading.pine_settle_max_wait_s * 2
+                settled = await self._wait_for_pine_settle_dual(
+                    sym_baselines, max_wait_s=symbol_max_wait,
                 )
-                # Don't return — caller's downstream calls (read_market_state,
-                # _switch_timeframe) will get whatever Pine has, and existing
-                # error handling skips the cycle if data is stale. Keeping
-                # parity with the legacy "sleep then continue" behaviour.
+                if not settled:
+                    logger.warning(
+                        "symbol_settle_timeout symbol={} max_wait_s={}",
+                        symbol, symbol_max_wait,
+                    )
+                    # Don't return — caller's downstream calls
+                    # (read_market_state, _switch_timeframe) will get whatever
+                    # Pine has; existing error handling skips the cycle if
+                    # data is stale. Parity with legacy "sleep then continue".
 
         # 0b. VWAP daily-reset blackout — skip new entries inside the
         # ±window around UTC 00:00. Pine 1m/3m/15m VWAPs all anchor on
