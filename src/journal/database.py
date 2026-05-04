@@ -165,12 +165,32 @@ CREATE TABLE IF NOT EXISTS trades (
     -- `{"above": [{price, notional_usd, distance_atr}, ...],
     --   "below": [{...}, ...]}`.
     -- Default '{}' when heatmap missing or already-open HTF skip empties cache.
-    liq_heatmap_top_clusters_json    TEXT NOT NULL DEFAULT '{}'
+    liq_heatmap_top_clusters_json    TEXT NOT NULL DEFAULT '{}',
+
+    -- 2026-05-04 — HA-native primary mode (Yol A) journal fields. Pass 3
+    -- GBT segments accuracy + R distribution by entry strategy via the
+    -- `is_ha_native` boolean (NULL on pre-Yol-A rows). HA snapshot fields
+    -- capture multi-TF color/streak/body/EMA200/volume at entry time —
+    -- continuous + categorical features specific to the HA-native doctrine
+    -- (color flip patterns, no-shadow momentum thrust proxy via body_pct,
+    -- macro EMA200 trend filter, RCS volume baseline). All NULL on rows
+    -- written before the migration.
+    is_ha_native             INTEGER,
+    ha_color_3m_at_entry     TEXT,
+    ha_color_15m_at_entry    TEXT,
+    ha_streak_3m_at_entry    INTEGER,
+    ha_streak_15m_at_entry   INTEGER,
+    ha_body_pct_3m_at_entry  REAL,
+    ema200_3m_at_entry       REAL,
+    volume_3m_ratio_at_entry REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_trades_outcome      ON trades(outcome);
 CREATE INDEX IF NOT EXISTS idx_trades_entry_ts     ON trades(entry_timestamp);
 CREATE INDEX IF NOT EXISTS idx_trades_exit_ts      ON trades(exit_timestamp);
+-- 2026-05-04 — index supports per-strategy WR / R aggregation queries
+-- (factor_audit.py + dashboard) filtering on is_ha_native.
+CREATE INDEX IF NOT EXISTS idx_trades_is_ha_native ON trades(is_ha_native);
 
 CREATE TABLE IF NOT EXISTS rejected_signals (
     rejection_id        TEXT PRIMARY KEY,
@@ -520,6 +540,17 @@ _COLUMNS = [
     "short_liq_notional_1h_at_entry",
     "ls_ratio_zscore_14d_at_entry",
     "liq_heatmap_top_clusters_json",
+    # 2026-05-04 — HA-native (Yol A) journal fields. Order MUST match the
+    # tuple returned by `_record_to_row` and the schema column order in
+    # `trades` CREATE TABLE.
+    "is_ha_native",
+    "ha_color_3m_at_entry",
+    "ha_color_15m_at_entry",
+    "ha_streak_3m_at_entry",
+    "ha_streak_15m_at_entry",
+    "ha_body_pct_3m_at_entry",
+    "ema200_3m_at_entry",
+    "volume_3m_ratio_at_entry",
 ]
 
 
@@ -863,6 +894,21 @@ _MIGRATIONS = [
     "ALTER TABLE rejected_signals ADD COLUMN adx_15m_at_entry REAL",
     "ALTER TABLE rejected_signals ADD COLUMN plus_di_15m_at_entry REAL",
     "ALTER TABLE rejected_signals ADD COLUMN minus_di_15m_at_entry REAL",
+    # 2026-05-04 — HA-native primary mode (Yol A) journal fields. Mirrors
+    # the schema block in `trades` CREATE statement; migration covers DBs
+    # that were created before this column landed. INTEGER for
+    # is_ha_native (SQLite has no BOOLEAN; 0/1/NULL). All other fields
+    # NULL when the entry was a legacy 5-pillar trade (no HA snapshot
+    # captured).
+    "ALTER TABLE trades ADD COLUMN is_ha_native INTEGER",
+    "ALTER TABLE trades ADD COLUMN ha_color_3m_at_entry TEXT",
+    "ALTER TABLE trades ADD COLUMN ha_color_15m_at_entry TEXT",
+    "ALTER TABLE trades ADD COLUMN ha_streak_3m_at_entry INTEGER",
+    "ALTER TABLE trades ADD COLUMN ha_streak_15m_at_entry INTEGER",
+    "ALTER TABLE trades ADD COLUMN ha_body_pct_3m_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN ema200_3m_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN volume_3m_ratio_at_entry REAL",
+    "CREATE INDEX IF NOT EXISTS idx_trades_is_ha_native ON trades(is_ha_native)",
 ]
 
 
@@ -913,6 +959,17 @@ def _record_to_row(rec: TradeRecord) -> tuple:
         rec.short_liq_notional_1h_at_entry,
         rec.ls_ratio_zscore_14d_at_entry,
         json.dumps(rec.liq_heatmap_top_clusters or {}),
+        # 2026-05-04 — HA-native (Yol A) journal fields. SQLite has no
+        # BOOLEAN; encode is_ha_native as INTEGER 0/1/NULL. All other
+        # fields are nullable text/int/real and accept None directly.
+        (None if rec.is_ha_native is None else int(rec.is_ha_native)),
+        rec.ha_color_3m_at_entry,
+        rec.ha_color_15m_at_entry,
+        rec.ha_streak_3m_at_entry,
+        rec.ha_streak_15m_at_entry,
+        rec.ha_body_pct_3m_at_entry,
+        rec.ema200_3m_at_entry,
+        rec.volume_3m_ratio_at_entry,
     )
 
 
@@ -1157,6 +1214,17 @@ def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
         short_liq_notional_1h_at_entry=_safe_col(row, "short_liq_notional_1h_at_entry"),
         ls_ratio_zscore_14d_at_entry=_safe_col(row, "ls_ratio_zscore_14d_at_entry"),
         liq_heatmap_top_clusters=_parse_liq_heatmap_clusters(row),
+        # 2026-05-04 — HA-native (Yol A) journal fields. _safe_bool keeps
+        # is_ha_native tri-state (None on pre-migration rows). Other
+        # fields default to None via _safe_col when column missing.
+        is_ha_native=_safe_bool(row, "is_ha_native"),
+        ha_color_3m_at_entry=_safe_col(row, "ha_color_3m_at_entry"),
+        ha_color_15m_at_entry=_safe_col(row, "ha_color_15m_at_entry"),
+        ha_streak_3m_at_entry=_safe_col(row, "ha_streak_3m_at_entry"),
+        ha_streak_15m_at_entry=_safe_col(row, "ha_streak_15m_at_entry"),
+        ha_body_pct_3m_at_entry=_safe_col(row, "ha_body_pct_3m_at_entry"),
+        ema200_3m_at_entry=_safe_col(row, "ema200_3m_at_entry"),
+        volume_3m_ratio_at_entry=_safe_col(row, "volume_3m_ratio_at_entry"),
     )
 
 
@@ -1297,6 +1365,20 @@ class TradeJournal:
         setup_zone_source: Optional[str] = None,
         zone_wait_bars: Optional[int] = None,
         zone_fill_latency_bars: Optional[int] = None,
+        # 2026-05-04 — HA-native (Yol A) journal fields. is_ha_native is the
+        # boolean entry-strategy tag (True for HA-native primary plans,
+        # False for legacy 5-pillar). HA snapshot fields capture the
+        # multi-TF color/streak/body/EMA200/volume context at entry-time
+        # so Pass 3 GBT has continuous + categorical features specific to
+        # the HA-native doctrine. All None on legacy / pre-Yol-A rows.
+        is_ha_native: Optional[bool] = None,
+        ha_color_3m_at_entry: Optional[str] = None,
+        ha_color_15m_at_entry: Optional[str] = None,
+        ha_streak_3m_at_entry: Optional[int] = None,
+        ha_streak_15m_at_entry: Optional[int] = None,
+        ha_body_pct_3m_at_entry: Optional[float] = None,
+        ema200_3m_at_entry: Optional[float] = None,
+        volume_3m_ratio_at_entry: Optional[float] = None,
         # Back-compat tail: callers may still pass these via direct kwargs
         # or `**enrichment` unpacking. Accepted but silently ignored
         # (kwargs no longer forwarded into TradeRecord — columns dropped
@@ -1369,6 +1451,14 @@ class TradeJournal:
             setup_zone_source=setup_zone_source,
             zone_wait_bars=zone_wait_bars,
             zone_fill_latency_bars=zone_fill_latency_bars,
+            is_ha_native=is_ha_native,
+            ha_color_3m_at_entry=ha_color_3m_at_entry,
+            ha_color_15m_at_entry=ha_color_15m_at_entry,
+            ha_streak_3m_at_entry=ha_streak_3m_at_entry,
+            ha_streak_15m_at_entry=ha_streak_15m_at_entry,
+            ha_body_pct_3m_at_entry=ha_body_pct_3m_at_entry,
+            ema200_3m_at_entry=ema200_3m_at_entry,
+            volume_3m_ratio_at_entry=volume_3m_ratio_at_entry,
         )
         placeholders = ", ".join("?" * len(_COLUMNS))
         cols = ", ".join(_COLUMNS)

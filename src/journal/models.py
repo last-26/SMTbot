@@ -223,6 +223,25 @@ class TradeRecord(BaseModel):
     # the nearest-above/nearest-below pair.
     liq_heatmap_top_clusters: dict = Field(default_factory=dict)
 
+    # 2026-05-04 — HA-native primary mode (Yol A) journal fields.
+    # `is_ha_native` is True when the entry came via _build_ha_native_trade_plan
+    # (HA-native planner OVERRIDE block produced the plan); False for legacy
+    # 5-pillar entries; None on pre-Yol-A rows. Lets Pass 3 GBT segment
+    # accuracy + R distribution by entry strategy.
+    # The HA snapshot fields capture the HA color/streak/body/EMA200/volume
+    # state at entry-time so GBT has continuous + categorical features
+    # specific to the HA-native doctrine (multi-TF color, momentum thrust,
+    # macro EMA200 proximity, RCS volume baseline). All Optional/None on
+    # rows written before the column landed.
+    is_ha_native: Optional[bool] = None
+    ha_color_3m_at_entry: Optional[str] = None
+    ha_color_15m_at_entry: Optional[str] = None
+    ha_streak_3m_at_entry: Optional[int] = None
+    ha_streak_15m_at_entry: Optional[int] = None
+    ha_body_pct_3m_at_entry: Optional[float] = None
+    ema200_3m_at_entry: Optional[float] = None
+    volume_3m_ratio_at_entry: Optional[float] = None
+
     @property
     def is_open(self) -> bool:
         return self.outcome == TradeOutcome.OPEN
