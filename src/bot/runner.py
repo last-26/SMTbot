@@ -3089,31 +3089,36 @@ class BotRunner:
             )
 
             # 2026-05-05 — operatör görsün: 3 tip skor + Major Reversal
-            # gate sonuçları (per-cycle özet). Pass 3 GBT'den önce manuel
-            # gözlem için.
+            # gate sonuçları (per-cycle özet). Multi-line + tab hizalı.
+            # Pass 3 GBT'den önce manuel gözlem için.
             try:
                 gate_results = decision.gate_results or {}
                 mr_gates = gate_results.get("major_reversal", {}) or {}
                 cont_gates = gate_results.get("continuation", {}) or {}
 
-                def _gate_compact(gates: dict) -> str:
+                def _gate_pretty(gates: dict) -> str:
+                    """Pass+fail görsel: ✓gate_name ✗gate_name ..."""
                     if not gates:
-                        return "-"
-                    return ",".join(
-                        f"{k}:{('T' if v else 'F')}"
+                        return "(no gates evaluated)"
+                    return " ".join(
+                        f"{'✓' if v else '✗'}{k}"
                         for k, v in gates.items()
                     )
 
-                mr_summary = _gate_compact(mr_gates)
-                cont_summary = _gate_compact(cont_gates)
-                ms_3m_dir = ha_state.mfi_3m_delta_dir
-                rs_3m_dir = ha_state.rsi_3m_delta_dir
+                mr_summary = _gate_pretty(mr_gates)
+                cont_summary = _gate_pretty(cont_gates)
+                ms_3m_dir = ha_state.mfi_3m_delta_dir or "?"
+                rs_3m_dir = ha_state.rsi_3m_delta_dir or "?"
+                streak_3m = sig.ha_streak_3m
+                streak_str = f"{streak_3m:+d}" if streak_3m else "0"
+
                 logger.info(
-                    "ha_native_decision symbol={} dir={} outcome={} "
-                    "scores=(MR={:.2f}/{:.1f},C={:.2f}/{:.1f},μR={:.2f}/{:.1f}) "
-                    "ha=(3m={}/streak={},15m={},body={:.1f}%) "
-                    "delta=(mfi={},rsi={}) "
-                    "MR_gates={} | C_gates={} | reason={}",
+                    "ha_native_decision symbol={} dir={} outcome={}"
+                    "\n\tscores  MR={:.2f}/{:.1f}  C={:.2f}/{:.1f}  μR={:.2f}/{:.1f}"
+                    "\n\tha      3m={}({})  15m={}  body={:.1f}%  delta=(mfi={} rsi={})"
+                    "\n\tMR      {}"
+                    "\n\tC       {}"
+                    "\n\treason  {}",
                     symbol,
                     decision.direction.value if decision.direction else "?",
                     decision.decision,
@@ -3124,12 +3129,13 @@ class BotRunner:
                     float(decision.micro_reversal_score or 0.0),
                     float(ha_cfg.micro_reversal_threshold),
                     sig.ha_color_3m or "?",
-                    sig.ha_streak_3m,
+                    streak_str,
                     sig.ha_color_15m or "?",
                     float(sig.ha_body_pct_3m or 0.0),
-                    ms_3m_dir or "?",
-                    rs_3m_dir or "?",
-                    mr_summary, cont_summary, decision.reason,
+                    ms_3m_dir, rs_3m_dir,
+                    mr_summary,
+                    cont_summary,
+                    decision.reason,
                 )
             except Exception:
                 logger.debug(
