@@ -595,6 +595,21 @@ class ExecutionConfig(BaseModel):
     defensive_close_maker_offset_ticks: int = 1
     defensive_close_maker_timeout_s: int = 30
 
+    # 2026-05-04 — HA-native exit gate (Yol A primary mode).
+    # Pozisyon HA-native primary planner'dan açıldıysa (is_ha_native=True),
+    # her cycle multi-TF HA color reversal kontrolü yapılır. 3m HA streak
+    # opposing (>= min_opposing_bars_3m) VEYA 15m HA color opposing (tek bar)
+    # → RCS volume gate confirm/noise classify → CLOSE veya HOLD.
+    # Reason damgası: EARLY_CLOSE_HA_FLIP_REVERSAL.
+    # Legacy 5-pillar pozisyonlar etkilenmez (gate sadece is_ha_native=True
+    # için fire eder).
+    ha_native_exit_enabled: bool = True
+    ha_native_exit_min_opposing_bars_3m: int = 2
+    ha_native_exit_enable_15m_opposing: bool = True
+    ha_native_exit_rcs_confirm: float = 1.3
+    ha_native_exit_rcs_noise: float = 0.8
+    ha_native_exit_min_bars_held: int = 1
+
     # Position-attached TP/SL trigger-price source. "mark" = index-weighted
     # price across the major real-market venues (cross-exchange VWAP).
     # "last" = last trade on the Bybit book (default in Bybit V5).
