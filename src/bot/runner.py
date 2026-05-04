@@ -2049,6 +2049,51 @@ class BotRunner:
             pass
         return out
 
+    def _ha_native_record_kwargs(
+        self,
+        plan: TradePlan,
+        state: Optional[MarketState],
+    ) -> dict:
+        """2026-05-04 — Build the HA-native journal-field kwargs for
+        `record_open`. Returns a dict with `is_ha_native` boolean +
+        7 HA snapshot fields read off `state.signal_table` at entry-time.
+
+        is_ha_native logic: `plan.reason` carries the `ha_native:` prefix
+        when `_build_ha_native_trade_plan` produced the plan (HA-native
+        primary mode OVERRIDE block). Legacy 5-pillar plans land here
+        with `is_ha_native=False` so Pass 3 GBT can segment by entry
+        strategy instead of inferring from a free-text reason field.
+
+        State guard: `state is None` (pending-fill rehydrate path doesn't
+        thread state) → all HA fields None; is_ha_native still derived
+        from plan.reason. State present → HA snapshot fields populated
+        from `state.signal_table`. None / 0.0 defaults are kept on the
+        write side (downstream Pass 3 reads NULLs via _safe_col).
+        """
+        is_ha_native = bool(
+            plan.reason and plan.reason.startswith("ha_native:")
+        )
+        kwargs: dict = {"is_ha_native": is_ha_native}
+        if state is None or state.signal_table is None:
+            return kwargs
+        sig = state.signal_table
+        kwargs.update({
+            "ha_color_3m_at_entry": sig.ha_color_3m or None,
+            "ha_color_15m_at_entry": sig.ha_color_15m or None,
+            "ha_streak_3m_at_entry": sig.ha_streak_3m,
+            "ha_streak_15m_at_entry": sig.ha_streak_15m,
+            "ha_body_pct_3m_at_entry": (
+                sig.ha_body_pct_3m if sig.ha_body_pct_3m else None
+            ),
+            "ema200_3m_at_entry": (
+                sig.ema200_3m if sig.ema200_3m else None
+            ),
+            "volume_3m_ratio_at_entry": (
+                sig.volume_3m_ratio if sig.volume_3m_ratio else None
+            ),
+        })
+        return kwargs
+
     def _per_symbol_cex_flow_for(self, symbol: str) -> Optional[float]:
         """Extract the per-symbol 1h CEX net flow (USD) from the Arkham
         snapshot's JSON dict.
@@ -3671,6 +3716,12 @@ class BotRunner:
                     candles=candles,
                     entry_tf_minutes=_timeframe_to_minutes(cfg.trading.entry_timeframe),
                 ),
+                # 2026-05-04 — HA-native (Yol A) journal fields. Plan reason
+                # carries the `ha_native:` prefix when the HA-native primary
+                # planner produced the plan; HA snapshot fields read off
+                # state.signal_table at entry-time. Pass 3 GBT segments by
+                # is_ha_native and consumes HA continuous features directly.
+                **self._ha_native_record_kwargs(plan, state),
             )
             self.ctx.open_trade_ids[(symbol, pos_side)] = rec.trade_id
             self.ctx.open_trade_opened_at[(symbol, pos_side)] = _utc_now()
@@ -4805,6 +4856,10 @@ class BotRunner:
                     max_wait_bars=int(meta.zone.max_wait_bars),
                 ),
                 **_derive_enrichment(state),
+                # 2026-05-04 — HA-native (Yol A) journal fields. State here
+                # is `meta.signal_state` (placement-time snapshot), so HA
+                # fields reflect the entry decision moment, not fill.
+                **self._ha_native_record_kwargs(plan, state),
             )
             self.ctx.open_trade_ids[key] = rec.trade_id
             self.ctx.open_trade_opened_at[key] = _utc_now()
