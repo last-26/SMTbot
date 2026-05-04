@@ -94,6 +94,7 @@ from src.execution.position_monitor import PendingEvent, PositionMonitor
 from src.journal.database import TradeJournal
 from src.journal.derivatives_journal import DerivativesJournal
 from src.strategy.ha_state import HAStateRegistry
+from src.strategy.rr_system import calculate_trade_plan
 from src.strategy.entry_signals import (
     _flow_alignment_score,
     build_trade_plan_with_reason,
@@ -2518,19 +2519,23 @@ class BotRunner:
         # the new TF (Operatör 2026-05-04 dinamik settle).
         return await self._wait_for_pine_settle_dual(baselines)
 
-    async def _audit_ha_native_decision(
+    async def _evaluate_ha_native_entry(
         self, symbol: str, market_state: MarketState,
-    ) -> None:
-        """Run HA-native planner in audit-only mode + write decision_log row.
+    ) -> Any:
+        """Run HA-native planner + write decision_log row + return decision.
 
-        Operatör 2026-05-04 HA-native runner integration üçüncü adımı.
-        Bu cycle'da bot'un HA-native gate'i ne dediği kayıt edilir;
-        karar mekanizması mevcut (5-pillar) path ile devam eder. Pass 3
-        GBT için zengin substrat — her cycle her sembol için 1 row.
+        Operatör 2026-05-04 HA-native runner integration. Yol A primary mode
+        için sonuç döndürür: caller `EntryDecision.is_take` kontrol eder ve
+        HA-native plan ile TradePlan oluşturur. Yol B (audit-only) caller
+        ise sonucu yok sayar; decision_log her durumda yazılır.
 
-        Failure tolerated: any exception logs + skips (bu cycle audit
-        atlanır, runner cycle devam eder). HA-native primary mode için
-        sıradaki adımda evaluate_entry sonucu TradePlan'a beslenecek.
+        Returns:
+            EntryDecision | None — None on any internal failure (hata
+            log'lanır, runner cycle bypass eder). Caller None'ı NO_ACTION
+            gibi davranır.
+
+        Failure tolerated: state pump henüz yapılmadıysa veya planner
+        başarısız olursa None döner.
         """
         try:
             from src.data.models import Direction
@@ -2542,7 +2547,7 @@ class BotRunner:
 
             ha_state = self.ctx.ha_state_registry.get(symbol)
             if ha_state is None:
-                return  # state pump henüz çalışmadı bu sembol için
+                return None  # state pump henüz çalışmadı bu sembol için
 
             sig = market_state.signal_table
 
@@ -2669,8 +2674,77 @@ class BotRunner:
                 session=session_name,
                 vwap_3m_side=vwap_3m_side,
             )
+            return decision
         except Exception:
             logger.exception("ha_native_audit_failed symbol={}", symbol)
+            return None
+
+    def _build_ha_native_trade_plan(
+        self,
+        decision: Any,  # EntryDecision (avoid circular import in type hint)
+        symbol: str,
+    ) -> Optional[TradePlan]:
+        """Build a TradePlan from HA-native EntryDecision.
+
+        Operatör 2026-05-04 Yol A primary mode: planner TAKE_LONG/SHORT
+        döndüğünde mevcut zone-planner / 5-pillar yerine bu helper
+        TradePlan oluşturur. `rr_system.calculate_trade_plan` reuse
+        edilir (sizing + leverage + contract math).
+
+        Returns:
+            TradePlan if decision.is_take and pricing valid, else None.
+        """
+        if not decision.is_take:
+            return None
+        if (
+            decision.suggested_entry_price is None
+            or decision.suggested_sl_price is None
+            or decision.suggested_entry_price <= 0
+            or decision.suggested_sl_price <= 0
+        ):
+            return None
+
+        cfg = self.ctx.config
+        # Sizing inputs
+        risk_amount = cfg.trading.risk_amount_usdt  # operator flat-$ override
+        margin_balance = (
+            self.ctx.last_margin_balance
+            if self.ctx.last_margin_balance > 0
+            else cfg.bot.starting_balance
+        )
+        contract_size = self.ctx.contract_sizes.get(
+            symbol, cfg.trading.contract_size,
+        )
+        max_leverage = self.ctx.max_leverage_per_symbol.get(
+            symbol, cfg.trading.max_leverage,
+        )
+
+        # HA-native uses 1.0R target by default (operatör scalp doctrine).
+        # TP from EntryDecision is consistent with this — calculate_trade_plan
+        # will recompute identically via rr_ratio param.
+        from src.strategy.ha_native_planner import HANativeConfig
+        ha_cfg = HANativeConfig()
+
+        try:
+            plan = calculate_trade_plan(
+                direction=decision.direction,
+                entry_price=decision.suggested_entry_price,
+                sl_price=decision.suggested_sl_price,
+                account_balance=margin_balance,
+                risk_pct=cfg.trading.risk_per_trade_pct / 100.0,
+                rr_ratio=ha_cfg.target_rr_ratio,
+                max_leverage=max_leverage,
+                contract_size=contract_size,
+                margin_balance=margin_balance,
+                fee_reserve_pct=cfg.trading.fee_reserve_pct,
+                risk_amount_usdt_override=risk_amount,
+                sl_source="ha_mss_swing",
+                reason=f"ha_native:{decision.reason}",
+            )
+            return plan
+        except Exception:
+            logger.exception("ha_native_trade_plan_build_failed symbol={}", symbol)
+            return None
 
     async def _run_one_symbol(self, symbol: str) -> None:
         cfg = self.ctx.config
@@ -2898,11 +2972,11 @@ class BotRunner:
             self.ctx.ha_state_registry.update(symbol, state, _utc_now())
         except Exception:
             logger.exception("ha_state_registry_update_failed symbol={}", symbol)
-        # 2026-05-04 — HA-native planner audit + decision_log row.
-        # Audit-only path: sonuç decision_log'a yazılır, mevcut karar
-        # mekanizması (5-pillar) etkilenmez. Sıradaki commit HA-native
-        # primary mode'a alacak.
-        await self._audit_ha_native_decision(symbol, state)
+        # 2026-05-04 — HA-native planner evaluate + decision_log row.
+        # Returns EntryDecision (or None on internal failure). Caller may
+        # use it for primary-mode TradePlan in step 3, or ignore it
+        # (audit-only) until then. decision_log is written either way.
+        ha_decision = await self._evaluate_ha_native_entry(symbol, state)
         buf = self.ctx.multi_tf.get_buffer(tf_key)
         # 100 candles is enough for EMA55 seeding in the zone builder's
         # ema21_pullback source; legacy confluence consumers only read the tail.
@@ -3207,6 +3281,28 @@ class BotRunner:
         except Exception:
             logger.exception("plan_build_failed symbol={}", symbol)
             return
+
+        # 2026-05-04 — HA-native primary mode (Yol A) OVERRIDE.
+        # Operatör spec: planner ENTRY_TAKEN → mevcut 5-pillar plan'ı
+        # bypass, HA-native plan'ı kullan. Eski path her durumda hesaplandı
+        # (CPU yedi) ama sonuç ezilir — kademeli geçiş; tam yorum satırı
+        # backup sıradaki commit'te. NO_SETUP/REJECT/None ise eski plan
+        # kalır (mevcut davranış korunur, regression yok).
+        if ha_decision is not None and ha_decision.is_take:
+            ha_plan = self._build_ha_native_trade_plan(ha_decision, symbol)
+            if ha_plan is not None:
+                old_reject = reject_reason
+                plan = ha_plan
+                reject_reason = None
+                logger.info(
+                    "ha_native_plan_override symbol={} dir={} entry={} "
+                    "sl={} tp={} contracts={} prev_5pillar_reject={}",
+                    symbol,
+                    ha_plan.direction.value if hasattr(ha_plan.direction, "value")
+                    else ha_plan.direction,
+                    ha_plan.entry_price, ha_plan.sl_price, ha_plan.tp_price,
+                    ha_plan.num_contracts, old_reject,
+                )
 
         if plan is None:
             # reject_reason taxonomy: below_confluence / session_filter /
