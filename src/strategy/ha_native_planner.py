@@ -17,9 +17,10 @@ onayı bekler. 3 farklı entry tipi paralel değerlendirilir:
     Faz 2'de tam implementation; bu commit'te score=0 stub.
 
   Tip 3 — Micro Reversal (1m mss dip/tepe avcılığı):
-    Operatör profili (WR + net R + mükemmelliyetçi) için ilk fazda
-    DISABLED. Schema hazır, knob ile aktif olunur.
-    Risk: yarı R, hedef 0.7R.
+    2026-05-05 v2 itibarıyla ENABLED (operatör doktrini: bot her cycle
+    aynı şekilde çalışsın, 3 tip paralel skorlanır). Mandatory fail
+    veya soft threshold altında kalsa da gerçek skor görünür.
+    Risk: yarı R ($12.5), hedef 0.7R.
 
 Her cycle 3 tip skor hesaplanır, threshold geçen + en yüksek skor
 kazanır. Hiçbiri threshold geçmezse REJECT. decision_log'a 3 skor da
@@ -61,9 +62,13 @@ class HANativeConfig:
     confluence_passive_threshold: float = 5.0
 
     # ── Tip 1 (Major Reversal) parametreleri ──────────────────────────────
-    # Önceki ters yönde minimum streak — operatör 2026-05-05: 3 bar
-    # ("entryler sık olmalı, 5 bar zor"). 3 bar = 9 dk 3m TF.
-    major_reversal_prev_streak_min: int = 3
+    # Önceki ters yönde minimum streak — operatör 2026-05-05 v2: 3→2.
+    # İlk live cycle gözleminde sürekli `prev_streak_min` mandatory fail
+    # ediyordu (bot uzun trend ortasında entry üretemiyordu, dönüş için
+    # 3+ önceki ters bar bulamıyordu); 2 bar = 6 dk 3m TF, daha sık entry
+    # candidate sağlar. Soft threshold 4.0 hâlâ kalite filtresi olarak
+    # devreye giriyor.
+    major_reversal_prev_streak_min: int = 2
     major_reversal_threshold: float = 4.0
     major_reversal_target_rr: float = 1.5
 
@@ -76,10 +81,12 @@ class HANativeConfig:
     continuation_main_trend_min_streak: int = 4
 
     # ── Tip 3 (Micro Reversal) parametreleri ──────────────────────────────
-    # Operatör 2026-05-05: Tip 3 DISABLED ilk fazda (WR + perfectionist
-    # profil). Schema + dispatcher hazır, dataset birikince re-enable
-    # config flip ile.
-    micro_reversal_enabled: bool = False
+    # Operatör 2026-05-05 v2: Tip 3 ENABLED. İlk live cycle gözleminde
+    # μR=0.00 sürekli görünüyordu (early return DISABLED branch'i score
+    # hesabına bile geçmiyordu). Dispatcher tüm cycle'larda 3 tip paralel
+    # skor üretsin — bot her zaman aynı şekilde çalışsın doktrini.
+    # Yarı R ($12.5) + 0.7R hedef güvenlik kalır.
+    micro_reversal_enabled: bool = True
     micro_reversal_threshold: float = 4.5
     micro_reversal_target_rr: float = 0.7
     micro_reversal_risk_multiplier: float = 0.5  # yarı R = $12.5
@@ -454,8 +461,8 @@ def _score_major_reversal(
     Mandatory gates (fail = score 0, failed_mandatory set):
       - HA color clear (3m DOJI değil) → direction implied
       - Yeni yönde streak ≥ min_streak_3m=2 (whipsaw guard)
-      - Önceki ters yönde streak ≥ major_reversal_prev_streak_min=3
-        (uzun trendin tepesi/dibi)
+      - Önceki ters yönde streak ≥ major_reversal_prev_streak_min=2
+        (trend dönüş başlangıcı — 2026-05-05 v2: 3→2)
       - mss_density (chop guard)
       - no_duplicate
       - body_size ≥ 30%
