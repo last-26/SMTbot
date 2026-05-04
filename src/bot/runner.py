@@ -2905,14 +2905,36 @@ class BotRunner:
                 except Exception:
                     pass  # ticker fail — gates'le ilgili değil
 
-            # Swing levels from MarketState liquidity (proxy: nearest above/below)
+            # 2026-05-05 v3 — Structural swing anchor for SL.
+            # Eski mantık: `sig.liquidity_below` (Pine likidite havuzu) en
+            # yakın değer alınıyordu — ama bu structural swing low DEĞİL,
+            # sadece nearby liquidity cluster. Operatör spec: "SL son
+            # swingin altına eklenmeli; SL'e değerse zaten MSS gelmiş
+            # olur" → yapısal swing point gerekli. 3m candle buffer'dan
+            # son 20 bar (60 dk) min/max + 0.5×ATR buffer (legacy
+            # apply_zone_to_plan ile aynı buffer). Buffer yoksa eski
+            # liquidity-pool fallback'i kalsın (degraded mode).
             last_swing_low: Optional[float] = None
             last_swing_high: Optional[float] = None
-            if sig.liquidity_below:
-                # Yakın seviye = price'ın altındaki en yüksek değer
+            try:
+                buf_3m = self.ctx.multi_tf.get_buffer("3m")
+                if buf_3m is not None and len(buf_3m) >= 5:
+                    candles_swing = buf_3m.last(20)
+                    if candles_swing:
+                        atr = sig.atr_14 if sig.atr_14 > 0 else 0.0
+                        buf_dist = 0.5 * atr if atr > 0 else 0.0
+                        lows = [c.low for c in candles_swing if c.low > 0]
+                        highs = [c.high for c in candles_swing if c.high > 0]
+                        if lows:
+                            last_swing_low = min(lows) - buf_dist
+                        if highs:
+                            last_swing_high = max(highs) + buf_dist
+            except Exception:
+                pass  # buffer hatası — liquidity-pool fallback'e düş
+            # Fallback: candle buffer yoksa eski liquidity-pool proxy
+            if last_swing_low is None and sig.liquidity_below:
                 last_swing_low = max(sig.liquidity_below)
-            if sig.liquidity_above:
-                # Yakın seviye = price'ın üstündeki en düşük değer
+            if last_swing_high is None and sig.liquidity_above:
                 last_swing_high = min(sig.liquidity_above)
 
             # Pending + open pairs from BotContext state
@@ -3209,11 +3231,32 @@ class BotRunner:
         # Reason includes entry_path for full traceability + journal segmentation
         plan_reason = f"ha_native:{entry_path}:{decision.reason}"
 
+        # 2026-05-05 v3 — per-symbol min_sl_distance_pct floor (HA-native plan
+        # builder). Sub-floor structural SL → notional-için leverage talebi
+        # global `trading.max_leverage` cap'ini aşıyor, risk_manager `blocked
+        # plan.leverage=N > max_leverage` ile reddediyordu (BTC %0.025 SL →
+        # 100x → 75 cap fail). Legacy `entry_signals.build_trade_plan_with_reason`
+        # path'inde aynı floor uygulanıyor (entry_signals.py:1180); HA-native
+        # bypass ediyordu. Floor'a widen et — risk amount sabit, position size
+        # auto-shrinks (risk_amount / sl_pct), TP otomatik recompute (rr_ratio
+        # × wider SL distance) `calculate_trade_plan` içinde.
+        entry_px = decision.suggested_entry_price
+        sl_px = decision.suggested_sl_price
+        min_sl_pct = cfg.min_sl_distance_pct_for(symbol)
+        if min_sl_pct > 0.0 and entry_px > 0.0:
+            sl_dist_pct = abs(entry_px - sl_px) / entry_px
+            if sl_dist_pct < min_sl_pct:
+                min_dist = entry_px * min_sl_pct
+                if decision.direction == Direction.BULLISH:
+                    sl_px = entry_px - min_dist
+                else:
+                    sl_px = entry_px + min_dist
+
         try:
             plan = calculate_trade_plan(
                 direction=decision.direction,
-                entry_price=decision.suggested_entry_price,
-                sl_price=decision.suggested_sl_price,
+                entry_price=entry_px,
+                sl_price=sl_px,
                 account_balance=margin_balance,
                 risk_pct=cfg.trading.risk_per_trade_pct / 100.0,
                 rr_ratio=target_rr,
