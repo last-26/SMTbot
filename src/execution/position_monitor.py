@@ -136,6 +136,13 @@ class _Tracked:
     # rows whose `createdTime` predates this open (those are from previous
     # closes on the same symbol+side and would mis-stamp the journal).
     opened_at: datetime = field(default_factory=_utc_now)
+    # 2026-05-04 — HA-native primary mode (Yol A) flag. True only when the
+    # entry came from `_build_ha_native_trade_plan` (HA-native planner
+    # produced the plan via OVERRIDE block); False for legacy 5-pillar
+    # entries. The HA-flip exit gate (`_maybe_close_on_ha_flip`) only
+    # fires for HA-native positions — legacy positions retain their
+    # pre-existing exit suite (momentum_fade, MAE-BE-recovery, etc.).
+    is_ha_native: bool = False
 
 
 @dataclass
@@ -230,6 +237,7 @@ class PositionMonitor:
         tp_limit_order_id: str = "",
         regime_at_entry: Optional[str] = None,
         opened_at: Optional[datetime] = None,
+        is_ha_native: bool = False,
     ) -> None:
         # plan_sl_price semantics: None → caller didn't provide one, default to
         # sl_price (correct at fill time). An explicit 0.0 → "unknown, disable
@@ -245,6 +253,7 @@ class PositionMonitor:
             tp_limit_order_id=tp_limit_order_id,
             regime_at_entry=regime_at_entry,
             opened_at=resolved_opened_at,
+            is_ha_native=is_ha_native,
         )
 
     def poll(
