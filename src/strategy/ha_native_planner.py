@@ -589,24 +589,234 @@ def _score_major_reversal(
     return score
 
 
-# ── Tip 2: Continuation score (STUB — Faz 2'de full) ──────────────────────
+# ── Tip 2: Continuation score ─────────────────────────────────────────────
+
+
+def _count_recent_counter_streak(
+    ha_state: HASymbolState, main_direction: Direction,
+) -> int:
+    """Mevcut bardan geriye doğru, main_direction'ın TERSİNDE ardışık bar
+    sayısı (Continuation için 'kandırıcı toparlanma' uzunluğu).
+
+    Operatör 2026-05-05 örneği: "downtrend devam ediyor, 1-2 yeşil bar
+    kandırıcı toparlanma sonra tekrar kırmızıya dönüş → SHORT."
+    Bu fonksiyon current bar'dan başlayarak geriye doğru "yeşil bar"
+    sayısını sayar (downtrend için).
+
+    Bu skor mantığında current bar **main yönde** olmalıdır (yani 3m HA
+    color = main_direction). Sayım current bar'dan ÖNCE başlar:
+
+      bars: [..., RED, RED, RED, GREEN, GREEN, RED]
+                                              ^current = main (RED)
+      counter_streak = 2 (GREEN, GREEN)
+
+    Returns 0 if current bar değil ana yönde veya counter bar yoksa.
+    """
+    if len(ha_state.history) < 2:
+        return 0
+    main_color = "GREEN" if main_direction == Direction.BULLISH else "RED"
+    counter_color = "RED" if main_direction == Direction.BULLISH else "GREEN"
+    history = list(ha_state.history)
+    # Current bar must be main color
+    if not history or history[-1].ha_color_3m != main_color:
+        return 0
+    # Count counter bars going backwards from before current
+    count = 0
+    for snap in reversed(history[:-1]):
+        if snap.ha_color_3m == counter_color:
+            count += 1
+        else:
+            break
+    return count
+
+
+def _count_main_trend_streak_before_pullback(
+    ha_state: HASymbolState, main_direction: Direction, counter_streak: int,
+) -> int:
+    """Pullback'ten ÖNCE ana yön streak'inin uzunluğu (önceki ana-yön gücü).
+
+    Continuation skoru için 'önceki ana-yön streak ≥ 4' faktörü:
+    bars: [..., RED, RED, RED, RED, RED, GREEN, GREEN, RED]
+                                                       ^current
+                <-- main_streak_before -->  <pull-back>
+    counter_streak = 2 (GREEN, GREEN)
+    main_streak_before = 5 (RED × 5)
+
+    Returns 0 if history yetersiz.
+    """
+    if len(ha_state.history) < counter_streak + 2:
+        return 0
+    main_color = "GREEN" if main_direction == Direction.BULLISH else "RED"
+    history = list(ha_state.history)
+    # Skip current bar + counter_streak counter bars, count main color back
+    skip = 1 + counter_streak
+    if len(history) <= skip:
+        return 0
+    count = 0
+    for snap in reversed(history[:-skip]):
+        if snap.ha_color_3m == main_color:
+            count += 1
+        else:
+            break
+    return count
 
 
 def _score_continuation(
     ctx: EntryContext, config: HANativeConfig,
 ) -> EntryTypeScore:
-    """Tip 2 — Trend Continuation (downtrend kandırıcı yükseliş case).
+    """Tip 2 — Trend Continuation (operatör spec: kandırıcı yükseliş sonrası
+    ana trende dönüş).
 
-    STUB: Faz 2'de full implementation. Şu an score=0 döner.
-    Direction hesaplanır ama gate'ler boş dict.
+    Senaryo:
+      15m + 3m downtrend, dominant_color RED
+      3m'de 1-2 GREEN bar (kandırıcı toparlanma)
+      Tekrar RED'e dönüş → SHORT (ana trend devam)
+
+    Mandatory gates (fail = score 0, failed_mandatory set):
+      - HA color clear (3m DOJI değil) → main direction
+      - 15m HA aynı yön (büyük resim onayı şart)
+      - dominant_color ana yönü destekliyor (chop değil)
+      - Karşı yönde önceki streak ≤ continuation_max_counter_streak=2
+        (kısa toparlanma — 3+ bar olsa Major Reversal candidate olur)
+      - Ana yönde yeni streak ≥ 1 (toparlanma sonrası ilk dönüş bar)
+      - no_duplicate, body_size ≥ 30%
+
+    Soft skor faktörleri (threshold ≥ 4.5 — Major Reversal'dan sıkı):
+      - MSS direction main yönü onaylıyor (yapısal devam): +2.0
+      - MFI delta ana yönde: +1.0
+      - RSI delta ana yönde: +1.0
+      - VWAP ana yönle aligned: +1.0
+      - Önceki ana-yön streak ≥ 4 (güçlü trend kanıtı): +1.0
+      - RCS volume_3m_ratio ≥ 1.3: +0.5
+      - first_entry_missed=True (kaçırılmış trend, runner DB query): +0.5
     """
     direction = _infer_direction_from_3m(ctx)
-    return EntryTypeScore(
-        score=0.0,
-        direction=direction,
-        gate_results={},
-        failed_mandatory="not_implemented_yet",
+    score = EntryTypeScore(score=0.0, direction=direction)
+    if direction is None:
+        score.failed_mandatory = "no_ha_direction"
+        return score
+
+    gates: dict[str, bool] = {}
+
+    # Mandatory: 15m alignment (HTF onayı şart)
+    gates["15m_aligned"] = _gate_15m_alignment(ctx.ha_state, direction)
+    if not gates["15m_aligned"]:
+        score.failed_mandatory = "15m_aligned"
+        score.gate_results = gates
+        return score
+
+    # Mandatory: dominant_color ana yönü destekliyor (operatör spec:
+    # büyük resim aynı yön olmalı — yoksa chop / belirsiz)
+    dominant = ctx.ha_state.dominant_color_3m()
+    target_color = "GREEN" if direction == Direction.BULLISH else "RED"
+    gates["dominant_color_main"] = (dominant == target_color)
+    if not gates["dominant_color_main"]:
+        score.failed_mandatory = "dominant_color_main"
+        score.gate_results = gates
+        return score
+
+    # Mandatory: counter streak (kandırıcı toparlanma) ≤ max
+    counter_streak = _count_recent_counter_streak(ctx.ha_state, direction)
+    gates["counter_streak_within_limit"] = (
+        1 <= counter_streak <= config.continuation_max_counter_streak
     )
+    if not gates["counter_streak_within_limit"]:
+        score.failed_mandatory = "counter_streak_within_limit"
+        score.gate_results = gates
+        return score
+
+    # Mandatory: yeni yönde streak ≥ 1 (toparlanma sonrası ilk dönüş bar)
+    if ctx.ha_state.latest is None:
+        score.failed_mandatory = "no_ha_data"
+        score.gate_results = gates
+        return score
+    new_streak = ctx.ha_state.latest.ha_streak_3m
+    if direction == Direction.BULLISH:
+        gates["new_direction_streak"] = new_streak >= 1
+    else:
+        gates["new_direction_streak"] = new_streak <= -1
+    if not gates["new_direction_streak"]:
+        score.failed_mandatory = "new_direction_streak"
+        score.gate_results = gates
+        return score
+
+    # Mandatory: no_duplicate
+    gates["no_duplicate"] = _gate_no_duplicate(
+        ctx.symbol, direction, ctx.pending_pairs, ctx.open_pairs,
+    )
+    if not gates["no_duplicate"]:
+        score.failed_mandatory = "no_duplicate"
+        score.gate_results = gates
+        return score
+
+    # Mandatory: body_size
+    gates["body_size"] = _gate_body_size(ctx.ha_state, config.min_body_pct_3m)
+    if not gates["body_size"]:
+        score.failed_mandatory = "body_size"
+        score.gate_results = gates
+        return score
+
+    # Soft factors
+    score_value = 0.0
+
+    gates["mss_direction_main"] = _gate_mss_direction_alignment(
+        ctx.last_mss_direction, direction,
+    )
+    if gates["mss_direction_main"]:
+        score_value += 2.0
+
+    gates["mfi_delta_main"] = _gate_mfi_delta_aligned(ctx.ha_state, direction)
+    if gates["mfi_delta_main"]:
+        score_value += 1.0
+
+    gates["rsi_delta_main"] = _gate_rsi_delta_aligned(ctx.ha_state, direction)
+    if gates["rsi_delta_main"]:
+        score_value += 1.0
+
+    gates["vwap_aligned"] = _gate_vwap_alignment(ctx.market_state, direction)
+    if gates["vwap_aligned"]:
+        score_value += 1.0
+
+    main_streak_before = _count_main_trend_streak_before_pullback(
+        ctx.ha_state, direction, counter_streak,
+    )
+    gates["main_trend_strong"] = (
+        main_streak_before >= config.continuation_main_trend_min_streak
+    )
+    if gates["main_trend_strong"]:
+        score_value += 1.0
+
+    gates["rcs_volume_confirm"] = _gate_rcs_volume(ctx.market_state, 1.3)
+    if gates["rcs_volume_confirm"]:
+        score_value += 0.5
+
+    gates["first_entry_missed"] = ctx.first_entry_missed
+    if ctx.first_entry_missed:
+        score_value += 0.5
+
+    score.score = score_value
+    score.gate_results = gates
+
+    # Build entry parameters if soft threshold passes
+    if score_value >= config.continuation_threshold:
+        if ctx.best_bid is None or ctx.best_ask is None:
+            score.failed_mandatory = "missing_orderbook"
+            return score
+        sl = _structural_sl_price(direction, ctx)
+        if sl is None:
+            score.failed_mandatory = "missing_swing_anchor"
+            return score
+        entry = _marketable_entry_price(
+            direction, ctx.best_bid, ctx.best_ask, config.marketable_offset_pct,
+        )
+        tp = _tp_price(direction, entry, sl, config.continuation_target_rr)
+        score.entry_price = entry
+        score.sl_price = sl
+        score.tp_price = tp
+        score.target_rr = config.continuation_target_rr
+        score.risk_multiplier = 1.0  # Continuation = full R
+
+    return score
 
 
 # ── Tip 3: Micro Reversal score (STUB + DISABLED) ─────────────────────────

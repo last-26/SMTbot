@@ -26,7 +26,7 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from loguru import logger
@@ -2659,6 +2659,49 @@ class BotRunner:
         # the new TF (Operatör 2026-05-04 dinamik settle).
         return await self._wait_for_pine_settle_dual(baselines)
 
+    async def _compute_first_entry_missed_for(
+        self, symbol: str, ha_state: Any,
+    ) -> bool:
+        """2026-05-05 — Tip 2 Continuation skoru için "kaçırılmış trend" flag.
+
+        Tanım: 3m HA dominant_color son K=30 bar same direction (yani
+        belirgin bir trend var) AND bot bu trend penceresi içinde bu
+        sembol+yön için `is_ha_native=True` trade almadı → flag=True
+        (kaçırıldı, +0.5 skor katkısı).
+
+        Implementation:
+          * Dominant trend'in başlangıç ts'i kabaca: now - 30 × 3m =
+            now - 90 dk (default dominant_color_window). Daha hassas
+            timestamp tracking gereksiz; window pencere yeterli.
+          * Journal'da `is_ha_native=1 AND symbol=? AND direction=?
+            AND entry_timestamp >= cutoff` → varsa flag=False.
+          * Dominant_color None (chop) → flag=False (Tip 2 zaten reject olur).
+        """
+        try:
+            dominant = ha_state.dominant_color_3m()
+        except Exception:
+            return False
+        if dominant not in ("GREEN", "RED"):
+            return False  # chop / belirsiz → flag relevant değil
+        direction = "BULLISH" if dominant == "GREEN" else "BEARISH"
+        # Trend window: 30 bar × 3m = 90 dakika (varsayılan)
+        cutoff = _utc_now() - timedelta(minutes=90)
+        try:
+            conn = self.ctx.journal._require_conn()
+            row = await (await conn.execute(
+                "SELECT 1 FROM trades "
+                "WHERE symbol = ? AND direction = ? "
+                "AND is_ha_native = 1 "
+                "AND entry_timestamp >= ? "
+                "LIMIT 1",
+                (symbol, direction, cutoff.isoformat()),
+            )).fetchone()
+            return row is None  # row yok → kaçırıldı
+        except Exception:
+            # Journal henüz hazır değil veya schema mismatch → güvenli
+            # default flag=False (Continuation'a +0.5 vermez).
+            return False
+
     async def _evaluate_ha_native_entry(
         self, symbol: str, market_state: MarketState,
     ) -> Any:
@@ -2739,6 +2782,13 @@ class BotRunner:
                 for (sym, side) in self.ctx.open_trade_ids.keys()
             )
 
+            # 2026-05-05 — Faz 2 Continuation skoru için first_entry_missed
+            # flag. Cycle başında DB query ile hesaplanır (cache'lenmez —
+            # 2 sembol × 1 sorgu = ~10ms ekstra, ihmal edilebilir).
+            first_entry_missed = await self._compute_first_entry_missed_for(
+                symbol, ha_state,
+            )
+
             ctx = EntryContext(
                 symbol=symbol,
                 market_state=market_state,
@@ -2750,6 +2800,7 @@ class BotRunner:
                 last_swing_high=last_swing_high,
                 pending_pairs=pending_pairs,
                 open_pairs=open_pairs,
+                first_entry_missed=first_entry_missed,
                 # adx_3m, plus_di_3m, minus_di_3m, mss_count_recent —
                 # not yet wired (sıradaki commit'te ADX cache + MSS density
                 # counter eklenecek). Şu an None bırakılır; gate'leri
