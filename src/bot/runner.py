@@ -937,6 +937,7 @@ class BotRunner:
         try:
             async with self.ctx.journal:
                 await self._prime()
+                await self._backfill_ha_history()
                 await self._start_derivatives()
                 await self._start_economic_calendar()
                 await self._start_on_chain_ws()
@@ -982,6 +983,56 @@ class BotRunner:
             await self._stop_economic_calendar()
             await self._stop_derivatives()
             await self._stop_on_chain()
+
+    async def _backfill_ha_history(self) -> None:
+        """Seed `HAStateRegistry` from Bybit kline so HA analytics are
+        immediately available on cycle 1 (no first-cycle history gap).
+
+        Operatör 2026-05-04: bot başlatıldığında her sembol için son 50
+        × 3m bar Bybit'ten çekilir, Pine v6 formülüyle birebir Heikin Ashi
+        OHLC + color + streak + body% + shadow flags hesaplanır,
+        `HASymbolState.history` deque'sine push edilir.
+
+        Sonuç:
+          - `dominant_color_3m()` cycle 1'den itibaren çalışır (operatör'ün
+            "5+ yeşil mum varsa kırmızı bekle" filtresi baştan aktif)
+          - HA streak counter Pine'la senkron başlar
+          - Color flip detection ilk cycle'dan doğru çalışır
+
+        Multi-TF (1m/15m) ve MFI/RSI runtime Pine cycle'larından dolar —
+        backfill sadece 3m HA color/streak/body/shadow için.
+
+        Failure-tolerant: bir sembol başarısız olsa loglar + sonrakilere
+        devam eder. Bybit demo bağlantısı yoksa bütün backfill skip.
+        """
+        if self.ctx.bybit_client is None:
+            logger.info("ha_backfill_skipped reason=no_bybit_client")
+            return
+        from src.strategy.ha_history_backfill import fetch_and_backfill
+        symbols = list(self.ctx.config.trading.symbols)
+        for symbol in symbols:
+            try:
+                raw_klines = await asyncio.to_thread(
+                    self.ctx.bybit_client.get_kline,
+                    symbol, "3", 50,
+                )
+                if not raw_klines:
+                    logger.warning("ha_backfill_empty symbol={}", symbol)
+                    continue
+                n = fetch_and_backfill(
+                    self.ctx.ha_state_registry, symbol, raw_klines,
+                )
+                state = self.ctx.ha_state_registry.get(symbol)
+                latest = state.latest if state else None
+                logger.info(
+                    "ha_backfill_done symbol={} bars={} "
+                    "latest_color={} latest_streak={}",
+                    symbol, n,
+                    latest.ha_color_3m if latest else None,
+                    latest.ha_streak_3m if latest else None,
+                )
+            except Exception:
+                logger.exception("ha_backfill_failed symbol={}", symbol)
 
     async def _start_derivatives(self) -> None:
         """Boot the Phase 1.5 derivatives tasks. Safe to call when disabled."""

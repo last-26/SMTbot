@@ -664,6 +664,36 @@ class BybitClient:
             float(row.get("markPrice") or 0.0),
         )
 
+    def get_kline(
+        self, inst_id: str, interval: str = "3", limit: int = 50,
+    ) -> list[list]:
+        """Fetch recent klines for HA history backfill (operatör 2026-05-04).
+
+        Used by `BotRunner.run()` startup to seed `HAStateRegistry` with the
+        last N 3m bars so `dominant_color_3m`, streak, body% are immediately
+        available — no first-cycle "insufficient history" gap.
+
+        Args:
+            inst_id: internal canonical symbol (e.g. "BTC-USDT-SWAP").
+            interval: Bybit V5 interval string ("1", "3", "15", "60", ...).
+            limit: bar count (Bybit max 1000; HA backfill ~50 yeterli).
+
+        Returns:
+            List of raw kline rows (Bybit list format: [ts, o, h, l, c, vol, turn])
+            in ASCENDING chronological order (oldest first). Bybit V5 returns
+            DESC by default; this method reverses for HA recursion correctness.
+            Empty list on missing rows / malformed payload.
+        """
+        resp = self.session.get_kline(
+            category=self.category,
+            symbol=_to_bybit_symbol(inst_id),
+            interval=interval,
+            limit=limit,
+        )
+        result = _check(resp, "get_kline")
+        rows = result.get("list") or []
+        return list(reversed(rows))
+
     def get_contract_size(self, inst_id: str) -> float:
         """Per-contract base-coin multiplier (internal canonical convention,
         carried over from the pre-migration sizing layer).

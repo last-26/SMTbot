@@ -265,6 +265,28 @@ def _gate_15m_alignment(
     return ha_state.latest.ha_color_15m == target
 
 
+def _gate_mss_direction_alignment(
+    last_mss_direction: Optional[Direction], direction: Direction,
+) -> bool:
+    """Gate: son MSS yönü ile HA 3m direction tutarlı (operatör 2026-05-04).
+
+    "3m'deki MSS de yön belirtir" — HA color + son MSS yapısal kırılım yönü
+    aynı yöne işaret etmelidir. Tek başına mss_direction yeterli sinyal
+    değil ama HA color ile birleşince yapısal teyit sağlar.
+
+    Args:
+        last_mss_direction: en son MSS yönü (BULLISH / BEARISH / None).
+        direction: HA-derived trend yönü (LONG/SHORT).
+
+    Returns:
+        True — last_mss yönü ile direction eşleşir
+        False — eşleşmez VEYA last_mss yok (no structural confirmation)
+    """
+    if last_mss_direction is None:
+        return False
+    return last_mss_direction == direction
+
+
 def _gate_dominant_color_alignment(
     ha_state: HASymbolState, direction: Direction,
 ) -> bool:
@@ -363,11 +385,15 @@ def evaluate_entry(
             gate_results={},
         )
 
-    # Run all 9 gates; collect results. Operatör 2026-05-04: ADX + fresh_mss
-    # gate'ten çıkarıldı; 15m_alignment + dominant_color_alignment eklendi.
+    # Run all 10 gates; collect results. Operatör 2026-05-04: ADX + fresh_mss
+    # gate'ten çıkarıldı; 15m_alignment + dominant_color_alignment +
+    # mss_direction_alignment eklendi.
     results: dict[str, bool] = {
         "mss_density": _gate_mss_density(
             ctx.mss_count_recent, config.mss_density_max,
+        ),
+        "mss_direction_alignment": _gate_mss_direction_alignment(
+            ctx.last_mss_direction, direction,
         ),
         "streak_3m": _gate_streak_3m(
             ctx.ha_state, direction, config.min_streak_3m,
