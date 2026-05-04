@@ -1,37 +1,34 @@
-"""HA-native entry decision gate.
+"""HA-native entry decision dispatcher — 3 entry tipi + score-based pick.
 
-Bot her cycle her sembol için entry gate'i evaluate eder. Tüm şartlar
-geçerse `EntryDecision(decision="TAKE_LONG"|"TAKE_SHORT")` döner. Aksi halde
-REJECT veya NO_SETUP.
+Operatör 2026-05-05 strateji felsefesi netleşti: bot her zaman trend
+DÖNÜŞÜ bekleyerek entry alır. Devam eden trende ortadan dalmaz, dönüş
+onayı bekler. 3 farklı entry tipi paralel değerlendirilir:
 
-Spec (operatör 2026-05-04 revize):
-  Ana sinyal: HA 3m current color + 15m alignment (sürekli işleme devam doktrini).
-  Renk değişimi → flip; renk devam ediyorsa entry/hold.
+  Tip 1 — Major Reversal (operatör ana case):
+    "Trend değişim noktası — uzun trendin tepesi/dibi"
+    Senaryo: 5+ ardışık yeşil → 2+ ardışık kırmızı → SHORT
+    Risk: tam R, hedef 1.5R (let it run)
 
-Gate'ler (8 adet — ek konfirmasyonlar):
-  1. MSS density: son M bar içinde <= K MSS (whipsaw guard)
-  2. HA 3m streak abs(>=) min trend yönünde
-  3. HA-MFI 3-bar delta dir trend yönünde (UP/DOWN strict monotonic)
-  4. HA-RSI 3-bar delta dir trend yönünde
-  5. Son 2 HA mum (3m + 1m) trend yönünde aynı renk
-  6. HA 15m current color == trend yönü (multi-TF anchor — KRİTİK)
-  7. Aynı sembol+yön pending/open yok
-  8. Body %3m >= min (momentum candle, doji-like skip)
+  Tip 2 — Continuation (downtrend kandırıcı yükseliş case):
+    "Ana trend devam ediyor, kısa düzeltme bitti"
+    Senaryo: 15m+3m downtrend, 1-2 yeşil bar (kandırıcı toparlanma),
+    tekrar kırmızıya dönüş → SHORT (ana trend devam)
+    Risk: tam R, hedef 1.0R (kısa hareket)
+    Faz 2'de tam implementation; bu commit'te score=0 stub.
 
-Yön belirleme: HA 3m current color (GREEN → BULLISH, RED → BEARISH, DOJI → None).
-ADX + fresh_mss zorunluluğu KALDIRILDI (operatör revize) — HA renk ana
-sinyal, sürekli işleme devam felsefesi. Kaldırılan helper'lar (`_gate_adx`,
-`_gate_fresh_mss`) decision_log audit için import edilebilir kalır.
+  Tip 3 — Micro Reversal (1m mss dip/tepe avcılığı):
+    Operatör profili (WR + net R + mükemmelliyetçi) için ilk fazda
+    DISABLED. Schema hazır, knob ile aktif olunur.
+    Risk: yarı R, hedef 0.7R.
 
-Passive support (gate değil, kayıt + opsiyonel sizing modifier):
-  - Confluence skor (mevcut 5-pillar)
-  - 4H HA renk (Faz 1 journal-only)
-  - EMA200 3m position (Faz 1 journal-only)
+Her cycle 3 tip skor hesaplanır, threshold geçen + en yüksek skor
+kazanır. Hiçbiri threshold geçmezse REJECT. decision_log'a 3 skor da
+yazılır (Pass 3 GBT segmentasyonu için).
 
-Entry params (output):
-  - entry_price: marketable limit (best_ask × (1+offset) long, best_bid × (1-offset) short)
-  - sl_price: structural swing (last_swing_low/high) + per-symbol floor (caller)
-  - tp_price: entry ± 1.0R (scalp doktrin — operatör 2026-05-04)
+Backward compat: `EntryDecision.decision` eski enum değerleri (TAKE_LONG /
+TAKE_SHORT / REJECT / NO_SETUP) kullanır; yeni `entry_path` field
+("major_reversal" / "continuation" / "micro_reversal") tip bilgisini
+taşır.
 """
 from __future__ import annotations
 
@@ -42,45 +39,66 @@ from src.data.models import Direction, MarketState
 from src.strategy.ha_state import HASymbolState
 
 
-# ── Config knobs (operatör seçimi 2026-05-04) ──────────────────────────────
+# ── Config ─────────────────────────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
 class HANativeConfig:
-    """Default knob values for the HA-native entry gate.
+    """Default knob values for the HA-native entry dispatcher.
 
-    Operatör güveni 2026-05-04: ben seçtim, operatör ileride değiştirir.
-
-    `adx_threshold` ve `fresh_mss_max_bars` 2026-05-04 revize ile gate'ten
-    çıkarıldı (HA renk ana sinyal). Knob'lar audit / decision_log için
-    EntryContext'e propagate edilebilir; ileride re-add edilirse default
-    None'a düşer.
+    Operatör 2026-05-05 spec'i:
+      - Önceki ters streak min 3 bar (sık entry için, 5 bar zor)
+      - Karma 15m anchor (skor katkısı, hard-block değil)
+      - Tip 1 + Tip 2 aktif, Tip 3 DISABLED ilk fazda
     """
 
-    # Structure gate
-    mss_density_window: int = 6           # Whipsaw guard window
-    mss_density_max: int = 2              # 3+ MSS = chop, skip
-
-    # HA continuity gates
-    min_streak_3m: int = 2                # 1-mum noise filter
-    min_delta_3bar: float = 0.5           # MFI/RSI delta floor (passed to ha_state)
-    min_body_pct_3m: float = 30.0         # Doji-like skip (momentum candle gate)
-
-    # Passive support (sizing modifier, gate değil)
+    # ── Mandatory gate parametreleri (her tip için ortak) ─────────────────
+    mss_density_window: int = 6
+    mss_density_max: int = 2
+    min_streak_3m: int = 2                    # whipsaw guard (yeni yönde)
+    min_body_pct_3m: float = 30.0             # doji-skip
+    min_delta_3bar: float = 0.5               # MFI/RSI delta floor
     confluence_passive_threshold: float = 5.0
 
-    # Entry execution
-    marketable_offset_pct: float = 0.0005  # 5 bps marketable limit slippage cap
-    entry_cycle_timeout: int = 1          # 1 cycle fill yoksa cancel
-    target_rr_ratio: float = 1.0          # Scalp doktrin (1.0R TP)
+    # ── Tip 1 (Major Reversal) parametreleri ──────────────────────────────
+    # Önceki ters yönde minimum streak — operatör 2026-05-05: 3 bar
+    # ("entryler sık olmalı, 5 bar zor"). 3 bar = 9 dk 3m TF.
+    major_reversal_prev_streak_min: int = 3
+    major_reversal_threshold: float = 4.0
+    major_reversal_target_rr: float = 1.5
 
-    # Deprecated — operatör 2026-05-04 revize ile gate'ten çıktı.
-    # Kept for decision_log audit + future re-add. None değeri "use yok".
+    # ── Tip 2 (Continuation) parametreleri ────────────────────────────────
+    continuation_threshold: float = 4.5
+    continuation_target_rr: float = 1.0
+    # Operatör spec: 3m'de karşı yön streak ≤ 2 (kısa toparlanma)
+    continuation_max_counter_streak: int = 2
+    # Önceki ana-yön streak gücü ≥ 4 (güçlü trend kanıtı)
+    continuation_main_trend_min_streak: int = 4
+
+    # ── Tip 3 (Micro Reversal) parametreleri ──────────────────────────────
+    # Operatör 2026-05-05: Tip 3 DISABLED ilk fazda (WR + perfectionist
+    # profil). Schema + dispatcher hazır, dataset birikince re-enable
+    # config flip ile.
+    micro_reversal_enabled: bool = False
+    micro_reversal_threshold: float = 4.5
+    micro_reversal_target_rr: float = 0.7
+    micro_reversal_risk_multiplier: float = 0.5  # yarı R = $12.5
+
+    # ── Entry execution ───────────────────────────────────────────────────
+    marketable_offset_pct: float = 0.0005     # 5 bps slippage cap
+    entry_cycle_timeout: int = 1              # 1 cycle fill yoksa cancel
+
+    # ── Backward compat: legacy single-RR knob (Tip 1 default'una map) ────
+    # `target_rr_ratio` mevcut runner caller'larında kullanılıyor; eski
+    # kod path'inde aynı kalsın diye.
+    target_rr_ratio: float = 1.0
+
+    # ── Deprecated knobs (audit için tutuluyor) ───────────────────────────
     adx_threshold: Optional[float] = None
     fresh_mss_max_bars: Optional[int] = None
 
 
-# ── Entry context + decision dataclasses ───────────────────────────────────
+# ── Entry context ──────────────────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
@@ -88,48 +106,92 @@ class EntryContext:
     """All inputs evaluate_entry() needs for one symbol cycle.
 
     Caller (runner) assembles this from BotContext caches + market_state +
-    ha_state. Frozen for safety — mutation breaks gate determinism.
+    ha_state. Frozen for safety.
     """
 
     symbol: str
     market_state: MarketState
     ha_state: HASymbolState
 
-    # ADX triad (computed by runner via Wilder ADX(14) on 3m candles)
+    # ADX triad
     adx_3m: Optional[float] = None
     plus_di_3m: Optional[float] = None
     minus_di_3m: Optional[float] = None
 
-    # Recent MSS history
+    # Recent MSS history (Pine'dan parse edilir)
     last_mss_bar: Optional[int] = None
     last_mss_direction: Optional[Direction] = None
     bars_since_last_mss: Optional[int] = None
-    mss_count_recent: int = 0          # MSS count in last `mss_density_window`
+    mss_count_recent: int = 0
 
     # Order book for marketable limit
     best_bid: Optional[float] = None
     best_ask: Optional[float] = None
 
-    # Pending + open pairs for cross-cycle deduplication
-    pending_pairs: frozenset = frozenset()  # {(symbol, Direction)}
+    # Cross-cycle deduplication
+    pending_pairs: frozenset = frozenset()
     open_pairs: frozenset = frozenset()
 
-    # Swing extremes for SL anchor (caller passes from analysis layer)
+    # Swing extremes for SL anchor
     last_swing_low: Optional[float] = None
     last_swing_high: Optional[float] = None
+
+    # 2026-05-05 — Tip 2 Continuation için:
+    # "İlk entry kaçırıldı" flag. Runner DB query ile doldurur:
+    # current dominant_color trend'i içinde bu sembole `is_ha_native=True`
+    # OPEN/CLOSED row var mı? Yoksa flag=True (skor +0.5).
+    first_entry_missed: bool = False
+
+    # 2026-05-05 — Önceki dominant trend streak (Tip 1 + Tip 2 input).
+    # `ha_state.history` üzerinden hesaplanabilir ama caller tarafında
+    # cache'lemek faster. Default 0 → Tip 1 reverse-streak hesabı
+    # ha_state'den fallback yapar.
+    prev_main_streak: int = 0
+
+
+# ── Entry decision (output) ───────────────────────────────────────────────
+
+
+@dataclass
+class EntryTypeScore:
+    """Tek bir entry tipinin score + parametre snapshot'ı."""
+
+    score: float = 0.0
+    direction: Optional[Direction] = None
+    gate_results: dict[str, bool] = field(default_factory=dict)
+    entry_price: Optional[float] = None
+    sl_price: Optional[float] = None
+    tp_price: Optional[float] = None
+    target_rr: float = 1.0
+    risk_multiplier: float = 1.0
+    # Bir gate fail ettiyse hangi gate (audit için)
+    failed_mandatory: Optional[str] = None
 
 
 @dataclass
 class EntryDecision:
-    """Output of evaluate_entry(). Always populated; reason explains the path."""
+    """Output of evaluate_entry()."""
 
-    decision: str                       # "TAKE_LONG" / "TAKE_SHORT" / "REJECT" / "NO_SETUP"
+    # decision = "TAKE_LONG" / "TAKE_SHORT" / "REJECT" / "NO_SETUP"
+    # (backward compat — runner reject_reason mapping bunu okur)
+    decision: str
     direction: Optional[Direction] = None
+    # 2026-05-05 — yeni: hangi entry tipi kazandı
+    entry_path: Optional[str] = None  # "major_reversal" / "continuation" / "micro_reversal"
     reason: str = ""
-    gate_results: dict[str, bool] = field(default_factory=dict)
+    # gate_results artık tip-spesifik nested dict:
+    # {"major_reversal": {...}, "continuation": {...}, "micro_reversal": {...}}
+    gate_results: dict[str, dict] = field(default_factory=dict)
+    # Per-tip skorlar (Pass 3 GBT için)
+    major_reversal_score: float = 0.0
+    continuation_score: float = 0.0
+    micro_reversal_score: float = 0.0
+    # Kazanan tipin parametreleri (TAKE durumunda dolu)
     suggested_entry_price: Optional[float] = None
     suggested_sl_price: Optional[float] = None
     suggested_tp_price: Optional[float] = None
+    target_rr: float = 1.0
+    risk_multiplier: float = 1.0
     notes: str = ""
 
     @property
@@ -137,35 +199,12 @@ class EntryDecision:
         return self.decision in ("TAKE_LONG", "TAKE_SHORT")
 
 
-# ── Direction inference ────────────────────────────────────────────────────
-
-
-def _infer_trend_direction(ctx: EntryContext) -> Optional[Direction]:
-    """Trend yönü: HA 3m current color (operatör 2026-05-04 revize).
-
-    Returns:
-      BULLISH — son 3m HA mum GREEN
-      BEARISH — son 3m HA mum RED
-      None    — DOJI / empty (no clean direction)
-
-    Diğer gate'ler bu yöne karşı evaluate edilir. MSS yönü artık
-    direction kaynağı değil; sadece audit için decision_log'a yazılır.
-    """
-    if ctx.ha_state.latest is None:
-        return None
-    color = ctx.ha_state.latest.ha_color_3m
-    if color == "GREEN":
-        return Direction.BULLISH
-    if color == "RED":
-        return Direction.BEARISH
-    return None  # DOJI / empty
-
-
-# ── Gate helpers ───────────────────────────────────────────────────────────
+# ── Backward-compat helpers (eski test API'sini destekler) ───────────────
 
 
 def _gate_adx(adx_3m: Optional[float], threshold: float) -> bool:
-    """Gate 1: ADX 3m >= threshold."""
+    """DEPRECATED gate (operatör 2026-05-04 revize ile entry gate'ten çıktı).
+    Backward-compat — eski testler decision_log audit için kullanır."""
     if adx_3m is None:
         return False
     return adx_3m >= threshold
@@ -174,69 +213,18 @@ def _gate_adx(adx_3m: Optional[float], threshold: float) -> bool:
 def _gate_fresh_mss(
     bars_since: Optional[int], max_bars: int,
 ) -> bool:
-    """Gate 2: Last MSS within the last `max_bars` bars."""
+    """DEPRECATED gate. Backward-compat helper."""
     if bars_since is None:
         return False
     return 0 <= bars_since <= max_bars
 
 
-def _gate_mss_density(count: int, max_count: int) -> bool:
-    """Gate 3: Recent-window MSS count <= max_count (whipsaw guard)."""
-    return count <= max_count
-
-
-def _gate_streak_3m(
-    ha_state: HASymbolState, direction: Direction, min_abs: int,
-) -> bool:
-    """Gate 4: |HA 3m streak| >= min, signed correctly for the direction.
-
-    LONG → streak > 0 (green run); SHORT → streak < 0 (red run).
-    """
-    if ha_state.latest is None:
-        return False
-    streak = ha_state.latest.ha_streak_3m
-    if direction == Direction.BULLISH:
-        return streak >= min_abs
-    if direction == Direction.BEARISH:
-        return streak <= -min_abs
-    return False
-
-
-def _gate_mfi_delta(
-    ha_state: HASymbolState, direction: Direction, min_abs_value: float,
-) -> bool:
-    """Gate 5: HA-MFI 3m 3-bar delta direction matches trend.
-
-    LONG needs UP delta; SHORT needs DOWN delta. Strict monotonic with
-    abs(delta) >= floor enforced by ha_state._delta_dir().
-    """
-    direction_str = ha_state.mfi_3m_delta_dir
-    if direction == Direction.BULLISH:
-        return direction_str == "UP"
-    if direction == Direction.BEARISH:
-        return direction_str == "DOWN"
-    return False
-
-
-def _gate_rsi_delta(
-    ha_state: HASymbolState, direction: Direction,
-) -> bool:
-    """Gate 6: HA-RSI 3m 3-bar delta direction matches trend."""
-    direction_str = ha_state.rsi_3m_delta_dir
-    if direction == Direction.BULLISH:
-        return direction_str == "UP"
-    if direction == Direction.BEARISH:
-        return direction_str == "DOWN"
-    return False
-
-
 def _gate_two_bar_color(
     ha_state: HASymbolState, direction: Direction,
 ) -> bool:
-    """Gate: Last 2 HA bars (3m + 1m) trend yönünde aynı renk.
-
-    Doji veya empty color → fail (no clean signal).
-    """
+    """DEPRECATED gate (yeni dispatcher kullanmıyor; operatör 2026-05-05:
+    `streak_3m` zaten 'art arda mum' çevirir). Backward-compat — eski
+    test_ha_native_planner.py tek-tek helper testlerini geçirsin diye."""
     if len(ha_state.history) < 2:
         return False
     target = "GREEN" if direction == Direction.BULLISH else "RED"
@@ -250,15 +238,103 @@ def _gate_two_bar_color(
     )
 
 
+def _gate_mfi_delta(
+    ha_state: HASymbolState, direction: Direction,
+    min_abs_value: float = 0.5,
+) -> bool:
+    """Backward-compat alias for `_gate_mfi_delta_aligned`. min_abs_value
+    parametresi `ha_state._delta_dir`'ün kendi kontrolüyle ortak."""
+    return _gate_mfi_delta_aligned(ha_state, direction)
+
+
+def _gate_rsi_delta(
+    ha_state: HASymbolState, direction: Direction,
+) -> bool:
+    """Backward-compat alias for `_gate_rsi_delta_aligned`."""
+    return _gate_rsi_delta_aligned(ha_state, direction)
+
+
+# ── Direction inference (3m HA color) ─────────────────────────────────────
+
+
+def _infer_direction_from_3m(ctx: EntryContext) -> Optional[Direction]:
+    """3m HA color → Direction. DOJI/empty → None."""
+    if ctx.ha_state.latest is None:
+        return None
+    color = ctx.ha_state.latest.ha_color_3m
+    if color == "GREEN":
+        return Direction.BULLISH
+    if color == "RED":
+        return Direction.BEARISH
+    return None
+
+
+# Backward-compat alias for legacy tests
+_infer_trend_direction = _infer_direction_from_3m
+
+
+def _infer_direction_from_15m(ctx: EntryContext) -> Optional[Direction]:
+    """15m HA color → Direction. DOJI/empty → None."""
+    if ctx.ha_state.latest is None:
+        return None
+    color = ctx.ha_state.latest.ha_color_15m
+    if color == "GREEN":
+        return Direction.BULLISH
+    if color == "RED":
+        return Direction.BEARISH
+    return None
+
+
+# ── Generic gate helpers (her tip kullanabilir) ──────────────────────────
+
+
+def _gate_mss_density(count: int, max_count: int) -> bool:
+    return count <= max_count
+
+
+def _gate_streak_3m(
+    ha_state: HASymbolState, direction: Direction, min_abs: int,
+) -> bool:
+    if ha_state.latest is None:
+        return False
+    streak = ha_state.latest.ha_streak_3m
+    if direction == Direction.BULLISH:
+        return streak >= min_abs
+    if direction == Direction.BEARISH:
+        return streak <= -min_abs
+    return False
+
+
+def _gate_no_duplicate(
+    symbol: str, direction: Direction,
+    pending: frozenset, open_set: frozenset,
+) -> bool:
+    pair = (symbol, direction)
+    return pair not in pending and pair not in open_set
+
+
+def _gate_body_size(
+    ha_state: HASymbolState, min_pct: float,
+) -> bool:
+    if ha_state.latest is None:
+        return False
+    return ha_state.latest.ha_body_pct_3m >= min_pct
+
+
+def _gate_dominant_color_alignment(
+    ha_state: HASymbolState, direction: Direction,
+) -> bool:
+    """Liberal: dominant ters baskı yoksa OK."""
+    dominant_3m = ha_state.dominant_color_3m()
+    if dominant_3m is None:
+        return True
+    opposite = "RED" if direction == Direction.BULLISH else "GREEN"
+    return dominant_3m != opposite
+
+
 def _gate_15m_alignment(
     ha_state: HASymbolState, direction: Direction,
 ) -> bool:
-    """Gate: HA 15m current color == trend direction (multi-TF anchor).
-
-    KRİTİK gate (operatör 2026-05-04 revize): 3m yön sinyali HTF onayıyla
-    desteklenmeli. 15m DOJI veya ters yön → fail. Bu, scalp tetiğini
-    HTF kırılımı yokken bloklar; 15m döndüğünde flip-side alanı açılır.
-    """
     if ha_state.latest is None:
         return False
     target = "GREEN" if direction == Direction.BULLISH else "RED"
@@ -268,70 +344,75 @@ def _gate_15m_alignment(
 def _gate_mss_direction_alignment(
     last_mss_direction: Optional[Direction], direction: Direction,
 ) -> bool:
-    """Gate: son MSS yönü ile HA 3m direction tutarlı (operatör 2026-05-04).
-
-    "3m'deki MSS de yön belirtir" — HA color + son MSS yapısal kırılım yönü
-    aynı yöne işaret etmelidir. Tek başına mss_direction yeterli sinyal
-    değil ama HA color ile birleşince yapısal teyit sağlar.
-
-    Args:
-        last_mss_direction: en son MSS yönü (BULLISH / BEARISH / None).
-        direction: HA-derived trend yönü (LONG/SHORT).
-
-    Returns:
-        True — last_mss yönü ile direction eşleşir
-        False — eşleşmez VEYA last_mss yok (no structural confirmation)
-    """
     if last_mss_direction is None:
         return False
     return last_mss_direction == direction
 
 
-def _gate_dominant_color_alignment(
+def _gate_mfi_delta_aligned(
     ha_state: HASymbolState, direction: Direction,
 ) -> bool:
-    """Gate: 3m HA dominant color son 30 barda trend yönüne ters DEĞİL.
-
-    Operatör 2026-05-04: "5 yeşil mum varsa kırmızıyı bekle short için —
-    düşüş ara düzeltme olabilir". 3m HA mum şu an kırmızı (SHORT direction)
-    olsa bile, son 30 bar yeşil dominant ise = ara düzeltme = short skip.
-
-    Liberal yorum (default):
-      LONG için: dominant_3m != "RED" (yukarı baskın veya balanced OK)
-      SHORT için: dominant_3m != "GREEN" (aşağı baskın veya balanced OK)
-
-    Balanced (None) durumunda OK — operatör "biraz daha verilerle destekleniyorsa"
-    dedi; balanced = ters baskı yok = entry OK. Strict'e çevirmek istersek:
-    dominant_3m == direction'ın renk ekvivalenti zorunlu yaparız.
-
-    15m destekleyici (operatör spec) ayrıca `_gate_15m_alignment` ile zaten
-    current color check ediliyor; 15m dominant audit için decision_log'a yazılır.
-    """
-    dominant_3m = ha_state.dominant_color_3m()
-    if dominant_3m is None:
-        return True  # balanced = ters baskı yok = OK
-    opposite = "RED" if direction == Direction.BULLISH else "GREEN"
-    return dominant_3m != opposite
+    direction_str = ha_state.mfi_3m_delta_dir
+    if direction == Direction.BULLISH:
+        return direction_str == "UP"
+    if direction == Direction.BEARISH:
+        return direction_str == "DOWN"
+    return False
 
 
-def _gate_no_duplicate(
-    symbol: str,
-    direction: Direction,
-    pending: frozenset,
-    open_set: frozenset,
+def _gate_rsi_delta_aligned(
+    ha_state: HASymbolState, direction: Direction,
 ) -> bool:
-    """Gate 8: Aynı sembol+yön pending ya da open değil."""
-    pair = (symbol, direction)
-    return pair not in pending and pair not in open_set
+    direction_str = ha_state.rsi_3m_delta_dir
+    if direction == Direction.BULLISH:
+        return direction_str == "UP"
+    if direction == Direction.BEARISH:
+        return direction_str == "DOWN"
+    return False
 
 
-def _gate_body_size(
-    ha_state: HASymbolState, min_pct: float,
+def _gate_vwap_alignment(
+    state: MarketState, direction: Direction,
 ) -> bool:
-    """Auxiliary gate: HA 3m body % >= min (momentum candle, not doji-like)."""
-    if ha_state.latest is None:
+    """Price vs vwap_3m alignment — LONG → price >= vwap, SHORT → tersi."""
+    sig = state.signal_table
+    if sig is None or sig.vwap_3m <= 0 or sig.price <= 0:
         return False
-    return ha_state.latest.ha_body_pct_3m >= min_pct
+    if direction == Direction.BULLISH:
+        return sig.price >= sig.vwap_3m
+    return sig.price <= sig.vwap_3m
+
+
+def _gate_rcs_volume(state: MarketState, threshold: float = 1.3) -> bool:
+    """volume_3m_ratio ≥ confirm threshold."""
+    sig = state.signal_table
+    if sig is None:
+        return False
+    return sig.volume_3m_ratio >= threshold
+
+
+def _prev_main_streak_from_history(
+    ha_state: HASymbolState, current_direction: Direction,
+) -> int:
+    """Mevcut bardan geriye doğru, current_direction'ın TERSİNDEKİ ardışık
+    bar sayısı. Major Reversal "önceki streak ≥ 3" gate'i için kullanılır.
+
+    Örn: ha_state son 5 bar = [GREEN, GREEN, GREEN, GREEN, RED] (oldest→newest)
+    current_direction = BEARISH (yeni RED bar)
+    → önceki ardışık YEŞİL = 4
+    """
+    if len(ha_state.history) < 2:
+        return 0
+    target_prev = "GREEN" if current_direction == Direction.BEARISH else "RED"
+    history = list(ha_state.history)
+    # Skip current bar (latest), count consecutive prev_target
+    count = 0
+    for snap in reversed(history[:-1]):
+        if snap.ha_color_3m == target_prev:
+            count += 1
+        else:
+            break
+    return count
 
 
 # ── Pricing helpers ────────────────────────────────────────────────────────
@@ -340,14 +421,14 @@ def _gate_body_size(
 def _marketable_entry_price(
     direction: Direction, best_bid: float, best_ask: float, offset_pct: float,
 ) -> float:
-    """LONG: ask × (1+offset); SHORT: bid × (1-offset)."""
     if direction == Direction.BULLISH:
         return best_ask * (1.0 + offset_pct)
     return best_bid * (1.0 - offset_pct)
 
 
-def _structural_sl_price(direction: Direction, ctx: EntryContext) -> Optional[float]:
-    """LONG → last_swing_low; SHORT → last_swing_high. None if missing."""
+def _structural_sl_price(
+    direction: Direction, ctx: EntryContext,
+) -> Optional[float]:
     if direction == Direction.BULLISH:
         return ctx.last_swing_low
     return ctx.last_swing_high
@@ -356,102 +437,295 @@ def _structural_sl_price(direction: Direction, ctx: EntryContext) -> Optional[fl
 def _tp_price(
     direction: Direction, entry: float, sl: float, rr: float,
 ) -> float:
-    """entry ± rr × sl_distance."""
     sl_distance = abs(entry - sl)
     if direction == Direction.BULLISH:
         return entry + rr * sl_distance
     return entry - rr * sl_distance
 
 
-# ── Main evaluator ─────────────────────────────────────────────────────────
+# ── Tip 1: Major Reversal score ───────────────────────────────────────────
+
+
+def _score_major_reversal(
+    ctx: EntryContext, config: HANativeConfig,
+) -> EntryTypeScore:
+    """Tip 1 — Major Reversal (büyük trend dönüşü).
+
+    Mandatory gates (fail = score 0, failed_mandatory set):
+      - HA color clear (3m DOJI değil) → direction implied
+      - Yeni yönde streak ≥ min_streak_3m=2 (whipsaw guard)
+      - Önceki ters yönde streak ≥ major_reversal_prev_streak_min=3
+        (uzun trendin tepesi/dibi)
+      - mss_density (chop guard)
+      - no_duplicate
+      - body_size ≥ 30%
+
+    Soft skor faktörleri (threshold ≥ 4.0):
+      - 15m HA pozisyon yönünde aligned: +2.0 (HTF anchor desteği)
+      - 15m HA hâlâ eski yönlü (anchor henüz dönmedi): +1.0 (agresif tepeden)
+      - MSS direction yeni yönü onaylıyor (yapı kırıldı): +2.0
+      - MFI delta yeni yönde: +1.0
+      - RSI delta yeni yönde: +1.0
+      - VWAP yeni yönle aligned: +0.5
+      - RCS volume_3m_ratio ≥ 1.3: +1.0
+      - dominant_color hâlâ eski yönlü (büyük resim trend tepesi): +0.5
+    """
+    direction = _infer_direction_from_3m(ctx)
+    score = EntryTypeScore(score=0.0, direction=direction)
+    if direction is None:
+        score.failed_mandatory = "no_ha_direction"
+        return score
+
+    # Mandatory gates
+    gates: dict[str, bool] = {}
+    gates["mss_density"] = _gate_mss_density(
+        ctx.mss_count_recent, config.mss_density_max,
+    )
+    gates["streak_3m_new_direction"] = _gate_streak_3m(
+        ctx.ha_state, direction, config.min_streak_3m,
+    )
+    prev_streak = (
+        ctx.prev_main_streak
+        if ctx.prev_main_streak > 0
+        else _prev_main_streak_from_history(ctx.ha_state, direction)
+    )
+    gates["prev_streak_min"] = prev_streak >= config.major_reversal_prev_streak_min
+    gates["no_duplicate"] = _gate_no_duplicate(
+        ctx.symbol, direction, ctx.pending_pairs, ctx.open_pairs,
+    )
+    gates["body_size"] = _gate_body_size(ctx.ha_state, config.min_body_pct_3m)
+
+    # Mandatory check
+    mandatory_keys = (
+        "mss_density", "streak_3m_new_direction", "prev_streak_min",
+        "no_duplicate", "body_size",
+    )
+    for k in mandatory_keys:
+        if not gates[k]:
+            score.failed_mandatory = k
+            score.gate_results = gates
+            return score
+
+    # Soft factors (threshold contribution)
+    score_value = 0.0
+    gates["15m_aligned_new"] = _gate_15m_alignment(ctx.ha_state, direction)
+    if gates["15m_aligned_new"]:
+        score_value += 2.0
+    else:
+        # 15m hâlâ eski yönlü → "tepeden agresif giriş" için ek skor
+        prev_dir = (
+            Direction.BEARISH if direction == Direction.BULLISH
+            else Direction.BULLISH
+        )
+        gates["15m_aligned_old"] = _gate_15m_alignment(ctx.ha_state, prev_dir)
+        if gates["15m_aligned_old"]:
+            score_value += 1.0
+
+    gates["mss_direction_aligned"] = _gate_mss_direction_alignment(
+        ctx.last_mss_direction, direction,
+    )
+    if gates["mss_direction_aligned"]:
+        score_value += 2.0
+
+    gates["mfi_delta_aligned"] = _gate_mfi_delta_aligned(
+        ctx.ha_state, direction,
+    )
+    if gates["mfi_delta_aligned"]:
+        score_value += 1.0
+
+    gates["rsi_delta_aligned"] = _gate_rsi_delta_aligned(
+        ctx.ha_state, direction,
+    )
+    if gates["rsi_delta_aligned"]:
+        score_value += 1.0
+
+    gates["vwap_aligned"] = _gate_vwap_alignment(ctx.market_state, direction)
+    if gates["vwap_aligned"]:
+        score_value += 0.5
+
+    gates["rcs_volume_confirm"] = _gate_rcs_volume(ctx.market_state, 1.3)
+    if gates["rcs_volume_confirm"]:
+        score_value += 1.0
+
+    # Eski yön dominant_color → büyük resim trend tepesi, reversal candidate güçlü
+    prev_dir = (
+        Direction.BEARISH if direction == Direction.BULLISH
+        else Direction.BULLISH
+    )
+    gates["dominant_color_old_aligned"] = _gate_15m_alignment(
+        ctx.ha_state, prev_dir,
+    )  # NB: kullanılmıyor — gate adı dominant değil 15m. fix:
+    # dominant_color_alignment'a bak:
+    dominant_3m = ctx.ha_state.dominant_color_3m()
+    expected_old = "GREEN" if direction == Direction.BEARISH else "RED"
+    gates["dominant_old_aligned"] = (dominant_3m == expected_old)
+    # Düzeltme: dominant_color_old_aligned key'i ile karışmasın
+    del gates["dominant_color_old_aligned"]
+    if gates["dominant_old_aligned"]:
+        score_value += 0.5
+
+    score.score = score_value
+    score.gate_results = gates
+
+    # Build entry parameters if soft threshold passes
+    if score_value >= config.major_reversal_threshold:
+        if ctx.best_bid is None or ctx.best_ask is None:
+            score.failed_mandatory = "missing_orderbook"
+            return score
+        sl = _structural_sl_price(direction, ctx)
+        if sl is None:
+            score.failed_mandatory = "missing_swing_anchor"
+            return score
+        entry = _marketable_entry_price(
+            direction, ctx.best_bid, ctx.best_ask, config.marketable_offset_pct,
+        )
+        tp = _tp_price(direction, entry, sl, config.major_reversal_target_rr)
+        score.entry_price = entry
+        score.sl_price = sl
+        score.tp_price = tp
+        score.target_rr = config.major_reversal_target_rr
+        score.risk_multiplier = 1.0
+
+    return score
+
+
+# ── Tip 2: Continuation score (STUB — Faz 2'de full) ──────────────────────
+
+
+def _score_continuation(
+    ctx: EntryContext, config: HANativeConfig,
+) -> EntryTypeScore:
+    """Tip 2 — Trend Continuation (downtrend kandırıcı yükseliş case).
+
+    STUB: Faz 2'de full implementation. Şu an score=0 döner.
+    Direction hesaplanır ama gate'ler boş dict.
+    """
+    direction = _infer_direction_from_3m(ctx)
+    return EntryTypeScore(
+        score=0.0,
+        direction=direction,
+        gate_results={},
+        failed_mandatory="not_implemented_yet",
+    )
+
+
+# ── Tip 3: Micro Reversal score (STUB + DISABLED) ─────────────────────────
+
+
+def _score_micro_reversal(
+    ctx: EntryContext, config: HANativeConfig,
+) -> EntryTypeScore:
+    """Tip 3 — Micro Reversal (1m mss dip/tepe avcılığı).
+
+    DISABLED ilk fazda (operatör profili: WR + perfectionist).
+    config.micro_reversal_enabled=False olduğu sürece score=0.
+    """
+    direction = _infer_direction_from_3m(ctx)
+    if not config.micro_reversal_enabled:
+        return EntryTypeScore(
+            score=0.0,
+            direction=direction,
+            gate_results={},
+            failed_mandatory="micro_reversal_disabled",
+        )
+    # Faz 3'te full implementation
+    return EntryTypeScore(
+        score=0.0,
+        direction=direction,
+        gate_results={},
+        failed_mandatory="not_implemented_yet",
+    )
+
+
+# ── Main dispatcher ────────────────────────────────────────────────────────
 
 
 def evaluate_entry(
     ctx: EntryContext, config: HANativeConfig,
 ) -> EntryDecision:
-    """Run the 8-condition gate; return a decision.
+    """Run 3 entry tipini paralel skor; threshold geçen + en yüksek skoru kazandır.
 
-    Hard short-circuit: missing direction signal = NO_SETUP (no MSS).
-    Otherwise run every gate, collect results, build the decision.
+    Hard short-circuits:
+      - 3m HA direction belirsiz (DOJI/empty) → NO_SETUP
 
-    Note: gate evaluation is NOT short-circuited mid-list — all gates run so
-    the caller sees every result in `gate_results` for decision_log audit.
+    Tüm 3 skor + gate_results her zaman EntryDecision'a yazılır
+    (decision_log audit için tam görünürlük).
     """
-    direction = _infer_trend_direction(ctx)
-    if direction is None:
+    direction_3m = _infer_direction_from_3m(ctx)
+    if direction_3m is None:
         return EntryDecision(
             decision="NO_SETUP",
             reason="no_ha_direction",
-            gate_results={},
+            gate_results={"major_reversal": {}, "continuation": {}, "micro_reversal": {}},
         )
 
-    # Run all 10 gates; collect results. Operatör 2026-05-04: ADX + fresh_mss
-    # gate'ten çıkarıldı; 15m_alignment + dominant_color_alignment +
-    # mss_direction_alignment eklendi.
-    results: dict[str, bool] = {
-        "mss_density": _gate_mss_density(
-            ctx.mss_count_recent, config.mss_density_max,
-        ),
-        "mss_direction_alignment": _gate_mss_direction_alignment(
-            ctx.last_mss_direction, direction,
-        ),
-        "streak_3m": _gate_streak_3m(
-            ctx.ha_state, direction, config.min_streak_3m,
-        ),
-        "mfi_delta": _gate_mfi_delta(
-            ctx.ha_state, direction, config.min_delta_3bar,
-        ),
-        "rsi_delta": _gate_rsi_delta(ctx.ha_state, direction),
-        "two_bar_color": _gate_two_bar_color(ctx.ha_state, direction),
-        "fifteen_min_alignment": _gate_15m_alignment(ctx.ha_state, direction),
-        "dominant_color_alignment": _gate_dominant_color_alignment(
-            ctx.ha_state, direction,
-        ),
-        "no_duplicate": _gate_no_duplicate(
-            ctx.symbol, direction, ctx.pending_pairs, ctx.open_pairs,
-        ),
-        "body_size": _gate_body_size(ctx.ha_state, config.min_body_pct_3m),
+    # Skor 3 tipi
+    s_major = _score_major_reversal(ctx, config)
+    s_cont = _score_continuation(ctx, config)
+    s_micro = _score_micro_reversal(ctx, config)
+
+    all_gate_results = {
+        "major_reversal": s_major.gate_results,
+        "continuation": s_cont.gate_results,
+        "micro_reversal": s_micro.gate_results,
     }
 
-    if not all(results.values()):
-        # Find the first failed gate for a human-readable reason.
-        first_failed = next(name for name, ok in results.items() if not ok)
+    # Aday filtresi: threshold geçen + entry params hazır
+    candidates: list[tuple[str, EntryTypeScore, float]] = [
+        ("major_reversal", s_major, config.major_reversal_threshold),
+        ("continuation", s_cont, config.continuation_threshold),
+        ("micro_reversal", s_micro, config.micro_reversal_threshold),
+    ]
+    valid = [
+        (name, score)
+        for name, score, threshold in candidates
+        if score.score >= threshold and score.entry_price is not None
+    ]
+
+    if not valid:
+        # En yüksek skoru olan reject reason için
+        top_name, top_score, top_threshold = max(
+            candidates, key=lambda c: c[1].score,
+        )
+        if top_score.failed_mandatory:
+            reason = (
+                f"{top_name}_mandatory_failed:"
+                f"{top_score.failed_mandatory}"
+            )
+        else:
+            reason = (
+                f"{top_name}_below_threshold:"
+                f"{top_score.score:.2f}<{top_threshold:.2f}"
+            )
         return EntryDecision(
             decision="REJECT",
-            direction=direction,
-            reason=f"gate_failed:{first_failed}",
-            gate_results=results,
+            direction=direction_3m,
+            entry_path=None,
+            reason=f"all_below_threshold:top={reason}",
+            gate_results=all_gate_results,
+            major_reversal_score=s_major.score,
+            continuation_score=s_cont.score,
+            micro_reversal_score=s_micro.score,
         )
 
-    # All gates passed — assemble entry parameters.
-    if ctx.best_bid is None or ctx.best_ask is None:
-        return EntryDecision(
-            decision="REJECT",
-            direction=direction,
-            reason="missing_orderbook",
-            gate_results=results,
-        )
-    sl_price = _structural_sl_price(direction, ctx)
-    if sl_price is None:
-        return EntryDecision(
-            decision="REJECT",
-            direction=direction,
-            reason="missing_swing_anchor",
-            gate_results=results,
-        )
-
-    entry_price = _marketable_entry_price(
-        direction, ctx.best_bid, ctx.best_ask, config.marketable_offset_pct,
+    # En yüksek skoru olan kazanır (tie → major_reversal preference; iteration order)
+    winner_name, winner_score = max(valid, key=lambda c: c[1].score)
+    decision_label = (
+        "TAKE_LONG" if winner_score.direction == Direction.BULLISH
+        else "TAKE_SHORT"
     )
-    tp_price = _tp_price(direction, entry_price, sl_price, config.target_rr_ratio)
-
-    decision_label = "TAKE_LONG" if direction == Direction.BULLISH else "TAKE_SHORT"
     return EntryDecision(
         decision=decision_label,
-        direction=direction,
-        reason="all_gates_passed",
-        gate_results=results,
-        suggested_entry_price=entry_price,
-        suggested_sl_price=sl_price,
-        suggested_tp_price=tp_price,
+        direction=winner_score.direction,
+        entry_path=winner_name,
+        reason=f"{winner_name}_passed:score={winner_score.score:.2f}",
+        gate_results=all_gate_results,
+        major_reversal_score=s_major.score,
+        continuation_score=s_cont.score,
+        micro_reversal_score=s_micro.score,
+        suggested_entry_price=winner_score.entry_price,
+        suggested_sl_price=winner_score.sl_price,
+        suggested_tp_price=winner_score.tp_price,
+        target_rr=winner_score.target_rr,
+        risk_multiplier=winner_score.risk_multiplier,
     )
