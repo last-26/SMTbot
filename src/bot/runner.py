@@ -94,6 +94,11 @@ from src.execution.position_monitor import PendingEvent, PositionMonitor
 from src.journal.database import TradeJournal
 from src.journal.derivatives_journal import DerivativesJournal
 from src.strategy.ha_state import HAStateRegistry
+from src.strategy.ha_native_exit import (
+    ExitContext as HANativeExitContext,
+    HANativeExitConfig,
+    evaluate_exit as evaluate_ha_native_exit,
+)
 from src.strategy.rr_system import calculate_trade_plan
 from src.strategy.entry_signals import (
     _flow_alignment_score,
@@ -1832,6 +1837,88 @@ class BotRunner:
         await self._defensive_close(symbol, pos_side, "momentum_fade")
         return True
 
+    async def _maybe_close_on_ha_flip(
+        self, symbol: str, pos_side: str, state: MarketState,
+    ) -> bool:
+        """HA-native pozisyon için multi-TF HA renk dönüşü exit gate.
+
+        Operatör 2026-05-04 spec'i (Yol A primary mode'un simetrik tarafı):
+        HA color primary direction signal, multi-TF (3m streak + 15m
+        opposing) + RCS (volume_3m_ratio) confirm + whipsaw guard. Sadece
+        `_Tracked.is_ha_native=True` olan pozisyonlar üzerinde fire eder;
+        legacy 5-pillar pozisyonlar mevcut momentum_fade / MAE-BE-recovery
+        / trailing exit'lerini korur (kademeli geçiş — yeni gate eski
+        gate'leri ezmez, sadece HA-native trade'lere uygulanır).
+
+        Decision flow (saf fonksiyon `evaluate_ha_native_exit`):
+          1. config.ha_native_exit_enabled toggle.
+          2. ha_state.latest var mı (boş history → HOLD).
+          3. bars_since_open >= min_bars_held (whipsaw guard ilk cycle).
+          4. 3m streak opposing (≥ min_opposing_bars_3m) VEYA
+             15m HA color opposing (tek bar yeterli).
+          5. RCS gate: volume_3m_ratio ≥ confirm → CLOSE,
+             ≤ noise → HOLD, arada → CLOSE (default exit fires).
+
+        Returns True when a defensive close was fired, False otherwise.
+        Caller (runner cycle) returns early when True so subsequent gates
+        (TP-revise, MFE-lock, MAE-recovery) don't fire on a closing
+        position.
+        """
+        cfg = self.ctx.config
+        if not cfg.execution.ha_native_exit_enabled:
+            return False
+
+        tracked = self.ctx.monitor.get_tracked(symbol, pos_side)
+        if tracked is None or not getattr(tracked, "is_ha_native", False):
+            return False
+
+        sym_state = self.ctx.ha_state_registry.get(symbol)
+        if sym_state is None or sym_state.latest is None:
+            return False
+
+        pos_dir = (
+            Direction.BULLISH if pos_side == "long" else Direction.BEARISH
+        )
+
+        # bars_since_open: 3m bar bazında (180s/bar). opened_at threading
+        # `register_open` üzerinden kuruldu; rehydrate path'i de aynı
+        # `entry_timestamp` kullanır → restart sonrası tutarlı.
+        try:
+            elapsed_s = (
+                _utc_now() - tracked.opened_at
+            ).total_seconds()
+        except Exception:
+            elapsed_s = 0.0
+        bars_held = max(0, int(elapsed_s // 180))
+
+        exit_ctx = HANativeExitContext(
+            position_direction=pos_dir,
+            ha_state=sym_state,
+            bars_since_open=bars_held,
+            volume_3m_ratio=float(state.signal_table.volume_3m_ratio or 1.0),
+        )
+        exit_cfg = HANativeExitConfig(
+            enabled=cfg.execution.ha_native_exit_enabled,
+            min_opposing_bars_3m=cfg.execution.ha_native_exit_min_opposing_bars_3m,
+            enable_15m_opposing=cfg.execution.ha_native_exit_enable_15m_opposing,
+            rcs_volume_ratio_confirm=cfg.execution.ha_native_exit_rcs_confirm,
+            rcs_volume_ratio_noise=cfg.execution.ha_native_exit_rcs_noise,
+            min_bars_held=cfg.execution.ha_native_exit_min_bars_held,
+        )
+        decision = evaluate_ha_native_exit(exit_ctx, exit_cfg)
+
+        if not decision.should_close:
+            return False
+
+        logger.info(
+            "ha_flip_exit_fired symbol={} side={} reason={} bars_held={} "
+            "vol_ratio={:.2f}",
+            symbol, pos_side, decision.reason, bars_held,
+            exit_ctx.volume_3m_ratio,
+        )
+        await self._defensive_close(symbol, pos_side, "ha_flip_reversal")
+        return True
+
     def _open_position_direction(self, symbol: str) -> Optional[Direction]:
         """Direction of the OPEN position on `symbol`, or None.
 
@@ -3082,6 +3169,19 @@ class BotRunner:
             if closed:
                 return
 
+        # 2j. Yol A HA-native exit gate (2026-05-04). Multi-TF HA color
+        # reversal + RCS volume confirm — fires only for positions opened
+        # via the HA-native primary path (`is_ha_native=True` flag stamped
+        # at register_open). Legacy 5-pillar positions retain their
+        # pre-existing exit suite (momentum_fade above already ran);
+        # this gate is purely additive for HA-native trades.
+        if open_side:
+            ha_closed = await self._maybe_close_on_ha_flip(
+                symbol, open_side, state,
+            )
+            if ha_closed:
+                return
+
         # 3. Symbol-level dedup — skip open if we still hold anything OR
         # already have a pending limit entry waiting for fill (Phase 7.C4).
         if any(k[0] == symbol for k in self.ctx.open_trade_ids):
@@ -3524,6 +3624,12 @@ class BotRunner:
             if trend_regime and trend_regime != TrendRegime.UNKNOWN
             else None
         )
+        # 2026-05-04 — Yol A: HA-native primary mode flag. Plans built by
+        # `_build_ha_native_trade_plan` carry a `ha_native:` reason prefix;
+        # downstream HA-flip exit gate keys off this flag to fire only
+        # for HA-native positions (legacy 5-pillar entries keep their
+        # existing exit suite).
+        is_ha_native = bool(plan.reason and plan.reason.startswith("ha_native:"))
         self.ctx.monitor.register_open(
             symbol, pos_side, float(plan.num_contracts), plan.entry_price,
             algo_ids=algo_ids, tp2_price=plan.tp_price,
@@ -3531,6 +3637,7 @@ class BotRunner:
             plan_sl_price=plan.sl_price,
             regime_at_entry=regime_str,
             opened_at=_utc_now(),
+            is_ha_native=is_ha_native,
         )
         self.ctx.risk_mgr.register_trade_opened()
 
@@ -4616,6 +4723,11 @@ class BotRunner:
                     ev.inst_id, ev.pos_side, plan.tp_price, exc, code,
                 )
 
+        # 2026-05-04 — Yol A: pending-fill path also stamps is_ha_native.
+        # `meta` is the PendingSetupMeta stashed at limit-place time; the
+        # plan reused here is the same one that produced the pending
+        # entry, so the `ha_native:` reason prefix carries through.
+        is_ha_native = bool(plan.reason and plan.reason.startswith("ha_native:"))
         self.ctx.monitor.register_open(
             ev.inst_id, ev.pos_side, float(plan.num_contracts), fill_px,
             algo_ids=algo_ids, tp2_price=plan.tp_price,
@@ -4624,6 +4736,7 @@ class BotRunner:
             tp_limit_order_id=tp_limit_order_id,
             regime_at_entry=meta.trend_regime_at_entry,
             opened_at=_utc_now(),
+            is_ha_native=is_ha_native,
         )
         self.ctx.risk_mgr.register_trade_opened()
 
@@ -5045,6 +5158,14 @@ class BotRunner:
                         "tp={} err={!r} code={} — OCO still protects",
                         rec.symbol, pos_side, rec.tp_price, exc, code,
                     )
+            # 2026-05-04 — Yol A: rehydrate path stamps is_ha_native from
+            # the journal `reason` column. Plans built by the HA-native
+            # planner write `ha_native:` prefix; rehydrated rows that
+            # match get the flag so the HA-flip exit gate fires after
+            # restart too. Pre-Yol-A rows have plain reasons → False.
+            is_ha_native = bool(
+                rec.reason and rec.reason.startswith("ha_native:")
+            )
             self.ctx.monitor.register_open(
                 rec.symbol, pos_side,
                 float(rec.num_contracts), rec.entry_price,
@@ -5060,6 +5181,7 @@ class BotRunner:
                 tp_limit_order_id=tp_limit_order_id,
                 regime_at_entry=rec.trend_regime_at_entry,
                 opened_at=rec.entry_timestamp,
+                is_ha_native=is_ha_native,
             )
             self.ctx.open_trade_ids[(rec.symbol, pos_side)] = rec.trade_id
             self.ctx.open_trade_opened_at[(rec.symbol, pos_side)] = rec.entry_timestamp
