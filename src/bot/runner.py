@@ -2877,6 +2877,14 @@ class BotRunner:
                 if not htf_ok:
                     logger.warning("htf_settle_timeout symbol={} — skipping symbol",
                                    symbol)
+                    # 2026-05-04 — pop stale htf_state_cache + htf_adx_cache
+                    # entries when the HTF settle fails. Same rationale as
+                    # the read-failure handler below: a settle timeout
+                    # signals Pine HTF data is unreliable; downstream
+                    # consumers must not see a stale snapshot mis-labelled
+                    # as fresh.
+                    self.ctx.htf_state_cache.pop(symbol, None)
+                    self.ctx.htf_adx_cache.pop(symbol, None)
                     return
             try:
                 htf_key = _timeframe_key(cfg.trading.htf_timeframe)
