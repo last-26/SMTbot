@@ -30,6 +30,7 @@ import aiosqlite
 from src.data.models import Direction
 from src.execution.models import CloseFill, ExecutionReport
 from src.journal.models import (
+    DecisionLogRecord,
     PositionSnapshotRecord,
     RejectedSignal,
     TradeOutcome,
@@ -415,6 +416,68 @@ CREATE TABLE IF NOT EXISTS position_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_position_snapshots_trade_id    ON position_snapshots(trade_id);
 CREATE INDEX IF NOT EXISTS idx_position_snapshots_captured_at ON position_snapshots(captured_at);
+
+-- 2026-05-04 — decision_log per-cycle per-symbol audit trail (operator onayı).
+-- One row per cycle per symbol. Tüm HA + osilatör + regime + confluence +
+-- gate eval results + bot karar (ENTRY_TAKEN/REJECTED/EXIT_TAKEN/NO_ACTION).
+-- Faz 2 GBT için zengin ham state feature substrat + post-trade audit.
+-- Volume: ~960 row/gün × 2 sembol; ~50MB/30gün.
+CREATE TABLE IF NOT EXISTS decision_log (
+    id                              INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp                       TEXT NOT NULL,
+    symbol                          TEXT NOT NULL,
+    cycle_id                        TEXT,
+    decision                        TEXT NOT NULL,
+    decision_reason                 TEXT,
+    -- Market snapshot
+    price                           REAL,
+    atr_14                          REAL,
+    -- HA multi-TF
+    ha_color_1m                     TEXT,
+    ha_color_3m                     TEXT,
+    ha_color_15m                    TEXT,
+    ha_color_4h                     TEXT,
+    ha_streak_1m                    INTEGER,
+    ha_streak_3m                    INTEGER,
+    ha_streak_15m                   INTEGER,
+    ha_streak_4h                    INTEGER,
+    ha_no_lower_shadow_3m           INTEGER,
+    ha_no_upper_shadow_3m           INTEGER,
+    ha_body_pct_3m                  REAL,
+    ema200_3m                       REAL,
+    -- HA oscillator
+    ha_mfi_1m                       REAL,
+    ha_mfi_3m                       REAL,
+    ha_mfi_15m                      REAL,
+    ha_rsi_1m                       REAL,
+    ha_rsi_3m                       REAL,
+    ha_rsi_15m                      REAL,
+    -- Bot-derived 3-bar deltas
+    mfi_3m_delta_dir                TEXT,
+    rsi_3m_delta_dir                TEXT,
+    mfi_3m_delta_value              REAL,
+    rsi_3m_delta_value              REAL,
+    -- Gate eval JSON ({gate_name: bool})
+    gate_results_json               TEXT,
+    -- Confluence (passive layer)
+    confluence_score                REAL,
+    confluence_factors_json         TEXT,
+    -- Regime
+    adx_3m                          REAL,
+    plus_di_3m                      REAL,
+    minus_di_3m                     REAL,
+    trend_regime                    TEXT,
+    -- Cross-asset open-position lock
+    btc_open_direction              TEXT,
+    eth_open_direction              TEXT,
+    -- Session + VWAP side
+    session                         TEXT,
+    vwap_3m_side                    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_decision_log_timestamp  ON decision_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_decision_log_symbol_ts ON decision_log(symbol, timestamp);
+CREATE INDEX IF NOT EXISTS idx_decision_log_decision  ON decision_log(decision);
 """
 
 
@@ -665,6 +728,31 @@ _MIGRATIONS = [
     # Idempotent ALTER on existing DBs (swallowed by _apply_migrations
     # when the column already exists).
     "ALTER TABLE position_snapshots ADD COLUMN confluence_score_now REAL",
+    # 2026-05-04 — decision_log per-cycle audit trail (HA-native rewrite).
+    # Operatör onayı: bot her cycle her sembol için 1 row yazar (zengin
+    # state + gate results + decision). Idempotent CREATE for existing DBs.
+    "CREATE TABLE IF NOT EXISTS decision_log ("
+    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+    "timestamp TEXT NOT NULL, symbol TEXT NOT NULL, "
+    "cycle_id TEXT, decision TEXT NOT NULL, decision_reason TEXT, "
+    "price REAL, atr_14 REAL, "
+    "ha_color_1m TEXT, ha_color_3m TEXT, ha_color_15m TEXT, ha_color_4h TEXT, "
+    "ha_streak_1m INTEGER, ha_streak_3m INTEGER, ha_streak_15m INTEGER, ha_streak_4h INTEGER, "
+    "ha_no_lower_shadow_3m INTEGER, ha_no_upper_shadow_3m INTEGER, "
+    "ha_body_pct_3m REAL, ema200_3m REAL, "
+    "ha_mfi_1m REAL, ha_mfi_3m REAL, ha_mfi_15m REAL, "
+    "ha_rsi_1m REAL, ha_rsi_3m REAL, ha_rsi_15m REAL, "
+    "mfi_3m_delta_dir TEXT, rsi_3m_delta_dir TEXT, "
+    "mfi_3m_delta_value REAL, rsi_3m_delta_value REAL, "
+    "gate_results_json TEXT, "
+    "confluence_score REAL, confluence_factors_json TEXT, "
+    "adx_3m REAL, plus_di_3m REAL, minus_di_3m REAL, trend_regime TEXT, "
+    "btc_open_direction TEXT, eth_open_direction TEXT, "
+    "session TEXT, vwap_3m_side TEXT"
+    ")",
+    "CREATE INDEX IF NOT EXISTS idx_decision_log_timestamp ON decision_log(timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_decision_log_symbol_ts ON decision_log(symbol, timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_decision_log_decision ON decision_log(decision)",
     # 2026-04-27 — schema cleanup pass. Drop 27 columns that audit
     # confirmed are either 100% NULL across the Bybit dataset
     # (kod doldurmuyor) or 1-distinct constants (no information).
@@ -1912,6 +2000,105 @@ class TradeJournal:
                  else json.dumps(oscillator_3m_now_json)),
                 vwap_3m_distance_atr_now,
                 confluence_score_now,
+            ),
+        )
+        await conn.commit()
+        return int(cur.lastrowid or 0)
+
+    async def record_decision_log(
+        self,
+        *,
+        timestamp: datetime,
+        symbol: str,
+        decision: str,
+        cycle_id: Optional[str] = None,
+        decision_reason: Optional[str] = None,
+        price: Optional[float] = None,
+        atr_14: Optional[float] = None,
+        ha_color_1m: str = "",
+        ha_color_3m: str = "",
+        ha_color_15m: str = "",
+        ha_color_4h: str = "",
+        ha_streak_1m: int = 0,
+        ha_streak_3m: int = 0,
+        ha_streak_15m: int = 0,
+        ha_streak_4h: int = 0,
+        ha_no_lower_shadow_3m: bool = False,
+        ha_no_upper_shadow_3m: bool = False,
+        ha_body_pct_3m: float = 0.0,
+        ema200_3m: float = 0.0,
+        ha_mfi_1m: float = 0.0,
+        ha_mfi_3m: float = 0.0,
+        ha_mfi_15m: float = 0.0,
+        ha_rsi_1m: float = 50.0,
+        ha_rsi_3m: float = 50.0,
+        ha_rsi_15m: float = 50.0,
+        mfi_3m_delta_dir: Optional[str] = None,
+        rsi_3m_delta_dir: Optional[str] = None,
+        mfi_3m_delta_value: Optional[float] = None,
+        rsi_3m_delta_value: Optional[float] = None,
+        gate_results: Optional[dict] = None,
+        confluence_score: Optional[float] = None,
+        confluence_factors: Optional[list[str]] = None,
+        adx_3m: Optional[float] = None,
+        plus_di_3m: Optional[float] = None,
+        minus_di_3m: Optional[float] = None,
+        trend_regime: Optional[str] = None,
+        btc_open_direction: Optional[str] = None,
+        eth_open_direction: Optional[str] = None,
+        session: Optional[str] = None,
+        vwap_3m_side: Optional[str] = None,
+    ) -> int:
+        """Append one row to `decision_log` — per-cycle per-symbol audit trail.
+
+        Bot her cycle her sembol için bir satır yazar. Decision values:
+        ENTRY_TAKEN / ENTRY_REJECTED / EXIT_TAKEN / NO_ACTION. Returns new
+        row id; caller usually ignores. JSON columns serialized inline.
+        """
+        conn = self._require_conn()
+        cur = await conn.execute(
+            """INSERT INTO decision_log (
+                   timestamp, symbol, cycle_id, decision, decision_reason,
+                   price, atr_14,
+                   ha_color_1m, ha_color_3m, ha_color_15m, ha_color_4h,
+                   ha_streak_1m, ha_streak_3m, ha_streak_15m, ha_streak_4h,
+                   ha_no_lower_shadow_3m, ha_no_upper_shadow_3m,
+                   ha_body_pct_3m, ema200_3m,
+                   ha_mfi_1m, ha_mfi_3m, ha_mfi_15m,
+                   ha_rsi_1m, ha_rsi_3m, ha_rsi_15m,
+                   mfi_3m_delta_dir, rsi_3m_delta_dir,
+                   mfi_3m_delta_value, rsi_3m_delta_value,
+                   gate_results_json,
+                   confluence_score, confluence_factors_json,
+                   adx_3m, plus_di_3m, minus_di_3m, trend_regime,
+                   btc_open_direction, eth_open_direction,
+                   session, vwap_3m_side
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                _iso(timestamp),
+                symbol,
+                cycle_id,
+                decision,
+                decision_reason,
+                (None if price is None else float(price)),
+                (None if atr_14 is None else float(atr_14)),
+                ha_color_1m, ha_color_3m, ha_color_15m, ha_color_4h,
+                int(ha_streak_1m), int(ha_streak_3m),
+                int(ha_streak_15m), int(ha_streak_4h),
+                int(bool(ha_no_lower_shadow_3m)),
+                int(bool(ha_no_upper_shadow_3m)),
+                float(ha_body_pct_3m), float(ema200_3m),
+                float(ha_mfi_1m), float(ha_mfi_3m), float(ha_mfi_15m),
+                float(ha_rsi_1m), float(ha_rsi_3m), float(ha_rsi_15m),
+                mfi_3m_delta_dir, rsi_3m_delta_dir,
+                mfi_3m_delta_value, rsi_3m_delta_value,
+                (None if gate_results is None else json.dumps(gate_results)),
+                confluence_score,
+                (None if confluence_factors is None else json.dumps(confluence_factors)),
+                adx_3m, plus_di_3m, minus_di_3m, trend_regime,
+                btc_open_direction, eth_open_direction,
+                session, vwap_3m_side,
             ),
         )
         await conn.commit()

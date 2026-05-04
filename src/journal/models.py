@@ -432,3 +432,79 @@ class PositionSnapshotRecord(BaseModel):
     # trajectories. None when the cycle didn't compute confluence (legacy
     # rows pre-Phase-A.7, or first cycle for a symbol post-restart).
     confluence_score_now: Optional[float] = None
+
+
+class DecisionLogRecord(BaseModel):
+    """One row in the `decision_log` table — per-cycle per-symbol audit trail.
+
+    Operatör onayı 2026-05-04. Bot her cycle her sembol için bir row yazar:
+    hangi şartlar geçti / kaldı, hangi karar verildi, neden. Faz 2 GBT için
+    zengin ham state feature substrat + post-trade audit + hata tespit.
+
+    Volume: ~960 row/gün × 2 sembol; ~50MB/30gün. Retention policy ileride.
+
+    Decision values:
+      ENTRY_TAKEN     — bot pozisyon açtı
+      ENTRY_REJECTED  — setup oluştu ama gate reddetti (rejected_signals da yazılır)
+      EXIT_TAKEN      — bot açık pozisyonu kapattı (defensive close, RCS, vs)
+      NO_ACTION       — hiç setup oluşmadı (cycle erken çıktı, threshold altı)
+    """
+
+    timestamp: datetime
+    symbol: str
+    cycle_id: Optional[str] = None
+    decision: str
+    decision_reason: Optional[str] = None
+
+    # Market snapshot
+    price: Optional[float] = None
+    atr_14: Optional[float] = None
+
+    # HA multi-TF state
+    ha_color_1m: str = ""
+    ha_color_3m: str = ""
+    ha_color_15m: str = ""
+    ha_color_4h: str = ""
+    ha_streak_1m: int = 0
+    ha_streak_3m: int = 0
+    ha_streak_15m: int = 0
+    ha_streak_4h: int = 0
+    ha_no_lower_shadow_3m: bool = False
+    ha_no_upper_shadow_3m: bool = False
+    ha_body_pct_3m: float = 0.0
+    ema200_3m: float = 0.0
+
+    # HA oscillator state
+    ha_mfi_1m: float = 0.0
+    ha_mfi_3m: float = 0.0
+    ha_mfi_15m: float = 0.0
+    ha_rsi_1m: float = 50.0
+    ha_rsi_3m: float = 50.0
+    ha_rsi_15m: float = 50.0
+
+    # Bot-derived 3-bar deltas (UP/DOWN/MIXED + raw value)
+    mfi_3m_delta_dir: Optional[str] = None
+    rsi_3m_delta_dir: Optional[str] = None
+    mfi_3m_delta_value: Optional[float] = None
+    rsi_3m_delta_value: Optional[float] = None
+
+    # Gate evaluation snapshot — dict gate_name → bool
+    gate_results: dict[str, Any] = Field(default_factory=dict)
+
+    # Confluence + supporting state (passive layer, gate'siz)
+    confluence_score: Optional[float] = None
+    confluence_factors: list[str] = Field(default_factory=list)
+
+    # Trend regime
+    adx_3m: Optional[float] = None
+    plus_di_3m: Optional[float] = None
+    minus_di_3m: Optional[float] = None
+    trend_regime: Optional[str] = None
+
+    # Cross-asset open-position lock state (BTC/ETH leadership)
+    btc_open_direction: Optional[str] = None
+    eth_open_direction: Optional[str] = None
+
+    # Session + VWAP side
+    session: Optional[str] = None
+    vwap_3m_side: Optional[str] = None

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from src.journal.database import TradeJournal
 from src.journal.models import (
+    DecisionLogRecord,
     RejectedSignal,
     TradeOutcome,
     TradeRecord,
@@ -39,6 +40,7 @@ from src.journal.reporter import (
 )
 
 __all__ = [
+    "DecisionLogRecord",
     "RejectedSignal",
     "TradeJournal",
     "TradeRecord",
