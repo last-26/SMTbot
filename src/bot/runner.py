@@ -3087,6 +3087,55 @@ class BotRunner:
                     decision, "micro_reversal_score", None,
                 ),
             )
+
+            # 2026-05-05 — operatör görsün: 3 tip skor + Major Reversal
+            # gate sonuçları (per-cycle özet). Pass 3 GBT'den önce manuel
+            # gözlem için.
+            try:
+                gate_results = decision.gate_results or {}
+                mr_gates = gate_results.get("major_reversal", {}) or {}
+                cont_gates = gate_results.get("continuation", {}) or {}
+
+                def _gate_compact(gates: dict) -> str:
+                    if not gates:
+                        return "-"
+                    return ",".join(
+                        f"{k}:{('T' if v else 'F')}"
+                        for k, v in gates.items()
+                    )
+
+                mr_summary = _gate_compact(mr_gates)
+                cont_summary = _gate_compact(cont_gates)
+                ms_3m_dir = ha_state.mfi_3m_delta_dir
+                rs_3m_dir = ha_state.rsi_3m_delta_dir
+                logger.info(
+                    "ha_native_decision symbol={} dir={} outcome={} "
+                    "scores=(MR={:.2f}/{:.1f},C={:.2f}/{:.1f},μR={:.2f}/{:.1f}) "
+                    "ha=(3m={}/streak={},15m={},body={:.1f}%) "
+                    "delta=(mfi={},rsi={}) "
+                    "MR_gates={} | C_gates={} | reason={}",
+                    symbol,
+                    decision.direction.value if decision.direction else "?",
+                    decision.decision,
+                    float(decision.major_reversal_score or 0.0),
+                    float(ha_cfg.major_reversal_threshold),
+                    float(decision.continuation_score or 0.0),
+                    float(ha_cfg.continuation_threshold),
+                    float(decision.micro_reversal_score or 0.0),
+                    float(ha_cfg.micro_reversal_threshold),
+                    sig.ha_color_3m or "?",
+                    sig.ha_streak_3m,
+                    sig.ha_color_15m or "?",
+                    float(sig.ha_body_pct_3m or 0.0),
+                    ms_3m_dir or "?",
+                    rs_3m_dir or "?",
+                    mr_summary, cont_summary, decision.reason,
+                )
+            except Exception:
+                logger.debug(
+                    "ha_native_decision_log_failed symbol={}", symbol,
+                )
+
             return decision
         except Exception:
             logger.exception("ha_native_audit_failed symbol={}", symbol)
