@@ -495,18 +495,24 @@ def _score_major_reversal(
     )
     gates["body_size"] = _gate_body_size(ctx.ha_state, config.min_body_pct_3m)
 
-    # Mandatory check
+    # 2026-05-05 — operatör spec: skor her zaman hesaplansın (mandatory
+    # fail olsa bile soft factors görünür → Pass 3 GBT için "mandatory
+    # fail anında soft durum neydi?" sorusu cevap bulur, anlık gözlemde
+    # de soft skor 0 yerine gerçek değer görülür). Mandatory fail flag'i
+    # tutulur ama erken return YOK — alttaki TAKE check'inde mandatory'ler
+    # hâlâ blocking. Yani take logic değişmez, sadece skor zenginleşir.
     mandatory_keys = (
         "mss_density", "streak_3m_new_direction", "prev_streak_min",
         "no_duplicate", "body_size",
     )
+    failed_mandatory_key: Optional[str] = None
     for k in mandatory_keys:
         if not gates[k]:
-            score.failed_mandatory = k
-            score.gate_results = gates
-            return score
+            failed_mandatory_key = k
+            break  # ilk fail eden — eski reason taxonomy ile uyumlu
 
-    # Soft factors (threshold contribution)
+    # Soft factors (threshold contribution) — mandatory fail durumunda
+    # bile hesaplanır, sadece TAKE block'unda guard var.
     score_value = 0.0
     gates["15m_aligned_new"] = _gate_15m_alignment(ctx.ha_state, direction)
     if gates["15m_aligned_new"]:
@@ -566,6 +572,13 @@ def _score_major_reversal(
 
     score.score = score_value
     score.gate_results = gates
+
+    # 2026-05-05 — Mandatory guard: skor görünür ama mandatory fail varsa
+    # TAKE etmiyoruz. Operatör spec: "mandatory'ler bel kemiği, fail =
+    # entry yok" — sadece skor görünür kalsın.
+    if failed_mandatory_key is not None:
+        score.failed_mandatory = failed_mandatory_key
+        return score
 
     # Build entry parameters if soft threshold passes
     if score_value >= config.major_reversal_threshold:
@@ -696,67 +709,51 @@ def _score_continuation(
         score.failed_mandatory = "no_ha_direction"
         return score
 
-    gates: dict[str, bool] = {}
-
-    # Mandatory: 15m alignment (HTF onayı şart)
-    gates["15m_aligned"] = _gate_15m_alignment(ctx.ha_state, direction)
-    if not gates["15m_aligned"]:
-        score.failed_mandatory = "15m_aligned"
-        score.gate_results = gates
+    if ctx.ha_state.latest is None:
+        score.failed_mandatory = "no_ha_data"
         return score
 
-    # Mandatory: dominant_color ana yönü destekliyor (operatör spec:
-    # büyük resim aynı yön olmalı — yoksa chop / belirsiz)
+    gates: dict[str, bool] = {}
+    counter_streak = _count_recent_counter_streak(ctx.ha_state, direction)
+
+    # 2026-05-05 — Mandatory gate sonuçları (skor görünümü için her zaman
+    # değerlendirilir). Erken return YOK — soft factor skoru hesaplanır,
+    # sonra mandatory guard'da TAKE blocked.
+    gates["15m_aligned"] = _gate_15m_alignment(ctx.ha_state, direction)
+
     dominant = ctx.ha_state.dominant_color_3m()
     target_color = "GREEN" if direction == Direction.BULLISH else "RED"
     gates["dominant_color_main"] = (dominant == target_color)
-    if not gates["dominant_color_main"]:
-        score.failed_mandatory = "dominant_color_main"
-        score.gate_results = gates
-        return score
 
-    # Mandatory: counter streak (kandırıcı toparlanma) ≤ max
-    counter_streak = _count_recent_counter_streak(ctx.ha_state, direction)
     gates["counter_streak_within_limit"] = (
         1 <= counter_streak <= config.continuation_max_counter_streak
     )
-    if not gates["counter_streak_within_limit"]:
-        score.failed_mandatory = "counter_streak_within_limit"
-        score.gate_results = gates
-        return score
 
-    # Mandatory: yeni yönde streak ≥ 1 (toparlanma sonrası ilk dönüş bar)
-    if ctx.ha_state.latest is None:
-        score.failed_mandatory = "no_ha_data"
-        score.gate_results = gates
-        return score
     new_streak = ctx.ha_state.latest.ha_streak_3m
     if direction == Direction.BULLISH:
         gates["new_direction_streak"] = new_streak >= 1
     else:
         gates["new_direction_streak"] = new_streak <= -1
-    if not gates["new_direction_streak"]:
-        score.failed_mandatory = "new_direction_streak"
-        score.gate_results = gates
-        return score
 
-    # Mandatory: no_duplicate
     gates["no_duplicate"] = _gate_no_duplicate(
         ctx.symbol, direction, ctx.pending_pairs, ctx.open_pairs,
     )
-    if not gates["no_duplicate"]:
-        score.failed_mandatory = "no_duplicate"
-        score.gate_results = gates
-        return score
 
-    # Mandatory: body_size
     gates["body_size"] = _gate_body_size(ctx.ha_state, config.min_body_pct_3m)
-    if not gates["body_size"]:
-        score.failed_mandatory = "body_size"
-        score.gate_results = gates
-        return score
 
-    # Soft factors
+    # Mandatory check — fail eden ilk gate'i tut, return etme.
+    mandatory_keys_cont = (
+        "15m_aligned", "dominant_color_main",
+        "counter_streak_within_limit", "new_direction_streak",
+        "no_duplicate", "body_size",
+    )
+    failed_mandatory_key: Optional[str] = None
+    for k in mandatory_keys_cont:
+        if not gates[k]:
+            failed_mandatory_key = k
+            break
+
+    # Soft factors — her durumda hesaplanır (mandatory fail olsa bile)
     score_value = 0.0
 
     gates["mss_direction_main"] = _gate_mss_direction_alignment(
@@ -796,6 +793,11 @@ def _score_continuation(
 
     score.score = score_value
     score.gate_results = gates
+
+    # Mandatory guard: skor görünür ama mandatory fail varsa TAKE yok
+    if failed_mandatory_key is not None:
+        score.failed_mandatory = failed_mandatory_key
+        return score
 
     # Build entry parameters if soft threshold passes
     if score_value >= config.continuation_threshold:
@@ -926,52 +928,36 @@ def _score_micro_reversal(
 
     gates: dict[str, bool] = {}
 
-    # Mandatory: 1m streak yeni yönde ≥ 2
+    # 2026-05-05 — Mandatory gate sonuçları (skor görünümü için her zaman
+    # değerlendirilir). Erken return YOK — soft skor hesabı sonrası
+    # mandatory guard ile TAKE blocked.
     gates["1m_streak_new"] = _gate_1m_streak_new_direction(
         ctx.ha_state, direction, 2,
     )
-    if not gates["1m_streak_new"]:
-        score.failed_mandatory = "1m_streak_new"
-        score.gate_results = gates
-        return score
-
-    # Mandatory: 1m MSS direction yeni yön (Pine'dan, last_mss_direction reuse)
-    # Şimdilik 1m MSS field ayrı emit edilmiyor; last_mss_direction 3m chart'tan.
-    # Yeni Pine field ileride emit edilirse buraya geçer. Mevcut behavior:
-    # mss_direction == direction → True (en az MSS yön onayı var).
     gates["1m_mss_direction"] = _gate_mss_direction_alignment(
         ctx.last_mss_direction, direction,
     )
-    if not gates["1m_mss_direction"]:
-        score.failed_mandatory = "1m_mss_direction"
-        score.gate_results = gates
-        return score
 
-    # Mandatory: RSI extreme veya divergence (en az biri)
     rsi_extreme = _gate_rsi_extreme(ctx.ha_state, direction)
     div_present = _gate_divergence_present(ctx.market_state, direction)
     gates["rsi_extreme_or_divergence"] = rsi_extreme or div_present
-    if not gates["rsi_extreme_or_divergence"]:
-        score.failed_mandatory = "rsi_extreme_or_divergence"
-        score.gate_results = gates
-        return score
 
-    # Mandatory: no_duplicate, body_size
     gates["no_duplicate"] = _gate_no_duplicate(
         ctx.symbol, direction, ctx.pending_pairs, ctx.open_pairs,
     )
-    if not gates["no_duplicate"]:
-        score.failed_mandatory = "no_duplicate"
-        score.gate_results = gates
-        return score
-
     gates["body_size"] = _gate_body_size(ctx.ha_state, config.min_body_pct_3m)
-    if not gates["body_size"]:
-        score.failed_mandatory = "body_size"
-        score.gate_results = gates
-        return score
 
-    # Soft factors
+    mandatory_keys_micro = (
+        "1m_streak_new", "1m_mss_direction", "rsi_extreme_or_divergence",
+        "no_duplicate", "body_size",
+    )
+    failed_mandatory_key: Optional[str] = None
+    for k in mandatory_keys_micro:
+        if not gates[k]:
+            failed_mandatory_key = k
+            break
+
+    # Soft factors — her durumda hesaplanır
     score_value = 0.0
 
     gates["1m_mss_strong"] = (ctx.last_mss_direction == direction)
@@ -1007,6 +993,11 @@ def _score_micro_reversal(
 
     score.score = score_value
     score.gate_results = gates
+
+    # Mandatory guard — skor görünür ama mandatory fail varsa TAKE yok
+    if failed_mandatory_key is not None:
+        score.failed_mandatory = failed_mandatory_key
+        return score
 
     # Build entry parameters if soft threshold passes
     if score_value >= config.micro_reversal_threshold:
