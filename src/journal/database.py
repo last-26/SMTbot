@@ -182,7 +182,25 @@ CREATE TABLE IF NOT EXISTS trades (
     ha_streak_15m_at_entry   INTEGER,
     ha_body_pct_3m_at_entry  REAL,
     ema200_3m_at_entry       REAL,
-    volume_3m_ratio_at_entry REAL
+    volume_3m_ratio_at_entry REAL,
+
+    -- 2026-05-05 — Yol A Faz 5: 3 entry tipi dispatcher journal fields.
+    -- Operatör spec: NULL kalmamalı, NOT NULL DEFAULT ile schema
+    -- doluluk garantisi. TAKE durumunda dispatcher tarafından dolduruyor;
+    -- per-tip differansiyel (RR + risk multiplier) ile Pass 3 GBT
+    -- segmentasyonu için kritik. Default values:
+    --   entry_path: '' (legacy rehydrate; runner her TAKE'de set eder)
+    --   *_score: 0.0 (TAKE'te dolduruyor; pre-Yol A'da hesaplanmadı)
+    --   mss_break_detected: 0 (false default; mss yön onayı yoksa)
+    --   target_rr_ratio_at_entry: 1.0 (Yol A scalp default)
+    --   risk_multiplier_at_entry: 1.0 (full R default)
+    entry_path                  TEXT NOT NULL DEFAULT '',
+    major_reversal_score        REAL NOT NULL DEFAULT 0.0,
+    continuation_score          REAL NOT NULL DEFAULT 0.0,
+    micro_reversal_score        REAL NOT NULL DEFAULT 0.0,
+    mss_break_detected          INTEGER NOT NULL DEFAULT 0,
+    target_rr_ratio_at_entry    REAL NOT NULL DEFAULT 1.0,
+    risk_multiplier_at_entry    REAL NOT NULL DEFAULT 1.0
 );
 
 CREATE INDEX IF NOT EXISTS idx_trades_outcome      ON trades(outcome);
@@ -191,6 +209,10 @@ CREATE INDEX IF NOT EXISTS idx_trades_exit_ts      ON trades(exit_timestamp);
 -- 2026-05-04 — index supports per-strategy WR / R aggregation queries
 -- (factor_audit.py + dashboard) filtering on is_ha_native.
 CREATE INDEX IF NOT EXISTS idx_trades_is_ha_native ON trades(is_ha_native);
+-- 2026-05-05 — Faz 5: Pass 3 GBT segments by entry_path
+-- (major_reversal/continuation/micro_reversal). Index supports
+-- per-tip WR + R distribution queries.
+CREATE INDEX IF NOT EXISTS idx_trades_entry_path   ON trades(entry_path);
 
 CREATE TABLE IF NOT EXISTS rejected_signals (
     rejection_id        TEXT PRIMARY KEY,
@@ -492,12 +514,22 @@ CREATE TABLE IF NOT EXISTS decision_log (
     eth_open_direction              TEXT,
     -- Session + VWAP side
     session                         TEXT,
-    vwap_3m_side                    TEXT
+    vwap_3m_side                    TEXT,
+    -- 2026-05-05 — Yol A Faz 5: 3 entry tipi dispatcher audit fields.
+    -- Operatör spec: NOT NULL DEFAULT, NULL bırakılmıyor. Her cycle her
+    -- 3 tipi de skor; entry_path dispatcher'ın seçtiği winner ya da
+    -- "" (no-take). Pass 3 GBT bu ayrımdan tip-spesifik WR / R / gate
+    -- importance çıkartır.
+    entry_path                      TEXT NOT NULL DEFAULT '',
+    major_reversal_score            REAL NOT NULL DEFAULT 0.0,
+    continuation_score              REAL NOT NULL DEFAULT 0.0,
+    micro_reversal_score            REAL NOT NULL DEFAULT 0.0
 );
 
 CREATE INDEX IF NOT EXISTS idx_decision_log_timestamp  ON decision_log(timestamp);
 CREATE INDEX IF NOT EXISTS idx_decision_log_symbol_ts ON decision_log(symbol, timestamp);
 CREATE INDEX IF NOT EXISTS idx_decision_log_decision  ON decision_log(decision);
+CREATE INDEX IF NOT EXISTS idx_decision_log_entry_path ON decision_log(entry_path);
 """
 
 
@@ -551,6 +583,15 @@ _COLUMNS = [
     "ha_body_pct_3m_at_entry",
     "ema200_3m_at_entry",
     "volume_3m_ratio_at_entry",
+    # 2026-05-05 — Yol A Faz 5: 3 entry tipi dispatcher fields. NOT NULL
+    # constraint — operatör spec'i, NULL kalmasın.
+    "entry_path",
+    "major_reversal_score",
+    "continuation_score",
+    "micro_reversal_score",
+    "mss_break_detected",
+    "target_rr_ratio_at_entry",
+    "risk_multiplier_at_entry",
 ]
 
 
@@ -909,6 +950,24 @@ _MIGRATIONS = [
     "ALTER TABLE trades ADD COLUMN ema200_3m_at_entry REAL",
     "ALTER TABLE trades ADD COLUMN volume_3m_ratio_at_entry REAL",
     "CREATE INDEX IF NOT EXISTS idx_trades_is_ha_native ON trades(is_ha_native)",
+    # 2026-05-05 — Yol A Faz 5: 3 entry tipi dispatcher fields. Operatör
+    # spec: NULL kalmasın, NOT NULL DEFAULT ile schema doluluk garantisi.
+    # SQLite ALTER TABLE ADD COLUMN with NOT NULL DEFAULT works for both
+    # fresh schema (CREATE) ve idempotent migration (varsa skip).
+    "ALTER TABLE trades ADD COLUMN entry_path TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE trades ADD COLUMN major_reversal_score REAL NOT NULL DEFAULT 0.0",
+    "ALTER TABLE trades ADD COLUMN continuation_score REAL NOT NULL DEFAULT 0.0",
+    "ALTER TABLE trades ADD COLUMN micro_reversal_score REAL NOT NULL DEFAULT 0.0",
+    "ALTER TABLE trades ADD COLUMN mss_break_detected INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE trades ADD COLUMN target_rr_ratio_at_entry REAL NOT NULL DEFAULT 1.0",
+    "ALTER TABLE trades ADD COLUMN risk_multiplier_at_entry REAL NOT NULL DEFAULT 1.0",
+    "CREATE INDEX IF NOT EXISTS idx_trades_entry_path ON trades(entry_path)",
+    # decision_log Faz 5 fields (mirror trades, audit cycle-by-cycle).
+    "ALTER TABLE decision_log ADD COLUMN entry_path TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE decision_log ADD COLUMN major_reversal_score REAL NOT NULL DEFAULT 0.0",
+    "ALTER TABLE decision_log ADD COLUMN continuation_score REAL NOT NULL DEFAULT 0.0",
+    "ALTER TABLE decision_log ADD COLUMN micro_reversal_score REAL NOT NULL DEFAULT 0.0",
+    "CREATE INDEX IF NOT EXISTS idx_decision_log_entry_path ON decision_log(entry_path)",
 ]
 
 
@@ -970,6 +1029,15 @@ def _record_to_row(rec: TradeRecord) -> tuple:
         rec.ha_body_pct_3m_at_entry,
         rec.ema200_3m_at_entry,
         rec.volume_3m_ratio_at_entry,
+        # 2026-05-05 — Faz 5: 3 entry tipi dispatcher fields. NOT NULL
+        # constraint — None gelmemeli; default'lara fallback.
+        rec.entry_path or "",
+        float(rec.major_reversal_score or 0.0),
+        float(rec.continuation_score or 0.0),
+        float(rec.micro_reversal_score or 0.0),
+        int(rec.mss_break_detected or 0),
+        float(rec.target_rr_ratio_at_entry or 1.0),
+        float(rec.risk_multiplier_at_entry or 1.0),
     )
 
 
@@ -1225,6 +1293,19 @@ def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
         ha_body_pct_3m_at_entry=_safe_col(row, "ha_body_pct_3m_at_entry"),
         ema200_3m_at_entry=_safe_col(row, "ema200_3m_at_entry"),
         volume_3m_ratio_at_entry=_safe_col(row, "volume_3m_ratio_at_entry"),
+        # 2026-05-05 — Faz 5: 3 entry tipi dispatcher fields. NOT NULL
+        # garantili kolonlar; pre-Faz-5 rows için DEFAULT değerler okunur.
+        entry_path=_safe_col(row, "entry_path") or "",
+        major_reversal_score=float(_safe_col(row, "major_reversal_score") or 0.0),
+        continuation_score=float(_safe_col(row, "continuation_score") or 0.0),
+        micro_reversal_score=float(_safe_col(row, "micro_reversal_score") or 0.0),
+        mss_break_detected=bool(_safe_col(row, "mss_break_detected") or 0),
+        target_rr_ratio_at_entry=float(
+            _safe_col(row, "target_rr_ratio_at_entry") or 1.0
+        ),
+        risk_multiplier_at_entry=float(
+            _safe_col(row, "risk_multiplier_at_entry") or 1.0
+        ),
     )
 
 
@@ -1379,6 +1460,15 @@ class TradeJournal:
         ha_body_pct_3m_at_entry: Optional[float] = None,
         ema200_3m_at_entry: Optional[float] = None,
         volume_3m_ratio_at_entry: Optional[float] = None,
+        # 2026-05-05 — Yol A Faz 5 dispatcher fields. NOT NULL constraint
+        # ile DB'ye yazılır; default değerler legacy rehydrate path için.
+        entry_path: str = "",
+        major_reversal_score: float = 0.0,
+        continuation_score: float = 0.0,
+        micro_reversal_score: float = 0.0,
+        mss_break_detected: bool = False,
+        target_rr_ratio_at_entry: float = 1.0,
+        risk_multiplier_at_entry: float = 1.0,
         # Back-compat tail: callers may still pass these via direct kwargs
         # or `**enrichment` unpacking. Accepted but silently ignored
         # (kwargs no longer forwarded into TradeRecord — columns dropped
@@ -1459,6 +1549,14 @@ class TradeJournal:
             ha_body_pct_3m_at_entry=ha_body_pct_3m_at_entry,
             ema200_3m_at_entry=ema200_3m_at_entry,
             volume_3m_ratio_at_entry=volume_3m_ratio_at_entry,
+            # 2026-05-05 — Faz 5 dispatcher fields
+            entry_path=entry_path,
+            major_reversal_score=major_reversal_score,
+            continuation_score=continuation_score,
+            micro_reversal_score=micro_reversal_score,
+            mss_break_detected=mss_break_detected,
+            target_rr_ratio_at_entry=target_rr_ratio_at_entry,
+            risk_multiplier_at_entry=risk_multiplier_at_entry,
         )
         placeholders = ", ".join("?" * len(_COLUMNS))
         cols = ", ".join(_COLUMNS)
@@ -2138,6 +2236,12 @@ class TradeJournal:
         eth_open_direction: Optional[str] = None,
         session: Optional[str] = None,
         vwap_3m_side: Optional[str] = None,
+        # 2026-05-05 — Yol A Faz 5: 3 entry tipi dispatcher fields
+        # NOT NULL DB constraint, default değerler ile.
+        entry_path: str = "",
+        major_reversal_score: float = 0.0,
+        continuation_score: float = 0.0,
+        micro_reversal_score: float = 0.0,
     ) -> int:
         """Append one row to `decision_log` — per-cycle per-symbol audit trail.
 
@@ -2162,9 +2266,12 @@ class TradeJournal:
                    confluence_score, confluence_factors_json,
                    adx_3m, plus_di_3m, minus_di_3m, trend_regime,
                    btc_open_direction, eth_open_direction,
-                   session, vwap_3m_side
+                   session, vwap_3m_side,
+                   entry_path,
+                   major_reversal_score, continuation_score, micro_reversal_score
                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                         ?, ?, ?, ?)""",
             (
                 _iso(timestamp),
                 symbol,
@@ -2189,6 +2296,11 @@ class TradeJournal:
                 adx_3m, plus_di_3m, minus_di_3m, trend_regime,
                 btc_open_direction, eth_open_direction,
                 session, vwap_3m_side,
+                # 2026-05-05 — Faz 5 dispatcher fields (NOT NULL guaranteed)
+                str(entry_path or ""),
+                float(major_reversal_score or 0.0),
+                float(continuation_score or 0.0),
+                float(micro_reversal_score or 0.0),
             ),
         )
         await conn.commit()

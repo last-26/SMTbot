@@ -242,6 +242,22 @@ class TradeRecord(BaseModel):
     ema200_3m_at_entry: Optional[float] = None
     volume_3m_ratio_at_entry: Optional[float] = None
 
+    # 2026-05-05 — Yol A Faz 5: 3 entry tipi dispatcher fields. Operatör
+    # spec: NOT NULL DB constraint, NULL kalmasın. Default değerler
+    # legacy rehydrate path (pre-Yol-A trade'leri) için non-None:
+    #   entry_path: "" (legacy/audit-only — runner her TAKE'de set)
+    #   *_score: 0.0 (legacy hesaplanmadı; TAKE'de skor yazılır)
+    #   mss_break_detected: False (default)
+    #   target_rr_ratio_at_entry: 1.0 (Yol A scalp default)
+    #   risk_multiplier_at_entry: 1.0 (full R default)
+    entry_path: str = ""
+    major_reversal_score: float = 0.0
+    continuation_score: float = 0.0
+    micro_reversal_score: float = 0.0
+    mss_break_detected: bool = False
+    target_rr_ratio_at_entry: float = 1.0
+    risk_multiplier_at_entry: float = 1.0
+
     @property
     def is_open(self) -> bool:
         return self.outcome == TradeOutcome.OPEN
