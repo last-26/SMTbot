@@ -163,13 +163,15 @@ def parse_signal_table(tables_data: dict[str, Any]) -> Optional[SignalTableData]
             if "SIGNALS" not in first_row.upper() and "Signal" not in name:
                 continue
 
-            # Parse key-value rows
+            # Parse key-value rows. Pine multi-col layout (2-pair → 4 col,
+            # 3-pair → 6 col): her row N pair (k1|v1|k2|v2|...). Tüm pair'ler
+            # kv'ye eklenir; 1-pair (eski) layout backward-compat.
             kv = {}
             for row in rows:
-                parts = row.split("|")
-                if len(parts) >= 2:
-                    key = parts[0].strip().lower().replace(" ", "_")
-                    val = parts[1].strip()
+                parts = [p.strip() for p in row.split("|")]
+                for i in range(0, len(parts) - 1, 2):
+                    key = parts[i].lower().replace(" ", "_")
+                    val = parts[i + 1]
                     if key and not key.startswith("="):
                         kv[key] = val
 
@@ -228,6 +230,19 @@ def _build_signal_data(kv: dict[str, str]) -> SignalTableData:
         vwap_15m=vwap_15m_val,
         vwap_3m_upper=vwap_3m_upper_val,
         vwap_3m_lower=vwap_3m_lower_val,
+        # Heikin Ashi multi-TF
+        ha_color_1m=kv.get("ha_color_1m", "").strip().upper(),
+        ha_color_3m=kv.get("ha_color_3m", "").strip().upper(),
+        ha_color_15m=kv.get("ha_color_15m", "").strip().upper(),
+        ha_color_4h=kv.get("ha_color_4h", "").strip().upper(),
+        ha_streak_1m=_parse_int(kv.get("ha_streak_1m")) or 0,
+        ha_streak_3m=_parse_int(kv.get("ha_streak_3m")) or 0,
+        ha_streak_15m=_parse_int(kv.get("ha_streak_15m")) or 0,
+        ha_streak_4h=_parse_int(kv.get("ha_streak_4h")) or 0,
+        ha_no_lower_shadow_3m=kv.get("ha_no_lower_shadow_3m", "NO").strip().upper() == "YES",
+        ha_no_upper_shadow_3m=kv.get("ha_no_upper_shadow_3m", "NO").strip().upper() == "YES",
+        ha_body_pct_3m=_parse_float((kv.get("ha_body_pct_3m", "0") or "0").rstrip("%").strip()) or 0.0,
+        ema200_3m=_parse_leading_float(kv.get("ema200_3m")),
         last_bar=_parse_int(kv.get("last_bar")),
     )
 
@@ -295,13 +310,13 @@ def parse_oscillator_table(tables_data: dict[str, Any]) -> Optional[OscillatorTa
             if "OSCILLATOR" not in first_row.upper():
                 continue
 
-            # Parse key-value rows
+            # Parse key-value rows. Multi-col layout: bkz parse_signal_table.
             kv: dict[str, str] = {}
             for row in rows:
-                parts = row.split("|")
-                if len(parts) >= 2:
-                    key = parts[0].strip().lower().replace(" ", "_")
-                    val = parts[1].strip()
+                parts = [p.strip() for p in row.split("|")]
+                for i in range(0, len(parts) - 1, 2):
+                    key = parts[i].lower().replace(" ", "_")
+                    val = parts[i + 1]
                     if key and not key.startswith("="):
                         kv[key] = val
 
@@ -364,6 +379,13 @@ def _build_oscillator_data(kv: dict[str, str]) -> OscillatorTableData:
         last_wt_div=div_name,
         last_wt_div_bars_ago=div_bars,
         momentum=momentum,
+        # Heikin Ashi MFI + RSI multi-TF
+        ha_mfi_1m=_parse_float(kv.get("ha_mfi_1m", "0")) or 0.0,
+        ha_mfi_3m=_parse_float(kv.get("ha_mfi_3m", "0")) or 0.0,
+        ha_mfi_15m=_parse_float(kv.get("ha_mfi_15m", "0")) or 0.0,
+        ha_rsi_1m=_parse_float(kv.get("ha_rsi_1m", "50")) or 50.0,
+        ha_rsi_3m=_parse_float(kv.get("ha_rsi_3m", "50")) or 50.0,
+        ha_rsi_15m=_parse_float(kv.get("ha_rsi_15m", "50")) or 50.0,
     )
 
 

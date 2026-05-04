@@ -127,6 +127,24 @@ class SignalTableData(BaseModel):
     vwap_3m_upper: float = 0.0
     vwap_3m_lower: float = 0.0
 
+    # Heikin Ashi multi-TF (1m/3m/15m primary; 4h journal-only Faz 1).
+    # GREEN = haC > haO; RED = haC < haO; DOJI = |body|/range < 0.10.
+    ha_color_1m: str = ""
+    ha_color_3m: str = ""
+    ha_color_15m: str = ""
+    ha_color_4h: str = ""    # Journal-only (karar etkisiz Faz 1)
+    # Signed streak: +N consecutive green, -N consecutive red, 0 = doji break.
+    ha_streak_1m: int = 0
+    ha_streak_3m: int = 0
+    ha_streak_15m: int = 0
+    ha_streak_4h: int = 0    # Journal-only (karar etkisiz Faz 1)
+    # 3m geometry — S&P alpha source: 5+ no-shadow streak → 71% continuation.
+    ha_no_lower_shadow_3m: bool = False  # True → strong bullish thrust
+    ha_no_upper_shadow_3m: bool = False  # True → strong bearish thrust
+    ha_body_pct_3m: float = 0.0          # |body|/range %; high = momentum
+    # EMA200 3m macro trend filter (journal-only Faz 1; gate Faz 2'de).
+    ema200_3m: float = 0.0
+
     last_bar: Optional[int] = None  # bar_index of last Pine update — used
                                     # by the runner's freshness-poll to
                                     # detect when a symbol / timeframe
@@ -165,6 +183,15 @@ class OscillatorTableData(BaseModel):
 
     # Summary
     momentum: int = 0  # 0-5
+
+    # Heikin Ashi multi-TF MFI + RSI (HA-OHLC bazlı paralel hesaplama).
+    # Bot 3-bar delta yön (UP/DOWN/MIXED) hesaplar; Pine raw değer döndürür.
+    ha_mfi_1m: float = 0.0
+    ha_mfi_3m: float = 0.0
+    ha_mfi_15m: float = 0.0
+    ha_rsi_1m: float = 50.0
+    ha_rsi_3m: float = 50.0
+    ha_rsi_15m: float = 50.0
 
 
 # ── Unified Market State ────────────────────────────────────────────────────
