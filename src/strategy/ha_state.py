@@ -34,9 +34,18 @@ from src.data.models import MarketState
 # 0.5 → küçük floor; "değer aynı kaldı" durumunu MIXED'e düşürür.
 DEFAULT_MIN_DELTA = 0.5
 
-# Per-symbol history buffer maksimum uzunluğu. 3-bar delta için 3 yeter ama
-# 10 tutuyoruz ki ileride daha uzun pencere gerekirse refactor olmasın.
-DEFAULT_HISTORY_MAXLEN = 10
+# Per-symbol history buffer maksimum uzunluğu. Operatör 2026-05-04: startup
+# backfill için 50+ bar tutmak istiyor (5 yeşil mum görüp short için kırmızı
+# beklemek + 30-bar dominant color analizi). Eski default 10'du; 60 ettim
+# (3m'de 60 bar = 3 saat, dominant_color_window=30 için iki katı tampon).
+DEFAULT_HISTORY_MAXLEN = 60
+
+# Dominant color analizi default penceresi. Operatör 2026-05-04: HA 3m
+# kırmızıya dönünce hemen short açma — son 30 bar dominant rengine bak.
+# Yeşil baskınsa "ara düzeltme", short skip; mixed/red baskınsa "gerçek
+# dönüş", short OK.
+DEFAULT_DOMINANT_WINDOW = 30
+DEFAULT_DOMINANT_THRESHOLD = 0.6  # %60+ tek renk → "dominant"; aksi → None
 
 
 @dataclass(frozen=True)
@@ -219,6 +228,63 @@ class HASymbolState:
         if len(self.history) < 2:
             return None
         return _color_flip(self.previous.ha_color_15m, self.latest.ha_color_15m)
+
+    # ── Dominant color analysis (window-based baskınlık) ───────────────────
+
+    def dominant_color_3m(
+        self,
+        window: int = DEFAULT_DOMINANT_WINDOW,
+        threshold: float = DEFAULT_DOMINANT_THRESHOLD,
+    ) -> Optional[str]:
+        """Son `window` snapshot'ta hangi 3m HA rengi baskın.
+
+        Operatör 2026-05-04: "5 yeşil mum varsa kırmızıyı bekle short için —
+        düşüş ara düzeltme olabilir, aşağı yön yukarıya ağır basıyorsa shortla."
+
+        Args:
+            window: kaç bar geriye bakılır (default 30 = 90 dk on 3m).
+            threshold: bir rengin baskın sayılması için minimum oran (0-1).
+
+        Returns:
+            "GREEN" / "RED" — son `window` bar içinde >= threshold oranında
+              ilgili renk varsa baskın
+            None — balanced (ne yeşil ne kırmızı net baskın) veya yetersiz
+              history (window'un yarısından az snapshot)
+        """
+        return self._dominant_color(self._colors_3m(), window, threshold)
+
+    def dominant_color_15m(
+        self,
+        window: int = DEFAULT_DOMINANT_WINDOW,
+        threshold: float = DEFAULT_DOMINANT_THRESHOLD,
+    ) -> Optional[str]:
+        """15m HA dominant color (HTF baskınlık — operatör destekleyici dedi)."""
+        return self._dominant_color(self._colors_15m(), window, threshold)
+
+    def _colors_3m(self) -> list[str]:
+        return [s.ha_color_3m for s in self.history]
+
+    def _colors_15m(self) -> list[str]:
+        return [s.ha_color_15m for s in self.history]
+
+    @staticmethod
+    def _dominant_color(
+        colors: list[str], window: int, threshold: float,
+    ) -> Optional[str]:
+        if not colors:
+            return None
+        recent = colors[-window:]
+        # Need at least half the window for a statistically meaningful read.
+        if len(recent) < max(1, window // 2):
+            return None
+        green_count = sum(1 for c in recent if c == "GREEN")
+        red_count = sum(1 for c in recent if c == "RED")
+        total = len(recent)
+        if green_count / total >= threshold:
+            return "GREEN"
+        if red_count / total >= threshold:
+            return "RED"
+        return None
 
 
 @dataclass
