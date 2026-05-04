@@ -93,6 +93,7 @@ from src.execution.order_router import OrderRouter, RouterConfig, dry_run_report
 from src.execution.position_monitor import PendingEvent, PositionMonitor
 from src.journal.database import TradeJournal
 from src.journal.derivatives_journal import DerivativesJournal
+from src.strategy.ha_state import HAStateRegistry
 from src.strategy.entry_signals import (
     _flow_alignment_score,
     build_trade_plan_with_reason,
@@ -668,6 +669,13 @@ class BotContext:
     # the per-symbol cycle. Stale on first cycle for each symbol post-restart;
     # the writer treats absence as None and stamps NULL on the row.
     last_market_state_per_symbol: dict[str, MarketState] = field(default_factory=dict)
+    # 2026-05-04 — HA-native runtime state registry. Per-symbol in-memory
+    # history buffer (HASymbolState with deque(maxlen=60)) for 3-bar delta
+    # direction (MFI/RSI), color flip detection, dominant_color analysis.
+    # Pumped each cycle from `last_market_state_per_symbol[symbol]`. Bot
+    # restart sıfırlanır; backfill helper Bybit kline'dan startup'ta
+    # 50-bar geçmiş push edebilir (separate runner step).
+    ha_state_registry: HAStateRegistry = field(default_factory=HAStateRegistry)
     # Monotonic ts of last position-snapshot batch write. Cadence-gated by
     # `journal.position_snapshot_cadence_s` (default 300s). 0.0 = never.
     last_position_snapshot_ts: float = 0.0
@@ -2399,10 +2407,18 @@ class BotRunner:
                     state = await self.ctx.reader.read_market_state()
                     sig = state.signal_table
                     osc = state.oscillator
+                # Operatör 2026-05-04 v4: data-ready check sıkılaştırması.
+                # Eski (price + last_bar) yetersizdi — Pine yarı render
+                # durumda price doldurmuş ama HA / ATR boş olabiliyor.
+                # Şimdi: HA color'lar + ATR dolu olmadan asla "ready" deme.
+                # Bot eski kısmi veriyle bir sonraki TF/sembole geçmesin.
                 if (
                     sig is not None
                     and sig.last_bar is not None
                     and sig.price > 0
+                    and sig.atr_14 > 0
+                    and sig.ha_color_3m  # truthy = non-empty string
+                    and sig.ha_color_15m
                     and osc is not None
                     and osc.last_bar is not None
                 ):
@@ -2669,6 +2685,14 @@ class BotRunner:
         # Cached AFTER on_chain/whale attachment so the snapshot row's
         # oscillator + VWAP fields match this cycle's downstream consumers.
         self.ctx.last_market_state_per_symbol[symbol] = state
+        # 2026-05-04 — HA-native state pump. Each cycle's entry-TF MarketState
+        # feeds the per-symbol HASymbolState history (deque maxlen=60). The
+        # planner / exit suite reads derived properties (delta dirs, color
+        # flips, dominant_color) without re-parsing tables.
+        try:
+            self.ctx.ha_state_registry.update(symbol, state, _utc_now())
+        except Exception:
+            logger.exception("ha_state_registry_update_failed symbol={}", symbol)
         buf = self.ctx.multi_tf.get_buffer(tf_key)
         # 100 candles is enough for EMA55 seeding in the zone builder's
         # ema21_pullback source; legacy confluence consumers only read the tail.
