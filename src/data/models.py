@@ -92,7 +92,18 @@ class SignalTableData(BaseModel):
     trend_htf: Direction = Direction.UNDEFINED
     trend_ltf: Direction = Direction.UNDEFINED
     structure: str = ""  # e.g. "HH_HL_bullish"
-    last_mss: Optional[str] = None  # e.g. "BULLISH@69450"
+    last_mss: Optional[str] = None  # e.g. "BULLISH@69450" (chart TF MSS proxy)
+    # 2026-05-05 Phase 3b — Yol A v5 multi-TF MSS API hazırlığı.
+    # Pine'da `lastMSSDir` chart TF (genellikle 3m) tek MSS emit ediyor;
+    # 1m / 15m ayrı emit henüz yok (gelecek Pine genişletmesi). Bu field'lar
+    # şimdilik Optional[None] default — parser Pine'da `mss_dir_1m`,
+    # `mss_dir_3m`, `mss_dir_15m` cell'leri görürse doldurur, görmezse
+    # None bırakır. Caller (`_maybe_close_on_ha_flip`) None ise `last_mss`
+    # fallback kullanır (Phase 3a "single MSS proxy" davranışı korunur).
+    # Format: "BULLISH" | "BEARISH" | None.
+    mss_direction_1m: Optional[str] = None
+    mss_direction_3m: Optional[str] = None
+    mss_direction_15m: Optional[str] = None
     active_fvg: Optional[str] = None  # e.g. "BULL@68900-69100"
     active_ob: Optional[str] = None  # e.g. "BULL@68500-68700"
     liquidity_above: list[float] = Field(default_factory=list)

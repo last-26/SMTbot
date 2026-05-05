@@ -580,6 +580,18 @@ class BotContext:
     defensive_close_in_flight: set = field(default_factory=set)
     pending_close_reasons: dict[tuple[str, str], str] = field(default_factory=dict)
     open_trade_opened_at: dict[tuple[str, str], datetime] = field(default_factory=dict)
+    # 2026-05-05 Phase 4 — Yol A v5 reverse-on-flip observability. Stamped
+    # by `_handle_close` whenever a position closes (any reason). Read by
+    # dispatcher cycle to log when an opposite-direction TAKE is being
+    # evaluated within `reverse_lookback_window_s` of a recent close —
+    # explicit reverse-candidate signal in logs (no behavior change; the
+    # `no_duplicate` gate already allows opposite direction once the same-
+    # symbol same-side close completes). `(symbol, closed_pos_side)` →
+    # close datetime; entries past `reverse_lookback_window_s` are pruned
+    # opportunistically when the dispatcher reads them.
+    recent_position_closes: dict[tuple[str, str], datetime] = field(
+        default_factory=dict,
+    )
     # Phase 1.5 — derivatives subsystem (all opt-in via DerivativesConfig.enabled)
     liquidation_stream: Any = None         # LiquidationStream
     derivatives_cache: Any = None          # DerivativesCache (Madde 3)
@@ -1915,13 +1927,22 @@ class BotRunner:
             elapsed_s = 0.0
         bars_held = max(0, int(elapsed_s // 180))
 
-        # MSS direction parse from signal_table.last_mss ("BULLISH@..."
-        # / "BEARISH@..."). Phase 3a uses single multi-TF agnostic MSS as
-        # "1m MSS proxy"; Phase 3b will replace with mss_direction_1m
-        # once Pine multi-TF MSS lands.
-        last_mss_dir: Optional[Direction] = None
+        # 2026-05-05 Phase 3b — multi-TF MSS prefer 1m direction (operatör
+        # doctrine "kısa-vadeli MSS ters yöne döndüyse close"). Pine
+        # genişletmesi sonrası signal_table.mss_direction_1m doldurulur;
+        # şimdilik None default → Phase 3a "single MSS proxy" fallback
+        # (last_mss chart TF MSS, genellikle 3m).
         sig = state.signal_table
-        if sig.last_mss:
+        last_mss_dir: Optional[Direction] = None
+        mss_1m_raw = sig.mss_direction_1m
+        if mss_1m_raw:
+            up = mss_1m_raw.upper()
+            if "BULL" in up:
+                last_mss_dir = Direction.BULLISH
+            elif "BEAR" in up:
+                last_mss_dir = Direction.BEARISH
+        if last_mss_dir is None and sig.last_mss:
+            # Fallback: chart TF MSS proxy (Phase 3a behavior).
             up = sig.last_mss.upper()
             if "BULL" in up:
                 last_mss_dir = Direction.BULLISH
@@ -3795,6 +3816,39 @@ class BotRunner:
         # _LEGACY_5PILLAR_ENABLED flag) was deleted in this commit.
         plan: Optional[TradePlan] = None
         reject_reason: Optional[str] = None
+        # 2026-05-05 Phase 4 — Yol A v5 reverse-on-flip log: when dispatcher
+        # produces a TAKE on this symbol within 600s of an opposite-side
+        # close (recent_position_closes stamp), emit a reverse_candidate log
+        # so live tail / journal review can spot close→reverse sequences.
+        # No gate — purely observational; the dispatcher decision is what
+        # actually opens the trade. Cooldown disabled per operator
+        # "hızlandır" directive (immediate flip ok if dispatcher agrees).
+        if ha_decision is not None and ha_decision.is_take:
+            try:
+                opp_side = (
+                    "short" if ha_decision.direction == Direction.BULLISH
+                    else "long"
+                )
+                last_close_at = self.ctx.recent_position_closes.get(
+                    (symbol, opp_side),
+                )
+                if last_close_at is not None:
+                    secs_since = (_utc_now() - last_close_at).total_seconds()
+                    if 0 <= secs_since <= 600:
+                        logger.info(
+                            "reverse_candidate symbol={} new_dir={} "
+                            "previous_side={} secs_since_close={:.0f}",
+                            symbol,
+                            getattr(ha_decision.direction, "value", "?"),
+                            opp_side, secs_since,
+                        )
+                    else:
+                        # Stale entry — prune lazily.
+                        self.ctx.recent_position_closes.pop(
+                            (symbol, opp_side), None,
+                        )
+            except Exception:
+                pass
         if ha_decision is not None and ha_decision.is_take:
             # 2026-05-05 — Faz 7: ema200_warmup gate. Operatör DB null
             # kuralı: ema200_3m=0.0 (Pine henüz 200-bar warmup'ta) →
@@ -5184,6 +5238,11 @@ class BotRunner:
             close_reason = _infer_close_reason(enriched.pnl_usdt)
         self.ctx.defensive_close_in_flight.discard(key)
         self.ctx.open_trade_opened_at.pop(key, None)
+        # 2026-05-05 Phase 4 — Yol A v5 reverse-on-flip stamp. Dispatcher
+        # next-cycle reads this dict to log opposite-direction TAKE as a
+        # reverse-candidate (observability only — `no_duplicate` gate
+        # naturally allows opposite side once close completes).
+        self.ctx.recent_position_closes[key] = _utc_now()
 
         if trade_id is None:
             logger.warning("orphan_close key={} (no matching trade_id)", key)
