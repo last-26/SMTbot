@@ -3089,13 +3089,20 @@ class BotRunner:
                 # durumda price doldurmuş ama HA / ATR boş olabiliyor.
                 # Şimdi: HA color'lar + ATR dolu olmadan asla "ready" deme.
                 # Bot eski kısmi veriyle bir sonraki TF/sembole geçmesin.
+                # 2026-05-05 — Yol B (HA Strategy) Pine settle check 5m+15m
+                # HA color bekler. Yol A frozen mode'da 3m+15m bekler. Pine
+                # 5m mode'da `ha_color_3m=""` olur, eski check timeout fire
+                # eder (operatör 2026-05-05 15:33 live bug raporu).
+                if self._STRATEGY_MODE == "vmc":
+                    ha_ok = bool(sig and sig.ha_color_5m and sig.ha_color_15m)
+                else:
+                    ha_ok = bool(sig and sig.ha_color_3m and sig.ha_color_15m)
                 if (
                     sig is not None
                     and sig.last_bar is not None
                     and sig.price > 0
                     and sig.atr_14 > 0
-                    and sig.ha_color_3m  # truthy = non-empty string
-                    and sig.ha_color_15m
+                    and ha_ok
                     and osc is not None
                     and osc.last_bar is not None
                 ):
