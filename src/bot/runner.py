@@ -1864,24 +1864,24 @@ class BotRunner:
     async def _maybe_close_on_ha_flip(
         self, symbol: str, pos_side: str, state: MarketState,
     ) -> bool:
-        """HA-native pozisyon için multi-TF HA renk dönüşü exit gate.
+        """HA-native pozisyon için Yol A v5 3-layer dynamic exit gate.
 
-        Operatör 2026-05-04 spec'i (Yol A primary mode'un simetrik tarafı):
-        HA color primary direction signal, multi-TF (3m streak + 15m
-        opposing) + RCS (volume_3m_ratio) confirm + whipsaw guard. Sadece
-        `_Tracked.is_ha_native=True` olan pozisyonlar üzerinde fire eder;
-        legacy 5-pillar pozisyonlar mevcut momentum_fade / MAE-BE-recovery
-        / trailing exit'lerini korur (kademeli geçiş — yeni gate eski
-        gate'leri ezmez, sadece HA-native trade'lere uygulanır).
+        Operatör doctrine (2026-05-05): "Trend devam ettikçe pozisyon
+        tutulmalı; ufak ters HA mumlarında kapatılmamalı; sadece kısa-
+        vadeli MSS ters yöne döndüğünde + supporting signals (MFI/RSI
+        delta + RCS volume) konfirme ettiğinde kapat."
 
-        Decision flow (saf fonksiyon `evaluate_ha_native_exit`):
-          1. config.ha_native_exit_enabled toggle.
-          2. ha_state.latest var mı (boş history → HOLD).
-          3. bars_since_open >= min_bars_held (whipsaw guard ilk cycle).
-          4. 3m streak opposing (≥ min_opposing_bars_3m) VEYA
-             15m HA color opposing (tek bar yeterli).
-          5. RCS gate: volume_3m_ratio ≥ confirm → CLOSE,
-             ≤ noise → HOLD, arada → CLOSE (default exit fires).
+        Layer architecture (saf fonksiyon `evaluate_ha_native_exit`):
+          * Layer 1 (HOLD): 3m HA color flip tek başına yetmez → tut.
+          * Layer 2 (WARN): last_mss_direction pozisyon yönüne ters →
+            tracked.structural_warning=True latch (sticky).
+          * Layer 3 (CLOSE): warning_active AND
+            (mfi_delta opposing OR rsi_delta opposing) AND
+            volume_3m_ratio ≥ rcs_confirm → defensive close fires.
+
+        Sadece `_Tracked.is_ha_native=True` olan pozisyonlar üzerinde
+        fire eder; legacy 5-pillar pozisyonlar mevcut exit suite'lerini
+        korur.
 
         Returns True when a defensive close was fired, False otherwise.
         Caller (runner cycle) returns early when True so subsequent gates
@@ -1915,30 +1915,65 @@ class BotRunner:
             elapsed_s = 0.0
         bars_held = max(0, int(elapsed_s // 180))
 
+        # MSS direction parse from signal_table.last_mss ("BULLISH@..."
+        # / "BEARISH@..."). Phase 3a uses single multi-TF agnostic MSS as
+        # "1m MSS proxy"; Phase 3b will replace with mss_direction_1m
+        # once Pine multi-TF MSS lands.
+        last_mss_dir: Optional[Direction] = None
+        sig = state.signal_table
+        if sig.last_mss:
+            up = sig.last_mss.upper()
+            if "BULL" in up:
+                last_mss_dir = Direction.BULLISH
+            elif "BEAR" in up:
+                last_mss_dir = Direction.BEARISH
+
+        # 3-bar delta directions from HASymbolState (MFI/RSI 3m).
+        mfi_delta = sym_state.mfi_3m_delta_dir
+        rsi_delta = sym_state.rsi_3m_delta_dir
+
         exit_ctx = HANativeExitContext(
             position_direction=pos_dir,
             ha_state=sym_state,
             bars_since_open=bars_held,
-            volume_3m_ratio=float(state.signal_table.volume_3m_ratio or 1.0),
+            volume_3m_ratio=float(sig.volume_3m_ratio or 1.0),
+            last_mss_direction=last_mss_dir,
+            mfi_delta_dir=mfi_delta,
+            rsi_delta_dir=rsi_delta,
+            structural_warning_active=getattr(
+                tracked, "structural_warning", False,
+            ),
         )
         exit_cfg = HANativeExitConfig(
             enabled=cfg.execution.ha_native_exit_enabled,
-            min_opposing_bars_3m=cfg.execution.ha_native_exit_min_opposing_bars_3m,
-            enable_15m_opposing=cfg.execution.ha_native_exit_enable_15m_opposing,
             rcs_volume_ratio_confirm=cfg.execution.ha_native_exit_rcs_confirm,
-            rcs_volume_ratio_noise=cfg.execution.ha_native_exit_rcs_noise,
             min_bars_held=cfg.execution.ha_native_exit_min_bars_held,
         )
         decision = evaluate_ha_native_exit(exit_ctx, exit_cfg)
+
+        # Layer 2 — stamp warning latch on the tracked position.
+        if decision.should_warn:
+            try:
+                tracked.structural_warning = True
+                logger.info(
+                    "ha_structural_warning_set symbol={} side={} reason={} "
+                    "mss_dir={} mfi_delta={} rsi_delta={} vol_ratio={:.2f}",
+                    symbol, pos_side, decision.reason,
+                    getattr(last_mss_dir, "value", None),
+                    mfi_delta, rsi_delta, exit_ctx.volume_3m_ratio,
+                )
+            except Exception:
+                pass
+            return False
 
         if not decision.should_close:
             return False
 
         logger.info(
             "ha_flip_exit_fired symbol={} side={} reason={} bars_held={} "
-            "vol_ratio={:.2f}",
+            "vol_ratio={:.2f} mfi_delta={} rsi_delta={}",
             symbol, pos_side, decision.reason, bars_held,
-            exit_ctx.volume_3m_ratio,
+            exit_ctx.volume_3m_ratio, mfi_delta, rsi_delta,
         )
         await self._defensive_close(symbol, pos_side, "ha_flip_reversal")
         return True

@@ -143,6 +143,12 @@ class _Tracked:
     # fires for HA-native positions — legacy positions retain their
     # pre-existing exit suite (momentum_fade, MAE-BE-recovery, etc.).
     is_ha_native: bool = False
+    # 2026-05-05 Phase 3a — Yol A v5 dynamic exit Layer 2 state stamp.
+    # Set True when evaluate_exit returns action="WARN" (MSS direction
+    # reversed against position). Layer 3 close path requires this latch
+    # plus supporting MFI/RSI delta + RCS volume confirm. Persists across
+    # cycles — once warned, stays warned until position closes.
+    structural_warning: bool = False
 
 
 @dataclass
