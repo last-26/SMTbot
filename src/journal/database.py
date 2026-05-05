@@ -1025,6 +1025,14 @@ _MIGRATIONS = [
     # SQLite 3.35+ DROP COLUMN destekler. Idempotent fail OK (kolon
     # zaten yoksa OperationalError, _apply_migrations swallow eder).
     "ALTER TABLE decision_log DROP COLUMN confluence_factors_json",
+    # 2026-05-05 — Phase 9: Arkham purge. Operator direktifi (Yol B) Arkham
+    # tamamen kaldirildi; runtime + journal + DB temizlik. Trial 2026-05-20
+    # expiry oncesinde sokulur. SQLite 3.35+ DROP COLUMN destek; idempotent
+    # fail OK (kolon zaten yoksa _apply_migrations swallow eder).
+    "DROP TABLE IF EXISTS on_chain_snapshots",
+    "DROP TABLE IF EXISTS whale_transfers",
+    "ALTER TABLE trades DROP COLUMN on_chain_context",
+    "ALTER TABLE rejected_signals DROP COLUMN on_chain_context",
 ]
 
 

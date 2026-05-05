@@ -995,7 +995,11 @@ class BotRunner:
                     await self._backfill_ha_history()
                 await self._start_derivatives()
                 await self._start_economic_calendar()
-                await self._start_on_chain_ws()
+                # 2026-05-05 — Phase 9 Arkham purge. Yol B doctrine'da on-chain
+                # signals kullanilmiyor; trial 2026-05-20 expiry oncesinde
+                # tamamen sokuldu. WS listener / REST client hic baslatilmaz.
+                # Code path'leri ileride file-delete edilecek; simdilik no-op.
+                # await self._start_on_chain_ws()
                 interval = self.ctx.config.bot.poll_interval_seconds
                 deadline = (
                     time.monotonic() + self.duration_seconds
