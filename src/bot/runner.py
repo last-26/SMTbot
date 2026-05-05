@@ -32,7 +32,7 @@ from typing import Any, Optional
 from loguru import logger
 
 from src.analysis.liquidity_heatmap import build_heatmap
-from src.analysis.multi_timeframe import calculate_confluence, score_direction
+from src.analysis.multi_timeframe import ConfluenceScore, score_direction
 from src.analysis.support_resistance import detect_sr_zones
 from src.analysis.trend_regime import (
     TrendRegime,
@@ -3735,56 +3735,35 @@ class BotRunner:
                     )
                 else:
                     reject_reason = "ha_native_no_setup"
-            # Legacy 5-pillar reject_reason taxonomy (only fires when
-            # _LEGACY_5PILLAR_ENABLED is True): below_confluence /
-            # session_filter / no_sl_source / vwap_misaligned /
-            # ema_momentum_contra / cross_asset_opposition /
-            # wrong_side_of_premium_discount / crowded_skip / zero_contracts
-            # / htf_tp_ceiling / tp_too_tight / insufficient_contracts_for_split
-            # / macro_event_blackout. Sub-floor SL distances are widened,
-            # not rejected.
+            # 2026-05-05 v3 — Yol A NO_TRADE branch sadeleştirildi. Legacy
+            # `calculate_confluence` çağrısı silindi; HA-native zaten
+            # `decision_log` tablosuna 40+ field per-cycle audit row
+            # yazıyor. `_record_reject` minimal stub conf ile çağrılır:
+            # direction HA-native'den, factors boş.
+            ha_dir = (
+                ha_decision.direction
+                if (ha_decision is not None and ha_decision.direction is not None)
+                else Direction.UNDEFINED
+            )
             try:
-                conf = calculate_confluence(
-                    state,
-                    ltf_candles=candles,
-                    allowed_sessions=cfg.allowed_sessions_for(symbol) or None,
-                    ltf_state=self.ctx.ltf_cache.get(symbol),
-                    htf_state=self.ctx.htf_state_cache.get(symbol),
-                    weights=cfg.analysis.confluence_weights or None,
-                    min_rsi_mfi_magnitude=cfg.analysis.min_rsi_mfi_magnitude,
-                    liquidity_pool_max_atr_dist=cfg.analysis.liquidity_pool_max_atr_dist,
-                    displacement_atr_mult=cfg.analysis.displacement_atr_mult,
-                    displacement_max_bars_ago=cfg.analysis.displacement_max_bars_ago,
-                    divergence_fresh_bars=cfg.analysis.divergence_fresh_bars,
-                    divergence_decay_bars=cfg.analysis.divergence_decay_bars,
-                    divergence_max_bars=cfg.analysis.divergence_max_bars,
-                    trend_regime=trend_regime,
-                    trend_regime_conditional_scoring_enabled=
-                        cfg.analysis.trend_regime_conditional_scoring_enabled,
-                    daily_bias_enabled=(
-                        cfg.on_chain.enabled
-                        and cfg.on_chain.daily_bias_enabled
-                    ),
-                    daily_bias_delta=cfg.on_chain.daily_bias_modifier_delta,
-                )
                 logger.info(
                     "symbol_decision symbol={} NO_TRADE reason={} price={:.4f} "
-                    "session={} direction={} confluence={:.2f}/{} factors={}",
+                    "session={} direction={}",
                     symbol, reject_reason or "unknown",
                     float(state.current_price or 0.0),
                     getattr(state.active_session, "value", "NONE"),
-                    getattr(conf.direction, "value", "UNDEFINED"),
-                    conf.score, cfg.analysis.min_confluence_score,
-                    ",".join(conf.factor_names) or "-",
+                    getattr(ha_dir, "value", "UNDEFINED"),
                 )
                 # Phase 7.B1 — persist reject context for counter-factual audit.
-                # Failure here must not block the cycle; downgrade to debug.
+                conf_stub = ConfluenceScore(
+                    direction=ha_dir, score=0.0, factors=[],
+                )
                 try:
                     await self._record_reject(
                         symbol=symbol,
                         reject_reason=reject_reason or "unknown",
                         state=state,
-                        conf=conf,
+                        conf=conf_stub,
                         candles=candles,
                         adx_3m_result=trend_regime_result,
                         adx_15m_result=htf_regime_result,
@@ -3852,33 +3831,16 @@ class BotRunner:
                     "symbol_decision symbol={} NO_TRADE reason=no_setup_zone "
                     "direction={}", symbol, plan.direction.value,
                 )
+                # 2026-05-05 v3 — Yol A: legacy `calculate_confluence` silindi.
+                # Plan zaten elimizde (HA-native plan), direction'u oradan alıp
+                # minimal stub conf ile reject row yazılır.
                 try:
-                    conf = calculate_confluence(
-                        state,
-                        ltf_candles=candles,
-                        allowed_sessions=cfg.allowed_sessions_for(symbol) or None,
-                        ltf_state=self.ctx.ltf_cache.get(symbol),
-                        htf_state=self.ctx.htf_state_cache.get(symbol),
-                        weights=cfg.analysis.confluence_weights or None,
-                        min_rsi_mfi_magnitude=cfg.analysis.min_rsi_mfi_magnitude,
-                        liquidity_pool_max_atr_dist=cfg.analysis.liquidity_pool_max_atr_dist,
-                        displacement_atr_mult=cfg.analysis.displacement_atr_mult,
-                        displacement_max_bars_ago=cfg.analysis.displacement_max_bars_ago,
-                        divergence_fresh_bars=cfg.analysis.divergence_fresh_bars,
-                        divergence_decay_bars=cfg.analysis.divergence_decay_bars,
-                        divergence_max_bars=cfg.analysis.divergence_max_bars,
-                        trend_regime=trend_regime,
-                        trend_regime_conditional_scoring_enabled=
-                            cfg.analysis.trend_regime_conditional_scoring_enabled,
-                        daily_bias_enabled=(
-                            cfg.on_chain.enabled
-                            and cfg.on_chain.daily_bias_enabled
-                        ),
-                        daily_bias_delta=cfg.on_chain.daily_bias_modifier_delta,
+                    conf_stub = ConfluenceScore(
+                        direction=plan.direction, score=0.0, factors=[],
                     )
                     await self._record_reject(
                         symbol=symbol, reject_reason="no_setup_zone",
-                        state=state, conf=conf, candles=candles,
+                        state=state, conf=conf_stub, candles=candles,
                         adx_3m_result=trend_regime_result,
                         adx_15m_result=htf_regime_result,
                     )
