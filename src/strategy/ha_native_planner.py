@@ -34,7 +34,7 @@ taşır.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from src.data.models import Direction, MarketState
 from src.strategy.ha_state import HASymbolState
@@ -100,6 +100,16 @@ class HANativeConfig:
     # kod path'inde aynı kalsın diye.
     target_rr_ratio: float = 1.0
 
+    # ── Confluence destek faktörü (operatör 2026-05-05 v4) ────────────────
+    # HA-native dispatcher entry kararını tek başına verir; confluence
+    # SOFT skoru aktif olarak etkiler (yön teyidi destek). Mandatory
+    # gate'lerde yeri yok — sadece soft skor seviyesinde aligned/opposing/
+    # strong farkı yaratır.
+    confluence_aligned_bonus: float = 2.0       # yön match
+    confluence_opposing_penalty: float = -1.5   # yön ters (negative)
+    confluence_strong_extra: float = 1.0        # aligned + score >= strong threshold
+    confluence_strong_threshold: float = 5.0    # confluence skor "strong" eşiği
+
     # ── Deprecated knobs (audit için tutuluyor) ───────────────────────────
     adx_threshold: Optional[float] = None
     fresh_mss_max_bars: Optional[int] = None
@@ -154,6 +164,13 @@ class EntryContext:
     # cache'lemek faster. Default 0 → Tip 1 reverse-streak hesabı
     # ha_state'den fallback yapar.
     prev_main_streak: int = 0
+
+    # 2026-05-05 v4 — Confluence destek sinyali. Caller (runner) cycle
+    # başına bir kez `calculate_confluence(...)` koşar, sonucu burada
+    # plan dispatcher'a pas eder. None → confluence destekli skor +0/-0
+    # (tarafsız). HA-native mandatory gate'lerini etkilemez; sadece soft
+    # skoru aligned bonus / opposing penalty / strong extra ile değiştirir.
+    confluence: Optional[Any] = None
 
 
 # ── Entry decision (output) ───────────────────────────────────────────────
@@ -398,6 +415,50 @@ def _gate_rcs_volume(state: MarketState, threshold: float = 1.3) -> bool:
     return sig.volume_3m_ratio >= threshold
 
 
+def _confluence_support(
+    ctx: EntryContext, direction: Direction, config: HANativeConfig,
+) -> tuple[dict[str, bool], float]:
+    """Confluence destek faktörü — yön teyidi.
+
+    Operatör 2026-05-05 v4: legacy multi-pillar (mss/vwap/mfi/rsi/divergence/
+    structure/liquidity) bel-kemiği onay sinyali. Entry kararı vermez ama
+    yön belirlenirken soft skoru aktif olarak etkiler:
+      * aligned (confluence.direction == direction): +confluence_aligned_bonus
+      * aligned + strong (score >= strong_threshold): ek +confluence_strong_extra
+      * opposing (confluence opposite direction): +confluence_opposing_penalty
+        (negative — score'u düşürür)
+      * UNDEFINED / None: tarafsız 0
+
+    Returns (gates_dict, score_delta).
+    """
+    gates: dict[str, bool] = {}
+    if ctx.confluence is None:
+        gates["confluence_aligned"] = False
+        gates["confluence_strong"] = False
+        gates["confluence_opposing"] = False
+        return gates, 0.0
+    conf_dir = getattr(ctx.confluence, "direction", None)
+    conf_score = float(getattr(ctx.confluence, "score", 0.0) or 0.0)
+    aligned = conf_dir == direction
+    opposing = (
+        conf_dir in (Direction.BULLISH, Direction.BEARISH)
+        and conf_dir != direction
+    )
+    gates["confluence_aligned"] = aligned
+    gates["confluence_strong"] = (
+        aligned and conf_score >= config.confluence_strong_threshold
+    )
+    gates["confluence_opposing"] = opposing
+    delta = 0.0
+    if aligned:
+        delta += config.confluence_aligned_bonus
+        if conf_score >= config.confluence_strong_threshold:
+            delta += config.confluence_strong_extra
+    elif opposing:
+        delta += config.confluence_opposing_penalty  # negative
+    return gates, delta
+
+
 def _prev_main_streak_from_history(
     ha_state: HASymbolState, current_direction: Direction,
 ) -> int:
@@ -576,6 +637,11 @@ def _score_major_reversal(
     del gates["dominant_color_old_aligned"]
     if gates["dominant_old_aligned"]:
         score_value += 0.5
+
+    # 2026-05-05 v4 — Confluence destek faktörü (yön teyidi, aktif)
+    conf_gates, conf_delta = _confluence_support(ctx, direction, config)
+    gates.update(conf_gates)
+    score_value += conf_delta
 
     score.score = score_value
     score.gate_results = gates
@@ -798,6 +864,11 @@ def _score_continuation(
     if ctx.first_entry_missed:
         score_value += 0.5
 
+    # 2026-05-05 v4 — Confluence destek faktörü (yön teyidi, aktif)
+    conf_gates, conf_delta = _confluence_support(ctx, direction, config)
+    gates.update(conf_gates)
+    score_value += conf_delta
+
     score.score = score_value
     score.gate_results = gates
 
@@ -997,6 +1068,11 @@ def _score_micro_reversal(
     gates["15m_aligned_old"] = _gate_15m_alignment(ctx.ha_state, prev_dir)
     if gates["15m_aligned_old"]:
         score_value += 0.5
+
+    # 2026-05-05 v4 — Confluence destek faktörü (yön teyidi, aktif)
+    conf_gates, conf_delta = _confluence_support(ctx, direction, config)
+    gates.update(conf_gates)
+    score_value += conf_delta
 
     score.score = score_value
     score.gate_results = gates
