@@ -106,11 +106,9 @@ from src.strategy.entry_signals import (
     in_vwap_reset_blackout,
 )
 from src.strategy.risk_manager import RiskManager, TradeResult
-from src.strategy.setup_planner import (
-    ZoneSetup,
-    apply_zone_to_plan,
-    build_zone_setup,
-)
+# Legacy `setup_planner` module deleted 2026-05-05 v3 (Faz 5 Yol A cleanup).
+# PendingSetupMeta.zone is always None for HA-native plans — typing kept
+# as Optional[Any] for backward-compat with any rehydrate-path consumer.
 from src.strategy.trade_plan import TradePlan
 from src.strategy.what_if_sltp import (
     NO_PROPOSED_SLTP_REASONS,
@@ -504,8 +502,8 @@ class PendingSetupMeta:
     """
     plan: TradePlan
     # 2026-05-05 v3 — Yol A: HA-native plans skip zone search; meta.zone
-    # is None for HA-native pendings, populated for legacy zone-based.
-    zone: Optional[ZoneSetup]
+    # is always None now (legacy ZoneSetup dataclass retired in Faz 5).
+    zone: Optional[Any]
     order_id: str
     signal_state: MarketState
     placed_at: datetime
@@ -4650,161 +4648,6 @@ class BotRunner:
             "entry={:.4f} sl={:.4f} tp={:.4f} contracts={} max_wait_s={:.0f}",
             symbol, pos_side, result.order_id, plan.entry_price,
             plan.sl_price, plan.tp_price, plan.num_contracts, max_wait_s,
-        )
-        return True
-
-    async def _try_place_zone_entry(
-        self,
-        *,
-        symbol: str,
-        pos_side: str,
-        plan: TradePlan,
-        state: MarketState,
-        candles: Optional[list] = None,
-        trend_regime: Optional[TrendRegime] = None,
-        adx_3m_result: Optional[TrendRegimeResult] = None,
-        adx_15m_result: Optional[TrendRegimeResult] = None,
-    ) -> bool:
-        """Try to place a zone-based limit entry. Return True if a pending
-        was registered, False otherwise (caller falls back to market path).
-        """
-        cfg = self.ctx.config
-        htf_state = self.ctx.htf_state_cache.get(symbol)
-        try:
-            zone = build_zone_setup(
-                direction=plan.direction,
-                state=state,
-                htf_state=htf_state,
-                heatmap=state.liquidity_heatmap,
-                ltf_candles=candles,
-                zone_buffer_atr=cfg.execution.zone_buffer_atr,
-                sl_buffer_atr=cfg.execution.zone_sl_buffer_atr,
-                max_wait_bars=cfg.execution.zone_max_wait_bars,
-                default_rr=cfg.execution.zone_default_rr,
-                liq_entry_near_max_atr=cfg.execution.liq_entry_near_max_atr,
-                liq_entry_magnitude_mult=cfg.execution.liq_entry_magnitude_mult,
-                ema21_pullback_enabled=cfg.execution.ema21_pullback_enabled,
-                ema_fast_period=cfg.analysis.ema_veto_fast_period,
-                ema_slow_period=cfg.analysis.ema_veto_slow_period,
-                htf_fvg_entry_enabled=cfg.execution.htf_fvg_entry_enabled,
-                tp_ladder_enabled=cfg.execution.tp_ladder_enabled,
-                tp_ladder_shares=tuple(cfg.execution.tp_ladder_shares),
-                tp_ladder_min_notional_frac=cfg.execution.tp_ladder_min_notional_frac,
-                # 2026-05-02 — Phase A.4b RANGING-only VWAP-band SL anchor.
-                # No-op for WEAK_TREND / STRONG_TREND / UNKNOWN.
-                trend_regime=trend_regime,
-            )
-        except Exception:
-            logger.exception("zone_setup_build_failed symbol={}", symbol)
-            return False
-        if zone is None:
-            logger.info(
-                "zone_setup_none symbol={} direction={} — no source available",
-                symbol, plan.direction.value,
-            )
-            return False
-
-        contract_size = self.ctx.contract_sizes.get(
-            symbol, cfg.trading.contract_size)
-        # Margin + leverage cap thread-through (2026-04-28): zone re-sizing
-        # against a tighter SL needs to recompute leverage so the new
-        # notional fits inside the per-slot margin budget. Without this,
-        # a 8.7% structural SL → 0.6% zone SL transition multiplies
-        # required notional ~14× while leverage stays pinned to the
-        # original (low) value, blowing past Bybit's initial-margin
-        # check (110007). DOGE was the canonical surface case.
-        zone_max_leverage = min(
-            cfg.trading.max_leverage,
-            self.ctx.max_leverage_per_symbol.get(
-                symbol, cfg.trading.max_leverage),
-            cfg.trading.symbol_leverage_caps.get(
-                symbol, cfg.trading.max_leverage),
-        )
-        try:
-            zoned_plan = apply_zone_to_plan(
-                plan, zone, contract_size,
-                min_sl_distance_pct=cfg.min_sl_distance_pct_for(symbol),
-                target_rr_cap=cfg.execution.target_rr_ratio,
-                vwap_long_anchor=cfg.analysis.vwap_zone_long_anchor,
-                vwap_short_anchor=cfg.analysis.vwap_zone_short_anchor,
-                margin_balance=self.ctx.last_margin_balance,
-                max_leverage=zone_max_leverage,
-            )
-        except Exception:
-            logger.exception(
-                "zone_apply_failed symbol={} zone_source={}",
-                symbol, zone.zone_source,
-            )
-            return False
-
-        # Re-gate risk against the re-sized plan (R budget may have shifted
-        # slightly with the structural SL).
-        allowed, reason = self.ctx.risk_mgr.can_trade(zoned_plan)
-        if not allowed:
-            logger.info(
-                "zone_plan_risk_blocked symbol={} reason={}", symbol, reason,
-            )
-            return False
-
-        try:
-            result = await asyncio.to_thread(
-                self.ctx.router.place_limit_entry,
-                zoned_plan, zoned_plan.entry_price, symbol,
-            )
-        except (LeverageSetError, OrderRejected, InsufficientMargin, ValueError) as exc:
-            code = getattr(exc, "code", None)
-            payload = getattr(exc, "payload", None)
-            logger.error(
-                "zone_limit_rejected symbol={}: {} | code={} | payload={}",
-                symbol, exc, code, payload,
-            )
-            return False
-        except Exception:
-            logger.exception(
-                "zone_limit_unexpected_error symbol={}", symbol,
-            )
-            return False
-
-        tf_sec = _tf_seconds(cfg.trading.entry_timeframe)
-        max_wait_s = float(zone.max_wait_bars * tf_sec)
-        placed_at = _utc_now()
-        self.ctx.monitor.register_pending(
-            inst_id=symbol, pos_side=pos_side, order_id=result.order_id,
-            num_contracts=float(zoned_plan.num_contracts),
-            entry_px=zoned_plan.entry_price,
-            max_wait_s=max_wait_s, placed_at=placed_at,
-        )
-        self.ctx.pending_setups[(symbol, pos_side)] = PendingSetupMeta(
-            plan=zoned_plan,
-            zone=zone,
-            order_id=result.order_id,
-            signal_state=state,
-            placed_at=placed_at,
-            trend_regime_at_entry=(
-                trend_regime.value
-                if trend_regime and trend_regime != TrendRegime.UNKNOWN
-                else None
-            ),
-            # 2026-04-22 (gece, late) — capture oscillator snapshot at
-            # placement time. Carried through to fill's record_open and
-            # pending-cancel's record_rejected_signal so the journal row
-            # reflects the decision moment's data, not the later
-            # fill/cancel moment when caches may have rotated.
-            oscillator_raw_values_at_placement=(
-                self._build_oscillator_raw_values(symbol, state)
-            ),
-            # 2026-05-02 — Phase A.9 ADX results captured at placement time
-            # for entry TF + HTF. Same lock-the-decision-moment rationale
-            # as the oscillator snapshot.
-            adx_3m_result_at_placement=adx_3m_result,
-            adx_15m_result_at_placement=adx_15m_result,
-        )
-        logger.info(
-            "zone_limit_placed symbol={} side={} order_id={} entry={:.4f} "
-            "sl={:.4f} tp={:.4f} zone_source={} max_wait_bars={}",
-            symbol, pos_side, result.order_id, zoned_plan.entry_price,
-            zoned_plan.sl_price, zoned_plan.tp_price, zone.zone_source,
-            zone.max_wait_bars,
         )
         return True
 

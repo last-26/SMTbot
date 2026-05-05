@@ -1,16 +1,18 @@
-"""Strategy engine — R:R sizing, entry signals, circuit breakers.
+"""Strategy engine — R:R sizing, HA-native dispatcher, circuit breakers.
 
 Public surface:
   - `TradePlan`                — the sized, risk-bounded trade
   - `calculate_trade_plan`     — pure R:R math
   - `generate_entry_intent`    — MarketState + confluence → EntryIntent
-  - `build_trade_plan_from_state` — full pipeline wrapper
   - `RiskManager`              — circuit breakers + balance bookkeeping
+
+HA-native (Yol A) entry path lives in `src/strategy/ha_native_planner.py`;
+legacy `build_trade_plan_from_state` / `build_trade_plan_with_reason`
+removed 2026-05-05 v3.
 """
 
 from src.strategy.entry_signals import (
     EntryIntent,
-    build_trade_plan_from_state,
     generate_entry_intent,
     select_sl_price,
 )
@@ -33,7 +35,6 @@ __all__ = [
     "expected_value_r",
     "EntryIntent",
     "generate_entry_intent",
-    "build_trade_plan_from_state",
     "select_sl_price",
     "RiskManager",
     "CircuitBreakerConfig",
