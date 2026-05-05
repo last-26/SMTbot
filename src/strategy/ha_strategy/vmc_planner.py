@@ -104,7 +104,13 @@ class EntryContext:
 
 @dataclass
 class EntryDecision:
-    """evaluate_entry output. is_take True ise plan builder çağrılır."""
+    """evaluate_entry output. is_take True ise plan builder çağrılır.
+
+    Yol A `EntryDecision` ile interface uyumlu: `decision` (action alias),
+    `entry_path` / `major_reversal_score` / vb. dispatcher fields None default.
+    Runner mode-bağımsız `_run_one_symbol` ortak kod path'lerinde her ikisi
+    de değişmeden tüketilir.
+    """
 
     action: str                        # "TAKE" | "NO_SETUP" | "REJECT"
     direction: Optional[Direction] = None
@@ -114,6 +120,23 @@ class EntryDecision:
     soft_factors: dict[str, float] = field(default_factory=dict)
     suggested_entry_price: Optional[float] = None
     suggested_sl_price: Optional[float] = None
+
+    # ─── Yol A interface uyumluluğu (backward compat) ────────────────────────
+    # _run_one_symbol ortak kod path'leri Yol A EntryDecision'in `decision`
+    # field'ını + 3-tip dispatcher field'larını okur. Yol B'de bu field'lar
+    # None / 0.0 default — Yol B dispatcher YOK.
+    entry_path: Optional[str] = None              # Yol A: major_reversal/continuation/micro_reversal
+    target_rr: Optional[float] = None             # Yol A: per-tip RR
+    risk_multiplier: Optional[float] = None       # Yol A: per-tip risk scale
+    major_reversal_score: Optional[float] = None
+    continuation_score: Optional[float] = None
+    micro_reversal_score: Optional[float] = None
+    mss_break_detected: Optional[bool] = None
+
+    @property
+    def decision(self) -> str:
+        """Yol A interface alias for `action`."""
+        return self.action
 
     @property
     def is_take(self) -> bool:
