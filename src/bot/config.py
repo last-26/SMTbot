@@ -785,53 +785,36 @@ class ExecutionConfig(BaseModel):
         return self.tp_min_rr_floor_per_regime.get(key, self.tp_min_rr_floor)
 
 
-class DerivativesConfig(BaseModel):
-    """Phase 1.5 — derivatives data layer configuration.
+# 2026-05-05 Phase 9.B — Coinalyze purge: DerivativesConfig kaldırıldı.
+# Yol B doctrine derivatives data kullanmıyor; runtime + journal + DB
+# temizlik. Backward-compat shim _NoOpDerivatives — runner.py'daki ~50
+#  referansı hiç değişmeden False/0/empty default okur,
+# Coinalyze gate'leri otomatik kapanır.
 
-    Defaults are conservative / off so the bot works without a COINALYZE_API_KEY
-    or a live Binance connection. Setting `enabled: true` (done in
-    `config/default.yaml` for Phase 1.5) starts the Binance liquidation WS
-    and the Coinalyze poll loop at startup.
-    """
-    enabled: bool = False
-    liquidation_buffer_size: int = 5000
-    liquidation_lookback_1h_ms: int = 60 * 60 * 1000
-    liquidation_lookback_4h_ms: int = 4 * 60 * 60 * 1000
-    liquidation_lookback_24h_ms: int = 24 * 60 * 60 * 1000
-    # Coinalyze REST (Madde 2) — off by default; enabled by setting
-    # COINALYZE_API_KEY and `derivatives.enabled: true`.
-    coinalyze_refresh_interval_s: int = 60
-    coinalyze_timeout_s: float = 10.0
-    coinalyze_max_retries: int = 3
-    # Liquidity heatmap (Madde 4).
-    heatmap_enabled: bool = True
-    heatmap_bucket_pct: float = 0.002
-    heatmap_historical_lookback_ms: int = 48 * 60 * 60 * 1000
-    heatmap_max_clusters_each_side: int = 10
-    leverage_buckets: list[tuple[int, float]] = Field(
-        default_factory=lambda: [(10, 0.30), (25, 0.35), (50, 0.20), (100, 0.15)]
-    )
-    # Regime classifier (Madde 5). Base thresholds default to BTC;
-    # per-symbol overrides (ETH lighter OI, SOL even lighter) merge on top.
-    regime_thresholds: dict[str, float] = Field(
-        default_factory=lambda: {
-            "funding_crowded_z": 2.0,
-            "ls_crowded_z": 2.0,
-            "oi_surge_pct": 8.0,
-            "oi_crash_pct": -10.0,
-            "capitulation_liq_notional": 10_000_000.0,
-            "stale_snapshot_s": 180.0,
-        }
-    )
-    regime_per_symbol_overrides: dict[str, dict[str, float]] = Field(
-        default_factory=dict
-    )
-    # Entry signal integration (Madde 6).
-    confluence_slot_enabled: bool = True        # reserved; factors always
-                                                # score, this flag is a switch
-                                                # future tooling can read.
-    crowded_skip_enabled: bool = True
-    crowded_skip_z_threshold: float = 3.0
+
+class _NoOpDerivatives:
+    """Phase 9.B Coinalyze purge backward-compat shim."""
+    enabled = False
+    coinalyze_api_key = ""
+    coinalyze_base_url = ""
+    refresh_interval_s = 86400
+    request_timeout_s = 10.0
+    max_retries = 3
+    fetch_funding_rate = False
+    fetch_long_short_ratio = False
+    fetch_open_interest = False
+    funding_history_hours = 24
+    ls_history_hours = 168
+    oi_history_hours = 24
+    heatmap_enabled = False
+    heatmap_bucket_pct = 0.001
+    heatmap_historical_lookback_ms = 0
+    heatmap_max_clusters_each_side = 5
+    leverage_buckets = []
+    regime_per_symbol_overrides: dict = {}
+    regime_modifiers_enabled = False
+    binance_liq_enabled = False
+    binance_ws_url = ""
 
 
 class EconomicCalendarConfig(BaseModel):
@@ -956,7 +939,6 @@ class BotConfig(BaseModel):
     journal: JournalConfig = Field(default_factory=JournalConfig)
     reentry: ReentryConfig = Field(default_factory=ReentryConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
-    derivatives: DerivativesConfig = Field(default_factory=DerivativesConfig)
     economic_calendar: EconomicCalendarConfig = Field(
         default_factory=EconomicCalendarConfig)
     rl: RLConfig = Field(default_factory=RLConfig)
@@ -967,6 +949,12 @@ class BotConfig(BaseModel):
     @property
     def on_chain(self) -> "_NoOpOnChain":
         return _NoOpOnChain()
+
+    # 2026-05-05 Phase 9.B — Coinalyze purge backward-compat shim.
+    # Runner.py'daki ~50 `cfg.derivatives.X` referansı no-op değerler okur.
+    @property
+    def derivatives(self) -> "_NoOpDerivatives":
+        return _NoOpDerivatives()
 
     @field_validator("bybit")
     @classmethod

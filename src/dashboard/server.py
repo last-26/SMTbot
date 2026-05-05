@@ -33,6 +33,7 @@ def create_app(config_path: Optional[Path] = None) -> FastAPI:
     db_path = cfg["db_path"]
     starting_balance = cfg["starting_balance"]
     clean_since = cfg["clean_since"]
+    symbols = cfg["symbols"]
     bybit_cfg = cfg["bybit"]
 
     app = FastAPI(
@@ -58,6 +59,7 @@ def create_app(config_path: Optional[Path] = None) -> FastAPI:
                 db_path,
                 starting_balance,
                 clean_since=clean_since,
+                symbols=symbols,
                 bybit_cfg=bybit_cfg,
             )
             return JSONResponse(payload)

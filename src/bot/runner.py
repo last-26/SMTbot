@@ -46,14 +46,32 @@ from src.analysis.trend_regime import (
 from src.bot.config import BotConfig
 from src.bot.lifecycle import install_shutdown_handlers
 from src.data.candle_buffer import MultiTFBuffer
-from src.data.derivatives_api import CoinalyzeClient
-from src.data.derivatives_cache import DerivativesCache
+# 2026-05-05 Phase 9.B — Coinalyze purge: file delete + stub. Yol B doctrine
+# derivatives data kullanmıyor. Runner'daki ~100 `ctx.derivatives_cache.X` ve
+# `cfg.derivatives.X` referansları aşağıdaki stub class + _NoOpDerivatives
+# shim ile no-op çalışır (Arkham purge ile aynı pattern).
+class CoinalyzeClient:  # type: ignore[no-redef]
+    pass
+class DerivativesCache:  # type: ignore[no-redef]
+    @staticmethod
+    def get(*args, **kwargs):
+        return None
+    async def start(self): pass
+    async def stop(self): pass
 from src.data.economic_calendar import (
     EconomicCalendarService,
     FairEconomyClient,
     FinnhubClient,
 )
-from src.data.liquidation_stream import LiquidationStream
+# 2026-05-05 Phase 9.B — Coinalyze purge: liquidation_stream Binance public
+# WS idi, Coinalyze'a bağımlı değildi ama derivatives_cache içinde merge
+# ediliyordu. Yol B'de gereksiz, stub.
+class LiquidationStream:  # type: ignore[no-redef]
+    async def start(self): pass
+    async def stop(self): pass
+    @staticmethod
+    def get(*args, **kwargs):
+        return None
 from src.data.ltf_reader import LTFReader, LTFState
 from src.data.models import Direction, MarketState, Session
 # 2026-05-05 Phase 9 — Arkham purge: src/data/on_chain*.py file delete edildi.
@@ -100,7 +118,12 @@ from src.execution.bybit_client import BybitClient
 from src.execution.order_router import OrderRouter, RouterConfig, dry_run_report
 from src.execution.position_monitor import PendingEvent, PositionMonitor
 from src.journal.database import TradeJournal
-from src.journal.derivatives_journal import DerivativesJournal
+# 2026-05-05 Phase 9.B — Coinalyze purge: derivatives_journal file delete edildi.
+class DerivativesJournal:  # type: ignore[no-redef]
+    async def ensure_schema(self): pass
+    async def list_funding_rate_history(self, *args, **kwargs): return []
+    async def list_long_short_ratio_history(self, *args, **kwargs): return []
+    async def list_open_interest_history(self, *args, **kwargs): return []
 from src.strategy.ha_state import HAStateRegistry
 from src.strategy.ha_strategy.vmc_state import VMCStateRegistry, VMCSymbolState
 from src.strategy.ha_native_exit import (
@@ -1148,50 +1171,15 @@ class BotRunner:
                 logger.exception("vmc_backfill_failed symbol={}", symbol)
 
     async def _start_derivatives(self) -> None:
-        """Boot the Phase 1.5 derivatives tasks. Safe to call when disabled."""
-        cache = self.ctx.derivatives_cache
-        if cache is not None:
-            deriv_journal = getattr(cache, "_deriv_journal_bootstrap", None)
-            if deriv_journal is not None:
-                try:
-                    await deriv_journal.ensure_schema()
-                except Exception:
-                    logger.exception("derivatives_schema_failed")
-        if self.ctx.liquidation_stream is not None:
-            try:
-                await self.ctx.liquidation_stream.start()
-            except Exception:
-                logger.exception("liquidation_stream_start_failed")
-        if cache is not None:
-            try:
-                await cache.start()
-            except Exception:
-                logger.exception("derivatives_cache_start_failed")
+        """2026-05-05 Phase 9.B — Coinalyze purge no-op. Yol B doctrine
+        derivatives data kullanmıyor; metoda korunuyor (call site dokunmuş
+        değil) ama içeriği boş — Coinalyze + Binance liq + derivatives_cache
+        + derivatives_journal hiç başlatılmaz.
+        """
+        return
 
     async def _stop_derivatives(self) -> None:
-        """Cascade stop (cache → stream → client). Best-effort, never raises."""
-        cache = self.ctx.derivatives_cache
-        if cache is not None:
-            try:
-                await cache.stop()
-            except Exception:
-                logger.exception("derivatives_cache_stop_failed")
-        stream = self.ctx.liquidation_stream
-        if stream is not None:
-            try:
-                await stream.stop()
-            except Exception:
-                logger.exception("liquidation_stream_stop_failed")
-        client = self.ctx.coinalyze_client
-        if client is not None:
-            try:
-                close = getattr(client, "close", None)
-                if close is not None:
-                    result = close()
-                    if asyncio.iscoroutine(result):
-                        await result
-            except Exception:
-                logger.exception("coinalyze_client_close_failed")
+        """Phase 9.B no-op (mirrors _start_derivatives)."""
         binance_public = self.ctx.binance_public
         if binance_public is not None:
             try:

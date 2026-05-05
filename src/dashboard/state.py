@@ -4,6 +4,10 @@ Opens the journal SQLite file in `?mode=ro` URI mode so we can never write,
 then reuses the existing `TradeJournal` reader methods + `reporter.summary`
 to produce the single dict the frontend renders.
 
+Post-Arkham purge (2026-05-05): on_chain / whale_transfers panels removed.
+Post-Yol-B (2026-05-05): decision_log per-cycle audit + Yol A/B/legacy
+strategy breakdown added.
+
 The bot is a separate writer process. Default SQLite journal mode (DELETE)
 serializes writers vs. readers, so a brief `SQLITE_BUSY` is possible during
 a bot commit; the read-only connection's `timeout=10` rides through it.
@@ -14,9 +18,8 @@ from __future__ import annotations
 import asyncio
 import math
 import os
-import re
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -61,10 +64,16 @@ def resolve_clean_since(cfg: dict) -> Optional[datetime]:
     return dt
 
 
+def resolve_symbols(cfg: dict) -> list[str]:
+    raw = (cfg.get("trading") or {}).get("symbols") or []
+    return [str(s) for s in raw if s]
+
+
 def load_dashboard_config(path: Optional[Path] = None) -> dict:
-    """Returns {db_path, starting_balance, clean_since, bybit} — fields the
-    dashboard needs. Skips `BotConfig.load_config()` (which would require
-    full schema validation) and loads only what the read-only dashboard uses.
+    """Returns {db_path, starting_balance, clean_since, symbols, bybit} —
+    fields the dashboard needs. Skips `BotConfig.load_config()` (which would
+    require full schema validation) and loads only what the read-only
+    dashboard uses.
 
     `bybit` block is None when credentials are missing — the dashboard then
     falls back to the simulated journal balance instead of querying Bybit.
@@ -74,6 +83,7 @@ def load_dashboard_config(path: Optional[Path] = None) -> dict:
         "db_path": resolve_db_path(cfg),
         "starting_balance": resolve_starting_balance(cfg),
         "clean_since": resolve_clean_since(cfg),
+        "symbols": resolve_symbols(cfg),
         "bybit": resolve_bybit_credentials(cfg),
     }
 
@@ -126,7 +136,7 @@ class ReadOnlyJournal(TradeJournal):
 
 _RECENT_CLOSED_LIMIT = 50
 _RECENT_REJECTED_LIMIT = 50
-_RECENT_WHALE_LIMIT = 25
+_RECENT_DECISION_LOG_LIMIT = 60
 
 
 def _trade_dump(t: TradeRecord) -> dict:
@@ -215,8 +225,8 @@ async def fetch_live_positions(bybit_cfg: Optional[dict]) -> Optional[list[dict]
     {inst_id, pos_side, mark_price, entry_price, unrealized_pnl_usd, size,
     leverage} keyed for frontend merge against the journal's open trades.
 
-    No cache — operator wants live UPnL ticking every 5s. Position endpoint
-    sits in its own rate-limit bucket on Bybit V5; 1 call / 5s is comfortable.
+    No cache — operator wants live UPnL ticking every 10s. Position endpoint
+    sits in its own rate-limit bucket on Bybit V5; 1 call / 10s is comfortable.
     Returns None on any failure so the frontend falls back to the journal's
     last `position_snapshots` row.
     """
@@ -251,11 +261,112 @@ async def fetch_live_positions(bybit_cfg: Optional[dict]) -> Optional[list[dict]
         return None
 
 
+# ── Decision log + strategy breakdown (Yol B per-cycle audit) ────────────────
+
+
+_DECISION_LOG_FIELDS: tuple[str, ...] = (
+    "id", "timestamp", "symbol", "decision", "decision_reason",
+    "entry_path", "major_reversal_score", "continuation_score",
+    "micro_reversal_score", "confluence_score", "trend_regime",
+    "ha_color_3m", "ha_color_15m", "ha_streak_3m", "ha_streak_15m",
+    "price", "atr_14", "session", "vwap_3m_side",
+)
+
+
+async def fetch_decision_log_recent(
+    db_path: str,
+    *,
+    limit: int = _RECENT_DECISION_LOG_LIMIT,
+) -> list[dict]:
+    """Read last N rows from `decision_log`, newest first.
+
+    Compact projection (19 of 40 columns) — the dashboard only needs
+    decision + entry_path + 3 scores + light context. Full row inspection
+    goes through the DB browser overlay.
+
+    Returns [] when the table is empty or the DB is missing.
+    """
+    cols = ", ".join(_DECISION_LOG_FIELDS)
+    sql = (
+        f"SELECT {cols} FROM decision_log "
+        f"ORDER BY timestamp DESC, id DESC "
+        f"LIMIT ?"
+    )
+    out: list[dict] = []
+    try:
+        async with ReadOnlyJournal(db_path) as j:
+            conn = j._conn
+            assert conn is not None
+            async with conn.execute(sql, (int(limit),)) as cur:
+                async for row in cur:
+                    out.append({k: _db_cell(row[k]) for k in _DECISION_LOG_FIELDS})
+    except Exception:
+        return []
+    return out
+
+
+def _strategy_label(t: TradeRecord) -> str:
+    """Classify a closed trade by its entry strategy.
+
+    is_vmc_strategy = 1   → "vmc"     (Yol B HA Strategy, post-2026-05-05)
+    is_ha_native    = 1   → "ha"      (Yol A HA-native, 2026-05-04 → 2026-05-05)
+    both NULL/0           → "legacy"  (pre-Yol-A 5-pillar zone-based)
+    """
+    if getattr(t, "is_vmc_strategy", None):
+        return "vmc"
+    if getattr(t, "is_ha_native", None):
+        return "ha"
+    return "legacy"
+
+
+def _build_strategy_breakdown(closed: list[TradeRecord]) -> dict:
+    """Group closed trades by strategy label and emit per-bucket stats:
+    count, wins, losses, breakeven, win_rate (decimal 0..1), net_r, gross_r.
+
+    Always includes vmc/ha/legacy keys, even if empty, so the frontend can
+    render a stable 3-row table.
+    """
+    buckets: dict[str, dict] = {
+        k: {"count": 0, "wins": 0, "losses": 0, "breakeven": 0,
+            "net_r": 0.0, "gross_r_wins": 0.0, "gross_r_losses": 0.0}
+        for k in ("vmc", "ha", "legacy")
+    }
+    for t in closed:
+        b = buckets[_strategy_label(t)]
+        b["count"] += 1
+        r = float(t.pnl_r or 0.0)
+        b["net_r"] += r
+        if r > 0:
+            b["wins"] += 1
+            b["gross_r_wins"] += r
+        elif r < 0:
+            b["losses"] += 1
+            b["gross_r_losses"] += r
+        else:
+            b["breakeven"] += 1
+    out: dict[str, dict] = {}
+    for k, b in buckets.items():
+        decided = b["wins"] + b["losses"]
+        wr = (b["wins"] / decided) if decided > 0 else None
+        out[k] = {
+            "count": b["count"],
+            "wins": b["wins"],
+            "losses": b["losses"],
+            "breakeven": b["breakeven"],
+            "win_rate": wr,
+            "net_r": round(b["net_r"], 4),
+            "gross_r_wins": round(b["gross_r_wins"], 4),
+            "gross_r_losses": round(b["gross_r_losses"], 4),
+        }
+    return out
+
+
 async def build_dashboard_state(
     db_path: str,
     starting_balance: float,
     *,
     clean_since: Optional[datetime] = None,
+    symbols: Optional[list[str]] = None,
     bybit_cfg: Optional[dict] = None,
 ) -> dict:
     """One-shot aggregator: opens RO journal, runs all reads, returns dict.
@@ -265,17 +376,14 @@ async def build_dashboard_state(
     — operator wants to see currently held positions regardless of cutoff.
     `bybit_cfg` enables a live wallet probe; None falls back to journal-only.
     """
-    on_chain_24h_since = datetime.now(tz=timezone.utc) - timedelta(hours=24)
     wallet_task = asyncio.create_task(fetch_wallet(bybit_cfg))
     live_positions_task = asyncio.create_task(fetch_live_positions(bybit_cfg))
+    decision_log_task = asyncio.create_task(fetch_decision_log_recent(db_path))
 
     async with ReadOnlyJournal(db_path) as j:
         closed = await j.list_closed_trades(since=clean_since)
         open_trades = await j.list_open_trades()
         rejected = await j.list_rejected_signals(since=clean_since)
-        whales = await j.list_whale_transfers(since=clean_since)
-        on_chain_rows = await j.list_on_chain_snapshots(since=clean_since)
-        on_chain_24h = await j.list_on_chain_snapshots(since=on_chain_24h_since)
 
         open_payload: list[dict] = []
         for t in open_trades:
@@ -288,6 +396,7 @@ async def build_dashboard_state(
 
     summary_dict = summary(closed, starting_balance)
     eq_points = _equity_points(closed, starting_balance)
+    strategy_breakdown = _build_strategy_breakdown(closed)
 
     closed_recent = [_trade_dump(t) for t in closed[-_RECENT_CLOSED_LIMIT:]]
     closed_recent.reverse()  # newest first for table display
@@ -297,44 +406,29 @@ async def build_dashboard_state(
 
     reject_counts = Counter(r.reject_reason for r in rejected)
 
-    whale_recent = [w.model_dump(mode="json") for w in whales[-_RECENT_WHALE_LIMIT:]]
-    whale_recent.reverse()
-
-    on_chain_latest = on_chain_rows[-1] if on_chain_rows else None
-    if on_chain_latest is not None:
-        on_chain_latest = _normalize_on_chain_row(on_chain_latest)
-
-    on_chain_series = _build_on_chain_series(on_chain_24h)
-    on_chain_candles = _build_exchange_candles_24h(on_chain_24h)
-    on_chain_per_asset = _build_per_venue_per_asset_series_24h(on_chain_24h)
-    on_chain_aggregate_per_asset = _build_aggregate_per_asset_series_24h(on_chain_24h)
     wallet = await wallet_task
     live_positions = await live_positions_task
+    decision_log_recent = await decision_log_task
 
     return _sanitize_floats({
         "generated_at": datetime.now(tz=timezone.utc).isoformat(),
         "starting_balance": starting_balance,
         "clean_since": clean_since.isoformat() if clean_since else None,
+        "symbols": symbols or [],
         "summary": summary_dict,
+        "strategy_breakdown": strategy_breakdown,
         "equity_curve": eq_points,
         "open_positions": open_payload,
         "closed_trades_recent": closed_recent,
         "rejected_recent": rejected_recent,
         "reject_reason_counts": dict(reject_counts.most_common()),
-        "on_chain_latest": on_chain_latest,
-        "on_chain_series_24h": on_chain_series,
-        "on_chain_candles_24h": on_chain_candles,
-        "on_chain_per_venue_per_asset_24h": on_chain_per_asset,
-        "on_chain_aggregate_per_asset_24h": on_chain_aggregate_per_asset,
-        "whale_transfers_recent": whale_recent,
+        "decision_log_recent": decision_log_recent,
         "wallet": wallet,
         "live_positions": live_positions,
         "counts": {
             "closed_total": len(closed),
             "open_total": len(open_trades),
             "rejected_total": len(rejected),
-            "whale_total": len(whales),
-            "on_chain_snapshots_total": len(on_chain_rows),
         },
     })
 
@@ -359,208 +453,6 @@ def _sanitize_floats(obj: Any) -> Any:
     return obj
 
 
-def _build_on_chain_series(rows: list[dict]) -> dict:
-    """Slice the last-24h on_chain_snapshots rows into per-metric arrays
-    suitable for Chart.js. Only keeps non-null values per metric so the
-    line plots don't draw zero-trough gaps when a column is NULL.
-    """
-    series = {
-        "btc_netflow_24h": [],
-        "eth_netflow_24h": [],
-        "stablecoin_pulse_1h": [],
-    }
-    for r in rows:
-        ts = r.get("captured_at")
-        if not ts:
-            continue
-        btc = r.get("cex_btc_netflow_24h_usd")
-        eth = r.get("cex_eth_netflow_24h_usd")
-        stb = r.get("stablecoin_pulse_1h_usd")
-        if btc is not None:
-            series["btc_netflow_24h"].append({"ts": ts, "v": float(btc)})
-        if eth is not None:
-            series["eth_netflow_24h"].append({"ts": ts, "v": float(eth)})
-        if stb is not None:
-            series["stablecoin_pulse_1h"].append({"ts": ts, "v": float(stb)})
-    return series
-
-
-_EXCHANGE_NETFLOW_FIELDS: tuple[tuple[str, str], ...] = (
-    ("coinbase", "cex_coinbase_netflow_24h_usd"),
-    ("binance", "cex_binance_netflow_24h_usd"),
-    ("bybit", "cex_bybit_netflow_24h_usd"),
-    ("bitfinex", "cex_bitfinex_netflow_24h_usd"),
-    ("kraken", "cex_kraken_netflow_24h_usd"),
-    ("okx", "cex_okx_netflow_24h_usd"),
-)
-
-
-def _build_exchange_candles_24h(rows: list[dict]) -> dict:
-    """Bucket on_chain_snapshots into 96 \u00d7 15min OHLC candles per named CEX.
-
-    The underlying value is `cex_<venue>_netflow_24h_usd` \u2014 a *rolling 24h*
-    aggregate sampled every \u22485 min by the writer. So each candle's OHLC
-    represents how that rolling sum drifted within the 15-min slot:
-      open  = first sample's value, close = last sample's value,
-      high  = max sample, low = min sample.
-    Empty slots emit `null` so the frontend can render a gap while keeping
-    a stable 24h X-axis (96 evenly-spaced slots, ending at the current
-    UTC quarter-hour). Color (frontend): green if close > open
-    (rolling-sum trending up = inflow accelerating), red otherwise.
-    """
-    end_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
-    end_ms = (end_ms // (15 * 60 * 1000)) * (15 * 60 * 1000)
-    slot_ms = 15 * 60 * 1000
-
-    parsed: list[tuple[int, dict]] = []
-    for r in rows or []:
-        ts = r.get("captured_at")
-        if not ts:
-            continue
-        try:
-            t = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-            if t.tzinfo is None:
-                t = t.replace(tzinfo=timezone.utc)
-            parsed.append((int(t.timestamp() * 1000), r))
-        except (TypeError, ValueError):
-            continue
-    parsed.sort(key=lambda p: p[0])
-
-    out: dict[str, list[dict]] = {label: [] for label, _ in _EXCHANGE_NETFLOW_FIELDS}
-    for i in range(96):
-        start = end_ms - (95 - i) * slot_ms
-        end = start + slot_ms
-        bucket = [(ms, row) for ms, row in parsed if start <= ms < end]
-        ts_iso = datetime.fromtimestamp(start / 1000, tz=timezone.utc).isoformat()
-        for label, field in _EXCHANGE_NETFLOW_FIELDS:
-            vals = [float(row[field]) for _, row in bucket
-                    if row.get(field) is not None]
-            if not vals:
-                out[label].append({"ts": ts_iso, "o": None, "h": None,
-                                    "l": None, "c": None})
-                continue
-            out[label].append({
-                "ts": ts_iso,
-                "o": vals[0],
-                "h": max(vals),
-                "l": min(vals),
-                "c": vals[-1],
-            })
-    return out
-
-
-_JSON_DICT_KEYS = (
-    "token_volume_1h_net_usd_json",
-    "cex_per_venue_btc_netflow_24h_usd_json",
-    "cex_per_venue_eth_netflow_24h_usd_json",
-    "cex_per_venue_stables_netflow_24h_usd_json",
-)
-
-
-_PER_ASSET_FIELD_MAP: tuple[tuple[str, str], ...] = (
-    ("btc",     "cex_per_venue_btc_netflow_24h_usd_json"),
-    ("eth",     "cex_per_venue_eth_netflow_24h_usd_json"),
-    ("stables", "cex_per_venue_stables_netflow_24h_usd_json"),
-)
-
-
-def _build_per_venue_per_asset_series_24h(rows: list[dict]) -> dict:
-    """Slice on_chain_snapshots rows into per-venue × per-asset 24h series.
-
-    Returns ``{venue: {asset: [{ts, v}, ...]}}`` where venue ∈
-    coinbase/binance/bybit/bitfinex/kraken/okx and asset ∈ btc/eth/stables.
-    Source columns are JSON-encoded dicts ``{venue: signed_usd_float}``
-    written by the runner's background fetcher; this function unrolls them
-    into per-venue arrays so each card can render 3 independent lines.
-
-    Pre-feature rows (where the JSON columns are NULL) silently contribute
-    nothing — the array stays empty for that timestamp + venue + asset.
-    """
-    import json as _json
-    out: dict[str, dict[str, list[dict]]] = {
-        venue: {"btc": [], "eth": [], "stables": []}
-        for venue, _ in _EXCHANGE_NETFLOW_FIELDS
-    }
-    for r in rows or []:
-        ts = r.get("captured_at")
-        if not ts:
-            continue
-        for asset_key, field in _PER_ASSET_FIELD_MAP:
-            raw = r.get(field)
-            if not isinstance(raw, str) or not raw:
-                continue
-            try:
-                d = _json.loads(raw)
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(d, dict):
-                continue
-            for venue, _ in _EXCHANGE_NETFLOW_FIELDS:
-                v = d.get(venue)
-                if v is None:
-                    continue
-                try:
-                    out[venue][asset_key].append({"ts": ts, "v": float(v)})
-                except (TypeError, ValueError):
-                    continue
-    return out
-
-
-def _build_aggregate_per_asset_series_24h(rows: list[dict]) -> dict:
-    """Sum per-venue × per-asset values across all 6 venues per timestamp.
-
-    Frontend renders this as the "Total netflow per asset" panel below the
-    6-card grid. A timestamp contributes only if at least one venue has
-    a value for that asset (so the line stays empty during pre-feature
-    rows where the JSON columns are NULL).
-    """
-    import json as _json
-    out: dict[str, list[dict]] = {"btc": [], "eth": [], "stables": []}
-    for r in rows or []:
-        ts = r.get("captured_at")
-        if not ts:
-            continue
-        for asset_key, field in _PER_ASSET_FIELD_MAP:
-            raw = r.get(field)
-            if not isinstance(raw, str) or not raw:
-                continue
-            try:
-                d = _json.loads(raw)
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(d, dict):
-                continue
-            total: Optional[float] = None
-            for venue, _ in _EXCHANGE_NETFLOW_FIELDS:
-                v = d.get(venue)
-                if v is None:
-                    continue
-                try:
-                    total = (total or 0.0) + float(v)
-                except (TypeError, ValueError):
-                    continue
-            if total is not None:
-                out[asset_key].append({"ts": ts, "v": total})
-    return out
-
-
-def _normalize_on_chain_row(row: dict) -> dict:
-    """Inline-parse the JSON-string columns in an on_chain_snapshots row so
-    the frontend doesn't have to do nested JSON.parse. Other columns pass
-    through unchanged.
-    """
-    import json as _json
-    out = dict(row)
-    for k in _JSON_DICT_KEYS:
-        v = out.get(k)
-        if isinstance(v, str) and v:
-            try:
-                out[k] = _json.loads(v)
-            except (TypeError, ValueError):
-                pass
-    return out
-
-
 # ── Generic DB browser (read-only, whitelist-only) ───────────────────────────
 #
 # Powers the "Database" overlay in the dashboard. Each entry maps a SQL
@@ -570,9 +462,12 @@ def _normalize_on_chain_row(row: dict) -> dict:
 _DB_BROWSER_TABLES: dict[str, tuple[str, bool]] = {
     "trades":             ("entry_timestamp",  True),
     "rejected_signals":   ("signal_timestamp", True),
+    "position_snapshots": ("captured_at",      True),
+    "decision_log":       ("timestamp",        True),
+    # Legacy archive tables — kept for inspection of pre-purge data, no live
+    # writers as of 2026-05-05.
     "on_chain_snapshots": ("captured_at",      True),
     "whale_transfers":    ("captured_at",      True),
-    "position_snapshots": ("captured_at",      True),
 }
 
 _DB_BROWSER_DEFAULT_LIMIT = 200
