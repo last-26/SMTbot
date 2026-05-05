@@ -489,9 +489,29 @@ def _prev_main_streak_from_history(
 def _marketable_entry_price(
     direction: Direction, best_bid: float, best_ask: float, offset_pct: float,
 ) -> float:
+    """Maker-mirror entry price for HA-native limit (Yol A v5, 2026-05-05).
+
+    Operator doctrine: scalp entries pay maker fees; never cross the spread
+    on entry. The previous "marketable" formula (BUY at ask + offset / SELL
+    at bid - offset) put orders on the wrong side of the book, causing
+    Bybit's match engine to async-cancel post-only orders ~200-500ms after
+    placement (`reason=external` cancels in 04:33 / 04:34 live cycle).
+
+    New formula rests passively inside the spread:
+      - LONG  (BUY):  best_bid - offset → BUY below bid (waits for dip)
+      - SHORT (SELL): best_ask + offset → SELL above ask (waits for pop)
+
+    Trade-off: no immediate fill guarantee — if price runs away within the
+    1-cycle timeout (3m), the limit cancels and dispatcher re-evaluates next
+    cycle. Acceptable for scalp doctrine; maker fee discount > miss cost.
+
+    Note: function name retained for back-compat; `marketable_offset_pct`
+    config knob stays the same. Phase 2+ may rename to `_passive_entry_price`
+    + `passive_offset_pct` once the dynamic-exit migration ships.
+    """
     if direction == Direction.BULLISH:
-        return best_ask * (1.0 + offset_pct)
-    return best_bid * (1.0 - offset_pct)
+        return best_bid * (1.0 - offset_pct)
+    return best_ask * (1.0 + offset_pct)
 
 
 def _structural_sl_price(
