@@ -503,7 +503,9 @@ class PendingSetupMeta:
     limit placement and a fill minutes later.
     """
     plan: TradePlan
-    zone: ZoneSetup
+    # 2026-05-05 v3 — Yol A: HA-native plans skip zone search; meta.zone
+    # is None for HA-native pendings, populated for legacy zone-based.
+    zone: Optional[ZoneSetup]
     order_id: str
     signal_state: MarketState
     placed_at: datetime
@@ -1255,6 +1257,15 @@ class BotRunner:
             except Exception:
                 logger.exception("symbol_cycle_failed symbol={}", symbol)
                 continue
+
+        # 2026-05-05 v3 — Yol A: final pending drain after the symbol loop.
+        # Last symbol's freshly-placed limit can fill in the same tick
+        # (production: rare but possible; tests: synthetic FILLED queued
+        # by FakeMonitor). No-op when there are no pending events.
+        try:
+            await self._process_pending()
+        except Exception:
+            logger.exception("final_pending_drain_failed")
 
     def _check_reentry_gate(
         self,
@@ -3807,138 +3818,34 @@ class BotRunner:
             logger.info("blocked symbol={} reason={}", symbol, reason)
             return
 
-        # 5. Place order. Phase 7.C4: zone-entry path places a limit order
-        # at a structural zone and registers a pending; fill processing
-        # runs in `_process_pending` on a later cycle. Legacy market path
-        # remains the default (fallback when zone-entry disabled or no
-        # setup is available and `zone_require_setup=False`).
+        # 5. Yol A: HA-native plan → marketable limit at plan.entry_price.
+        # Planner already computed entry_price as last_close ± marketable_offset
+        # (default 5 bps); no zone-search needed. 1-cycle timeout, fill
+        # processing in `_process_pending` next cycle.
         pos_side = _direction_to_pos_side(plan.direction)
-        if cfg.execution.zone_entry_enabled:
-            placed = await self._try_place_zone_entry(
-                symbol=symbol,
-                pos_side=pos_side,
-                plan=plan,
-                state=state,
-                candles=candles,
-                trend_regime=trend_regime,
+        placed = await self._place_ha_native_limit(
+            symbol=symbol, pos_side=pos_side, plan=plan, state=state,
+            adx_3m_result=trend_regime_result,
+            adx_15m_result=htf_regime_result,
+        )
+        if placed:
+            return  # wait for fill event
+
+        # Limit placement failed (router exception). Record reject + return;
+        # no fallback to market on Yol A.
+        try:
+            conf_stub = ConfluenceScore(
+                direction=plan.direction, score=0.0, factors=[],
+            )
+            await self._record_reject(
+                symbol=symbol, reject_reason="ha_native_limit_place_failed",
+                state=state, conf=conf_stub, candles=candles,
                 adx_3m_result=trend_regime_result,
                 adx_15m_result=htf_regime_result,
             )
-            if placed:
-                return  # wait for fill event
-            if cfg.execution.zone_require_setup:
-                logger.info(
-                    "symbol_decision symbol={} NO_TRADE reason=no_setup_zone "
-                    "direction={}", symbol, plan.direction.value,
-                )
-                # 2026-05-05 v3 — Yol A: legacy `calculate_confluence` silindi.
-                # Plan zaten elimizde (HA-native plan), direction'u oradan alıp
-                # minimal stub conf ile reject row yazılır.
-                try:
-                    conf_stub = ConfluenceScore(
-                        direction=plan.direction, score=0.0, factors=[],
-                    )
-                    await self._record_reject(
-                        symbol=symbol, reject_reason="no_setup_zone",
-                        state=state, conf=conf_stub, candles=candles,
-                        adx_3m_result=trend_regime_result,
-                        adx_15m_result=htf_regime_result,
-                    )
-                except Exception:
-                    logger.debug("no_setup_zone_reject_log_failed symbol={}", symbol)
-                return
-            # else: fall through to legacy market path
-
-        try:
-            report = await asyncio.to_thread(self.ctx.router.place, plan, symbol)
-        except AlgoOrderError as exc:
-            logger.error("algo_failure_position_auto_closed symbol={}: {}", symbol, exc)
-            return
-        except (LeverageSetError, OrderRejected, InsufficientMargin, ValueError) as exc:
-            code = getattr(exc, "code", None)
-            payload = getattr(exc, "payload", None)
-            logger.error("order_rejected symbol={}: {} | code={} | payload={}",
-                         symbol, exc, code, payload)
-            return
         except Exception:
-            logger.exception("order_unexpected_error symbol={}", symbol)
-            return
-
-        # 6. In-memory FIRST — can't meaningfully fail; keeps us honest even
-        # if the journal write below errors out.
-        algo_ids = [a.algo_id for a in report.algos if a.algo_id]
-        runner_size = _runner_size(plan.num_contracts, cfg)
-        regime_str = (
-            trend_regime.value
-            if trend_regime and trend_regime != TrendRegime.UNKNOWN
-            else None
-        )
-        # 2026-05-04 — Yol A: HA-native primary mode flag. Plans built by
-        # `_build_ha_native_trade_plan` carry a `ha_native:` reason prefix;
-        # downstream HA-flip exit gate keys off this flag to fire only
-        # for HA-native positions (legacy 5-pillar entries keep their
-        # existing exit suite).
-        is_ha_native = bool(plan.reason and plan.reason.startswith("ha_native:"))
-        self.ctx.monitor.register_open(
-            symbol, pos_side, float(plan.num_contracts), plan.entry_price,
-            algo_ids=algo_ids, tp2_price=plan.tp_price,
-            sl_price=plan.sl_price, runner_size=runner_size,
-            plan_sl_price=plan.sl_price,
-            regime_at_entry=regime_str,
-            opened_at=_utc_now(),
-            is_ha_native=is_ha_native,
-        )
-        self.ctx.risk_mgr.register_trade_opened()
-
-        # 7. Persist to journal. Failure here leaves an orphan we'll see at
-        # next startup via _reconcile_orphans(); do not undo the live position.
-        try:
-            rec = await self.ctx.journal.record_open(
-                plan, report,
-                symbol=symbol,
-                signal_timestamp=_utc_now(),
-                entry_timeframe=cfg.trading.entry_timeframe,
-                htf_timeframe=cfg.trading.htf_timeframe,
-                htf_bias=_bias_str(state),
-                session=_session_str(state),
-                market_structure=_structure_str(state),
-                trend_regime_at_entry=(
-                    trend_regime.value
-                    if trend_regime and trend_regime != TrendRegime.UNKNOWN
-                    else None
-                ),
-                # 2026-05-02 — Phase A.9 ADX numeric capture (entry + HTF).
-                **_adx_triad_kwargs("3m", trend_regime_result),
-                **_adx_triad_kwargs("15m", htf_regime_result),
-                on_chain_context=self._on_chain_context_dict(),
-                confluence_pillar_scores=dict(plan.confluence_pillar_scores or {}),
-                oscillator_raw_values=self._build_oscillator_raw_values(
-                    symbol, state,
-                ),
-                **_derive_enrichment(
-                    state,
-                    candles=candles,
-                    entry_tf_minutes=_timeframe_to_minutes(cfg.trading.entry_timeframe),
-                ),
-                # 2026-05-04 — HA-native (Yol A) journal fields. Plan reason
-                # carries the `ha_native:` prefix when the HA-native primary
-                # planner produced the plan; HA snapshot fields read off
-                # state.signal_table at entry-time. Pass 3 GBT segments by
-                # is_ha_native and consumes HA continuous features directly.
-                # 2026-05-05 — Faz 6: ha_decision parametresi de geçilir,
-                # 3-tip dispatcher field'ları (entry_path + skor'lar +
-                # mss_break + target_rr + risk_mult) NOT NULL DB
-                # constraint sayesinde dolu yazılır.
-                **self._ha_native_record_kwargs(plan, state, ha_decision),
-            )
-            self.ctx.open_trade_ids[(symbol, pos_side)] = rec.trade_id
-            self.ctx.open_trade_opened_at[(symbol, pos_side)] = _utc_now()
-            logger.info("opened {} {} {}c @ {} trade_id={}",
-                        plan.direction.value, symbol, plan.num_contracts,
-                        plan.entry_price, rec.trade_id)
-        except Exception:
-            logger.exception("journal_write_failed_live_position_orphaned symbol={}",
-                             symbol)
+            logger.debug("ha_native_limit_fail_log_failed symbol={}", symbol)
+        return
 
     # ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -4680,6 +4587,72 @@ class BotRunner:
 
     # ── Pending-entry lifecycle (Phase 7.C4) ────────────────────────────────
 
+    async def _place_ha_native_limit(
+        self,
+        *,
+        symbol: str,
+        pos_side: str,
+        plan: TradePlan,
+        state: MarketState,
+        adx_3m_result: Optional[TrendRegimeResult] = None,
+        adx_15m_result: Optional[TrendRegimeResult] = None,
+    ) -> bool:
+        """Yol A: marketable limit at plan.entry_price (already last_close ±
+        marketable_offset_pct from the HA-native dispatcher). 1-cycle
+        timeout; fill is processed in `_process_pending` next cycle.
+
+        Returns True when the limit was registered (caller awaits fill),
+        False when the router rejected the order (caller logs reject).
+        """
+        cfg = self.ctx.config
+        try:
+            result = await asyncio.to_thread(
+                self.ctx.router.place_limit_entry,
+                plan, plan.entry_price, symbol,
+            )
+        except (LeverageSetError, OrderRejected, InsufficientMargin, ValueError) as exc:
+            logger.error(
+                "ha_native_limit_rejected symbol={}: {} | code={} | payload={}",
+                symbol, exc,
+                getattr(exc, "code", None), getattr(exc, "payload", None),
+            )
+            return False
+        except Exception:
+            logger.exception("ha_native_limit_unexpected_error symbol={}", symbol)
+            return False
+
+        # 1-cycle timeout = entry-TF bar duration (planner's
+        # `entry_cycle_timeout=1`). PositionMonitor cancels at this boundary.
+        tf_sec = _tf_seconds(cfg.trading.entry_timeframe)
+        max_wait_s = float(tf_sec)
+        placed_at = _utc_now()
+
+        self.ctx.monitor.register_pending(
+            inst_id=symbol, pos_side=pos_side, order_id=result.order_id,
+            num_contracts=float(plan.num_contracts),
+            entry_px=plan.entry_price,
+            max_wait_s=max_wait_s, placed_at=placed_at,
+        )
+        self.ctx.pending_setups[(symbol, pos_side)] = PendingSetupMeta(
+            plan=plan,
+            zone=None,  # HA-native: no zone source (planner-direct limit)
+            order_id=result.order_id,
+            signal_state=state,
+            placed_at=placed_at,
+            oscillator_raw_values_at_placement=(
+                self._build_oscillator_raw_values(symbol, state)
+            ),
+            adx_3m_result_at_placement=adx_3m_result,
+            adx_15m_result_at_placement=adx_15m_result,
+        )
+        logger.info(
+            "ha_native_limit_placed symbol={} side={} order_id={} "
+            "entry={:.4f} sl={:.4f} tp={:.4f} contracts={} max_wait_s={:.0f}",
+            symbol, pos_side, result.order_id, plan.entry_price,
+            plan.sl_price, plan.tp_price, plan.num_contracts, max_wait_s,
+        )
+        return True
+
     async def _try_place_zone_entry(
         self,
         *,
@@ -5047,21 +5020,27 @@ class BotRunner:
                 oscillator_raw_values=dict(
                     meta.oscillator_raw_values_at_placement or {}
                 ),
-                # 2026-04-27 (F3) — zone metadata forwarding. Pre-fix the
-                # 9 Bybit-era trades all had setup_zone_source / wait_bars
-                # / fill_latency NULL despite being zone-based entries.
-                # `zone_fill_latency_bars` is computed from wall-clock time
-                # between placement and fill, divided by entry_tf_minutes.
-                # Bounded above by zone.max_wait_bars (timeout cancels at
-                # that boundary so the limit never sits longer).
-                setup_zone_source=str(meta.zone.zone_source),
-                zone_wait_bars=int(meta.zone.max_wait_bars),
+                # 2026-05-05 v3 — Yol A: HA-native plans have meta.zone=None
+                # (no zone-search). Source labeled "ha_native"; wait bars
+                # default 1 (planner's entry_cycle_timeout). Legacy zone
+                # branches keep their zone source label.
+                setup_zone_source=(
+                    str(meta.zone.zone_source) if meta.zone is not None
+                    else "ha_native"
+                ),
+                zone_wait_bars=(
+                    int(meta.zone.max_wait_bars) if meta.zone is not None
+                    else 1
+                ),
                 zone_fill_latency_bars=_zone_fill_latency_bars(
                     placed_at=meta.placed_at,
                     fill_at=_utc_now(),
                     entry_tf_minutes=_timeframe_to_minutes(
                         cfg.trading.entry_timeframe),
-                    max_wait_bars=int(meta.zone.max_wait_bars),
+                    max_wait_bars=(
+                        int(meta.zone.max_wait_bars) if meta.zone is not None
+                        else 1
+                    ),
                 ),
                 **_derive_enrichment(state),
                 # 2026-05-04 — HA-native (Yol A) journal fields. State here
@@ -5075,7 +5054,11 @@ class BotRunner:
                 "pending_filled_promoted inst={} side={} contracts={} "
                 "fill_px={:.4f} zone={} trade_id={}",
                 ev.inst_id, ev.pos_side, plan.num_contracts, fill_px,
-                meta.zone.zone_source, rec.trade_id,
+                (
+                    meta.zone.zone_source if meta.zone is not None
+                    else "ha_native"
+                ),
+                rec.trade_id,
             )
         except Exception:
             logger.exception(
