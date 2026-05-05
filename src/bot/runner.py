@@ -2030,7 +2030,18 @@ class BotRunner:
             return False
 
         tracked = self.ctx.monitor.get_tracked(symbol, pos_side)
-        if tracked is None or not getattr(tracked, "is_ha_native", False):
+        if tracked is None:
+            return False
+        # 2026-05-05 Phase 3a v6 — Yol A v5 doctrine ile çakışma fix.
+        # counter_reversal_exit gate'i HA-native pozisyonlarda Phase 3a
+        # 3-layer doctrine ile çelişiyor: "ters yönde Major Reversal
+        # score ≥ 5 → kapat" davranışı pozisyonu erken öldürüyor (canlı
+        # gözlem 07:32 DOGE -1.48, 08:15 ETH +2.06 close — ikisi de
+        # Layer 3 confirm beklemeden kapandı). HA-native pozisyonlar
+        # için exit yolu ÖZEL olarak `_maybe_close_on_ha_flip` Layer 1/2/3
+        # doctrine'ı; counter_reversal sadece legacy 5-pillar
+        # (`is_ha_native=False`) pozisyonlar için aktif kalır.
+        if getattr(tracked, "is_ha_native", False):
             return False
 
         # Yeni evaluate_entry çağrısı — context inşa et
