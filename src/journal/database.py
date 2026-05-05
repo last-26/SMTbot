@@ -225,8 +225,10 @@ CREATE INDEX IF NOT EXISTS idx_trades_exit_ts      ON trades(exit_timestamp);
 -- 2026-05-04 — index supports per-strategy WR / R aggregation queries
 -- (factor_audit.py + dashboard) filtering on is_ha_native.
 CREATE INDEX IF NOT EXISTS idx_trades_is_ha_native ON trades(is_ha_native);
--- 2026-05-05 — Yol B index for is_vmc_strategy segmentation.
-CREATE INDEX IF NOT EXISTS idx_trades_is_vmc_strategy ON trades(is_vmc_strategy);
+-- 2026-05-05 — Yol B is_vmc_strategy INDEX sadece _MIGRATIONS'ta;
+-- _SCHEMA içinde olursa eski DB'de kolon eklenmeden önce INDEX yaratımı
+-- "no such column: is_vmc_strategy" hatası verir. INDEX migration ALTER
+-- TABLE'dan sonra çalışır, sıralama doğru olur.
 -- 2026-05-05 — Faz 5: Pass 3 GBT segments by entry_path
 -- (major_reversal/continuation/micro_reversal). Index supports
 -- per-tip WR + R distribution queries.
