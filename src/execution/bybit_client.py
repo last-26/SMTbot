@@ -193,6 +193,16 @@ _INTERNAL_TO_BYBIT_SYMBOL = {
     "BNB-USDT-SWAP": "BNBUSDT",
     "XRP-USDT-SWAP": "XRPUSDT",
     "ADA-USDT-SWAP": "ADAUSDT",
+    # 2026-05-05 — Yol B (HA Strategy) pair expansion. Operatör spec:
+    # 8 yeni altcoin. CLUSDT bilinmeyen Bybit symbol — Phase 11 startup'ta
+    # `get_instrument_spec` ile doğrulanır; yoksa runtime'da skip + log.
+    "ZEC-USDT-SWAP":      "ZECUSDT",
+    "HYPE-USDT-SWAP":     "HYPEUSDT",
+    "1000PEPE-USDT-SWAP": "1000PEPEUSDT",
+    "ONDO-USDT-SWAP":     "ONDOUSDT",
+    "XAUT-USDT-SWAP":     "XAUTUSDT",
+    "CLUSDT-USDT-SWAP":   "CLUSDTUSDT",
+    "LINK-USDT-SWAP":     "LINKUSDT",
 }
 
 # Per-symbol contract-value-per-contract (carried over from the
@@ -209,6 +219,17 @@ _INTERNAL_CT_VAL = {
     "BNB-USDT-SWAP": 0.01,
     "XRP-USDT-SWAP": 100.0,
     "ADA-USDT-SWAP": 100.0,
+    # 2026-05-05 — Yol B pair expansion. ct_val = number of base units per
+    # internal "1 contract". Bybit qtyStep her zaman bu değeri böler.
+    # Tahmini değerler — Phase 10 startup'ta `get_instrument_spec` ile
+    # doğrulanır; mismatch varsa exception (operator log'dan görür).
+    "ZEC-USDT-SWAP":      0.1,    # ZEC ~$30, qtyStep 0.1
+    "HYPE-USDT-SWAP":     1.0,    # HYPE ~$30, qtyStep 0.01-1
+    "1000PEPE-USDT-SWAP": 1000.0, # 1000PEPE scaled (1k token), qtyStep 1000+
+    "ONDO-USDT-SWAP":     10.0,   # ONDO ~$1, qtyStep 1-10
+    "XAUT-USDT-SWAP":     0.001,  # XAUT (Tether Gold) ~$3000, qtyStep 0.001
+    "CLUSDT-USDT-SWAP":   100.0,  # bilinmeyen, varsayılan altcoin (Phase 10 doğrula)
+    "LINK-USDT-SWAP":     0.1,    # LINK ~$15, qtyStep 0.1
 }
 
 
