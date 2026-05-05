@@ -56,18 +56,25 @@ class HANativeConfig:
     # ── Mandatory gate parametreleri (her tip için ortak) ─────────────────
     mss_density_window: int = 6
     mss_density_max: int = 2
-    min_streak_3m: int = 2                    # whipsaw guard (yeni yönde)
+    # 2026-05-05 Phase 5: 2 → 1. Whipsaw guard'ı gevşettik — ilk yön değişimi
+    # barında dispatcher fire edebilir. 16 dk live'da Major skor 9.5 + Cont
+    # skor 8.5+ ama her cycle `streak_3m_new_direction ≥ 2` mandatory'sinde
+    # bloklanıyordu. min_body_pct_3m + 1m_streak_new alone (Micro) hâlâ
+    # quality filter; soft thresholds (4.0/4.5) gerçek kalite kapısı.
+    min_streak_3m: int = 1                    # whipsaw guard (yeni yönde)
     min_body_pct_3m: float = 30.0             # doji-skip
     min_delta_3bar: float = 0.5               # MFI/RSI delta floor
     confluence_passive_threshold: float = 5.0
 
     # ── Tip 1 (Major Reversal) parametreleri ──────────────────────────────
-    # Önceki ters yönde minimum streak — operatör 2026-05-05 v2: 3→2.
-    # İlk live cycle gözleminde sürekli `prev_streak_min` mandatory fail
-    # ediyordu (bot uzun trend ortasında entry üretemiyordu, dönüş için
-    # 3+ önceki ters bar bulamıyordu); 2 bar = 6 dk 3m TF, daha sık entry
-    # candidate sağlar. Soft threshold 4.0 hâlâ kalite filtresi olarak
-    # devreye giriyor.
+    # 2026-05-05 Phase 5: `prev_streak_min` MANDATORY → SOFT factor.
+    # Operatör doctrine "trend devam ettikçe pozisyon tutulmalı, reversal
+    # için önceki tam dönüş şart değil". Live'da 16 dk Major skor 9.5
+    # gözlemlendi ama prev_streak_min mandatory'sinde sürekli bloklandı.
+    # Gate hâlâ hesaplanıyor (gate_results dict'inde görünür) ama bu sefer
+    # +1.0 soft factor — geçerse +1.0, geçmezse +0.0 (penalti yok).
+    # `major_reversal_prev_streak_min` knob'u soft kontribüsyon eşiği
+    # olarak kalır (2 = "≥2 prev opposite bar" → +1.0 bonus).
     major_reversal_prev_streak_min: int = 2
     major_reversal_threshold: float = 4.0
     major_reversal_target_rr: float = 1.5
@@ -589,8 +596,11 @@ def _score_major_reversal(
     # de soft skor 0 yerine gerçek değer görülür). Mandatory fail flag'i
     # tutulur ama erken return YOK — alttaki TAKE check'inde mandatory'ler
     # hâlâ blocking. Yani take logic değişmez, sadece skor zenginleşir.
+    # 2026-05-05 Phase 5 — `prev_streak_min` mandatory'den çıkarıldı (soft
+    # factor olarak alttaki score_value akışında +1.0 eklenir). Gate hâlâ
+    # gate_results dict'inde görünür, ama TAKE blocker değil.
     mandatory_keys = (
-        "mss_density", "streak_3m_new_direction", "prev_streak_min",
+        "mss_density", "streak_3m_new_direction",
         "no_duplicate", "body_size",
     )
     failed_mandatory_key: Optional[str] = None
@@ -614,6 +624,12 @@ def _score_major_reversal(
         gates["15m_aligned_old"] = _gate_15m_alignment(ctx.ha_state, prev_dir)
         if gates["15m_aligned_old"]:
             score_value += 1.0
+
+    # 2026-05-05 Phase 5 — prev_streak_min soft factor: +1.0 if yes,
+    # 0.0 otherwise (no penalty). Mandatory'den çıkarıldı, score'a
+    # taşındı. Soft threshold (4.0) hâlâ kalite filtresi.
+    if gates["prev_streak_min"]:
+        score_value += 1.0
 
     gates["mss_direction_aligned"] = _gate_mss_direction_alignment(
         ctx.last_mss_direction, direction,
@@ -818,8 +834,11 @@ def _score_continuation(
     target_color = "GREEN" if direction == Direction.BULLISH else "RED"
     gates["dominant_color_main"] = (dominant == target_color)
 
+    # 2026-05-05 Phase 5 — counter_streak=0 da kabul (hot continuation).
+    # Operatör doctrine "trend devam ediyorsa pullback şart değil".
+    # 3+ counter bar hâlâ Major Reversal candidate olur (reject buradan).
     gates["counter_streak_within_limit"] = (
-        1 <= counter_streak <= config.continuation_max_counter_streak
+        0 <= counter_streak <= config.continuation_max_counter_streak
     )
 
     new_streak = ctx.ha_state.latest.ha_streak_3m
@@ -1029,8 +1048,12 @@ def _score_micro_reversal(
     # 2026-05-05 — Mandatory gate sonuçları (skor görünümü için her zaman
     # değerlendirilir). Erken return YOK — soft skor hesabı sonrası
     # mandatory guard ile TAKE blocked.
+    # 2026-05-05 Phase 5: 2 → 1. İlk 1m ters bar'da Micro Reversal fire
+    # edebilir. Pre-Phase-5 "2+ ardışık" şart canlı'da ETH/BTC/DOGE'da
+    # sürekli 1m_streak_new mandatory fail oluşturuyordu — operatör
+    # "ufak ters MSS'de yakala" doctrine'ı için gevşetildi.
     gates["1m_streak_new"] = _gate_1m_streak_new_direction(
-        ctx.ha_state, direction, 2,
+        ctx.ha_state, direction, 1,
     )
     gates["1m_mss_direction"] = _gate_mss_direction_alignment(
         ctx.last_mss_direction, direction,
