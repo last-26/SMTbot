@@ -184,6 +184,25 @@ CREATE TABLE IF NOT EXISTS trades (
     ema200_3m_at_entry       REAL,
     volume_3m_ratio_at_entry REAL,
 
+    -- 2026-05-05 — Yol B (HA Strategy) journal fields. Pass 3 GBT segments
+    -- accuracy + R distribution by entry strategy via `is_vmc_strategy`
+    -- boolean (NULL on pre-Yol-B rows). 5m HA snapshot at entry, oscillator
+    -- core (WT2/MFI/wt_vwap_fast), 5m volume ratio. Yol A is_ha_native ile
+    -- mutex değildir (theoretically her ikisi True olabilir; pratikte runner
+    -- planner çıktısına göre tek yön set eder).
+    is_vmc_strategy            INTEGER,
+    ha_color_5m_at_entry       TEXT,
+    ha_streak_5m_at_entry      INTEGER,
+    ha_body_pct_5m_at_entry    REAL,
+    ema200_5m_at_entry         REAL,
+    volume_5m_ratio_at_entry   REAL,
+    vwap_5m_at_entry           REAL,
+    wt1_at_entry               REAL,
+    wt2_at_entry               REAL,
+    wt_vwap_fast_at_entry      REAL,
+    ha_mfi_5m_at_entry         REAL,
+    ha_rsi_5m_at_entry         REAL,
+
     -- 2026-05-05 — Yol A Faz 5/8: 3 entry tipi dispatcher journal fields.
     -- Operatör 2026-05-05 düzeltme: NOT NULL DEFAULT yaklaşımı yanlıştı —
     -- 0.0 (gerçek mandatory-fail score) ile NULL (hesaplanmadı) karışıyor.
@@ -205,6 +224,8 @@ CREATE INDEX IF NOT EXISTS idx_trades_exit_ts      ON trades(exit_timestamp);
 -- 2026-05-04 — index supports per-strategy WR / R aggregation queries
 -- (factor_audit.py + dashboard) filtering on is_ha_native.
 CREATE INDEX IF NOT EXISTS idx_trades_is_ha_native ON trades(is_ha_native);
+-- 2026-05-05 — Yol B index for is_vmc_strategy segmentation.
+CREATE INDEX IF NOT EXISTS idx_trades_is_vmc_strategy ON trades(is_vmc_strategy);
 -- 2026-05-05 — Faz 5: Pass 3 GBT segments by entry_path
 -- (major_reversal/continuation/micro_reversal). Index supports
 -- per-tip WR + R distribution queries.
@@ -589,6 +610,21 @@ _COLUMNS = [
     "mss_break_detected",
     "target_rr_ratio_at_entry",
     "risk_multiplier_at_entry",
+    # 2026-05-05 — Yol B (HA Strategy) journal fields. is_vmc_strategy +
+    # 5m HA snapshot + WT2/MFI/wt_vwap_fast at entry. Order MUST match
+    # the schema CREATE TABLE block + _record_to_row tuple.
+    "is_vmc_strategy",
+    "ha_color_5m_at_entry",
+    "ha_streak_5m_at_entry",
+    "ha_body_pct_5m_at_entry",
+    "ema200_5m_at_entry",
+    "volume_5m_ratio_at_entry",
+    "vwap_5m_at_entry",
+    "wt1_at_entry",
+    "wt2_at_entry",
+    "wt_vwap_fast_at_entry",
+    "ha_mfi_5m_at_entry",
+    "ha_rsi_5m_at_entry",
 ]
 
 
@@ -947,6 +983,22 @@ _MIGRATIONS = [
     "ALTER TABLE trades ADD COLUMN ema200_3m_at_entry REAL",
     "ALTER TABLE trades ADD COLUMN volume_3m_ratio_at_entry REAL",
     "CREATE INDEX IF NOT EXISTS idx_trades_is_ha_native ON trades(is_ha_native)",
+    # 2026-05-05 — Yol B (HA Strategy) journal fields. is_vmc_strategy +
+    # 5m HA snapshot + WT2/MFI/wt_vwap_fast at entry. Idempotent ALTER —
+    # mevcut DB'lere ek edilir, eski rows NULL kalır.
+    "ALTER TABLE trades ADD COLUMN is_vmc_strategy INTEGER",
+    "ALTER TABLE trades ADD COLUMN ha_color_5m_at_entry TEXT",
+    "ALTER TABLE trades ADD COLUMN ha_streak_5m_at_entry INTEGER",
+    "ALTER TABLE trades ADD COLUMN ha_body_pct_5m_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN ema200_5m_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN volume_5m_ratio_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN vwap_5m_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN wt1_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN wt2_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN wt_vwap_fast_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN ha_mfi_5m_at_entry REAL",
+    "ALTER TABLE trades ADD COLUMN ha_rsi_5m_at_entry REAL",
+    "CREATE INDEX IF NOT EXISTS idx_trades_is_vmc_strategy ON trades(is_vmc_strategy)",
     # 2026-05-05 — Yol A Faz 5/8: 3 entry tipi dispatcher fields. Operatör
     # 2026-05-05 düzeltme: NOT NULL DEFAULT yanlış (0.0 valid değer ile
     # NULL "veri yok" karışıyor). Şimdi nullable. Yeni satırlar runner'da
@@ -1047,6 +1099,19 @@ def _record_to_row(rec: TradeRecord) -> tuple:
          else int(rec.mss_break_detected)),
         rec.target_rr_ratio_at_entry,
         rec.risk_multiplier_at_entry,
+        # 2026-05-05 — Yol B (HA Strategy) journal fields.
+        (None if rec.is_vmc_strategy is None else int(rec.is_vmc_strategy)),
+        rec.ha_color_5m_at_entry,
+        rec.ha_streak_5m_at_entry,
+        rec.ha_body_pct_5m_at_entry,
+        rec.ema200_5m_at_entry,
+        rec.volume_5m_ratio_at_entry,
+        rec.vwap_5m_at_entry,
+        rec.wt1_at_entry,
+        rec.wt2_at_entry,
+        rec.wt_vwap_fast_at_entry,
+        rec.ha_mfi_5m_at_entry,
+        rec.ha_rsi_5m_at_entry,
     )
 
 
@@ -1311,6 +1376,19 @@ def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
         mss_break_detected=_safe_bool(row, "mss_break_detected"),
         target_rr_ratio_at_entry=_safe_col(row, "target_rr_ratio_at_entry"),
         risk_multiplier_at_entry=_safe_col(row, "risk_multiplier_at_entry"),
+        # 2026-05-05 — Yol B (HA Strategy) journal fields.
+        is_vmc_strategy=_safe_bool(row, "is_vmc_strategy"),
+        ha_color_5m_at_entry=_safe_col(row, "ha_color_5m_at_entry"),
+        ha_streak_5m_at_entry=_safe_col(row, "ha_streak_5m_at_entry"),
+        ha_body_pct_5m_at_entry=_safe_col(row, "ha_body_pct_5m_at_entry"),
+        ema200_5m_at_entry=_safe_col(row, "ema200_5m_at_entry"),
+        volume_5m_ratio_at_entry=_safe_col(row, "volume_5m_ratio_at_entry"),
+        vwap_5m_at_entry=_safe_col(row, "vwap_5m_at_entry"),
+        wt1_at_entry=_safe_col(row, "wt1_at_entry"),
+        wt2_at_entry=_safe_col(row, "wt2_at_entry"),
+        wt_vwap_fast_at_entry=_safe_col(row, "wt_vwap_fast_at_entry"),
+        ha_mfi_5m_at_entry=_safe_col(row, "ha_mfi_5m_at_entry"),
+        ha_rsi_5m_at_entry=_safe_col(row, "ha_rsi_5m_at_entry"),
     )
 
 
@@ -1475,6 +1553,21 @@ class TradeJournal:
         mss_break_detected: Optional[bool] = None,
         target_rr_ratio_at_entry: Optional[float] = None,
         risk_multiplier_at_entry: Optional[float] = None,
+        # 2026-05-05 — Yol B (HA Strategy) journal fields. is_vmc_strategy
+        # boolean entry tag + 5m HA snapshot + WT2/MFI/wt_vwap_fast at entry.
+        # All None on Yol A / legacy / pre-Yol-B rows.
+        is_vmc_strategy: Optional[bool] = None,
+        ha_color_5m_at_entry: Optional[str] = None,
+        ha_streak_5m_at_entry: Optional[int] = None,
+        ha_body_pct_5m_at_entry: Optional[float] = None,
+        ema200_5m_at_entry: Optional[float] = None,
+        volume_5m_ratio_at_entry: Optional[float] = None,
+        vwap_5m_at_entry: Optional[float] = None,
+        wt1_at_entry: Optional[float] = None,
+        wt2_at_entry: Optional[float] = None,
+        wt_vwap_fast_at_entry: Optional[float] = None,
+        ha_mfi_5m_at_entry: Optional[float] = None,
+        ha_rsi_5m_at_entry: Optional[float] = None,
         # Back-compat tail: callers may still pass these via direct kwargs
         # or `**enrichment` unpacking. Accepted but silently ignored
         # (kwargs no longer forwarded into TradeRecord — columns dropped
@@ -1563,6 +1656,19 @@ class TradeJournal:
             mss_break_detected=mss_break_detected,
             target_rr_ratio_at_entry=target_rr_ratio_at_entry,
             risk_multiplier_at_entry=risk_multiplier_at_entry,
+            # 2026-05-05 — Yol B (HA Strategy) fields.
+            is_vmc_strategy=is_vmc_strategy,
+            ha_color_5m_at_entry=ha_color_5m_at_entry,
+            ha_streak_5m_at_entry=ha_streak_5m_at_entry,
+            ha_body_pct_5m_at_entry=ha_body_pct_5m_at_entry,
+            ema200_5m_at_entry=ema200_5m_at_entry,
+            volume_5m_ratio_at_entry=volume_5m_ratio_at_entry,
+            vwap_5m_at_entry=vwap_5m_at_entry,
+            wt1_at_entry=wt1_at_entry,
+            wt2_at_entry=wt2_at_entry,
+            wt_vwap_fast_at_entry=wt_vwap_fast_at_entry,
+            ha_mfi_5m_at_entry=ha_mfi_5m_at_entry,
+            ha_rsi_5m_at_entry=ha_rsi_5m_at_entry,
         )
         placeholders = ", ".join("?" * len(_COLUMNS))
         cols = ", ".join(_COLUMNS)

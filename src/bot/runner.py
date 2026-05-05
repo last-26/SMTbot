@@ -2517,9 +2517,16 @@ class BotRunner:
                 "risk_multiplier_at_entry": None,
             })
 
+        # 2026-05-05 — Yol B (HA Strategy) is_vmc_strategy boolean. plan.reason
+        # 'ha_strategy:' prefix taşırsa True. Yol A / legacy plan'larda False.
+        kwargs["is_vmc_strategy"] = bool(
+            plan.reason and plan.reason.startswith("ha_strategy:")
+        )
+
         if state is None or state.signal_table is None:
             return kwargs
         sig = state.signal_table
+        osc = state.oscillator
         kwargs.update({
             "ha_color_3m_at_entry": sig.ha_color_3m or None,
             "ha_color_15m_at_entry": sig.ha_color_15m or None,
@@ -2533,6 +2540,34 @@ class BotRunner:
             ),
             "volume_3m_ratio_at_entry": (
                 sig.volume_3m_ratio if sig.volume_3m_ratio else None
+            ),
+            # 2026-05-05 — Yol B 5m HA snapshot + WT/MFI at entry-time.
+            "ha_color_5m_at_entry": sig.ha_color_5m or None,
+            "ha_streak_5m_at_entry": (
+                sig.ha_streak_5m if sig.ha_streak_5m else None
+            ),
+            "ha_body_pct_5m_at_entry": (
+                sig.ha_body_pct_5m if sig.ha_body_pct_5m else None
+            ),
+            "ema200_5m_at_entry": (
+                sig.ema200_5m if sig.ema200_5m else None
+            ),
+            "volume_5m_ratio_at_entry": (
+                sig.volume_5m_ratio if sig.volume_5m_ratio else None
+            ),
+            "vwap_5m_at_entry": (
+                sig.vwap_5m if sig.vwap_5m else None
+            ),
+            "wt1_at_entry": osc.wt1 if osc and osc.wt1 else None,
+            "wt2_at_entry": osc.wt2 if osc and osc.wt2 else None,
+            "wt_vwap_fast_at_entry": (
+                osc.wt_vwap_fast if osc and osc.wt_vwap_fast else None
+            ),
+            "ha_mfi_5m_at_entry": (
+                osc.ha_mfi_5m if osc and osc.ha_mfi_5m else None
+            ),
+            "ha_rsi_5m_at_entry": (
+                osc.ha_rsi_5m if osc and osc.ha_rsi_5m else None
             ),
         })
         return kwargs

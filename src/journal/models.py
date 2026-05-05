@@ -242,6 +242,23 @@ class TradeRecord(BaseModel):
     ema200_3m_at_entry: Optional[float] = None
     volume_3m_ratio_at_entry: Optional[float] = None
 
+    # 2026-05-05 — Yol B (HA Strategy) journal fields. is_vmc_strategy boolean
+    # + 5m HA snapshot + WT2 / wt_vwap_fast / MFI 5m at entry. Pre-Yol-B rows
+    # (Yol A ve legacy) için tüm field'lar None. Pass 3 GBT segments by
+    # is_vmc_strategy / is_ha_native / pre-Yol-A.
+    is_vmc_strategy: Optional[bool] = None
+    ha_color_5m_at_entry: Optional[str] = None
+    ha_streak_5m_at_entry: Optional[int] = None
+    ha_body_pct_5m_at_entry: Optional[float] = None
+    ema200_5m_at_entry: Optional[float] = None
+    volume_5m_ratio_at_entry: Optional[float] = None
+    vwap_5m_at_entry: Optional[float] = None
+    wt1_at_entry: Optional[float] = None
+    wt2_at_entry: Optional[float] = None
+    wt_vwap_fast_at_entry: Optional[float] = None
+    ha_mfi_5m_at_entry: Optional[float] = None
+    ha_rsi_5m_at_entry: Optional[float] = None
+
     # 2026-05-05 — Yol A Faz 5/8: 3 entry tipi dispatcher fields, nullable.
     # Operatör 2026-05-05 düzeltme: NOT NULL DEFAULT yanlış, çünkü 0.0
     # gerçek mandatory-fail score ile NULL ("hesaplanmadı") karışıyor.
