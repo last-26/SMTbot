@@ -102,7 +102,6 @@ from src.strategy.ha_native_exit import (
 from src.strategy.rr_system import calculate_trade_plan
 from src.strategy.entry_signals import (
     _flow_alignment_score,
-    build_trade_plan_with_reason,
     evaluate_pending_invalidation_gates,
     in_vwap_reset_blackout,
 )
@@ -730,13 +729,9 @@ class _DryRunRouter:
 
 
 class BotRunner:
-    # 2026-05-04 — Yol A: HA-native primary mode. The legacy 5-pillar entry
-    # path (build_trade_plan_with_reason call in _run_one_symbol) is disabled
-    # by default. Confluence scoring still runs in the NO_TRADE branch as a
-    # supportive journal signal, but does NOT create a TradePlan. Flip this
-    # to True for emergency revert (single-flag switch — no other change
-    # needed; the legacy block is preserved verbatim).
-    _LEGACY_5PILLAR_ENABLED: bool = False
+    # 2026-05-05 v3 — Yol A is the only entry strategy. Legacy 5-pillar
+    # path (build_trade_plan_with_reason + _LEGACY_5PILLAR_ENABLED flag +
+    # pillar helpers + cross-asset veto) was deleted in this commit.
 
     def __init__(
         self,
@@ -1346,12 +1341,16 @@ class BotRunner:
             if meta is None:
                 continue
             try:
+                # 2026-05-05 v3 — Yol A: HA-native pending limit'leri için
+                # sadece time-based gate (vwap_reset_blackout) kalır. Legacy
+                # `pillar_opposition` / `vwap_hard_veto` / `ema_veto` config
+                # default'ları False; HA-native exit kendi `_maybe_close_on_ha_flip`
+                # path'ini kullanıyor.
                 gate_reason = evaluate_pending_invalidation_gates(
                     state=state,
                     candles=candles,
                     direction=meta.plan.direction,
                     entry_price=float(meta.plan.entry_price),
-                    pillar_opposition=self._pillar_opposition_for(symbol_),
                     vwap_hard_veto_enabled=cfg.analysis.vwap_hard_veto_enabled,
                     ema_veto_enabled=cfg.analysis.ema_veto_enabled,
                     ema_veto_fast_period=cfg.analysis.ema_veto_fast_period,
@@ -2007,59 +2006,6 @@ class BotRunner:
                 return Direction.BEARISH
         return None
 
-    def _pillar_opposition_for(self, symbol: str) -> Optional[Direction]:
-        """Open-position-based cross-asset lock for the entry on `symbol`.
-
-        Replaced the EMA-stack pillar_bias snapshot model on 2026-05-01
-        (ikinci tighten revert): once one of BTC / ETH holds an OPEN
-        position, the other pillar — and any altcoin — cannot take the
-        opposite direction. The lock decays only when the position closes.
-
-        Returns:
-          * Direction.BULLISH → "an active LONG context is set; reject
-            BEARISH entries" (caller's `_cross_asset_opposes` blocks SHORTs).
-          * Direction.BEARISH → mirror.
-          * None → no lock active. Either no open BTC/ETH position, or BTC
-            and ETH are themselves open in opposite directions (the lock
-            cannot resolve a single direction in that case — defer to
-            confluence). Also None when veto disabled.
-
-        Per-symbol resolution:
-          * BTC entry → ETH's open-position direction (None if ETH closed).
-          * ETH entry → BTC's open-position direction (None if BTC closed).
-          * Altcoin entry → BTC OR ETH, whichever is open (agreement when
-            both open; None on disagreement or both closed).
-        """
-        cfg = self.ctx.config.analysis
-        if not cfg.cross_asset_veto_enabled:
-            return None
-
-        btc_dir = self._open_position_direction("BTC-USDT-SWAP")
-        eth_dir = self._open_position_direction("ETH-USDT-SWAP")
-
-        if symbol == "BTC-USDT-SWAP":
-            return eth_dir
-        if symbol == "ETH-USDT-SWAP":
-            return btc_dir
-
-        # Altcoin: prefer agreement; on disagreement defer (no lock).
-        if btc_dir is not None and eth_dir is not None:
-            return btc_dir if btc_dir == eth_dir else None
-        return btc_dir or eth_dir
-
-    def _pillar_bias_label(self, pillar_symbol: str) -> Optional[str]:
-        """Open-position direction label for `pillar_symbol`, or None.
-
-        Persisted on `rejected_signals.pillar_btc_bias` /
-        `pillar_eth_bias` columns for the counter-factual auditor. After
-        the 2026-05-01 ikinci tighten revert this is no longer the EMA
-        stack snapshot — it is the live OPEN position direction (or None
-        when the pillar is flat). Schema-compatible: the column still
-        carries 'BULLISH' / 'BEARISH' / NULL as a string.
-        """
-        direction = self._open_position_direction(pillar_symbol)
-        return direction.value if direction is not None else None
-
     def _build_oscillator_raw_values(
         self,
         symbol: str,
@@ -2365,8 +2311,10 @@ class BotRunner:
             nearest_liq_cluster_below_notional=enrichment["nearest_liq_cluster_below_notional"],
             nearest_liq_cluster_above_distance_atr=enrichment["nearest_liq_cluster_above_distance_atr"],
             nearest_liq_cluster_below_distance_atr=enrichment["nearest_liq_cluster_below_distance_atr"],
-            pillar_btc_bias=self._pillar_bias_label("BTC-USDT-SWAP"),
-            pillar_eth_bias=self._pillar_bias_label("ETH-USDT-SWAP"),
+            # pillar_btc_bias / pillar_eth_bias dropped 2026-05-05 v3
+            # (legacy cross-asset open-position lock retired with Yol A
+            # cleanup). Schema columns kept on RejectedSignal for backward
+            # compat; just stop writing.
             on_chain_context=self._on_chain_context_dict(),
             confluence_pillar_scores={
                 f.name: float(f.weight)
@@ -3718,146 +3666,11 @@ class BotRunner:
         # writes NULLs for the 15m triad.
         htf_regime_result = self.ctx.htf_adx_cache.get(symbol)
 
-        # 2026-05-04 — Yol A: legacy 5-pillar entry path is now BACKUP
-        # ONLY. HA-native primary mode (see OVERRIDE block below) owns
-        # entry decisions. The full call below is preserved verbatim and
-        # gated by `self._LEGACY_5PILLAR_ENABLED` — flip to True to revert
-        # to the prior behavior with zero diff. Confluence scoring still
-        # runs in the NO_TRADE branch as a supportive journal signal
-        # (operator: "destekleyici olarak tutabilirsin"); only the entry
-        # path is HA-native-exclusive now.
+        # 2026-05-05 v3 — Yol A: HA-native primary mode is the only entry path.
+        # Legacy 5-pillar block (build_trade_plan_with_reason +
+        # _LEGACY_5PILLAR_ENABLED flag) was deleted in this commit.
         plan: Optional[TradePlan] = None
         reject_reason: Optional[str] = None
-        if self._LEGACY_5PILLAR_ENABLED:
-            try:
-                plan, reject_reason = build_trade_plan_with_reason(
-                    state, risk_balance,
-                    candles=candles,
-                    min_confluence_score=cfg.analysis.min_confluence_score,
-                    weights=cfg.analysis.confluence_weights or None,
-                    risk_pct=cfg.risk_pct_fraction(),
-                    rr_ratio=cfg.trading.default_rr_ratio,
-                    min_rr_ratio=cfg.trading.min_rr_ratio,
-                    max_leverage=min(
-                        cfg.trading.max_leverage,
-                        self.ctx.max_leverage_per_symbol.get(
-                            symbol, cfg.trading.max_leverage),
-                        cfg.trading.symbol_leverage_caps.get(
-                            symbol, cfg.trading.max_leverage),
-                    ),
-                    contract_size=self.ctx.contract_sizes.get(
-                        symbol, cfg.trading.contract_size),
-                    margin_balance=margin_balance,
-                    risk_amount_usdt_override=risk_amount_override,
-                    swing_lookback=cfg.swing_lookback_for(symbol),
-                    allowed_sessions=cfg.allowed_sessions_for(symbol) or None,
-                    htf_sr_zones=self.ctx.htf_sr_cache.get(symbol),
-                    htf_sr_ceiling_enabled=cfg.analysis.htf_sr_ceiling_enabled,
-                    htf_sr_buffer_atr=cfg.htf_sr_buffer_atr_for(symbol),
-                    crowded_skip_enabled=cfg.derivatives.crowded_skip_enabled,
-                    crowded_skip_z_threshold=cfg.derivatives.crowded_skip_z_threshold,
-                    ltf_state=self.ctx.ltf_cache.get(symbol),
-                    htf_state=self.ctx.htf_state_cache.get(symbol),
-                    min_tp_distance_pct=cfg.analysis.min_tp_distance_pct,
-                    min_sl_distance_pct=cfg.min_sl_distance_pct_for(symbol),
-                    fee_reserve_pct=cfg.trading.fee_reserve_pct,
-                    partial_tp_enabled=cfg.execution.partial_tp_enabled,
-                    partial_tp_ratio=cfg.execution.partial_tp_ratio,
-                    min_rsi_mfi_magnitude=cfg.analysis.min_rsi_mfi_magnitude,
-                    liquidity_pool_max_atr_dist=cfg.analysis.liquidity_pool_max_atr_dist,
-                    vwap_hard_veto_enabled=cfg.analysis.vwap_hard_veto_enabled,
-                    ema_veto_enabled=cfg.analysis.ema_veto_enabled,
-                    ema_veto_fast_period=cfg.analysis.ema_veto_fast_period,
-                    ema_veto_slow_period=cfg.analysis.ema_veto_slow_period,
-                    pillar_opposition=self._pillar_opposition_for(symbol),
-                    premium_discount_veto_enabled=cfg.analysis.premium_discount_veto_enabled,
-                    premium_discount_lookback=cfg.analysis.premium_discount_lookback,
-                    displacement_atr_mult=cfg.analysis.displacement_atr_mult,
-                    displacement_max_bars_ago=cfg.analysis.displacement_max_bars_ago,
-                    divergence_fresh_bars=cfg.analysis.divergence_fresh_bars,
-                    divergence_decay_bars=cfg.analysis.divergence_decay_bars,
-                    divergence_max_bars=cfg.analysis.divergence_max_bars,
-                    trend_regime=trend_regime,
-                    trend_regime_conditional_scoring_enabled=
-                        cfg.analysis.trend_regime_conditional_scoring_enabled,
-                    daily_bias_enabled=(
-                        cfg.on_chain.enabled
-                        and cfg.on_chain.daily_bias_enabled
-                    ),
-                    daily_bias_delta=cfg.on_chain.daily_bias_modifier_delta,
-                    stablecoin_pulse_enabled=(
-                        cfg.on_chain.enabled
-                        and cfg.on_chain.stablecoin_pulse_enabled
-                    ),
-                    stablecoin_pulse_usd=self.ctx.stablecoin_pulse_1h_usd,
-                    stablecoin_pulse_threshold_usd=(
-                        cfg.on_chain.stablecoin_pulse_threshold_usd),
-                    stablecoin_pulse_penalty=(
-                        cfg.on_chain.stablecoin_pulse_penalty),
-                    altcoin_index_enabled=(
-                        cfg.on_chain.enabled
-                        and cfg.on_chain.altcoin_index_enabled
-                    ),
-                    altcoin_index_value=self.ctx.altcoin_index_value,
-                    altcoin_index_is_altcoin=(symbol not in _PILLAR_SYMBOLS),
-                    altcoin_index_bearish_threshold=(
-                        cfg.on_chain.altcoin_index_bearish_threshold),
-                    altcoin_index_bullish_threshold=(
-                        cfg.on_chain.altcoin_index_bullish_threshold),
-                    altcoin_index_penalty=(
-                        cfg.on_chain.altcoin_index_modifier_delta),
-                    # 2026-04-22 — flow_alignment soft directional signal.
-                    # Replaces the whale hard gate; penalty defaults to 0.25
-                    # in Pass 1 (tuned in Pass 2).
-                    flow_alignment_enabled=(
-                        cfg.on_chain.enabled
-                        and cfg.on_chain.flow_alignment_enabled
-                    ),
-                    flow_alignment_penalty=cfg.on_chain.flow_alignment_penalty,
-                    flow_alignment_noise_floor_usd=(
-                        cfg.on_chain.flow_alignment_noise_floor_usd),
-                    flow_alignment_btc_netflow_24h_usd=(
-                        self.ctx.on_chain_snapshot.cex_btc_netflow_24h_usd
-                        if self.ctx.on_chain_snapshot is not None else None
-                    ),
-                    flow_alignment_eth_netflow_24h_usd=(
-                        self.ctx.on_chain_snapshot.cex_eth_netflow_24h_usd
-                        if self.ctx.on_chain_snapshot is not None else None
-                    ),
-                    flow_alignment_coinbase_netflow_24h_usd=(
-                        self.ctx.on_chain_snapshot.cex_coinbase_netflow_24h_usd
-                        if self.ctx.on_chain_snapshot is not None else None
-                    ),
-                    flow_alignment_binance_netflow_24h_usd=(
-                        self.ctx.on_chain_snapshot.cex_binance_netflow_24h_usd
-                        if self.ctx.on_chain_snapshot is not None else None
-                    ),
-                    flow_alignment_bybit_netflow_24h_usd=(
-                        self.ctx.on_chain_snapshot.cex_bybit_netflow_24h_usd
-                        if self.ctx.on_chain_snapshot is not None else None
-                    ),
-                    # 2026-04-22 (gece, late) — per-symbol 1h CEX volume penalty.
-                    # Looked up per-symbol from the snapshot's JSON dict.
-                    per_symbol_cex_flow_enabled=(
-                        cfg.on_chain.enabled
-                        and cfg.on_chain.per_symbol_cex_flow_enabled
-                    ),
-                    per_symbol_cex_flow_usd=self._per_symbol_cex_flow_for(symbol),
-                    per_symbol_cex_flow_noise_floor_usd=(
-                        cfg.on_chain.per_symbol_cex_flow_noise_floor_usd),
-                    per_symbol_cex_flow_penalty=(
-                        cfg.on_chain.per_symbol_cex_flow_penalty),
-                )
-            except Exception:
-                logger.exception("plan_build_failed symbol={}", symbol)
-                return
-
-        # 2026-05-04 — HA-native primary mode (Yol A) OVERRIDE.
-        # Operatör spec: planner ENTRY_TAKEN → HA-native plan oluştur.
-        # _LEGACY_5PILLAR_ENABLED=False olduğu için yukarıdaki block
-        # atlandı; plan/reject_reason None geldi. HA-native ENTRY ise
-        # buradan plan üretilir; aksi halde plan None kalır → NO_TRADE
-        # branch'ı reject_reason="ha_native_no_setup" damgalar.
         if ha_decision is not None and ha_decision.is_take:
             # 2026-05-05 — Faz 7: ema200_warmup gate. Operatör DB null
             # kuralı: ema200_3m=0.0 (Pine henüz 200-bar warmup'ta) →
@@ -5373,8 +5186,7 @@ class BotRunner:
                 nearest_liq_cluster_below_notional=enrichment["nearest_liq_cluster_below_notional"],
                 nearest_liq_cluster_above_distance_atr=enrichment["nearest_liq_cluster_above_distance_atr"],
                 nearest_liq_cluster_below_distance_atr=enrichment["nearest_liq_cluster_below_distance_atr"],
-                pillar_btc_bias=self._pillar_bias_label("BTC-USDT-SWAP"),
-                pillar_eth_bias=self._pillar_bias_label("ETH-USDT-SWAP"),
+                # pillar_btc_bias / pillar_eth_bias dropped 2026-05-05 v3.
                 on_chain_context=self._on_chain_context_dict(),
                 confluence_pillar_scores=dict(plan.confluence_pillar_scores or {}),
                 # 2026-04-22 (gece, late) — same placement-time oscillator
