@@ -4282,20 +4282,29 @@ class BotRunner:
         if plan is None:
             # 2026-05-04 — Yol A: derive a sensible reject_reason for the
             # NO_TRADE branch when HA-native is the sole entry path.
-            # reject_reason will be None whenever _LEGACY_5PILLAR_ENABLED is
-            # False AND HA-native didn't take (the legacy taxonomy below
-            # only fires when the legacy block ran). Map ha_decision outcome
-            # to a clean reason so journal/audit lines stay searchable.
+            # 2026-05-05 — Yol B (HA Strategy): same logic but with
+            # `ha_strategy_*` labels + forward decision.reason (vwap_slope_fail
+            # / mfi_delta_fail / wt2_turning_fail / ha_color_5m_fail) to log
+            # so operator sees WHICH gate failed, not just generic "no_setup".
             if reject_reason is None:
+                is_vmc = self._STRATEGY_MODE == "vmc"
+                prefix = "ha_strategy" if is_vmc else "ha_native"
                 if ha_decision is None:
-                    reject_reason = "ha_native_audit_skipped"
+                    reject_reason = f"{prefix}_audit_skipped"
                 elif ha_decision.decision == "REJECT":
                     reject_reason = (
-                        f"ha_native_reject:{ha_decision.reason}"
-                        if ha_decision.reason else "ha_native_reject"
+                        f"{prefix}_reject:{ha_decision.reason}"
+                        if ha_decision.reason else f"{prefix}_reject"
                     )
+                elif ha_decision.decision == "NO_SETUP" and ha_decision.reason:
+                    # Forward the actual gate failure (e.g. "ha_strategy_long:
+                    # vwap_slope_fail:slope=FLAT/sign_ok=False/value=-30.00")
+                    # so factor_audit / log searches reveal which gate is the
+                    # bottleneck. Yol A NO_SETUP'ta reason ya boş ya generic
+                    # idi → label'a düştü; Yol B'de reason zengin.
+                    reject_reason = ha_decision.reason
                 else:
-                    reject_reason = "ha_native_no_setup"
+                    reject_reason = f"{prefix}_no_setup"
             # 2026-05-05 v4 — cycle_confluence zaten yukarıda hesaplandı
             # (dispatcher yön-teyidi soft factor için kullandı); journal'a
             # da onu yaz, redundant ikinci çağrı yapma.
