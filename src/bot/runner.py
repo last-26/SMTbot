@@ -98,6 +98,7 @@ from src.execution.position_monitor import PendingEvent, PositionMonitor
 from src.journal.database import TradeJournal
 from src.journal.derivatives_journal import DerivativesJournal
 from src.strategy.ha_state import HAStateRegistry
+from src.strategy.ha_strategy.vmc_state import VMCStateRegistry, VMCSymbolState
 from src.strategy.ha_native_exit import (
     ExitContext as HANativeExitContext,
     HANativeExitConfig,
@@ -702,6 +703,15 @@ class BotContext:
     # restart sıfırlanır; backfill helper Bybit kline'dan startup'ta
     # 50-bar geçmiş push edebilir (separate runner step).
     ha_state_registry: HAStateRegistry = field(default_factory=HAStateRegistry)
+    # 2026-05-05 — Yol B (HA Strategy) runtime state registry. Per-symbol
+    # in-memory history buffer (VMCSymbolState with deque(maxlen=60)) for
+    # VWAP slope (wt_vwap_fast 2-bar), MFI/RSI 3-bar delta, WT2 lokal turn,
+    # 5m HA color/streak, 15m HA anchor, dominant_color, ha_close_break.
+    # Yol B aktiv olduğunda (BotRunner._STRATEGY_MODE=='vmc') her cycle
+    # `last_market_state_per_symbol[symbol]` üzerinden pumped. Startup'ta
+    # `vmc_history_backfill.fetch_and_backfill` Bybit 5m + 15m kline'dan
+    # 60-bar geçmiş push eder.
+    vmc_state_registry: VMCStateRegistry = field(default_factory=VMCStateRegistry)
     # Monotonic ts of last position-snapshot batch write. Cadence-gated by
     # `journal.position_snapshot_cadence_s` (default 300s). 0.0 = never.
     last_position_snapshot_ts: float = 0.0
@@ -753,6 +763,16 @@ class BotRunner:
     # 2026-05-05 v3 — Yol A is the only entry strategy. Legacy 5-pillar
     # path (build_trade_plan_with_reason + _LEGACY_5PILLAR_ENABLED flag +
     # pillar helpers + cross-asset veto) was deleted in this commit.
+    #
+    # 2026-05-05 — Yol B (HA Strategy) migration: oscillator-slope-driven
+    # entry on 5m + 15m HA. _STRATEGY_MODE class-level constant multiplexes
+    # the entry/exit code paths. Yol A path (HA-native 3m + dispatcher 3-tip)
+    # frozen ama tamamen korundu — flag flip + Pine .bak.pre_yolb restore ile
+    # bir-line revert. Default "vmc" = Yol B aktif. Operatör Phase 10'da TV
+    # chart 5m'a alıp Pine'ı yükledikten sonra canlı çalışır.
+    #
+    # Modes: "vmc" (Yol B, default) | "ha_native" (Yol A frozen).
+    _STRATEGY_MODE: str = "vmc"
 
     def __init__(
         self,
@@ -967,7 +987,12 @@ class BotRunner:
         try:
             async with self.ctx.journal:
                 await self._prime()
-                await self._backfill_ha_history()
+                # Strategy-mode-aware HA history backfill. Yol B (vmc) fetches
+                # 5m + 15m kline; Yol A (ha_native) frozen path fetches 3m only.
+                if self._STRATEGY_MODE == "vmc":
+                    await self._backfill_vmc_history()
+                else:
+                    await self._backfill_ha_history()
                 await self._start_derivatives()
                 await self._start_economic_calendar()
                 await self._start_on_chain_ws()
@@ -1063,6 +1088,56 @@ class BotRunner:
                 )
             except Exception:
                 logger.exception("ha_backfill_failed symbol={}", symbol)
+
+    async def _backfill_vmc_history(self) -> None:
+        """Yol B (HA Strategy) startup backfill — Bybit 5m + 15m kline → VMC state.
+
+        Operatör 2026-05-05: Yol B aktiv olduğunda her sembol için son 60 ×
+        5m bar + 60 × 15m bar Bybit'ten çekilir, Pine v6 formülüyle birebir
+        Heikin Ashi OHLC + color + streak + body% + shadow + price hesaplanır.
+        15m bar'ları her 5m timestamp'ine forward-fill ile align edilir.
+
+        Sonuç:
+          - `dominant_color_5m()` cycle 1'den itibaren çalışır
+          - `ha_close_break_long/short(5)` exit guard ilk cycle'dan aktif
+          - 5m + 15m HA streak/color senkron başlar (Pine match)
+
+        Oscillator field'ları (wt1/wt2/MFI/RSI) ve Pine VWAP backfill'da
+        default kalır — runtime Pine cycle'larında dolar (ilk 3 cycle entry
+        yok, 15dk startup gecikmesi kabul). Failure-tolerant.
+        """
+        if self.ctx.bybit_client is None:
+            logger.info("vmc_backfill_skipped reason=no_bybit_client")
+            return
+        from src.strategy.ha_strategy.vmc_history_backfill import fetch_and_backfill
+        symbols = list(self.ctx.config.trading.symbols)
+        for symbol in symbols:
+            try:
+                raw_5m = await asyncio.to_thread(
+                    self.ctx.bybit_client.get_kline, symbol, "5", 60,
+                )
+                raw_15m = await asyncio.to_thread(
+                    self.ctx.bybit_client.get_kline, symbol, "15", 60,
+                )
+                if not raw_5m:
+                    logger.warning("vmc_backfill_empty symbol={}", symbol)
+                    continue
+                n = fetch_and_backfill(
+                    self.ctx.vmc_state_registry, symbol, raw_5m, raw_15m,
+                )
+                state = self.ctx.vmc_state_registry.get(symbol)
+                latest = state.latest if state else None
+                logger.info(
+                    "vmc_backfill_done symbol={} bars_5m={} bars_15m={} "
+                    "latest_5m={}/{} latest_15m={}/{}",
+                    symbol, n, len(raw_15m) if raw_15m else 0,
+                    latest.ha_color_5m if latest else None,
+                    latest.ha_streak_5m if latest else None,
+                    latest.ha_color_15m if latest else None,
+                    latest.ha_streak_15m if latest else None,
+                )
+            except Exception:
+                logger.exception("vmc_backfill_failed symbol={}", symbol)
 
     async def _start_derivatives(self) -> None:
         """Boot the Phase 1.5 derivatives tasks. Safe to call when disabled."""
