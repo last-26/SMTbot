@@ -56,20 +56,24 @@ from src.data.economic_calendar import (
 from src.data.liquidation_stream import LiquidationStream
 from src.data.ltf_reader import LTFReader, LTFState
 from src.data.models import Direction, MarketState, Session
-from src.data.on_chain import (
-    ArkhamClient,
-    fetch_daily_snapshot,
-    fetch_entity_netflow_24h,
-    fetch_entity_per_asset_netflow_24h,
-    fetch_hourly_stablecoin_pulse,
-    fetch_token_volume_last_hour,
-)
-from src.data.on_chain_types import (
-    OnChainSnapshot,
-    WATCHED_SYMBOL_TO_TOKEN_ID,
-    WhaleBlackoutState,
-)
-from src.data.on_chain_ws import ArkhamWebSocketListener
+# 2026-05-05 Phase 9 — Arkham purge: src/data/on_chain*.py file delete edildi.
+# Runner'da kalan ~24 `cfg.on_chain.X` referansı `_NoOpOnChain` shim ile
+# default False/0/empty okur — Arkham gate'leri tamamen kapanır. Aşağıdaki
+# stub'lar mevcut helper imzalarını korur (NameError engeller); hiç çağrılmaz.
+class ArkhamClient:  # type: ignore[no-redef]
+    pass
+class OnChainSnapshot:  # type: ignore[no-redef]
+    pass
+class WhaleBlackoutState:  # type: ignore[no-redef]
+    pass
+class ArkhamWebSocketListener:  # type: ignore[no-redef]
+    pass
+WATCHED_SYMBOL_TO_TOKEN_ID: dict = {}
+fetch_daily_snapshot = None
+fetch_entity_netflow_24h = None
+fetch_entity_per_asset_netflow_24h = None
+fetch_hourly_stablecoin_pulse = None
+fetch_token_volume_last_hour = None
 from src.data.public_market_feed import (
     BinancePublicClient,
     RealCandle,
@@ -2716,11 +2720,8 @@ class BotRunner:
             nearest_liq_cluster_below_notional=enrichment["nearest_liq_cluster_below_notional"],
             nearest_liq_cluster_above_distance_atr=enrichment["nearest_liq_cluster_above_distance_atr"],
             nearest_liq_cluster_below_distance_atr=enrichment["nearest_liq_cluster_below_distance_atr"],
-            # pillar_btc_bias / pillar_eth_bias dropped 2026-05-05 v3
-            # (legacy cross-asset open-position lock retired with Yol A
-            # cleanup). Schema columns kept on RejectedSignal for backward
-            # compat; just stop writing.
-            on_chain_context=self._on_chain_context_dict(),
+            # pillar_btc_bias / pillar_eth_bias dropped 2026-05-05 v3.
+            # 2026-05-05 Phase 9 Arkham purge: on_chain_context kaldırıldı.
             confluence_pillar_scores={
                 f.name: float(f.weight)
                 for f in getattr(conf, "factors", []) or []
@@ -5410,7 +5411,6 @@ class BotRunner:
                 **_adx_triad_kwargs(
                     "15m", meta.adx_15m_result_at_placement,
                 ),
-                on_chain_context=self._on_chain_context_dict(),
                 # 2026-05-05 v4 — Yol A: confluence destek sinyali
                 # placement-time'da hesaplandı + meta'ya stash'lendi;
                 # fill'de journal'a yazılır. Plan kendi
@@ -5547,7 +5547,6 @@ class BotRunner:
                 nearest_liq_cluster_above_distance_atr=enrichment["nearest_liq_cluster_above_distance_atr"],
                 nearest_liq_cluster_below_distance_atr=enrichment["nearest_liq_cluster_below_distance_atr"],
                 # pillar_btc_bias / pillar_eth_bias dropped 2026-05-05 v3.
-                on_chain_context=self._on_chain_context_dict(),
                 confluence_pillar_scores=dict(plan.confluence_pillar_scores or {}),
                 # 2026-04-22 (gece, late) — same placement-time oscillator
                 # snapshot used by the pending-fill path. The cancel might

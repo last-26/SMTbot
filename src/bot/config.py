@@ -858,259 +858,54 @@ class EconomicCalendarConfig(BaseModel):
     faireconomy_max_retries: int = 3
 
 
-class OnChainConfig(BaseModel):
-    """Arkham on-chain integration (2026-04-21, trial 30-day key).
+# 2026-05-05 Phase 9 — Arkham purge: OnChainConfig class kaldırıldı.
+# Yol B doctrine on-chain signals kullanmıyor; trial 2026-05-20 expiry
+# öncesinde tamamen sökıldü. YAML on_chain section da kaldırıldı.
+# Backward-compat shim: BotConfig.on_chain property'i bir _NoOpOnChain
+# döndürür — runner.py'daki ~24 `cfg.on_chain.X` referansları hiç
+# değişmeden False/0/empty default okur, Arkham gate'leri otomatik kapanır.
 
-    All flags default OFF. `enabled=false` (master switch) keeps the
-    entire pipeline idle: no HTTP requests, no WebSocket connection,
-    no modifier effects, MarketState.on_chain stays None. Rolling back
-    after the trial window = set `enabled: false` and restart. No code
-    removal required; schema columns stay in place for the historical
-    `on_chain_context` JSON on pre-rollback trades.
 
-    Sub-features (layered on top of master):
-      * daily_bias_enabled         — Phase C: ±delta confluence modifier.
-      * stablecoin_pulse_enabled   — Phase E: below_confluence penalty.
-      * whale_blackout_enabled     — 2026-04-22: HARD GATE REMOVED. Now
-        purely controls whether the WS listener runs (streams whale
-        transfers into the `whale_transfers` journal + `whale_blackout_active`
-        snapshot bool). No runtime entry / pending invalidation effect.
-        Legacy name preserved to avoid YAML migration; rename tracked as
-        Pass 2 cleanup.
-      * flow_alignment_enabled     — 2026-04-22: soft directional signal.
-        Combines stablecoin pulse + BTC/ETH + Coinbase/Binance/Bybit
-        netflow into a score [-1, +1]; misaligned direction pays additive
-        penalty on min_confluence. Per-entity inputs added late-gece as
-        journal-only promotion. Default-weighted (no tuning in Pass 1).
-        Tuned in Pass 2 once Arkham coverage is uniform across dataset.
-      * per_symbol_cex_flow_enabled — 2026-04-22 (gece, late): per-symbol
-        1h CEX volume penalty. Symbol's own token INTO CEX = bearish /
-        OUT = bullish; misaligned direction pays additive threshold bump.
-        Default-weighted; tuned in Pass 2.
-    Phase B (journal enrichment) is always-on when `enabled=true` — no
-    separate flag, the `on_chain_context` JSON column just stays NULL
-    whenever the snapshot is unavailable.
-    """
+class _NoOpOnChain:
+    """Phase 9 Arkham purge backward-compat. Tüm flag'ler default kapalı."""
 
-    enabled: bool = False
-
-    # Phase C — daily macro bias (see src/analysis/multi_timeframe.py).
-    # Default delta bumped 0.10 → 0.15 on 2026-04-21 (eve) after observing
-    # every bias-opposed setup still cleared the threshold. GBT-tunable.
-    daily_bias_enabled: bool = False
-    daily_bias_modifier_delta: float = 0.15
-    daily_bias_stablecoin_threshold_usd: float = 50_000_000.0
-    daily_bias_btc_netflow_threshold_usd: float = 50_000_000.0
-    # 2026-04-23 — "daily" is a misnomer now. The bundle (bias + BTC/ETH
-    # 24h netflow + per-entity Coinbase/Binance/Bybit 24h netflow) used to
-    # refresh once per UTC day, which froze DB rows for hours once the
-    # underlying Arkham queries were rewritten from daily buckets to rolling
-    # 24h histogram windows. Refresh now on a monotonic cadence so new
-    # `on_chain_snapshots` rows actually replace stale values.
-    #   5 min chosen from live probe: Arkham indexer repopulates the
-    #   active-hour bucket every 60-120s; 5 min is safely above that,
-    #   catches intraday inflection without polling identical buckets.
-    #   12 histogram calls per cycle × 12 cycles/h = 144 calls/h; label-
-    #   free endpoints, so label budget (10k/mo, currently 558) untouched.
-    daily_snapshot_refresh_s: int = 300
-
-    # Phase E — stablecoin pulse cross-asset penalty.
-    # Default penalty bumped 0.5 → 0.75 on 2026-04-21 (eve), paired with the
-    # daily_bias_modifier_delta bump. Effective threshold 3.0 → 3.75 on misaligned.
-    stablecoin_pulse_enabled: bool = False
-    stablecoin_pulse_refresh_s: int = 3600
-    stablecoin_pulse_threshold_usd: float = 50_000_000.0
-    stablecoin_pulse_penalty: float = 0.75
-
-    # Phase D — Arkham whale-transfer pipeline.
-    # 2026-04-22 (gece): RUNTIME HARD GATE REMOVED. This flag now only
-    # controls whether the WS listener (`ArkhamWebSocketListener`) runs —
-    # whale events still stream into the `whale_transfers` journal table
-    # and flip the informational `whale_blackout_active` bool on every
-    # `on_chain_snapshots` row. Entry pipeline no longer rejects on whale
-    # events; pending limits are no longer invalidated. The flag name is
-    # preserved to avoid YAML migration.
-    # Arkham's WS filter requires `usdGte >= 10_000_000` per the API docs;
-    # the validator enforces this. Default 150M (bumped 100M → 150M on
-    # 2026-04-22) — at $100M the trial label-lookup quota was burning
-    # ~17k/month from incidental whale events.
-    whale_blackout_enabled: bool = False
-    whale_threshold_usd: float = 150_000_000.0
-    # State-activity window. Within this window after a whale event the
-    # `WhaleBlackoutState.is_active()` returns True → snapshot logs
-    # `whale_blackout_active=true`. NOT a runtime gate (removed 2026-04-22).
-    whale_blackout_duration_s: int = 600  # 10 minutes
-    # Token slug filter on the WS stream (Arkham coingecko-style ids).
-    # Restricts incoming whale events to the tokens we actually trade
-    # (5 perps + 2 stablecoins). Without this, every $100M+ CEX↔CEX
-    # transfer in any token reaches us — XRP, ADA, MATIC, LINK, etc.
-    # consume label lookups (each transfer = from + to entity labels)
-    # without affecting any of our blackout decisions, since
-    # `affected_symbols_for` returns empty tuple for unmapped tokens.
-    # Bumped 2026-04-22 with the threshold change above.
-    whale_tokens: list[str] = Field(default_factory=lambda: [
-        # XRP intentionally omitted: Arkham doesn't index XRPL per-token
-        # data (probed 2026-04-25, all XRP slug variants rejected). Adding
-        # it would just burn label-lookup quota on events that
-        # `affected_symbols_for` would silently drop.
-        "bitcoin", "ethereum", "solana", "dogecoin",
-        "tether", "usd-coin",
-    ])
-
-    # Phase F2 (2026-04-21 post-integration) — Arkham altcoin index
-    # modifier. Index is a scalar 0-100 from `/marketdata/altcoin_index`
-    # (low = altcoins underperforming BTC, high = altcoins outperforming).
-    # Applies only to altcoin symbols (not BTC / ETH). Misaligned direction
-    # (long alt in BTC-dominance season, or short alt in altseason) takes
-    # a penalty bump on the effective `min_confluence_score`.
-    altcoin_index_enabled: bool = False
-    altcoin_index_bearish_threshold: int = 25
-    altcoin_index_bullish_threshold: int = 75
-    altcoin_index_modifier_delta: float = 0.5
-    # Refresh cadence (seconds) — index is macro-scale, hourly is plenty.
-    altcoin_index_refresh_s: int = 3600
-
-    # 2026-04-22 (gece) — flow_alignment soft directional signal.
-    # Combines six Arkham inputs into a [-1, +1] directional score:
-    #   stablecoin pulse (0.25)  — hourly, natural sign (IN=bullish)
-    #   BTC netflow      (0.25)  — daily, inverted (OUT=bullish)
-    #   ETH netflow      (0.15)  — daily, inverted
-    #   Coinbase netflow (0.15)  — daily, inverted ("Coinbase premium" pattern)
-    #   Binance netflow  (0.10)  — daily, inverted
-    #   Bybit netflow    (0.10)  — daily, inverted
-    # Per-entity inputs (Coinbase/Binance/Bybit) added 2026-04-22 (gece,
-    # late) when their journal-only columns were promoted to runtime ahead
-    # of the Pass 1 clean restart. Misaligned direction (long on bearish
-    # score OR short on bullish score) pays additive penalty on
-    # `min_confluence_score`, scaled linearly by `|score|`. Default-
-    # weighted for Pass 1 (no tuning on current 42 trades where Arkham
-    # coverage is inconsistent). Pass 2 tunes penalty + noise_floor +
-    # individual weights against uniform-coverage dataset.
-    flow_alignment_enabled: bool = True
-    flow_alignment_penalty: float = 0.25
-    # Signals below this USD magnitude treated as noise → contribute 0
-    # (not +1 / -1) to the score, regardless of sign. Prevents random
-    # sub-$1M flow ticks from dragging the signal around.
-    flow_alignment_noise_floor_usd: float = 1_000_000.0
-
-    # 2026-04-22 (gece, late) — per-symbol 1h CEX volume penalty.
-    # Unlike stablecoins, token flowing INTO exchange is BEARISH for that
-    # symbol (selling setup), OUT is BULLISH (cold/DEX accumulation).
-    # Misaligned direction on the traded symbol pays additive threshold
-    # bump. Source: Arkham `/token/volume/{id}?granularity=1h`
-    # most-recent bucket's `inUSD - outUSD` (positive = net inflow).
-    # Promoted to runtime alongside per-entity netflow expansion.
-    per_symbol_cex_flow_enabled: bool = True
-    per_symbol_cex_flow_penalty: float = 0.25
-    # Higher floor than flow_alignment: token volume on a 1h bucket is
-    # noisier than macro stablecoin pulse ($1M moves are routine).
-    per_symbol_cex_flow_noise_floor_usd: float = 5_000_000.0
-
-    # 2026-04-22 — per-entity (Coinbase + Binance + Bybit) 24h netflow.
-    # Refreshes on the same UTC-day cadence as `daily_macro_bias`.
-    # Probe (2026-04-22) confirmed: 3 credits / call, 0 label lookups,
-    # all three slugs valid. Journal-only signal, no runtime effect.
-    entity_netflow_enabled: bool = True
-
-    # 2026-04-22 — per-symbol CEX hourly volume via `/token/volume/{id}`.
-    # Probe (2026-04-22) confirmed: granularity=1h works, 5m/15m/30m
-    # return 500. Refresh cadence intentionally hourly (matches data
-    # granularity). 5 symbols * 1 call/h * 3 credits = 360/day = ~11k/mo
-    # credits, 0 label lookups. Journal-only signal.
-    token_volume_enabled: bool = True
-    token_volume_refresh_s: int = 3600
-
-    # Safety / budget controls.
-    # Auto-disable the master when the reported label-usage fraction
-    # crosses this percent. Prevents the trial key from being exhausted
-    # and the paid plan from over-spending on bot telemetry.
-    api_usage_auto_disable_pct: float = 95.0
-    api_client_timeout_s: float = 10.0
-    # Snapshots older than this are considered stale by downstream
-    # gates (daily_bias modifier falls through to 1.0, penalty to 0.0).
-    snapshot_staleness_threshold_s: int = 7200
-
-    @field_validator("daily_bias_modifier_delta")
-    @classmethod
-    def _daily_bias_delta_sane(cls, v: float) -> float:
-        if not (0.0 <= v <= 0.5):
-            raise ValueError(
-                f"on_chain.daily_bias_modifier_delta must be in [0.0, 0.5] "
-                f"(delta >0.5 would swap long/short rather than nudge); got {v}"
-            )
-        return v
-
-    @field_validator("daily_bias_stablecoin_threshold_usd",
-                     "daily_bias_btc_netflow_threshold_usd",
-                     "stablecoin_pulse_threshold_usd",
-                     "stablecoin_pulse_penalty",
-                     "flow_alignment_penalty",
-                     "flow_alignment_noise_floor_usd",
-                     "per_symbol_cex_flow_penalty",
-                     "per_symbol_cex_flow_noise_floor_usd")
-    @classmethod
-    def _non_negative(cls, v: float) -> float:
-        if v < 0:
-            raise ValueError(
-                f"on_chain thresholds / penalties must be ≥ 0; got {v}"
-            )
-        return v
-
-    @field_validator("whale_threshold_usd")
-    @classmethod
-    def _whale_threshold_meets_ws_minimum(cls, v: float) -> float:
-        # Arkham WS filter requires `usdGte >= 10M` per API documentation.
-        if v < 10_000_000.0:
-            raise ValueError(
-                f"on_chain.whale_threshold_usd must be ≥ 10_000_000 "
-                f"(Arkham WS `usdGte` minimum); got {v}"
-            )
-        return v
-
-    @field_validator("whale_blackout_duration_s", "stablecoin_pulse_refresh_s",
-                     "snapshot_staleness_threshold_s",
-                     "altcoin_index_refresh_s",
-                     "token_volume_refresh_s")
-    @classmethod
-    def _positive_duration(cls, v: int) -> int:
-        if v <= 0:
-            raise ValueError(
-                f"on_chain duration fields must be > 0 seconds; got {v}"
-            )
-        return v
-
-    @field_validator("altcoin_index_bearish_threshold",
-                     "altcoin_index_bullish_threshold")
-    @classmethod
-    def _altcoin_thresholds_in_range(cls, v: int) -> int:
-        if not (0 <= v <= 100):
-            raise ValueError(
-                f"on_chain.altcoin_index_* thresholds must be in [0, 100]; "
-                f"got {v}"
-            )
-        return v
-
-    @model_validator(mode="after")
-    def _altcoin_thresholds_ordered(self) -> "OnChainConfig":
-        if (self.altcoin_index_bearish_threshold
-                >= self.altcoin_index_bullish_threshold):
-            raise ValueError(
-                f"on_chain.altcoin_index_bearish_threshold "
-                f"({self.altcoin_index_bearish_threshold}) must be strictly "
-                f"less than altcoin_index_bullish_threshold "
-                f"({self.altcoin_index_bullish_threshold}); otherwise the "
-                f"neutral band collapses and every value triggers a penalty."
-            )
-        return self
-
-    @field_validator("api_usage_auto_disable_pct")
-    @classmethod
-    def _usage_pct_in_range(cls, v: float) -> float:
-        if not (0.0 < v <= 100.0):
-            raise ValueError(
-                f"on_chain.api_usage_auto_disable_pct must be in (0, 100]; got {v}"
-            )
-        return v
+    # Master + per-feature toggles
+    enabled = False
+    daily_bias_enabled = False
+    whale_blackout_enabled = False
+    altcoin_index_enabled = False
+    stablecoin_pulse_enabled = False
+    flow_alignment_enabled = False
+    per_symbol_cex_flow_enabled = False
+    entity_netflow_enabled = False
+    token_volume_enabled = False
+    # Penalty / modifier knobs
+    daily_bias_modifier_delta = 0.0
+    altcoin_index_modifier_delta = 0.0
+    stablecoin_pulse_penalty = 0.0
+    flow_alignment_penalty = 0.0
+    flow_alignment_noise_floor_usd = 0.0
+    per_symbol_cex_flow_penalty = 0.0
+    per_symbol_cex_flow_noise_floor_usd = 0.0
+    altcoin_index_bearish_threshold = 0
+    altcoin_index_bullish_threshold = 0
+    daily_bias_stablecoin_threshold_usd = 0.0
+    daily_bias_btc_netflow_threshold_usd = 0.0
+    stablecoin_pulse_threshold_usd = 0.0
+    # Refresh intervals (büyük değerler — şü an aktif olmasalar bile cycle
+    # latency'ye etki etmez)
+    daily_snapshot_refresh_s = 86400
+    altcoin_index_refresh_s = 86400
+    stablecoin_pulse_refresh_s = 86400
+    token_volume_refresh_s = 86400
+    # Whale settings (kullanılmaz)
+    whale_threshold_usd = 0.0
+    whale_blackout_duration_s = 600
+    whale_tokens: list = []
+    # API client
+    api_client_timeout_s = 10.0
+    api_usage_auto_disable_pct = 95.0
+    snapshot_staleness_threshold_s = 7200
 
 
 class ReentryConfig(BaseModel):
@@ -1164,8 +959,14 @@ class BotConfig(BaseModel):
     derivatives: DerivativesConfig = Field(default_factory=DerivativesConfig)
     economic_calendar: EconomicCalendarConfig = Field(
         default_factory=EconomicCalendarConfig)
-    on_chain: OnChainConfig = Field(default_factory=OnChainConfig)
     rl: RLConfig = Field(default_factory=RLConfig)
+
+    # 2026-05-05 Phase 9 — Arkham purge backward-compat shim.
+    # Runner.py'daki ~24 `cfg.on_chain.X` referansı hiç değişmeden no-op
+    # değerler okur (enabled=False otomatik tüm Arkham gate'lerini kapatır).
+    @property
+    def on_chain(self) -> "_NoOpOnChain":
+        return _NoOpOnChain()
 
     @field_validator("bybit")
     @classmethod

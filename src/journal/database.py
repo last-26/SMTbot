@@ -128,7 +128,8 @@ CREATE TABLE IF NOT EXISTS trades (
     demo_artifact           INTEGER,
     artifact_reason         TEXT,
 
-    on_chain_context        TEXT,
+    -- 2026-05-05 Phase 9 — Arkham purge: on_chain_context kolonu kaldırıldı.
+    -- Eski DB'lerde DROP COLUMN migration'ı (aşağıda _MIGRATIONS) ile silinir.
 
     -- 2026-04-22 — per-pillar raw scores (ConfluenceFactor.name → weight)
     -- as JSON dict. Enables Pass 2 replay-tuning of per-pillar weights
@@ -293,7 +294,7 @@ CREATE TABLE IF NOT EXISTS rejected_signals (
     hypothetical_bars_to_tp   INTEGER,
     hypothetical_bars_to_sl   INTEGER,
 
-    on_chain_context        TEXT,
+    -- 2026-05-05 Phase 9 — Arkham purge: on_chain_context kolonu kaldırıldı.
 
     -- 2026-04-22 — mirrors trades.confluence_pillar_scores. Rejected-signal
     -- counter-factuals feed Pass 2 per-pillar weight tuning too: removing
@@ -579,7 +580,6 @@ _COLUMNS = [
     "adx_15m_at_entry", "plus_di_15m_at_entry", "minus_di_15m_at_entry",
     "real_market_entry_valid", "real_market_exit_valid",
     "demo_artifact", "artifact_reason",
-    "on_chain_context",
     "confluence_pillar_scores",
     "oscillator_raw_values",
     "open_interest_usd_at_entry",
@@ -649,7 +649,6 @@ _REJECTED_COLUMNS = [
     "adx_3m_at_entry", "plus_di_3m_at_entry", "minus_di_3m_at_entry",
     "adx_15m_at_entry", "plus_di_15m_at_entry", "minus_di_15m_at_entry",
     "hypothetical_outcome", "hypothetical_bars_to_tp", "hypothetical_bars_to_sl",
-    "on_chain_context",
     "confluence_pillar_scores",
     "oscillator_raw_values",
     "open_interest_usd_at_entry",
@@ -720,8 +719,11 @@ _MIGRATIONS = [
     # before the Arkham pipeline was enabled, or when `on_chain.enabled`
     # was off at open-time. Present on both trades and rejected_signals
     # so factor-audit can segment rejects by on-chain context too.
-    "ALTER TABLE trades ADD COLUMN on_chain_context TEXT",
-    "ALTER TABLE rejected_signals ADD COLUMN on_chain_context TEXT",
+    # 2026-05-05 Phase 9 — Arkham purge: on_chain_context ADD COLUMN
+    # migration'ları kaldırıldı; aşağıda DROP COLUMN ile silinir. Idempotent
+    # fail OK eski DB'lerde (kolon zaten yoksa _apply_migrations swallow eder).
+    # "ALTER TABLE trades ADD COLUMN on_chain_context TEXT",
+    # "ALTER TABLE rejected_signals ADD COLUMN on_chain_context TEXT",
     # 2026-04-22 — per-entity (Coinbase, Binance, Bybit) 24h netflow + per-symbol
     # 1h CEX volume (JSON dict). Journal-only enrichment for Phase 9 GBT.
     "ALTER TABLE on_chain_snapshots ADD COLUMN cex_coinbase_netflow_24h_usd REAL",
@@ -1025,15 +1027,13 @@ _MIGRATIONS = [
     # SQLite 3.35+ DROP COLUMN destekler. Idempotent fail OK (kolon
     # zaten yoksa OperationalError, _apply_migrations swallow eder).
     "ALTER TABLE decision_log DROP COLUMN confluence_factors_json",
-    # 2026-05-05 — Phase 9 (deferred): Arkham purge. DROP COLUMN migration'lari
-    # writer'dan once degil — _COLUMNS listesinde on_chain_context hala oldugu
-    # icin INSERT statement'i kolon ismi referans veriyor. Full Phase 9'da
-    # birlikte sokulacak (writer + reader + record_open API + TradeRecord
-    # field + DB drop). Simdilik DB intact.
-    # "DROP TABLE IF EXISTS on_chain_snapshots",
-    # "DROP TABLE IF EXISTS whale_transfers",
-    # "ALTER TABLE trades DROP COLUMN on_chain_context",
-    # "ALTER TABLE rejected_signals DROP COLUMN on_chain_context",
+    # 2026-05-05 Phase 9 — Arkham purge full. Operator direktifi: 'Arkham
+    # komple kalkacak. veri tutmayi da sileceğiz. db tarafini da yok edeceğiz.'
+    # SQLite 3.35+ DROP COLUMN destek. Idempotent fail OK eski DB'lerde.
+    "DROP TABLE IF EXISTS on_chain_snapshots",
+    "DROP TABLE IF EXISTS whale_transfers",
+    "ALTER TABLE trades DROP COLUMN on_chain_context",
+    "ALTER TABLE rejected_signals DROP COLUMN on_chain_context",
 ]
 
 
@@ -1072,8 +1072,7 @@ def _record_to_row(rec: TradeRecord) -> tuple:
          else int(rec.real_market_exit_valid)),
         (None if rec.demo_artifact is None else int(rec.demo_artifact)),
         rec.artifact_reason,
-        (json.dumps(rec.on_chain_context)
-         if rec.on_chain_context is not None else None),
+        # 2026-05-05 Phase 9 — Arkham purge: on_chain_context tuple'dan kaldırıldı.
         json.dumps(rec.confluence_pillar_scores or {}),
         json.dumps(rec.oscillator_raw_values or {}),
         rec.open_interest_usd_at_entry,
@@ -1141,8 +1140,7 @@ def _rejected_to_row(rec: RejectedSignal) -> tuple:
         rec.adx_3m_at_entry, rec.plus_di_3m_at_entry, rec.minus_di_3m_at_entry,
         rec.adx_15m_at_entry, rec.plus_di_15m_at_entry, rec.minus_di_15m_at_entry,
         rec.hypothetical_outcome, rec.hypothetical_bars_to_tp, rec.hypothetical_bars_to_sl,
-        (json.dumps(rec.on_chain_context)
-         if rec.on_chain_context is not None else None),
+        # 2026-05-05 Phase 9 — Arkham purge: on_chain_context kaldırıldı.
         json.dumps(rec.confluence_pillar_scores or {}),
         json.dumps(rec.oscillator_raw_values or {}),
         rec.open_interest_usd_at_entry,
@@ -1196,7 +1194,6 @@ def _row_to_rejected(row: aiosqlite.Row) -> RejectedSignal:
         hypothetical_outcome=_safe_col(row, "hypothetical_outcome"),
         hypothetical_bars_to_tp=_safe_col(row, "hypothetical_bars_to_tp"),
         hypothetical_bars_to_sl=_safe_col(row, "hypothetical_bars_to_sl"),
-        on_chain_context=_parse_on_chain_context(row),
         confluence_pillar_scores=_parse_pillar_scores(row),
         oscillator_raw_values=_parse_oscillator_raw_values(row),
         open_interest_usd_at_entry=_safe_col(row, "open_interest_usd_at_entry"),
@@ -1282,22 +1279,6 @@ def _parse_pillar_scores(row: aiosqlite.Row) -> dict[str, float]:
     return out
 
 
-def _parse_on_chain_context(row: aiosqlite.Row) -> Optional[dict]:
-    """Decode the JSON `on_chain_context` column; None on missing / null /
-    invalid JSON so legacy rows and migration edges read as absent rather
-    than erroring."""
-    raw = _safe_col(row, "on_chain_context")
-    if raw is None:
-        return None
-    try:
-        parsed = json.loads(raw)
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(parsed, dict):
-        return None
-    return parsed
-
-
 def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
     return TradeRecord(
         trade_id=row["trade_id"],
@@ -1354,7 +1335,6 @@ def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
         real_market_exit_valid=_safe_bool(row, "real_market_exit_valid"),
         demo_artifact=_safe_bool(row, "demo_artifact"),
         artifact_reason=_safe_col(row, "artifact_reason"),
-        on_chain_context=_parse_on_chain_context(row),
         confluence_pillar_scores=_parse_pillar_scores(row),
         oscillator_raw_values=_parse_oscillator_raw_values(row),
         open_interest_usd_at_entry=_safe_col(row, "open_interest_usd_at_entry"),
@@ -1512,7 +1492,7 @@ class TradeJournal:
         adx_15m_at_entry: Optional[float] = None,
         plus_di_15m_at_entry: Optional[float] = None,
         minus_di_15m_at_entry: Optional[float] = None,
-        on_chain_context: Optional[dict] = None,
+        # 2026-05-05 Phase 9 — Arkham purge: on_chain_context kwarg kaldırıldı.
         confluence_pillar_scores: Optional[dict[str, float]] = None,
         oscillator_raw_values: Optional[dict[str, dict]] = None,
         open_interest_usd_at_entry: Optional[float] = None,
@@ -1635,7 +1615,6 @@ class TradeJournal:
             adx_15m_at_entry=adx_15m_at_entry,
             plus_di_15m_at_entry=plus_di_15m_at_entry,
             minus_di_15m_at_entry=minus_di_15m_at_entry,
-            on_chain_context=on_chain_context,
             confluence_pillar_scores=dict(confluence_pillar_scores or {}),
             oscillator_raw_values=dict(oscillator_raw_values or {}),
             open_interest_usd_at_entry=open_interest_usd_at_entry,
@@ -1835,7 +1814,7 @@ class TradeJournal:
         adx_15m_at_entry: Optional[float] = None,
         plus_di_15m_at_entry: Optional[float] = None,
         minus_di_15m_at_entry: Optional[float] = None,
-        on_chain_context: Optional[dict] = None,
+        # 2026-05-05 Phase 9 — Arkham purge: on_chain_context kwarg kaldırıldı.
         confluence_pillar_scores: Optional[dict[str, float]] = None,
         oscillator_raw_values: Optional[dict[str, dict]] = None,
         open_interest_usd_at_entry: Optional[float] = None,
@@ -1894,7 +1873,6 @@ class TradeJournal:
             adx_15m_at_entry=adx_15m_at_entry,
             plus_di_15m_at_entry=plus_di_15m_at_entry,
             minus_di_15m_at_entry=minus_di_15m_at_entry,
-            on_chain_context=on_chain_context,
             confluence_pillar_scores=dict(confluence_pillar_scores or {}),
             oscillator_raw_values=dict(oscillator_raw_values or {}),
             open_interest_usd_at_entry=open_interest_usd_at_entry,
