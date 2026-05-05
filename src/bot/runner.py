@@ -3853,7 +3853,15 @@ class BotRunner:
             self.ctx.htf_adx_cache.pop(symbol, None)
 
         # 2b. LTF pass — read oscillator into LTFState, cache for Madde F.
-        if self.ctx.bridge is not None and self.ctx.ltf_reader is not None:
+        # 2026-05-05 — Yol B (HA Strategy): 1m LTF kontrolu yapilmaz. Strateji
+        # 5m + 15m uzerinden calisir, 1m TF switch + Pine settle bekleme cycle
+        # latency'yi 3x'e cikariyor + Pine 1m yayini Yol B'de yok = settle hep
+        # timeout. Yol A frozen path icin korunur.
+        if (
+            self._STRATEGY_MODE != "vmc"
+            and self.ctx.bridge is not None
+            and self.ctx.ltf_reader is not None
+        ):
             ltf_ok = await self._switch_timeframe(cfg.trading.ltf_timeframe)
             if not ltf_ok:
                 logger.info("ltf_settle_timeout symbol={} — entry path continues "
@@ -3866,6 +3874,9 @@ class BotRunner:
                 except Exception:
                     logger.exception("ltf_read_failed symbol={}", symbol)
                     self.ctx.ltf_cache.pop(symbol, None)
+        elif self._STRATEGY_MODE == "vmc":
+            # Yol B: ltf_cache populate edilmez; downstream tuketiciler None okur.
+            self.ctx.ltf_cache.pop(symbol, None)
 
         # 2c. Entry TF pass — switch + settle + read the entry state.
         if self.ctx.bridge is not None:

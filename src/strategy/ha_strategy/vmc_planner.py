@@ -67,7 +67,7 @@ class VMCEntryConfig:
         "HYPE-USDT-SWAP":     0.010,
         "1000PEPE-USDT-SWAP": 0.010,
         "ONDO-USDT-SWAP":     0.010,
-        "XAUT-USDT-SWAP":     0.010,
+        "AVAX-USDT-SWAP":     0.010,
         "DOGE-USDT-SWAP":     0.010,
         "ADA-USDT-SWAP":      0.010,
         "LINK-USDT-SWAP":     0.010,
