@@ -32,7 +32,11 @@ from typing import Any, Optional
 from loguru import logger
 
 from src.analysis.liquidity_heatmap import build_heatmap
-from src.analysis.multi_timeframe import ConfluenceScore, score_direction
+from src.analysis.multi_timeframe import (
+    ConfluenceScore,
+    calculate_confluence,
+    score_direction,
+)
 from src.analysis.support_resistance import detect_sr_zones
 from src.analysis.trend_regime import (
     TrendRegime,
@@ -525,6 +529,11 @@ class PendingSetupMeta:
     # `_adx_triad_kwargs` helper turns None / UNKNOWN into NULL columns.
     adx_3m_result_at_placement: Optional[TrendRegimeResult] = None
     adx_15m_result_at_placement: Optional[TrendRegimeResult] = None
+    # 2026-05-05 v4 — Yol A confluence support signal stamped at placement
+    # time. Used as direction-confirmation + Pass 3 GBT feature only;
+    # never gates the entry decision (HA-native dispatcher owns that).
+    # Forwarded to journal `confluence_pillar_scores` on fill.
+    confluence_at_placement: Optional[ConfluenceScore] = None
 
 
 @dataclass
@@ -3744,35 +3753,53 @@ class BotRunner:
                     )
                 else:
                     reject_reason = "ha_native_no_setup"
-            # 2026-05-05 v3 — Yol A NO_TRADE branch sadeleştirildi. Legacy
-            # `calculate_confluence` çağrısı silindi; HA-native zaten
-            # `decision_log` tablosuna 40+ field per-cycle audit row
-            # yazıyor. `_record_reject` minimal stub conf ile çağrılır:
-            # direction HA-native'den, factors boş.
-            ha_dir = (
-                ha_decision.direction
-                if (ha_decision is not None and ha_decision.direction is not None)
-                else Direction.UNDEFINED
-            )
+            # 2026-05-05 v4 — Yol A: confluence yön-tayini DESTEK sinyali
+            # olarak geri getirildi (Faz 3'teki silme operatör doktrini ile
+            # çelişiyordu — entry kararı HA-native, ama confluence journal
+            # + Pass 3 GBT feature + yön teyidi için yazılıyor). Hiçbir
+            # gating yok; sadece kayıt.
             try:
+                conf = calculate_confluence(
+                    state,
+                    ltf_candles=candles,
+                    allowed_sessions=cfg.allowed_sessions_for(symbol) or None,
+                    ltf_state=self.ctx.ltf_cache.get(symbol),
+                    htf_state=self.ctx.htf_state_cache.get(symbol),
+                    weights=cfg.analysis.confluence_weights or None,
+                    min_rsi_mfi_magnitude=cfg.analysis.min_rsi_mfi_magnitude,
+                    liquidity_pool_max_atr_dist=cfg.analysis.liquidity_pool_max_atr_dist,
+                    displacement_atr_mult=cfg.analysis.displacement_atr_mult,
+                    displacement_max_bars_ago=cfg.analysis.displacement_max_bars_ago,
+                    divergence_fresh_bars=cfg.analysis.divergence_fresh_bars,
+                    divergence_decay_bars=cfg.analysis.divergence_decay_bars,
+                    divergence_max_bars=cfg.analysis.divergence_max_bars,
+                    trend_regime=trend_regime,
+                    trend_regime_conditional_scoring_enabled=(
+                        cfg.analysis.trend_regime_conditional_scoring_enabled
+                    ),
+                    daily_bias_enabled=(
+                        cfg.on_chain.enabled
+                        and cfg.on_chain.daily_bias_enabled
+                    ),
+                    daily_bias_delta=cfg.on_chain.daily_bias_modifier_delta,
+                )
                 logger.info(
                     "symbol_decision symbol={} NO_TRADE reason={} price={:.4f} "
-                    "session={} direction={}",
+                    "session={} direction={} confluence={:.2f}/{} factors={}",
                     symbol, reject_reason or "unknown",
                     float(state.current_price or 0.0),
                     getattr(state.active_session, "value", "NONE"),
-                    getattr(ha_dir, "value", "UNDEFINED"),
+                    getattr(conf.direction, "value", "UNDEFINED"),
+                    conf.score, cfg.analysis.min_confluence_score,
+                    ",".join(conf.factor_names) or "-",
                 )
                 # Phase 7.B1 — persist reject context for counter-factual audit.
-                conf_stub = ConfluenceScore(
-                    direction=ha_dir, score=0.0, factors=[],
-                )
                 try:
                     await self._record_reject(
                         symbol=symbol,
                         reject_reason=reject_reason or "unknown",
                         state=state,
-                        conf=conf_stub,
+                        conf=conf,
                         candles=candles,
                         adx_3m_result=trend_regime_result,
                         adx_15m_result=htf_regime_result,
@@ -3820,11 +3847,44 @@ class BotRunner:
         # Planner already computed entry_price as last_close ± marketable_offset
         # (default 5 bps); no zone-search needed. 1-cycle timeout, fill
         # processing in `_process_pending` next cycle.
+        # 2026-05-05 v4 — confluence destek sinyali placement-time'da
+        # hesaplanır + PendingSetupMeta'ya stash'lenir, fill'de journal'a
+        # yazılır (yön teyidi + Pass 3 GBT feature).
+        try:
+            placement_conf = calculate_confluence(
+                state,
+                ltf_candles=candles,
+                allowed_sessions=cfg.allowed_sessions_for(symbol) or None,
+                ltf_state=self.ctx.ltf_cache.get(symbol),
+                htf_state=self.ctx.htf_state_cache.get(symbol),
+                weights=cfg.analysis.confluence_weights or None,
+                min_rsi_mfi_magnitude=cfg.analysis.min_rsi_mfi_magnitude,
+                liquidity_pool_max_atr_dist=cfg.analysis.liquidity_pool_max_atr_dist,
+                displacement_atr_mult=cfg.analysis.displacement_atr_mult,
+                displacement_max_bars_ago=cfg.analysis.displacement_max_bars_ago,
+                divergence_fresh_bars=cfg.analysis.divergence_fresh_bars,
+                divergence_decay_bars=cfg.analysis.divergence_decay_bars,
+                divergence_max_bars=cfg.analysis.divergence_max_bars,
+                trend_regime=trend_regime,
+                trend_regime_conditional_scoring_enabled=(
+                    cfg.analysis.trend_regime_conditional_scoring_enabled
+                ),
+                daily_bias_enabled=(
+                    cfg.on_chain.enabled
+                    and cfg.on_chain.daily_bias_enabled
+                ),
+                daily_bias_delta=cfg.on_chain.daily_bias_modifier_delta,
+            )
+        except Exception:
+            logger.debug("placement_confluence_failed symbol={}", symbol)
+            placement_conf = None
+
         pos_side = _direction_to_pos_side(plan.direction)
         placed = await self._place_ha_native_limit(
             symbol=symbol, pos_side=pos_side, plan=plan, state=state,
             adx_3m_result=trend_regime_result,
             adx_15m_result=htf_regime_result,
+            confluence=placement_conf,
         )
         if placed:
             return  # wait for fill event
@@ -4594,6 +4654,7 @@ class BotRunner:
         state: MarketState,
         adx_3m_result: Optional[TrendRegimeResult] = None,
         adx_15m_result: Optional[TrendRegimeResult] = None,
+        confluence: Optional[ConfluenceScore] = None,
     ) -> bool:
         """Yol A: marketable limit at plan.entry_price (already last_close ±
         marketable_offset_pct from the HA-native dispatcher). 1-cycle
@@ -4642,6 +4703,7 @@ class BotRunner:
             ),
             adx_3m_result_at_placement=adx_3m_result,
             adx_15m_result_at_placement=adx_15m_result,
+            confluence_at_placement=confluence,
         )
         logger.info(
             "ha_native_limit_placed symbol={} side={} order_id={} "
@@ -4855,7 +4917,23 @@ class BotRunner:
                     "15m", meta.adx_15m_result_at_placement,
                 ),
                 on_chain_context=self._on_chain_context_dict(),
-                confluence_pillar_scores=dict(plan.confluence_pillar_scores or {}),
+                # 2026-05-05 v4 — Yol A: confluence destek sinyali
+                # placement-time'da hesaplandı + meta'ya stash'lendi;
+                # fill'de journal'a yazılır. Plan kendi
+                # `confluence_pillar_scores`'unu set etmediği (HA-native
+                # builder boş bırakır) için meta'dan okuruz.
+                confluence_pillar_scores=(
+                    {
+                        f.name: float(f.weight)
+                        for f in (
+                            meta.confluence_at_placement.factors
+                            if meta.confluence_at_placement is not None
+                            else []
+                        )
+                    }
+                    if meta.confluence_at_placement is not None
+                    else dict(plan.confluence_pillar_scores or {})
+                ),
                 # 2026-04-22 (gece, late) — journal oscillator snapshot
                 # captured at pending PLACEMENT (not fill) so the row
                 # reflects the decision moment. Fill may happen minutes
