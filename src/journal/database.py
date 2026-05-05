@@ -87,16 +87,7 @@ CREATE TABLE IF NOT EXISTS trades (
     sl_moved_to_be      INTEGER NOT NULL DEFAULT 0,
     close_reason        TEXT,
 
-    funding_z_at_entry                  REAL,
-    ls_ratio_at_entry                   REAL,
-    oi_change_24h_at_entry              REAL,
-    liq_imbalance_1h_at_entry           REAL,
-    nearest_liq_cluster_above_price     REAL,
-    nearest_liq_cluster_below_price     REAL,
-    nearest_liq_cluster_above_notional  REAL,
-    nearest_liq_cluster_below_notional  REAL,
-    nearest_liq_cluster_above_distance_atr REAL,
-    nearest_liq_cluster_below_distance_atr REAL,
+    -- 2026-05-05 Phase 9.C — Coinalyze derivatives kolonları kaldırıldı.
 
     setup_zone_source       TEXT,
     zone_wait_bars          INTEGER,
@@ -145,28 +136,7 @@ CREATE TABLE IF NOT EXISTS trades (
     -- Empty dict '{}' on pre-migration rows.
     oscillator_raw_values TEXT NOT NULL DEFAULT '{}',
 
-    -- 2026-04-23 — extended derivatives enrichment (Pass 3 GBT inputs).
-    -- All 9 columns were already available on `DerivativesState` at cycle
-    -- time but previously only 4 fields landed in journal. Unpopulated on
-    -- pre-migration rows; new rows carry every field when the Coinalyze
-    -- cache has fresh data.
-    open_interest_usd_at_entry       REAL,   -- absolute OI $; pairs with oi_change_* for crowding context
-    oi_change_1h_pct_at_entry        REAL,   -- 1h window OI change % (short-term positioning shift)
-    funding_rate_current_at_entry    REAL,   -- current funding rate (raw decimal, e.g. 0.0001 = 0.01%/8h)
-    funding_rate_predicted_at_entry  REAL,   -- next-funding prediction
-    long_liq_notional_1h_at_entry    REAL,   -- long-side liquidation USD past 1h
-    short_liq_notional_1h_at_entry   REAL,   -- short-side liquidation USD past 1h
-    ls_ratio_zscore_14d_at_entry     REAL,   -- LS ratio z-score over 14 days
-    -- price_change_1h_pct_at_entry / price_change_4h_pct_at_entry dropped
-    -- 2026-04-27 (by-design NULL on pending-fill entries — every Bybit-era
-    -- trade is pending-fill, candles=None plumbed by design). Re-add only
-    -- if a market-entry path is reactivated. RL pipeline can compute %
-    -- change over candle buffers from raw derivatives_snapshots.
-    -- Top-N liquidation heatmap clusters (JSON list of dicts):
-    -- `{"above": [{price, notional_usd, distance_atr}, ...],
-    --   "below": [{...}, ...]}`.
-    -- Default '{}' when heatmap missing or already-open HTF skip empties cache.
-    liq_heatmap_top_clusters_json    TEXT NOT NULL DEFAULT '{}',
+    -- 2026-05-05 Phase 9.C — Coinalyze derivatives + heatmap kolonları kaldırıldı.
 
     -- 2026-05-04 — HA-native primary mode (Yol A) journal fields. Pass 3
     -- GBT segments accuracy + R distribution by entry strategy via the
@@ -262,16 +232,7 @@ CREATE TABLE IF NOT EXISTS rejected_signals (
     proposed_tp_price   REAL,
     proposed_rr_ratio   REAL,
 
-    funding_z_at_entry                  REAL,
-    ls_ratio_at_entry                   REAL,
-    oi_change_24h_at_entry              REAL,
-    liq_imbalance_1h_at_entry           REAL,
-    nearest_liq_cluster_above_price     REAL,
-    nearest_liq_cluster_below_price     REAL,
-    nearest_liq_cluster_above_notional  REAL,
-    nearest_liq_cluster_below_notional  REAL,
-    nearest_liq_cluster_above_distance_atr REAL,
-    nearest_liq_cluster_below_distance_atr REAL,
+    -- 2026-05-05 Phase 9.C — Coinalyze derivatives kolonları kaldırıldı.
 
     pillar_btc_bias     TEXT,
     pillar_eth_bias     TEXT,
@@ -309,25 +270,10 @@ CREATE TABLE IF NOT EXISTS rejected_signals (
     -- counter-factual analysis has continuous features for the reject
     -- subset too (e.g., "would a lower oscillator_raw_values.3m.rsi
     -- threshold have admitted this reject?").
-    oscillator_raw_values TEXT NOT NULL DEFAULT '{}',
-
-    -- 2026-04-23 — mirrors trades.* extended derivatives enrichment.
-    -- Rejected signals carry the same snapshot so Pass 3 counter-factual
-    -- analysis can test "would trade have opened at this OI/funding
-    -- state?" even for the reject subset.
-    open_interest_usd_at_entry       REAL,
-    oi_change_1h_pct_at_entry        REAL,
-    funding_rate_current_at_entry    REAL,
-    funding_rate_predicted_at_entry  REAL,
-    long_liq_notional_1h_at_entry    REAL,
-    short_liq_notional_1h_at_entry   REAL,
-    ls_ratio_zscore_14d_at_entry     REAL,
-    -- price_change_1h_pct_at_entry / price_change_4h_pct_at_entry kept
-    -- on rejected_signals (F1 plumbing fills these for synchronous
-    -- rejects with candle buffer). Pending-cancel rows stay NULL.
-    price_change_1h_pct_at_entry     REAL,
-    price_change_4h_pct_at_entry     REAL,
-    liq_heatmap_top_clusters_json    TEXT NOT NULL DEFAULT '{}'
+    -- 2026-05-05 Phase 9.C — Coinalyze derivatives + heatmap + price_change
+    -- kolonları kaldırıldı. price_change_*h_pct_at_entry kullanım sıfırdı
+    -- (F1 plumbing pending-cancel'larda hep NULL'du).
+    oscillator_raw_values TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_rejected_symbol_ts  ON rejected_signals(symbol, signal_timestamp);
@@ -565,16 +511,11 @@ _COLUMNS = [
     # 2026-04-27 drops on trades: algo_id, client_algo_id, algo_ids,
     # entry_timeframe, htf_timeframe, regime_at_entry, funding_z_6h,
     # funding_z_24h, notes, screenshot_entry, screenshot_exit,
-    # price_change_1h_pct_at_entry, price_change_4h_pct_at_entry.
     "order_id", "client_order_id",
     "htf_bias", "session", "market_structure",
     "exit_price", "pnl_usdt", "pnl_r", "fees_usdt",
     "sl_moved_to_be", "close_reason",
-    "funding_z_at_entry", "ls_ratio_at_entry",
-    "oi_change_24h_at_entry", "liq_imbalance_1h_at_entry",
-    "nearest_liq_cluster_above_price", "nearest_liq_cluster_below_price",
-    "nearest_liq_cluster_above_notional", "nearest_liq_cluster_below_notional",
-    "nearest_liq_cluster_above_distance_atr", "nearest_liq_cluster_below_distance_atr",
+    # 2026-05-05 Phase 9.C — Coinalyze derivatives + heatmap kolonları kaldırıldı.
     "setup_zone_source", "zone_wait_bars", "zone_fill_latency_bars",
     "trend_regime_at_entry",
     # 2026-05-02 — Phase A.9 ADX numeric capture (trades + rejected mirror).
@@ -584,14 +525,6 @@ _COLUMNS = [
     "demo_artifact", "artifact_reason",
     "confluence_pillar_scores",
     "oscillator_raw_values",
-    "open_interest_usd_at_entry",
-    "oi_change_1h_pct_at_entry",
-    "funding_rate_current_at_entry",
-    "funding_rate_predicted_at_entry",
-    "long_liq_notional_1h_at_entry",
-    "short_liq_notional_1h_at_entry",
-    "ls_ratio_zscore_14d_at_entry",
-    "liq_heatmap_top_clusters_json",
     # 2026-05-04 — HA-native (Yol A) journal fields. Order MUST match the
     # tuple returned by `_record_to_row` and the schema column order in
     # `trades` CREATE TABLE.
@@ -641,11 +574,7 @@ _REJECTED_COLUMNS = [
     # regime_at_entry (1-distinct constants).
     "proposed_sl_price", "proposed_tp_price", "proposed_rr_ratio",
     "htf_bias", "session", "market_structure",
-    "funding_z_at_entry", "ls_ratio_at_entry",
-    "oi_change_24h_at_entry", "liq_imbalance_1h_at_entry",
-    "nearest_liq_cluster_above_price", "nearest_liq_cluster_below_price",
-    "nearest_liq_cluster_above_notional", "nearest_liq_cluster_below_notional",
-    "nearest_liq_cluster_above_distance_atr", "nearest_liq_cluster_below_distance_atr",
+    # 2026-05-05 Phase 9.C — Coinalyze derivatives + heatmap kolonları kaldırıldı.
     "pillar_btc_bias", "pillar_eth_bias",
     # 2026-05-02 — Phase A.9 ADX numeric capture (trades + rejected mirror).
     "adx_3m_at_entry", "plus_di_3m_at_entry", "minus_di_3m_at_entry",
@@ -653,16 +582,6 @@ _REJECTED_COLUMNS = [
     "hypothetical_outcome", "hypothetical_bars_to_tp", "hypothetical_bars_to_sl",
     "confluence_pillar_scores",
     "oscillator_raw_values",
-    "open_interest_usd_at_entry",
-    "oi_change_1h_pct_at_entry",
-    "funding_rate_current_at_entry",
-    "funding_rate_predicted_at_entry",
-    "long_liq_notional_1h_at_entry",
-    "short_liq_notional_1h_at_entry",
-    "ls_ratio_zscore_14d_at_entry",
-    "price_change_1h_pct_at_entry",
-    "price_change_4h_pct_at_entry",
-    "liq_heatmap_top_clusters_json",
 ]
 
 
@@ -691,17 +610,7 @@ _MIGRATIONS = [
     "ALTER TABLE trades ADD COLUMN close_reason TEXT",
     # Phase 1.5 Madde 7 — derivatives snapshot at entry time.
     "ALTER TABLE trades ADD COLUMN regime_at_entry TEXT",
-    "ALTER TABLE trades ADD COLUMN funding_z_at_entry REAL",
-    "ALTER TABLE trades ADD COLUMN ls_ratio_at_entry REAL",
-    "ALTER TABLE trades ADD COLUMN oi_change_24h_at_entry REAL",
-    "ALTER TABLE trades ADD COLUMN liq_imbalance_1h_at_entry REAL",
-    "ALTER TABLE trades ADD COLUMN nearest_liq_cluster_above_price REAL",
-    "ALTER TABLE trades ADD COLUMN nearest_liq_cluster_below_price REAL",
-    "ALTER TABLE trades ADD COLUMN nearest_liq_cluster_above_notional REAL",
-    "ALTER TABLE trades ADD COLUMN nearest_liq_cluster_below_notional REAL",
     # BLOK D-7 — cluster distance in ATR units, pre-computed at entry.
-    "ALTER TABLE trades ADD COLUMN nearest_liq_cluster_above_distance_atr REAL",
-    "ALTER TABLE trades ADD COLUMN nearest_liq_cluster_below_distance_atr REAL",
     # Phase 7.B5 schema v2 — zone-entry context + ADX regime + windowed funding.
     "ALTER TABLE trades ADD COLUMN setup_zone_source TEXT",
     "ALTER TABLE trades ADD COLUMN zone_wait_bars INTEGER",
@@ -748,28 +657,7 @@ _MIGRATIONS = [
     # written (regime / funding_z_30d / ls_ratio / oi_change_24h / liq_imb_1h);
     # the other 9 joined-later for Pass 3 GBT continuous-feature search.
     # price_change_1h/4h_pct_at_entry derived from the entry-TF candle
-    # buffer (zero extra API cost). liq_heatmap_top_clusters_json carries
     # top-5 above + top-5 below JSON for richer magnet / target modelling.
-    "ALTER TABLE trades ADD COLUMN open_interest_usd_at_entry REAL",
-    "ALTER TABLE trades ADD COLUMN oi_change_1h_pct_at_entry REAL",
-    "ALTER TABLE trades ADD COLUMN funding_rate_current_at_entry REAL",
-    "ALTER TABLE trades ADD COLUMN funding_rate_predicted_at_entry REAL",
-    "ALTER TABLE trades ADD COLUMN long_liq_notional_1h_at_entry REAL",
-    "ALTER TABLE trades ADD COLUMN short_liq_notional_1h_at_entry REAL",
-    "ALTER TABLE trades ADD COLUMN ls_ratio_zscore_14d_at_entry REAL",
-    "ALTER TABLE trades ADD COLUMN price_change_1h_pct_at_entry REAL",
-    "ALTER TABLE trades ADD COLUMN price_change_4h_pct_at_entry REAL",
-    "ALTER TABLE trades ADD COLUMN liq_heatmap_top_clusters_json TEXT NOT NULL DEFAULT '{}'",
-    "ALTER TABLE rejected_signals ADD COLUMN open_interest_usd_at_entry REAL",
-    "ALTER TABLE rejected_signals ADD COLUMN oi_change_1h_pct_at_entry REAL",
-    "ALTER TABLE rejected_signals ADD COLUMN funding_rate_current_at_entry REAL",
-    "ALTER TABLE rejected_signals ADD COLUMN funding_rate_predicted_at_entry REAL",
-    "ALTER TABLE rejected_signals ADD COLUMN long_liq_notional_1h_at_entry REAL",
-    "ALTER TABLE rejected_signals ADD COLUMN short_liq_notional_1h_at_entry REAL",
-    "ALTER TABLE rejected_signals ADD COLUMN ls_ratio_zscore_14d_at_entry REAL",
-    "ALTER TABLE rejected_signals ADD COLUMN price_change_1h_pct_at_entry REAL",
-    "ALTER TABLE rejected_signals ADD COLUMN price_change_4h_pct_at_entry REAL",
-    "ALTER TABLE rejected_signals ADD COLUMN liq_heatmap_top_clusters_json TEXT NOT NULL DEFAULT '{}'",
     # 2026-04-24 (evening) — per-exchange derivatives JSON columns REMOVED.
     # Tier A ADDs (trades + rejected_signals × 3 cols = 6 migrations) were
     # rolled back after 4 iterations of chasing Coinalyze 429 rate-limits
@@ -922,8 +810,6 @@ _MIGRATIONS = [
     "ALTER TABLE trades DROP COLUMN screenshot_exit",
     "ALTER TABLE trades DROP COLUMN funding_z_6h",
     "ALTER TABLE trades DROP COLUMN funding_z_24h",
-    "ALTER TABLE trades DROP COLUMN price_change_1h_pct_at_entry",
-    "ALTER TABLE trades DROP COLUMN price_change_4h_pct_at_entry",
     "ALTER TABLE trades DROP COLUMN entry_timeframe",
     "ALTER TABLE trades DROP COLUMN htf_timeframe",
     "ALTER TABLE trades DROP COLUMN regime_at_entry",
@@ -1059,11 +945,7 @@ def _record_to_row(rec: TradeRecord) -> tuple:
         rec.htf_bias, rec.session, rec.market_structure,
         rec.exit_price, rec.pnl_usdt, rec.pnl_r, rec.fees_usdt,
         int(rec.sl_moved_to_be), rec.close_reason,
-        rec.funding_z_at_entry, rec.ls_ratio_at_entry,
-        rec.oi_change_24h_at_entry, rec.liq_imbalance_1h_at_entry,
-        rec.nearest_liq_cluster_above_price, rec.nearest_liq_cluster_below_price,
-        rec.nearest_liq_cluster_above_notional, rec.nearest_liq_cluster_below_notional,
-        rec.nearest_liq_cluster_above_distance_atr, rec.nearest_liq_cluster_below_distance_atr,
+        # 2026-05-05 Phase 9.C — Coinalyze derivatives tuple kolonları kaldırıldı.
         rec.setup_zone_source, rec.zone_wait_bars, rec.zone_fill_latency_bars,
         rec.trend_regime_at_entry,
         rec.adx_3m_at_entry, rec.plus_di_3m_at_entry, rec.minus_di_3m_at_entry,
@@ -1077,14 +959,7 @@ def _record_to_row(rec: TradeRecord) -> tuple:
         # 2026-05-05 Phase 9 — Arkham purge: on_chain_context tuple'dan kaldırıldı.
         json.dumps(rec.confluence_pillar_scores or {}),
         json.dumps(rec.oscillator_raw_values or {}),
-        rec.open_interest_usd_at_entry,
-        rec.oi_change_1h_pct_at_entry,
-        rec.funding_rate_current_at_entry,
-        rec.funding_rate_predicted_at_entry,
-        rec.long_liq_notional_1h_at_entry,
-        rec.short_liq_notional_1h_at_entry,
-        rec.ls_ratio_zscore_14d_at_entry,
-        json.dumps(rec.liq_heatmap_top_clusters or {}),
+        # 2026-05-05 Phase 9.C — Coinalyze derivatives + heatmap tuple kolonları kaldırıldı.
         # 2026-05-04 — HA-native (Yol A) journal fields. SQLite has no
         # BOOLEAN; encode is_ha_native as INTEGER 0/1/NULL. All other
         # fields are nullable text/int/real and accept None directly.
@@ -1133,28 +1008,13 @@ def _rejected_to_row(rec: RejectedSignal) -> tuple:
         json.dumps(rec.confluence_factors),
         rec.proposed_sl_price, rec.proposed_tp_price, rec.proposed_rr_ratio,
         rec.htf_bias, rec.session, rec.market_structure,
-        rec.funding_z_at_entry, rec.ls_ratio_at_entry,
-        rec.oi_change_24h_at_entry, rec.liq_imbalance_1h_at_entry,
-        rec.nearest_liq_cluster_above_price, rec.nearest_liq_cluster_below_price,
-        rec.nearest_liq_cluster_above_notional, rec.nearest_liq_cluster_below_notional,
-        rec.nearest_liq_cluster_above_distance_atr, rec.nearest_liq_cluster_below_distance_atr,
+        # 2026-05-05 Phase 9.C — Coinalyze derivatives kolonları kaldırıldı.
         rec.pillar_btc_bias, rec.pillar_eth_bias,
         rec.adx_3m_at_entry, rec.plus_di_3m_at_entry, rec.minus_di_3m_at_entry,
         rec.adx_15m_at_entry, rec.plus_di_15m_at_entry, rec.minus_di_15m_at_entry,
         rec.hypothetical_outcome, rec.hypothetical_bars_to_tp, rec.hypothetical_bars_to_sl,
-        # 2026-05-05 Phase 9 — Arkham purge: on_chain_context kaldırıldı.
         json.dumps(rec.confluence_pillar_scores or {}),
         json.dumps(rec.oscillator_raw_values or {}),
-        rec.open_interest_usd_at_entry,
-        rec.oi_change_1h_pct_at_entry,
-        rec.funding_rate_current_at_entry,
-        rec.funding_rate_predicted_at_entry,
-        rec.long_liq_notional_1h_at_entry,
-        rec.short_liq_notional_1h_at_entry,
-        rec.ls_ratio_zscore_14d_at_entry,
-        rec.price_change_1h_pct_at_entry,
-        rec.price_change_4h_pct_at_entry,
-        json.dumps(rec.liq_heatmap_top_clusters or {}),
     )
 
 
@@ -1175,16 +1035,6 @@ def _row_to_rejected(row: aiosqlite.Row) -> RejectedSignal:
         htf_bias=row["htf_bias"],
         session=row["session"],
         market_structure=row["market_structure"],
-        funding_z_at_entry=row["funding_z_at_entry"],
-        ls_ratio_at_entry=row["ls_ratio_at_entry"],
-        oi_change_24h_at_entry=row["oi_change_24h_at_entry"],
-        liq_imbalance_1h_at_entry=row["liq_imbalance_1h_at_entry"],
-        nearest_liq_cluster_above_price=row["nearest_liq_cluster_above_price"],
-        nearest_liq_cluster_below_price=row["nearest_liq_cluster_below_price"],
-        nearest_liq_cluster_above_notional=row["nearest_liq_cluster_above_notional"],
-        nearest_liq_cluster_below_notional=row["nearest_liq_cluster_below_notional"],
-        nearest_liq_cluster_above_distance_atr=row["nearest_liq_cluster_above_distance_atr"],
-        nearest_liq_cluster_below_distance_atr=row["nearest_liq_cluster_below_distance_atr"],
         pillar_btc_bias=row["pillar_btc_bias"],
         pillar_eth_bias=row["pillar_eth_bias"],
         adx_3m_at_entry=_safe_col(row, "adx_3m_at_entry"),
@@ -1198,40 +1048,7 @@ def _row_to_rejected(row: aiosqlite.Row) -> RejectedSignal:
         hypothetical_bars_to_sl=_safe_col(row, "hypothetical_bars_to_sl"),
         confluence_pillar_scores=_parse_pillar_scores(row),
         oscillator_raw_values=_parse_oscillator_raw_values(row),
-        open_interest_usd_at_entry=_safe_col(row, "open_interest_usd_at_entry"),
-        oi_change_1h_pct_at_entry=_safe_col(row, "oi_change_1h_pct_at_entry"),
-        funding_rate_current_at_entry=_safe_col(row, "funding_rate_current_at_entry"),
-        funding_rate_predicted_at_entry=_safe_col(row, "funding_rate_predicted_at_entry"),
-        long_liq_notional_1h_at_entry=_safe_col(row, "long_liq_notional_1h_at_entry"),
-        short_liq_notional_1h_at_entry=_safe_col(row, "short_liq_notional_1h_at_entry"),
-        ls_ratio_zscore_14d_at_entry=_safe_col(row, "ls_ratio_zscore_14d_at_entry"),
-        price_change_1h_pct_at_entry=_safe_col(row, "price_change_1h_pct_at_entry"),
-        price_change_4h_pct_at_entry=_safe_col(row, "price_change_4h_pct_at_entry"),
-        liq_heatmap_top_clusters=_parse_liq_heatmap_clusters(row),
-    )
-
-
-def _parse_liq_heatmap_clusters(row: aiosqlite.Row) -> dict:
-    """Decode `liq_heatmap_top_clusters_json`; `{}` on any issue.
-
-    Expected shape: `{"above": [{price, notional_usd, distance_atr}, ...],
-    "below": [...]}`. Missing/malformed → empty dict; non-dict top-level
-    → empty dict; list values with non-dict entries filtered."""
-    raw = _safe_col(row, "liq_heatmap_top_clusters_json")
-    if raw is None:
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except (TypeError, ValueError):
-        return {}
-    if not isinstance(parsed, dict):
-        return {}
-    out: dict[str, list] = {}
-    for side in ("above", "below"):
-        value = parsed.get(side)
-        if isinstance(value, list):
-            out[side] = [dict(c) for c in value if isinstance(c, dict)]
-    return out
+    )# 2026-05-05 Phase 9.C — Coinalyze purge: _parse_liq_heatmap_clusters silindi.
 
 
 def _parse_oscillator_raw_values(row: aiosqlite.Row) -> dict[str, dict]:
@@ -1313,16 +1130,6 @@ def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
         fees_usdt=row["fees_usdt"] or 0.0,
         sl_moved_to_be=bool(_safe_col(row, "sl_moved_to_be") or 0),
         close_reason=_safe_col(row, "close_reason"),
-        funding_z_at_entry=_safe_col(row, "funding_z_at_entry"),
-        ls_ratio_at_entry=_safe_col(row, "ls_ratio_at_entry"),
-        oi_change_24h_at_entry=_safe_col(row, "oi_change_24h_at_entry"),
-        liq_imbalance_1h_at_entry=_safe_col(row, "liq_imbalance_1h_at_entry"),
-        nearest_liq_cluster_above_price=_safe_col(row, "nearest_liq_cluster_above_price"),
-        nearest_liq_cluster_below_price=_safe_col(row, "nearest_liq_cluster_below_price"),
-        nearest_liq_cluster_above_notional=_safe_col(row, "nearest_liq_cluster_above_notional"),
-        nearest_liq_cluster_below_notional=_safe_col(row, "nearest_liq_cluster_below_notional"),
-        nearest_liq_cluster_above_distance_atr=_safe_col(row, "nearest_liq_cluster_above_distance_atr"),
-        nearest_liq_cluster_below_distance_atr=_safe_col(row, "nearest_liq_cluster_below_distance_atr"),
         setup_zone_source=_safe_col(row, "setup_zone_source"),
         zone_wait_bars=_safe_col(row, "zone_wait_bars"),
         zone_fill_latency_bars=_safe_col(row, "zone_fill_latency_bars"),
@@ -1339,14 +1146,6 @@ def _row_to_record(row: aiosqlite.Row) -> TradeRecord:
         artifact_reason=_safe_col(row, "artifact_reason"),
         confluence_pillar_scores=_parse_pillar_scores(row),
         oscillator_raw_values=_parse_oscillator_raw_values(row),
-        open_interest_usd_at_entry=_safe_col(row, "open_interest_usd_at_entry"),
-        oi_change_1h_pct_at_entry=_safe_col(row, "oi_change_1h_pct_at_entry"),
-        funding_rate_current_at_entry=_safe_col(row, "funding_rate_current_at_entry"),
-        funding_rate_predicted_at_entry=_safe_col(row, "funding_rate_predicted_at_entry"),
-        long_liq_notional_1h_at_entry=_safe_col(row, "long_liq_notional_1h_at_entry"),
-        short_liq_notional_1h_at_entry=_safe_col(row, "short_liq_notional_1h_at_entry"),
-        ls_ratio_zscore_14d_at_entry=_safe_col(row, "ls_ratio_zscore_14d_at_entry"),
-        liq_heatmap_top_clusters=_parse_liq_heatmap_clusters(row),
         # 2026-05-04 — HA-native (Yol A) journal fields. _safe_bool keeps
         # is_ha_native tri-state (None on pre-migration rows). Other
         # fields default to None via _safe_col when column missing.
@@ -1476,16 +1275,6 @@ class TradeJournal:
         htf_bias: Optional[str] = None,
         session: Optional[str] = None,
         market_structure: Optional[str] = None,
-        funding_z_at_entry: Optional[float] = None,
-        ls_ratio_at_entry: Optional[float] = None,
-        oi_change_24h_at_entry: Optional[float] = None,
-        liq_imbalance_1h_at_entry: Optional[float] = None,
-        nearest_liq_cluster_above_price: Optional[float] = None,
-        nearest_liq_cluster_below_price: Optional[float] = None,
-        nearest_liq_cluster_above_notional: Optional[float] = None,
-        nearest_liq_cluster_below_notional: Optional[float] = None,
-        nearest_liq_cluster_above_distance_atr: Optional[float] = None,
-        nearest_liq_cluster_below_distance_atr: Optional[float] = None,
         trend_regime_at_entry: Optional[str] = None,
         # 2026-05-02 — Phase A.9 ADX numeric capture (entry TF + HTF triad).
         adx_3m_at_entry: Optional[float] = None,
@@ -1497,14 +1286,6 @@ class TradeJournal:
         # 2026-05-05 Phase 9 — Arkham purge: on_chain_context kwarg kaldırıldı.
         confluence_pillar_scores: Optional[dict[str, float]] = None,
         oscillator_raw_values: Optional[dict[str, dict]] = None,
-        open_interest_usd_at_entry: Optional[float] = None,
-        oi_change_1h_pct_at_entry: Optional[float] = None,
-        funding_rate_current_at_entry: Optional[float] = None,
-        funding_rate_predicted_at_entry: Optional[float] = None,
-        long_liq_notional_1h_at_entry: Optional[float] = None,
-        short_liq_notional_1h_at_entry: Optional[float] = None,
-        ls_ratio_zscore_14d_at_entry: Optional[float] = None,
-        liq_heatmap_top_clusters: Optional[dict] = None,
         # price_change_1h/4h_pct_at_entry kwargs dropped 2026-04-27 —
         # by-design NULL on every Bybit-era trade (all pending-fill,
         # candles=None plumbed by design).
@@ -1566,8 +1347,6 @@ class TradeJournal:
         entry_timeframe: Optional[str] = None,  # noqa: ARG002 (1-distinct config constant)
         htf_timeframe: Optional[str] = None,    # noqa: ARG002 (1-distinct config constant)
         regime_at_entry: Optional[str] = None,  # noqa: ARG002 (was 1-distinct constant 'BALANCED')
-        price_change_1h_pct_at_entry: Optional[float] = None,  # noqa: ARG002
-        price_change_4h_pct_at_entry: Optional[float] = None,  # noqa: ARG002
     ) -> TradeRecord:
         """Insert an OPEN row describing a freshly-placed trade.
 
@@ -1600,16 +1379,6 @@ class TradeJournal:
             htf_bias=htf_bias,
             session=session,
             market_structure=market_structure,
-            funding_z_at_entry=funding_z_at_entry,
-            ls_ratio_at_entry=ls_ratio_at_entry,
-            oi_change_24h_at_entry=oi_change_24h_at_entry,
-            liq_imbalance_1h_at_entry=liq_imbalance_1h_at_entry,
-            nearest_liq_cluster_above_price=nearest_liq_cluster_above_price,
-            nearest_liq_cluster_below_price=nearest_liq_cluster_below_price,
-            nearest_liq_cluster_above_notional=nearest_liq_cluster_above_notional,
-            nearest_liq_cluster_below_notional=nearest_liq_cluster_below_notional,
-            nearest_liq_cluster_above_distance_atr=nearest_liq_cluster_above_distance_atr,
-            nearest_liq_cluster_below_distance_atr=nearest_liq_cluster_below_distance_atr,
             trend_regime_at_entry=trend_regime_at_entry,
             adx_3m_at_entry=adx_3m_at_entry,
             plus_di_3m_at_entry=plus_di_3m_at_entry,
@@ -1619,14 +1388,6 @@ class TradeJournal:
             minus_di_15m_at_entry=minus_di_15m_at_entry,
             confluence_pillar_scores=dict(confluence_pillar_scores or {}),
             oscillator_raw_values=dict(oscillator_raw_values or {}),
-            open_interest_usd_at_entry=open_interest_usd_at_entry,
-            oi_change_1h_pct_at_entry=oi_change_1h_pct_at_entry,
-            funding_rate_current_at_entry=funding_rate_current_at_entry,
-            funding_rate_predicted_at_entry=funding_rate_predicted_at_entry,
-            long_liq_notional_1h_at_entry=long_liq_notional_1h_at_entry,
-            short_liq_notional_1h_at_entry=short_liq_notional_1h_at_entry,
-            ls_ratio_zscore_14d_at_entry=ls_ratio_zscore_14d_at_entry,
-            liq_heatmap_top_clusters=dict(liq_heatmap_top_clusters or {}),
             setup_zone_source=setup_zone_source,
             zone_wait_bars=zone_wait_bars,
             zone_fill_latency_bars=zone_fill_latency_bars,
@@ -1797,16 +1558,6 @@ class TradeJournal:
         htf_bias: Optional[str] = None,
         session: Optional[str] = None,
         market_structure: Optional[str] = None,
-        funding_z_at_entry: Optional[float] = None,
-        ls_ratio_at_entry: Optional[float] = None,
-        oi_change_24h_at_entry: Optional[float] = None,
-        liq_imbalance_1h_at_entry: Optional[float] = None,
-        nearest_liq_cluster_above_price: Optional[float] = None,
-        nearest_liq_cluster_below_price: Optional[float] = None,
-        nearest_liq_cluster_above_notional: Optional[float] = None,
-        nearest_liq_cluster_below_notional: Optional[float] = None,
-        nearest_liq_cluster_above_distance_atr: Optional[float] = None,
-        nearest_liq_cluster_below_distance_atr: Optional[float] = None,
         pillar_btc_bias: Optional[str] = None,
         pillar_eth_bias: Optional[str] = None,
         # 2026-05-02 — Phase A.9 ADX numeric capture (entry TF + HTF triad).
@@ -1819,16 +1570,6 @@ class TradeJournal:
         # 2026-05-05 Phase 9 — Arkham purge: on_chain_context kwarg kaldırıldı.
         confluence_pillar_scores: Optional[dict[str, float]] = None,
         oscillator_raw_values: Optional[dict[str, dict]] = None,
-        open_interest_usd_at_entry: Optional[float] = None,
-        oi_change_1h_pct_at_entry: Optional[float] = None,
-        funding_rate_current_at_entry: Optional[float] = None,
-        funding_rate_predicted_at_entry: Optional[float] = None,
-        long_liq_notional_1h_at_entry: Optional[float] = None,
-        short_liq_notional_1h_at_entry: Optional[float] = None,
-        ls_ratio_zscore_14d_at_entry: Optional[float] = None,
-        price_change_1h_pct_at_entry: Optional[float] = None,
-        price_change_4h_pct_at_entry: Optional[float] = None,
-        liq_heatmap_top_clusters: Optional[dict] = None,
     ) -> RejectedSignal:
         """Insert a single row into `rejected_signals`.
 
@@ -1857,16 +1598,6 @@ class TradeJournal:
             htf_bias=htf_bias,
             session=session,
             market_structure=market_structure,
-            funding_z_at_entry=funding_z_at_entry,
-            ls_ratio_at_entry=ls_ratio_at_entry,
-            oi_change_24h_at_entry=oi_change_24h_at_entry,
-            liq_imbalance_1h_at_entry=liq_imbalance_1h_at_entry,
-            nearest_liq_cluster_above_price=nearest_liq_cluster_above_price,
-            nearest_liq_cluster_below_price=nearest_liq_cluster_below_price,
-            nearest_liq_cluster_above_notional=nearest_liq_cluster_above_notional,
-            nearest_liq_cluster_below_notional=nearest_liq_cluster_below_notional,
-            nearest_liq_cluster_above_distance_atr=nearest_liq_cluster_above_distance_atr,
-            nearest_liq_cluster_below_distance_atr=nearest_liq_cluster_below_distance_atr,
             pillar_btc_bias=pillar_btc_bias,
             pillar_eth_bias=pillar_eth_bias,
             adx_3m_at_entry=adx_3m_at_entry,
@@ -1877,16 +1608,6 @@ class TradeJournal:
             minus_di_15m_at_entry=minus_di_15m_at_entry,
             confluence_pillar_scores=dict(confluence_pillar_scores or {}),
             oscillator_raw_values=dict(oscillator_raw_values or {}),
-            open_interest_usd_at_entry=open_interest_usd_at_entry,
-            oi_change_1h_pct_at_entry=oi_change_1h_pct_at_entry,
-            funding_rate_current_at_entry=funding_rate_current_at_entry,
-            funding_rate_predicted_at_entry=funding_rate_predicted_at_entry,
-            long_liq_notional_1h_at_entry=long_liq_notional_1h_at_entry,
-            short_liq_notional_1h_at_entry=short_liq_notional_1h_at_entry,
-            ls_ratio_zscore_14d_at_entry=ls_ratio_zscore_14d_at_entry,
-            price_change_1h_pct_at_entry=price_change_1h_pct_at_entry,
-            price_change_4h_pct_at_entry=price_change_4h_pct_at_entry,
-            liq_heatmap_top_clusters=dict(liq_heatmap_top_clusters or {}),
         )
         placeholders = ", ".join("?" * len(_REJECTED_COLUMNS))
         cols = ", ".join(_REJECTED_COLUMNS)

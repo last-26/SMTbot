@@ -71,6 +71,12 @@ class VMCEntryConfig:
         "DOGE-USDT-SWAP":     0.010,
         "ADA-USDT-SWAP":      0.010,
         "LINK-USDT-SWAP":     0.010,
+        # 2026-05-05 — 5 yeni pair (15 toplam).
+        "ENA-USDT-SWAP":      0.010,
+        "SUI-USDT-SWAP":      0.010,
+        "TAO-USDT-SWAP":      0.010,
+        "DASH-USDT-SWAP":     0.010,
+        "DOT-USDT-SWAP":      0.010,
     })
     sl_pct_default: float = 0.010
 

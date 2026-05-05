@@ -202,6 +202,12 @@ _INTERNAL_TO_BYBIT_SYMBOL = {
     "ONDO-USDT-SWAP":     "ONDOUSDT",
     "AVAX-USDT-SWAP":     "AVAXUSDT",
     "LINK-USDT-SWAP":     "LINKUSDT",
+    # 2026-05-05 — 5 yeni pair (operatör: 15 toplam; cycle 5dk).
+    "ENA-USDT-SWAP":      "ENAUSDT",
+    "SUI-USDT-SWAP":      "SUIUSDT",
+    "TAO-USDT-SWAP":      "TAOUSDT",
+    "DASH-USDT-SWAP":     "DASHUSDT",
+    "DOT-USDT-SWAP":      "DOTUSDT",
 }
 
 # Per-symbol contract-value-per-contract (carried over from the
@@ -228,6 +234,12 @@ _INTERNAL_CT_VAL = {
     "ONDO-USDT-SWAP":     10.0,   # ONDO ~$1, qtyStep 1-10
     "AVAX-USDT-SWAP":     0.1,    # AVAX ~$30, qtyStep 0.1
     "LINK-USDT-SWAP":     0.1,    # LINK ~$15, qtyStep 0.1
+    # 2026-05-05 — 5 yeni pair (operatör: 15 toplam).
+    "ENA-USDT-SWAP":      10.0,   # ENA ~$0.5, qtyStep 1-10
+    "SUI-USDT-SWAP":      1.0,    # SUI ~$3, qtyStep 0.1-1
+    "TAO-USDT-SWAP":      0.01,   # TAO ~$300, qtyStep 0.01
+    "DASH-USDT-SWAP":     0.1,    # DASH ~$30, qtyStep 0.1
+    "DOT-USDT-SWAP":      1.0,    # DOT ~$5, qtyStep 0.1-1
 }
 
 

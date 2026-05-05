@@ -105,19 +105,9 @@ class TradeRecord(BaseModel):
     # RL features. All optional so legacy rows stay readable.
     # 2026-04-27 drop: regime_at_entry (DerivativesRegime classifier
     # always returned 'BALANCED' — 1-distinct constant).
-    funding_z_at_entry: Optional[float] = None
-    ls_ratio_at_entry: Optional[float] = None
-    oi_change_24h_at_entry: Optional[float] = None
-    liq_imbalance_1h_at_entry: Optional[float] = None
-    nearest_liq_cluster_above_price: Optional[float] = None
-    nearest_liq_cluster_below_price: Optional[float] = None
-    nearest_liq_cluster_above_notional: Optional[float] = None
-    nearest_liq_cluster_below_notional: Optional[float] = None
     # BLOK D-7 — pre-computed ATR distance to the nearest cluster on each
     # side. Avoids post-hoc join against price+ATR (which may not be in the
     # row for older migrations). None when heatmap or ATR is missing.
-    nearest_liq_cluster_above_distance_atr: Optional[float] = None
-    nearest_liq_cluster_below_distance_atr: Optional[float] = None
 
     # Phase 7.B5 schema v2 — nullable on pre-pivot rows, filled by 7.C/7.D.
     # setup_zone_source: which zone source produced the limit entry
@@ -198,13 +188,6 @@ class TradeRecord(BaseModel):
     # price changes over 1h/4h from the entry-TF candle buffer
     # (price-OI divergence patterns). None on rows where the cache was
     # unavailable (bridge=None tests, early tick before Coinalyze warms).
-    open_interest_usd_at_entry: Optional[float] = None
-    oi_change_1h_pct_at_entry: Optional[float] = None
-    funding_rate_current_at_entry: Optional[float] = None
-    funding_rate_predicted_at_entry: Optional[float] = None
-    long_liq_notional_1h_at_entry: Optional[float] = None
-    short_liq_notional_1h_at_entry: Optional[float] = None
-    ls_ratio_zscore_14d_at_entry: Optional[float] = None
     # 2026-04-27 drops: price_change_1h/4h_pct_at_entry — by-design NULL
     # on every Bybit-era trade (all pending-fill, candles=None plumbed by
     # design). Reject-side (RejectedSignal) keeps these because reject
@@ -214,7 +197,6 @@ class TradeRecord(BaseModel):
     #    "below": [{...}, ...]}
     # Default empty dict; richer target/magnet modelling in Pass 3 vs just
     # the nearest-above/nearest-below pair.
-    liq_heatmap_top_clusters: dict = Field(default_factory=dict)
 
     # 2026-05-04 — HA-native primary mode (Yol A) journal fields.
     # `is_ha_native` is True when the entry came via _build_ha_native_trade_plan
@@ -330,16 +312,6 @@ class RejectedSignal(BaseModel):
     proposed_rr_ratio: Optional[float] = None
 
     # Derivatives snapshot — same fields as TradeRecord
-    funding_z_at_entry: Optional[float] = None
-    ls_ratio_at_entry: Optional[float] = None
-    oi_change_24h_at_entry: Optional[float] = None
-    liq_imbalance_1h_at_entry: Optional[float] = None
-    nearest_liq_cluster_above_price: Optional[float] = None
-    nearest_liq_cluster_below_price: Optional[float] = None
-    nearest_liq_cluster_above_notional: Optional[float] = None
-    nearest_liq_cluster_below_notional: Optional[float] = None
-    nearest_liq_cluster_above_distance_atr: Optional[float] = None
-    nearest_liq_cluster_below_distance_atr: Optional[float] = None
 
     # Cross-asset pillar state (Phase 7.A6) — essential for auditing
     # `cross_asset_opposition` rejects: were BTC + ETH really opposing?
@@ -384,16 +356,6 @@ class RejectedSignal(BaseModel):
     # 2026-04-23 — mirrors TradeRecord.* extended derivatives enrichment.
     # Lets Pass 3 counter-factual analysis test "would trade have opened
     # at this OI/funding/LS state?" for the reject subset too.
-    open_interest_usd_at_entry: Optional[float] = None
-    oi_change_1h_pct_at_entry: Optional[float] = None
-    funding_rate_current_at_entry: Optional[float] = None
-    funding_rate_predicted_at_entry: Optional[float] = None
-    long_liq_notional_1h_at_entry: Optional[float] = None
-    short_liq_notional_1h_at_entry: Optional[float] = None
-    ls_ratio_zscore_14d_at_entry: Optional[float] = None
-    price_change_1h_pct_at_entry: Optional[float] = None
-    price_change_4h_pct_at_entry: Optional[float] = None
-    liq_heatmap_top_clusters: dict = Field(default_factory=dict)
 
 
 class WhaleTransferRecord(BaseModel):

@@ -421,89 +421,12 @@ def _derive_enrichment(
     candles: Optional[list] = None,
     entry_tf_minutes: int = 3,
 ) -> dict:
-    """Pull derivatives + heatmap snapshot fields out of MarketState for
-    journal persistence. All keys are None when a source is missing — the
-    journal's ALTER TABLE columns default to NULL so that's safe.
-
-    2026-04-23 extension: pulls every `DerivativesState` field that feeds
-    Pass 3 continuous-feature GBT (absolute OI, 1h OI change, absolute
-    funding + predicted, per-side 1h liquidation notionals, LS
-    z-score-14d) plus price-change windows derived from the entry-TF
-    candle buffer (1h / 4h via `_price_change_pct`) plus top-N heatmap
-    clusters via `_top_n_heatmap_clusters`. `candles` and
-    `entry_tf_minutes` default to None/3 to preserve backward-compat
-    with callers (tests, rehydrate path) that don't thread the buffer.
+    """2026-05-05 Phase 9.C — Coinalyze purge: derivatives/heatmap enrichment
+    no-op. Yol B doctrine bu data'yi kullanmiyor, journal kolonlari da
+    silindi. Sadece regime_at_entry korunur (ADX classifier'dan, derivatives
+    bagimli degil).
     """
-    out: dict = {
-        "regime_at_entry": None,
-        "funding_z_at_entry": None,
-        "ls_ratio_at_entry": None,
-        "oi_change_24h_at_entry": None,
-        "liq_imbalance_1h_at_entry": None,
-        "nearest_liq_cluster_above_price": None,
-        "nearest_liq_cluster_below_price": None,
-        "nearest_liq_cluster_above_notional": None,
-        "nearest_liq_cluster_below_notional": None,
-        "nearest_liq_cluster_above_distance_atr": None,
-        "nearest_liq_cluster_below_distance_atr": None,
-        # 2026-04-23 extension ↓
-        "open_interest_usd_at_entry": None,
-        "oi_change_1h_pct_at_entry": None,
-        "funding_rate_current_at_entry": None,
-        "funding_rate_predicted_at_entry": None,
-        "long_liq_notional_1h_at_entry": None,
-        "short_liq_notional_1h_at_entry": None,
-        "ls_ratio_zscore_14d_at_entry": None,
-        "price_change_1h_pct_at_entry": None,
-        "price_change_4h_pct_at_entry": None,
-        "liq_heatmap_top_clusters": {},
-    }
-    deriv = getattr(state, "derivatives", None)
-    if deriv is not None:
-        out["regime_at_entry"] = getattr(deriv, "regime", None)
-        out["funding_z_at_entry"] = getattr(deriv, "funding_rate_zscore_30d", None)
-        out["ls_ratio_at_entry"] = getattr(deriv, "long_short_ratio", None)
-        out["oi_change_24h_at_entry"] = getattr(deriv, "oi_change_24h_pct", None)
-        out["liq_imbalance_1h_at_entry"] = getattr(deriv, "liq_imbalance_1h", None)
-        # 2026-04-23 extension: additional DerivativesState fields that
-        # previously lived only in runtime.
-        out["open_interest_usd_at_entry"] = getattr(deriv, "open_interest_usd", None)
-        out["oi_change_1h_pct_at_entry"] = getattr(deriv, "oi_change_1h_pct", None)
-        out["funding_rate_current_at_entry"] = getattr(deriv, "funding_rate_current", None)
-        out["funding_rate_predicted_at_entry"] = getattr(deriv, "funding_rate_predicted", None)
-        out["long_liq_notional_1h_at_entry"] = getattr(deriv, "long_liq_notional_1h", None)
-        out["short_liq_notional_1h_at_entry"] = getattr(deriv, "short_liq_notional_1h", None)
-        out["ls_ratio_zscore_14d_at_entry"] = getattr(deriv, "ls_ratio_zscore_14d", None)
-    hm = getattr(state, "liquidity_heatmap", None)
-    price = float(getattr(state, "current_price", 0.0) or 0.0)
-    atr = float(getattr(state, "atr", 0.0) or 0.0)
-    if hm is not None:
-        na = getattr(hm, "nearest_above", None)
-        nb = getattr(hm, "nearest_below", None)
-        if na is not None:
-            out["nearest_liq_cluster_above_price"] = getattr(na, "price", None)
-            out["nearest_liq_cluster_above_notional"] = getattr(na, "notional_usd", None)
-            if atr > 0 and price > 0 and getattr(na, "price", None):
-                out["nearest_liq_cluster_above_distance_atr"] = (na.price - price) / atr
-        if nb is not None:
-            out["nearest_liq_cluster_below_price"] = getattr(nb, "price", None)
-            out["nearest_liq_cluster_below_notional"] = getattr(nb, "notional_usd", None)
-            if atr > 0 and price > 0 and getattr(nb, "price", None):
-                out["nearest_liq_cluster_below_distance_atr"] = (price - nb.price) / atr
-        # 2026-04-23 extension: top-N clusters for richer magnet modelling.
-        out["liq_heatmap_top_clusters"] = _top_n_heatmap_clusters(
-            hm, current_price=price, atr=atr, top_n=5,
-        )
-    # 2026-04-23 extension: price change over 1h / 4h windows from the
-    # entry-TF candle buffer. 1h = 60/entry_tf_minutes bars back; 4h =
-    # 240/entry_tf_minutes. On 3m TF → 20 / 80 bars; buffer's default
-    # size of 100 covers 4h comfortably.
-    if candles and entry_tf_minutes > 0:
-        bars_1h = max(1, int(60 / entry_tf_minutes))
-        bars_4h = max(1, int(240 / entry_tf_minutes))
-        out["price_change_1h_pct_at_entry"] = _price_change_pct(candles, bars_1h)
-        out["price_change_4h_pct_at_entry"] = _price_change_pct(candles, bars_4h)
-    return out
+    return {"regime_at_entry": None}
 
 
 # ── Context ─────────────────────────────────────────────────────────────────
@@ -2698,16 +2621,6 @@ class BotRunner:
             session=session.value if session != Session.OFF else None,
             market_structure=_structure_str(state),
             regime_at_entry=enrichment["regime_at_entry"],
-            funding_z_at_entry=enrichment["funding_z_at_entry"],
-            ls_ratio_at_entry=enrichment["ls_ratio_at_entry"],
-            oi_change_24h_at_entry=enrichment["oi_change_24h_at_entry"],
-            liq_imbalance_1h_at_entry=enrichment["liq_imbalance_1h_at_entry"],
-            nearest_liq_cluster_above_price=enrichment["nearest_liq_cluster_above_price"],
-            nearest_liq_cluster_below_price=enrichment["nearest_liq_cluster_below_price"],
-            nearest_liq_cluster_above_notional=enrichment["nearest_liq_cluster_above_notional"],
-            nearest_liq_cluster_below_notional=enrichment["nearest_liq_cluster_below_notional"],
-            nearest_liq_cluster_above_distance_atr=enrichment["nearest_liq_cluster_above_distance_atr"],
-            nearest_liq_cluster_below_distance_atr=enrichment["nearest_liq_cluster_below_distance_atr"],
             # pillar_btc_bias / pillar_eth_bias dropped 2026-05-05 v3.
             # 2026-05-05 Phase 9 Arkham purge: on_chain_context kaldırıldı.
             confluence_pillar_scores={
@@ -2728,16 +2641,6 @@ class BotRunner:
             # be enriched. A back-fill script can replay these fields from
             # `derivatives_snapshots` joined on signal_timestamp if Pass 3
             # finds the gap material.
-            open_interest_usd_at_entry=enrichment["open_interest_usd_at_entry"],
-            oi_change_1h_pct_at_entry=enrichment["oi_change_1h_pct_at_entry"],
-            funding_rate_current_at_entry=enrichment["funding_rate_current_at_entry"],
-            funding_rate_predicted_at_entry=enrichment["funding_rate_predicted_at_entry"],
-            long_liq_notional_1h_at_entry=enrichment["long_liq_notional_1h_at_entry"],
-            short_liq_notional_1h_at_entry=enrichment["short_liq_notional_1h_at_entry"],
-            ls_ratio_zscore_14d_at_entry=enrichment["ls_ratio_zscore_14d_at_entry"],
-            price_change_1h_pct_at_entry=enrichment["price_change_1h_pct_at_entry"],
-            price_change_4h_pct_at_entry=enrichment["price_change_4h_pct_at_entry"],
-            liq_heatmap_top_clusters=enrichment["liq_heatmap_top_clusters"],
             # 2026-05-02 — Phase A.9 ADX numeric capture (entry TF + HTF).
             **_adx_triad_kwargs("3m", adx_3m_result),
             **_adx_triad_kwargs("15m", adx_15m_result),
@@ -5551,16 +5454,6 @@ class BotRunner:
                 session=_session_str(state),
                 market_structure=_structure_str(state),
                 regime_at_entry=enrichment["regime_at_entry"],
-                funding_z_at_entry=enrichment["funding_z_at_entry"],
-                ls_ratio_at_entry=enrichment["ls_ratio_at_entry"],
-                oi_change_24h_at_entry=enrichment["oi_change_24h_at_entry"],
-                liq_imbalance_1h_at_entry=enrichment["liq_imbalance_1h_at_entry"],
-                nearest_liq_cluster_above_price=enrichment["nearest_liq_cluster_above_price"],
-                nearest_liq_cluster_below_price=enrichment["nearest_liq_cluster_below_price"],
-                nearest_liq_cluster_above_notional=enrichment["nearest_liq_cluster_above_notional"],
-                nearest_liq_cluster_below_notional=enrichment["nearest_liq_cluster_below_notional"],
-                nearest_liq_cluster_above_distance_atr=enrichment["nearest_liq_cluster_above_distance_atr"],
-                nearest_liq_cluster_below_distance_atr=enrichment["nearest_liq_cluster_below_distance_atr"],
                 # pillar_btc_bias / pillar_eth_bias dropped 2026-05-05 v3.
                 confluence_pillar_scores=dict(plan.confluence_pillar_scores or {}),
                 # 2026-04-22 (gece, late) — same placement-time oscillator
@@ -5578,16 +5471,6 @@ class BotRunner:
                 # on cancel rows by design — pending-fill paths don't
                 # stash a placement-time candle buffer (CLAUDE.md
                 # "pending-fill paths stay candles=None").
-                open_interest_usd_at_entry=enrichment["open_interest_usd_at_entry"],
-                oi_change_1h_pct_at_entry=enrichment["oi_change_1h_pct_at_entry"],
-                funding_rate_current_at_entry=enrichment["funding_rate_current_at_entry"],
-                funding_rate_predicted_at_entry=enrichment["funding_rate_predicted_at_entry"],
-                long_liq_notional_1h_at_entry=enrichment["long_liq_notional_1h_at_entry"],
-                short_liq_notional_1h_at_entry=enrichment["short_liq_notional_1h_at_entry"],
-                ls_ratio_zscore_14d_at_entry=enrichment["ls_ratio_zscore_14d_at_entry"],
-                price_change_1h_pct_at_entry=enrichment["price_change_1h_pct_at_entry"],
-                price_change_4h_pct_at_entry=enrichment["price_change_4h_pct_at_entry"],
-                liq_heatmap_top_clusters=enrichment["liq_heatmap_top_clusters"],
                 # 2026-05-02 — Phase A.9 ADX numeric stamped from PLACEMENT
                 # TIME (cancel may fire many bars after placement; the
                 # decision-moment regime is what we want for the
