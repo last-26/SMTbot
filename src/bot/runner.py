@@ -3147,6 +3147,7 @@ class BotRunner:
         self,
         decision: Any,  # EntryDecision (avoid circular import in type hint)
         symbol: str,
+        cycle_confluence: Optional[ConfluenceScore] = None,
     ) -> Optional[TradePlan]:
         """Build a TradePlan from HA-native EntryDecision (3-tip differansiyel).
 
@@ -3242,6 +3243,19 @@ class BotRunner:
                 sl_source=sl_source,
                 reason=plan_reason,
             )
+            # 2026-05-05 v5 — forward cycle_confluence onto the plan so the
+            # PLANNED log line + journal trade row carry the actual
+            # directional confluence score (was 0.0/empty since Faz 3 cleanup
+            # — Pass 3 GBT feature poisoning). HA-native entry decision is
+            # already made; this is purely for downstream observability.
+            if cycle_confluence is not None:
+                try:
+                    plan.confluence_score = float(cycle_confluence.score)
+                    plan.confluence_factors = list(
+                        cycle_confluence.factor_names
+                    )
+                except Exception:
+                    pass
             return plan
         except Exception:
             logger.exception("ha_native_trade_plan_build_failed symbol={}", symbol)
@@ -3747,17 +3761,19 @@ class BotRunner:
             else:
                 ha_plan = self._build_ha_native_trade_plan(
                     ha_decision, symbol,
+                    cycle_confluence=cycle_confluence,
                 )
                 if ha_plan is not None:
-                    old_reject = reject_reason
                     plan = ha_plan
                     reject_reason = None
+                    # 2026-05-05 v5 — `prev_5pillar_reject` token retired
+                    # (Faz 5 deleted legacy 5-pillar entirely, value was
+                    # always None — log noise).
                     logger.info(
                         "ha_native_plan_override symbol={} dir={} "
                         "entry_path={} entry={} sl={} tp={} contracts={} "
                         "rr={:.2f} risk_mult={:.2f} "
-                        "scores=(MR={:.2f},C={:.2f},MicR={:.2f}) "
-                        "prev_5pillar_reject={}",
+                        "scores=(MR={:.2f},C={:.2f},MicR={:.2f})",
                         symbol,
                         ha_plan.direction.value if hasattr(
                             ha_plan.direction, "value"
@@ -3770,7 +3786,6 @@ class BotRunner:
                         ha_decision.major_reversal_score,
                         ha_decision.continuation_score,
                         ha_decision.micro_reversal_score,
-                        old_reject,
                     )
 
         if plan is None:
