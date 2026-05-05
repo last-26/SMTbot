@@ -1457,6 +1457,13 @@ class BotRunner:
         snap = self.ctx.monitor.get_tracked_runner(symbol, pos_side)
         if snap is None:
             return
+        # 2026-05-05 Phase 2 — Yol A v5 dynamic-exit doctrine: HA-native
+        # positions carry NO fixed TP (plan.tp_price=0 sentinel). The
+        # dynamic-TP revise gate must not re-anchor a fixed-RR TP on these
+        # positions; exit is driven by HA flip + momentum fade + MFE-lock +
+        # Phase A.5 trailing + MAE-BE recovery + defensive close suite.
+        if snap.get("is_ha_native"):
+            return
         # 2026-05-02 — Phase A regime-aware RR. The position carries the ADX
         # regime captured at entry-time; resolve the per-regime override
         # (`target_rr_ratio_per_regime[regime]` if set, else global). UNKNOWN
@@ -3256,6 +3263,19 @@ class BotRunner:
                     )
                 except Exception:
                     pass
+            # 2026-05-05 Phase 2 — Yol A v5 dynamic-exit doctrine: HA-native
+            # plans carry NO fixed TP. plan.tp_price set to 0.0 sentinel so
+            # downstream `attach_algos` (order_router) and the maker TP-limit
+            # placement in `_handle_pending_filled` skip TP attachment
+            # entirely. Position only carries SL; exit is driven by HA flip,
+            # momentum fade, MFE-lock, Phase A.5 trailing, MAE-BE recovery,
+            # defensive close. `plan.rr_ratio` retained as reported by
+            # `calculate_trade_plan` (cosmetic — journal feature for Pass 3
+            # segmentation; risk_manager.can_trade min_rr_ratio=0.0 floor).
+            try:
+                plan.tp_price = 0.0
+            except Exception:
+                pass
             return plan
         except Exception:
             logger.exception("ha_native_trade_plan_build_failed symbol={}", symbol)

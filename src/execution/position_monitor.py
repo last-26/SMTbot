@@ -553,6 +553,12 @@ class PositionMonitor:
             # Tuple to give the runner an immutable snapshot — the gate
             # mustn't mutate the canonical _Tracked list via this view.
             "recent_confluence_history": tuple(t.recent_confluence_history),
+            # 2026-05-05 Phase 2 — Yol A v5 dynamic-exit doctrine. Dynamic
+            # TP revision must skip HA-native positions (plan.tp_price=0
+            # sentinel; exit driven by HA flip + momentum fade + MFE-lock +
+            # trailing + MAE-BE recovery + defensive close). Legacy 5-pillar
+            # positions still get the regime-aware fixed-RR TP revise.
+            "is_ha_native": t.is_ha_native,
         }
 
     def get_tracked(
