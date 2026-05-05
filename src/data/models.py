@@ -163,6 +163,26 @@ class SignalTableData(BaseModel):
     volume_3m: float = 0.0
     volume_3m_ratio: float = 1.0
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Yol B (HA Strategy, 2026-05-05) — 5m primary fields
+    #
+    # Pine schema migration: 1m + 3m HA layer kaldırıldı, 5m + 15m yayını aktif.
+    # Yol A (HA-native) flag flip'i sonrası operatör Pine'ı .bak.pre_yolb'tan
+    # restore eder → 3m field'ları yeniden dolar. Bu blok yalnızca Yol B mode'da
+    # populate edilir; Yol A mode'da default kalır.
+    # ─────────────────────────────────────────────────────────────────────────
+    vwap_5m: float = 0.0
+    vwap_5m_upper: float = 0.0
+    vwap_5m_lower: float = 0.0
+    ha_color_5m: str = ""              # GREEN / RED / DOJI
+    ha_streak_5m: int = 0              # signed (+green / -red)
+    ha_no_lower_shadow_5m: bool = False
+    ha_no_upper_shadow_5m: bool = False
+    ha_body_pct_5m: float = 0.0        # |body|/range %; doji guard input
+    ema200_5m: float = 0.0             # chart-context (Yol B chart 5m)
+    volume_5m: float = 0.0
+    volume_5m_ratio: float = 1.0       # exit confirm: ≥ 1.2 → hacimli
+
     last_bar: Optional[int] = None  # bar_index of last Pine update — used
                                     # by the runner's freshness-poll to
                                     # detect when a symbol / timeframe
@@ -204,12 +224,17 @@ class OscillatorTableData(BaseModel):
 
     # Heikin Ashi multi-TF MFI + RSI (HA-OHLC bazlı paralel hesaplama).
     # Bot 3-bar delta yön (UP/DOWN/MIXED) hesaplar; Pine raw değer döndürür.
+    # 1m / 3m fields: Yol A backward compat (Pine .bak.pre_yolb restore'da dolar).
     ha_mfi_1m: float = 0.0
     ha_mfi_3m: float = 0.0
     ha_mfi_15m: float = 0.0
     ha_rsi_1m: float = 50.0
     ha_rsi_3m: float = 50.0
     ha_rsi_15m: float = 50.0
+    # Yol B (HA Strategy, 2026-05-05) — 5m primary HA-MFI/RSI yayını.
+    # Bot Yol B entry: 3-bar delta yön onayı + exit'te konfluans referansı.
+    ha_mfi_5m: float = 0.0
+    ha_rsi_5m: float = 50.0
 
     # Pine's bar_index emitted as the LAST row beacon — used by the runner's
     # dual-table freshness poll so a TF/symbol switch unblocks as soon as

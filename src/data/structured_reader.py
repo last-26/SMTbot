@@ -200,6 +200,10 @@ def _build_signal_data(kv: dict[str, str]) -> SignalTableData:
     vwap_15m_val = _parse_leading_float(kv.get("vwap_15m"))
     vwap_3m_upper_val = _parse_leading_float(kv.get("vwap_3m_upper"))
     vwap_3m_lower_val = _parse_leading_float(kv.get("vwap_3m_lower"))
+    # Yol B 5m fields (Pine 2026-05-05 migration)
+    vwap_5m_val       = _parse_leading_float(kv.get("vwap_5m"))
+    vwap_5m_upper_val = _parse_leading_float(kv.get("vwap_5m_upper"))
+    vwap_5m_lower_val = _parse_leading_float(kv.get("vwap_5m_lower"))
 
     return SignalTableData(
         # Price Action
@@ -246,6 +250,20 @@ def _build_signal_data(kv: dict[str, str]) -> SignalTableData:
         # Volume pulse (operatör 2026-05-04 — RCS gate input)
         volume_3m=_parse_float(kv.get("volume_3m", "0")) or 0.0,
         volume_3m_ratio=_parse_float(kv.get("volume_3m_ratio", "1")) or 1.0,
+        # Yol B 5m fields (Pine 2026-05-05 migration). Pine 5m mode'da bu cell'ler
+        # populate edilir; Yol A backup mode'unda Pine .bak'tan restore edilirse
+        # 3m field'ları dolar ve aşağıdaki 5m field'ları default kalır.
+        vwap_5m=vwap_5m_val,
+        vwap_5m_upper=vwap_5m_upper_val,
+        vwap_5m_lower=vwap_5m_lower_val,
+        ha_color_5m=kv.get("ha_color_5m", "").strip().upper(),
+        ha_streak_5m=_parse_int(kv.get("ha_streak_5m")) or 0,
+        ha_no_lower_shadow_5m=kv.get("ha_no_lower_shadow_5m", "NO").strip().upper() == "YES",
+        ha_no_upper_shadow_5m=kv.get("ha_no_upper_shadow_5m", "NO").strip().upper() == "YES",
+        ha_body_pct_5m=_parse_float((kv.get("ha_body_pct_5m", "0") or "0").rstrip("%").strip()) or 0.0,
+        ema200_5m=_parse_leading_float(kv.get("ema200_5m")),
+        volume_5m=_parse_float(kv.get("volume_5m", "0")) or 0.0,
+        volume_5m_ratio=_parse_float(kv.get("volume_5m_ratio", "1")) or 1.0,
         last_bar=_parse_int(kv.get("last_bar")),
     )
 
@@ -385,9 +403,11 @@ def _build_oscillator_data(kv: dict[str, str]) -> OscillatorTableData:
         # Heikin Ashi MFI + RSI multi-TF
         ha_mfi_1m=_parse_float(kv.get("ha_mfi_1m", "0")) or 0.0,
         ha_mfi_3m=_parse_float(kv.get("ha_mfi_3m", "0")) or 0.0,
+        ha_mfi_5m=_parse_float(kv.get("ha_mfi_5m", "0")) or 0.0,
         ha_mfi_15m=_parse_float(kv.get("ha_mfi_15m", "0")) or 0.0,
         ha_rsi_1m=_parse_float(kv.get("ha_rsi_1m", "50")) or 50.0,
         ha_rsi_3m=_parse_float(kv.get("ha_rsi_3m", "50")) or 50.0,
+        ha_rsi_5m=_parse_float(kv.get("ha_rsi_5m", "50")) or 50.0,
         ha_rsi_15m=_parse_float(kv.get("ha_rsi_15m", "50")) or 50.0,
         last_bar=_parse_int(kv.get("last_bar")),
     )
