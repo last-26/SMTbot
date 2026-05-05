@@ -149,6 +149,24 @@ class _Tracked:
     # plus supporting MFI/RSI delta + RCS volume confirm. Persists across
     # cycles — once warned, stays warned until position closes.
     structural_warning: bool = False
+    # 2026-05-05 — Yol B (HA Strategy) per-position fields. Set when the
+    # entry came from `_build_vmc_trade_plan` (Yol B planner produced the
+    # plan via OVERRIDE block); False for Yol A / legacy positions. The
+    # VMC exit gate (`_maybe_close_on_vmc_exit`) only fires for Yol B
+    # positions — Yol A positions retain HA-native 3-layer exit suite.
+    is_vmc: bool = False
+    # WT2 peak (LONG max) / trough (SHORT min) seen since position opened.
+    # Updated each cycle by `_maybe_close_on_vmc_exit`. 0.0 sentinel = first
+    # cycle, will be set to current wt2 on initial peak update. In-memory
+    # only; restart sonrası 0'dan başlar (acceptable, ilk cycle peak update'i
+    # current wt2'ye set eder).
+    wt2_peak_during_position: float = 0.0
+    # WT2 at entry — sadece audit için, exit doctrine'ında kullanılmaz.
+    wt2_at_entry: float = 0.0
+    # 15m hold-extension counter — `evaluate_exit` WARN action her cycle
+    # ++. Threshold (`hold_extension_max_cycles`, default 2) aşılınca
+    # CLOSE'a düşer. Restart sonrası 0'dan başlar.
+    hold_extension_count: int = 0
 
 
 @dataclass
@@ -244,6 +262,8 @@ class PositionMonitor:
         regime_at_entry: Optional[str] = None,
         opened_at: Optional[datetime] = None,
         is_ha_native: bool = False,
+        is_vmc: bool = False,
+        wt2_at_entry: float = 0.0,
     ) -> None:
         # plan_sl_price semantics: None → caller didn't provide one, default to
         # sl_price (correct at fill time). An explicit 0.0 → "unknown, disable
@@ -260,6 +280,8 @@ class PositionMonitor:
             regime_at_entry=regime_at_entry,
             opened_at=resolved_opened_at,
             is_ha_native=is_ha_native,
+            is_vmc=is_vmc,
+            wt2_at_entry=wt2_at_entry,
         )
 
     def poll(
@@ -565,6 +587,12 @@ class PositionMonitor:
             # trailing + MAE-BE recovery + defensive close). Legacy 5-pillar
             # positions still get the regime-aware fixed-RR TP revise.
             "is_ha_native": t.is_ha_native,
+            # 2026-05-05 — Yol B (HA Strategy) snapshot fields. Dynamic-TP
+            # revise also skipped when is_vmc=True (Yol B has no fixed TP).
+            "is_vmc": t.is_vmc,
+            "wt2_peak_during_position": t.wt2_peak_during_position,
+            "wt2_at_entry": t.wt2_at_entry,
+            "hold_extension_count": t.hold_extension_count,
         }
 
     def get_tracked(

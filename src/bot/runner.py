@@ -2156,6 +2156,205 @@ class BotRunner:
         )
         return True
 
+    # ─── Yol B (HA Strategy) integration — 2026-05-05 ─────────────────────────
+    # Operatör doctrine: oscillator-slope-driven entry on 5m + 15m HA.
+    # 4-gate entry (vwap_slope + mfi_delta + wt2_turning + ha_color_5m) +
+    # dynamic exit (peak drawdown + osc dot + ha_close_break + 15m extension).
+    # Aktivasyon: BotRunner._STRATEGY_MODE='vmc' (default 2026-05-05+).
+    # Yol A revert: flag 'ha_native' + Pine .bak.pre_yolb manuel restore.
+
+    async def _evaluate_vmc_entry(
+        self, symbol: str, state: MarketState,
+    ) -> Any:
+        """Yol B entry değerlendirmesi — saf vmc_planner.evaluate_entry wrapper.
+
+        Cycle başı `vmc_state_registry` o sembol için update edilmiş olmalı
+        (`_run_one_symbol` Yol B branch'i bunu yapar). Pure function gate
+        evaluation + per-symbol SL pricing dönüşür.
+        """
+        from src.strategy.ha_strategy.vmc_planner import (
+            VMCEntryConfig, EntryContext, evaluate_entry, EntryDecision,
+        )
+        vmc_state = self.ctx.vmc_state_registry.get(symbol)
+        if vmc_state is None:
+            return EntryDecision(action="NO_SETUP", reason="vmc_state_missing")
+        sig = state.signal_table
+        last_close = float(sig.price or 0.0)
+        pos_dir = self._open_position_direction(symbol)
+        ctx = EntryContext(
+            symbol=symbol,
+            vmc_state=vmc_state,
+            last_close=last_close,
+            market_state=state,
+            has_open_position=pos_dir is not None,
+            open_position_direction=pos_dir,
+        )
+        return evaluate_entry(ctx, VMCEntryConfig())
+
+    def _build_vmc_trade_plan(
+        self, decision: Any, symbol: str,
+    ) -> Optional[TradePlan]:
+        """Yol B EntryDecision → TradePlan.
+
+        SL: per-symbol fixed pct (BTC 0.5% / ETH 0.8% / diğer 1% — operatör
+        2026-05-05). TP: 0.0 sentinel — Yol B dynamic exit, fixed TP yok
+        (Yol A v5 Phase 2 doctrine).
+        """
+        if not decision.is_take:
+            return None
+        if (
+            decision.suggested_entry_price is None
+            or decision.suggested_sl_price is None
+            or decision.suggested_entry_price <= 0
+            or decision.suggested_sl_price <= 0
+        ):
+            return None
+
+        cfg = self.ctx.config
+        base_risk = cfg.trading.risk_amount_usdt
+        margin_balance = (
+            self.ctx.last_margin_balance
+            if self.ctx.last_margin_balance > 0
+            else cfg.bot.starting_balance
+        )
+        contract_size = self.ctx.contract_sizes.get(
+            symbol, cfg.trading.contract_size,
+        )
+        max_leverage = self.ctx.max_leverage_per_symbol.get(
+            symbol, cfg.trading.max_leverage,
+        )
+        plan_reason = f"ha_strategy:{decision.reason}"
+
+        try:
+            plan = calculate_trade_plan(
+                direction=decision.direction,
+                entry_price=decision.suggested_entry_price,
+                sl_price=decision.suggested_sl_price,
+                account_balance=margin_balance,
+                risk_pct=cfg.trading.risk_per_trade_pct / 100.0,
+                # rr_ratio=1.0 sizing math placeholder; tp_price=0 sentinel
+                # downstream (attach_algos / maker TP-limit / rehydrate) skips
+                # TP attach. Yol B'de exit %100 Python tarafında dinamik.
+                rr_ratio=1.0,
+                max_leverage=max_leverage,
+                contract_size=contract_size,
+                margin_balance=margin_balance,
+                fee_reserve_pct=cfg.trading.fee_reserve_pct,
+                risk_amount_usdt_override=base_risk,
+                sl_source="vmc_fixed_pct",
+                reason=plan_reason,
+            )
+            plan.tp_price = 0.0
+            plan.rr_ratio = 0.0
+        except Exception:
+            logger.exception(
+                "vmc_plan_build_failed symbol=%s dir=%s",
+                symbol, decision.direction,
+            )
+            return None
+        return plan
+
+    async def _maybe_close_on_vmc_exit(
+        self, symbol: str, pos_side: str, state: MarketState,
+    ) -> bool:
+        """Yol B exit gate — peak update + evaluate_exit + defensive close.
+
+        Sıralama:
+          1) Pozisyon Yol B mi? `_Tracked.is_vmc=True` olmalı; legacy/Yol A
+             pozisyonlar bu gate'i bypass eder.
+          2) WT2 peak (LONG max) / trough (SHORT min) update.
+          3) `evaluate_exit()` pure function — drawdown + dot/vol + 15m ext.
+          4) WARN → `_Tracked.hold_extension_count++`, return False.
+          5) CLOSE → defensive close (maker-first Phase A.10), return True.
+
+        Returns True when close fired; caller cycle returns early.
+        """
+        from src.strategy.ha_strategy.vmc_exit import (
+            VMCExitConfig, ExitContext, evaluate_exit,
+        )
+        tracked = self.ctx.monitor.get_tracked(symbol, pos_side)
+        if tracked is None or not getattr(tracked, "is_vmc", False):
+            return False
+        vmc_state = self.ctx.vmc_state_registry.get(symbol)
+        if vmc_state is None or vmc_state.latest is None:
+            return False
+
+        pos_dir = (
+            Direction.BULLISH if pos_side == "long" else Direction.BEARISH
+        )
+        # 5m bar bazında bars_held (300s/bar)
+        try:
+            elapsed_s = (_utc_now() - tracked.opened_at).total_seconds()
+        except Exception:
+            elapsed_s = 0.0
+        bars_held = max(0, int(elapsed_s // 300))
+
+        # Peak/trough monotonic update — runtime in-memory only.
+        current_wt2 = float(vmc_state.latest.wt2 or 0.0)
+        current_peak = float(
+            getattr(tracked, "wt2_peak_during_position", 0.0) or 0.0
+        )
+        if current_peak == 0.0:
+            new_peak = current_wt2
+        elif pos_dir == Direction.BULLISH:
+            new_peak = max(current_peak, current_wt2)
+        else:
+            new_peak = min(current_peak, current_wt2)
+        if new_peak != current_peak:
+            try:
+                tracked.wt2_peak_during_position = new_peak
+            except Exception:
+                pass
+
+        osc = state.oscillator
+        wt_cross = (osc.wt_cross or "—").upper()
+        wt_state = (osc.wt_state or "NEUTRAL").upper()
+
+        ctx = ExitContext(
+            direction=pos_dir,
+            vmc_state=vmc_state,
+            wt2_peak_during_position=new_peak,
+            wt2_at_entry=float(
+                getattr(tracked, "wt2_at_entry", 0.0) or 0.0
+            ),
+            bars_held=bars_held,
+            hold_extension_count=int(
+                getattr(tracked, "hold_extension_count", 0) or 0
+            ),
+            wt_cross=wt_cross,
+            wt_state=wt_state,
+        )
+        decision = evaluate_exit(ctx, VMCExitConfig())
+
+        if decision.should_warn:
+            try:
+                tracked.hold_extension_count = (
+                    int(getattr(tracked, "hold_extension_count", 0) or 0) + 1
+                )
+                logger.info(
+                    "vmc_exit_warn_extended symbol={} side={} count={} "
+                    "reason={}",
+                    symbol, pos_side,
+                    tracked.hold_extension_count, decision.reason,
+                )
+            except Exception:
+                pass
+            return False
+
+        if not decision.should_close:
+            return False
+
+        logger.info(
+            "vmc_exit_fired symbol={} side={} reason={} drawdown={:.2%} "
+            "in_hold_zone={} osc_dot={} ha_break={} vol_ok={} bars_held={}",
+            symbol, pos_side, decision.reason,
+            decision.drawdown_pct or 0.0, decision.in_hold_zone,
+            decision.osc_dot_fired, decision.ha_close_break_fired,
+            decision.volume_confirmed, bars_held,
+        )
+        await self._defensive_close(symbol, pos_side, "vmc_exit")
+        return True
+
     def _open_position_direction(self, symbol: str) -> Optional[Direction]:
         """Direction of the OPEN position on `symbol`, or None.
 
@@ -3657,6 +3856,15 @@ class BotRunner:
             self.ctx.ha_state_registry.update(symbol, state, _utc_now())
         except Exception:
             logger.exception("ha_state_registry_update_failed symbol={}", symbol)
+        # 2026-05-05 — Yol B (HA Strategy) state pump. Aktiv mode bağımsız
+        # registry'ye push: Yol A frozen mode'da bu satır crash riski yaratmaz
+        # (state default-valued snapshot eklenir), Yol B mode'da slope/turn/
+        # delta/break helper'ları için zorunlu. Restart sonrası registry boş
+        # gelir → backfill startup'ta seed eder, runtime'da bu pump günceller.
+        try:
+            self.ctx.vmc_state_registry.update(symbol, state, _utc_now())
+        except Exception:
+            logger.exception("vmc_state_registry_update_failed symbol={}", symbol)
         # 2026-05-04 — HA-native planner evaluate + decision_log row.
         # Returns EntryDecision (or None on internal failure). Caller may
         # use it for primary-mode TradePlan in step 3, or ignore it
@@ -3692,9 +3900,16 @@ class BotRunner:
         except Exception:
             logger.debug("cycle_confluence_failed symbol={}", symbol)
             cycle_confluence = None
-        ha_decision = await self._evaluate_ha_native_entry(
-            symbol, state, confluence=cycle_confluence,
-        )
+        # 2026-05-05 — Yol B / Yol A multiplexer. _STRATEGY_MODE class flag
+        # seçer; Yol A path frozen ama korundu, flag flip ile bir-line revert.
+        if self._STRATEGY_MODE == "vmc":
+            # Yol B (HA Strategy) — 4-gate evaluator. confluence param yok
+            # (planner saf oscillator-driven; confluence journal-only kalır).
+            ha_decision = await self._evaluate_vmc_entry(symbol, state)
+        else:
+            ha_decision = await self._evaluate_ha_native_entry(
+                symbol, state, confluence=cycle_confluence,
+            )
 
         # 2c-bis. Attach derivatives state + liquidity heatmap (Phase 1.5).
         # Failure here must never crash the symbol cycle.
@@ -3791,6 +4006,19 @@ class BotRunner:
         # Reversal sinyali gelirse hemen close, sonraki cycle yeni yönde
         # entry alabilir. HA-flip'ten daha sıkı (skor ≥ 5.0 + structural
         # MR confirmation).
+        # 2026-05-05 — strategy-mode exit multiplexer.
+        # Yol B (vmc): _maybe_close_on_vmc_exit (peak drawdown + dot/vol +
+        # 15m hold-extension). Yol A path (counter_reversal + ha_flip)
+        # frozen — _Tracked.is_vmc=True olmayan pozisyonlar (legacy / Yol A)
+        # için Yol A path ÇAĞRILABİLİR (gate kendi içinde is_ha_native check'i
+        # yapar). Bu sayede aynı bot session'ında karma pozisyon olsa bile
+        # her biri doğru exit doctrine'ından geçer.
+        if open_side and self._STRATEGY_MODE == "vmc":
+            vmc_closed = await self._maybe_close_on_vmc_exit(
+                symbol, open_side, state,
+            )
+            if vmc_closed:
+                return
         if open_side:
             cr_closed = await self._maybe_close_on_counter_reversal(
                 symbol, open_side, state,
@@ -3942,22 +4170,32 @@ class BotRunner:
             # null-equivalent (Pine emit edemedi). Production'da TV
             # chart 200+ bar açıldığı için pratik olarak hep dolu, ama
             # edge case için savunmacı kontrol.
-            ema200 = float(state.signal_table.ema200_3m or 0.0)
+            # 2026-05-05 — strategy-mode-aware EMA200 warmup field. Yol B 5m
+            # chart, Yol A 3m chart. Pine emit edilmemişse 0.0 olur.
+            if self._STRATEGY_MODE == "vmc":
+                ema200 = float(state.signal_table.ema200_5m or 0.0)
+            else:
+                ema200 = float(state.signal_table.ema200_3m or 0.0)
             if (
                 cfg.execution.ema200_warmup_gate_enabled
                 and ema200 <= 0.0
             ):
                 logger.warning(
-                    "ema200_warmup_gate_blocked symbol={} ema200={} — "
-                    "skipping HA-native entry (Pine henüz 200-bar warmup'ta)",
-                    symbol, ema200,
+                    "ema200_warmup_gate_blocked symbol={} ema200={} mode={} — "
+                    "skipping entry (Pine henüz 200-bar warmup'ta)",
+                    symbol, ema200, self._STRATEGY_MODE,
                 )
                 reject_reason = "ema200_warmup_not_ready"
             else:
-                ha_plan = self._build_ha_native_trade_plan(
-                    ha_decision, symbol,
-                    cycle_confluence=cycle_confluence,
-                )
+                # Strategy-mode-aware plan builder — Yol B fixed-pct SL +
+                # tp_price=0 sentinel; Yol A 3-tip dispatcher + per-tip RR.
+                if self._STRATEGY_MODE == "vmc":
+                    ha_plan = self._build_vmc_trade_plan(ha_decision, symbol)
+                else:
+                    ha_plan = self._build_ha_native_trade_plan(
+                        ha_decision, symbol,
+                        cycle_confluence=cycle_confluence,
+                    )
                 if ha_plan is not None:
                     plan = ha_plan
                     reject_reason = None
@@ -5065,11 +5303,21 @@ class BotRunner:
                     ev.inst_id, ev.pos_side, plan.tp_price, exc, code,
                 )
 
-        # 2026-05-04 — Yol A: pending-fill path also stamps is_ha_native.
-        # `meta` is the PendingSetupMeta stashed at limit-place time; the
-        # plan reused here is the same one that produced the pending
-        # entry, so the `ha_native:` reason prefix carries through.
+        # 2026-05-04 — Yol A: pending-fill path stamps is_ha_native.
+        # 2026-05-05 — Yol B: pending-fill path stamps is_vmc + wt2_at_entry.
+        # plan.reason prefix ("ha_native:" / "ha_strategy:") tag'ler.
         is_ha_native = bool(plan.reason and plan.reason.startswith("ha_native:"))
+        is_vmc = bool(plan.reason and plan.reason.startswith("ha_strategy:"))
+        # WT2 at entry — Yol B exit audit için. last_market_state_per_symbol'den
+        # son cycle wt2 alınır; pending-fill anında registry hâlâ dolu.
+        wt2_at_entry = 0.0
+        if is_vmc:
+            try:
+                state_at = self.ctx.last_market_state_per_symbol.get(ev.inst_id)
+                if state_at is not None:
+                    wt2_at_entry = float(state_at.oscillator.wt2 or 0.0)
+            except Exception:
+                pass
         self.ctx.monitor.register_open(
             ev.inst_id, ev.pos_side, float(plan.num_contracts), fill_px,
             algo_ids=algo_ids, tp2_price=plan.tp_price,
@@ -5079,6 +5327,8 @@ class BotRunner:
             regime_at_entry=meta.trend_regime_at_entry,
             opened_at=_utc_now(),
             is_ha_native=is_ha_native,
+            is_vmc=is_vmc,
+            wt2_at_entry=wt2_at_entry,
         )
         self.ctx.risk_mgr.register_trade_opened()
 
@@ -5534,13 +5784,15 @@ class BotRunner:
                         "tp={} err={!r} code={} — OCO still protects",
                         rec.symbol, pos_side, rec.tp_price, exc, code,
                     )
-            # 2026-05-04 — Yol A: rehydrate path stamps is_ha_native from
-            # the journal `reason` column. Plans built by the HA-native
-            # planner write `ha_native:` prefix; rehydrated rows that
-            # match get the flag so the HA-flip exit gate fires after
-            # restart too. Pre-Yol-A rows have plain reasons → False.
+            # 2026-05-04 — Yol A: rehydrate is_ha_native from journal `reason`.
+            # 2026-05-05 — Yol B: rehydrate is_vmc from `ha_strategy:` prefix.
+            # Restart sonrası is_vmc trade'leri Yol B exit gate'inden geçer;
+            # wt2_at_entry restart'ta 0 kalır (peak rebuild ilk cycle'da).
             is_ha_native = bool(
                 rec.reason and rec.reason.startswith("ha_native:")
+            )
+            is_vmc = bool(
+                rec.reason and rec.reason.startswith("ha_strategy:")
             )
             self.ctx.monitor.register_open(
                 rec.symbol, pos_side,
@@ -5558,6 +5810,8 @@ class BotRunner:
                 regime_at_entry=rec.trend_regime_at_entry,
                 opened_at=rec.entry_timestamp,
                 is_ha_native=is_ha_native,
+                is_vmc=is_vmc,
+                wt2_at_entry=0.0,  # restart sonrası rebuild
             )
             self.ctx.open_trade_ids[(rec.symbol, pos_side)] = rec.trade_id
             self.ctx.open_trade_opened_at[(rec.symbol, pos_side)] = rec.entry_timestamp
